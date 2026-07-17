@@ -42,8 +42,15 @@ pub(crate) struct GuardSnapshot {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct InjectIfRequest {
-    pub user_gen: u64,
-    pub input_epoch: u64,
+    /// Client-observed lease. `None` skips the precondition: the caller takes
+    /// the apply-point value returned in the response as its lease instead
+    /// (delivery does this — the proxy main loop has already counted every
+    /// forwarded human byte into `user_gen` by the time this op applies, so
+    /// the returned value is the authoritative "no human touch up to here").
+    #[serde(default)]
+    pub user_gen: Option<u64>,
+    #[serde(default)]
+    pub input_epoch: Option<u64>,
     #[serde(default)]
     pub require_empty: bool,
     pub payload: String,
@@ -97,10 +104,14 @@ pub(crate) fn check_inject(req: &InjectIfRequest, snap: &GuardSnapshot) -> Decis
         InputObservation::Unavailable => return Err(RefuseReason::Unavailable),
         InputObservation::Text(text) => text,
     };
-    if snap.user_gen != req.user_gen {
+    if let Some(user_gen) = req.user_gen
+        && snap.user_gen != user_gen
+    {
         return Err(RefuseReason::StaleUserGen);
     }
-    if snap.input_epoch != req.input_epoch {
+    if let Some(input_epoch) = req.input_epoch
+        && snap.input_epoch != input_epoch
+    {
         return Err(RefuseReason::StaleEpoch);
     }
     if req.require_empty && !text.is_empty() {
@@ -155,8 +166,8 @@ mod tests {
 
     fn inject_req(user_gen: u64, epoch: u64, payload: &str) -> InjectIfRequest {
         InjectIfRequest {
-            user_gen,
-            input_epoch: epoch,
+            user_gen: Some(user_gen),
+            input_epoch: Some(epoch),
             require_empty: true,
             payload: payload.into(),
         }
@@ -297,5 +308,25 @@ mod tests {
             let s = snap(3, 8, obs);
             assert_eq!(check_submit(&submit_req(3, Some(8), "hi"), &s), Err(reason));
         }
+    }
+
+    #[test]
+    fn inject_without_lease_takes_apply_point_as_baseline() {
+        // Delivery's shape: no client lease, require_empty only. The apply
+        // point still refuses a visibly non-empty prompt; the caller adopts
+        // the returned gen/epoch as its immutable lease.
+        let open = InjectIfRequest {
+            user_gen: None,
+            input_epoch: None,
+            require_empty: true,
+            payload: "hi".into(),
+        };
+        let empty = snap(9, 4, InputObservation::Text(String::new()));
+        assert_eq!(check_inject(&open, &empty), Ok(()));
+        let drafted = snap(9, 4, InputObservation::Text("draft".into()));
+        assert_eq!(
+            check_inject(&open, &drafted),
+            Err(RefuseReason::PromptNotEmpty)
+        );
     }
 }

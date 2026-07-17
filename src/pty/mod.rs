@@ -1420,7 +1420,11 @@ impl Proxy {
                     return "ERROR write_failed\n".into();
                 }
                 let epoch = self.screen.bump_input_epoch();
-                format!("OK epoch={epoch}\n")
+                // gen is the apply-point user generation: every human byte
+                // forwarded so far is counted (the stdin arm runs before the
+                // inject-client arm in each loop iteration), so callers may
+                // adopt it as their immutable submit lease.
+                format!("OK epoch={epoch} gen={}\n", self.screen.user_gen())
             }
             Err(reason) => format!("REFUSED {}\n", reason.wire()),
         }
@@ -1439,7 +1443,7 @@ impl Proxy {
                     return "ERROR write_failed\n".into();
                 }
                 let epoch = self.screen.bump_input_epoch();
-                format!("OK epoch={epoch}\n")
+                format!("OK epoch={epoch} gen={}\n", self.screen.user_gen())
             }
             Err(reason) => format!("REFUSED {}\n", reason.wire()),
         }

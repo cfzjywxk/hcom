@@ -1036,36 +1036,105 @@ impl GuardedSubmit {
     }
 }
 
+/// Immutable submit lease for ONE delivery inject attempt.
+///
+/// Captured atomically at the inject apply point (the proxy returns the
+/// user generation it observed while writing the payload) and reused
+/// unchanged for the first submit AND every Enter retry of the attempt.
+/// It is never refreshed from a later screen snapshot: any human input
+/// after the inject must make every subsequent submit of this attempt
+/// STALE at the proxy — re-reading a newer generation would launder the
+/// human's touch into a fresh baseline.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AttemptLease {
+    user_gen: u64,
+    /// Inject-response epoch: valid only for the first submit (our own CR
+    /// write advances the epoch, so retries pass no epoch and rely on the
+    /// immutable user_gen + exact-text match).
+    first_submit_epoch: u64,
+}
+
+impl AttemptLease {
+    pub(crate) fn submit_args(&self, first_submit: bool) -> (u64, Option<u64>) {
+        (
+            self.user_gen,
+            first_submit.then_some(self.first_submit_epoch),
+        )
+    }
+}
+
+/// Parse `OK epoch=<n> gen=<g>` responses from guarded RPCs.
+fn parse_ok_response(response: &str) -> Option<(u64, u64)> {
+    let rest = response.strip_prefix("OK ")?;
+    let mut epoch = None;
+    let mut user_gen = None;
+    for token in rest.split_whitespace() {
+        if let Some(v) = token.strip_prefix("epoch=") {
+            epoch = v.parse().ok();
+        } else if let Some(v) = token.strip_prefix("gen=") {
+            user_gen = v.parse().ok();
+        }
+    }
+    Some((epoch?, user_gen?))
+}
+
+/// Guarded delivery inject: the proxy verifies the prompt is empty at the
+/// apply point, writes the payload, and returns the lease this attempt must
+/// use for every submit. Refusal writes zero bytes.
+pub(crate) fn inject_if_leased(port: u16, payload: &str) -> Result<AttemptLease, String> {
+    let req = serde_json::json!({
+        "require_empty": true,
+        "payload": payload,
+    });
+    let response = guarded_frame(port, &format!("\x00INJECT_IF {req}\n"))?;
+    match parse_ok_response(&response) {
+        Some((epoch, user_gen)) => Ok(AttemptLease {
+            user_gen,
+            first_submit_epoch: epoch,
+        }),
+        None => Err(response),
+    }
+}
+
 /// Ask the proxy to press Enter ONLY IF, at the apply point, no user input
-/// happened since `user_gen` and the prompt still shows exactly
-/// `expected_text`. The proxy never writes the CR on refusal — this replaces
-/// the raw `inject_enter` in the automatic delivery path so hcom cannot
-/// submit on the human's behalf (guarded-submit contract).
-pub(crate) fn submit_if(port: u16, user_gen: u64, expected_text: &str) -> GuardedSubmit {
+/// happened since the lease was captured at inject time and the prompt still
+/// shows exactly `expected_text`. The proxy never writes the CR on refusal —
+/// this replaces the raw `inject_enter` in the automatic delivery path so
+/// hcom cannot submit on the human's behalf (guarded-submit contract).
+pub(crate) fn submit_if(
+    port: u16,
+    lease: AttemptLease,
+    first_submit: bool,
+    expected_text: &str,
+) -> GuardedSubmit {
+    let (user_gen, input_epoch) = lease.submit_args(first_submit);
     let req = serde_json::json!({
         "user_gen": user_gen,
+        "input_epoch": input_epoch,
         "expected_text": expected_text,
     });
-    let frame = format!("\x00SUBMIT_IF {req}\n");
-    let mut stream = match TcpStream::connect(format!("127.0.0.1:{port}")) {
-        Ok(stream) => stream,
-        Err(e) => return GuardedSubmit::Refused(format!("connect: {e}")),
-    };
+    match guarded_frame(port, &format!("\x00SUBMIT_IF {req}\n")) {
+        Ok(response) if response.starts_with("OK") => GuardedSubmit::Sent,
+        Ok(response) => GuardedSubmit::Refused(response),
+        Err(e) => GuardedSubmit::Refused(e),
+    }
+}
+
+/// One request/response round-trip on the inject port.
+fn guarded_frame(port: u16, frame: &str) -> Result<String, String> {
+    let mut stream =
+        TcpStream::connect(format!("127.0.0.1:{port}")).map_err(|e| format!("connect: {e}"))?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-    if stream.write_all(frame.as_bytes()).is_err() {
-        return GuardedSubmit::Refused("write_failed".into());
-    }
+    stream
+        .write_all(frame.as_bytes())
+        .map_err(|_| "write_failed".to_string())?;
     let _ = stream.shutdown(std::net::Shutdown::Write);
     let mut response = String::new();
-    if stream.read_to_string(&mut response).is_err() {
-        return GuardedSubmit::Refused("read_failed".into());
-    }
-    if response.starts_with("OK") {
-        GuardedSubmit::Sent
-    } else {
-        GuardedSubmit::Refused(response.trim().to_string())
-    }
+    stream
+        .read_to_string(&mut response)
+        .map_err(|_| "read_failed".to_string())?;
+    Ok(response.trim().to_string())
 }
 
 /// Fixed retry delay between gate-blocked delivery attempts.
@@ -1358,6 +1427,9 @@ pub fn run_delivery_loop(
         let mut inject_attempt: u32 = 0;
         let mut enter_attempt: u32 = 0;
         let mut injected_text = String::new();
+        // Set once per inject attempt from the inject apply point; never
+        // refreshed from later screen snapshots (see AttemptLease).
+        let mut attempt_lease: Option<AttemptLease> = None;
         let mut phase_started_at = Instant::now();
         let mut cursor_before: i64 = 0;
         // Gate block tracking for TUI status updates
@@ -1528,25 +1600,37 @@ pub fn run_delivery_loop(
                             _ => build_wake_inject_text(db, &current_name, input_box_width),
                         };
 
-                        if inject_text(state.inject_port, &text) {
-                            log_info(
-                                "native",
-                                "delivery.injected",
-                                &format!(
-                                    "Injected '{}' (len={}, inject_attempt={})",
-                                    truncate_chars(&text, 40),
-                                    text.len(),
-                                    inject_attempt
-                                ),
-                            );
-                            injected_text = text;
-                            phase_started_at = Instant::now();
-                            enter_attempt = 0;
-                            delivery_state = State::WaitTextRender;
-                            continue; // Skip retry delay - now in WaitTextRender phase
-                        } else {
-                            log_warn("native", "delivery.inject_fail", "TCP inject failed");
-                            attempt += 1;
+                        // Guarded inject: the proxy re-verifies prompt
+                        // emptiness at the apply point and returns the
+                        // immutable lease every submit of this attempt uses.
+                        match inject_if_leased(state.inject_port, &text) {
+                            Ok(lease) => {
+                                log_info(
+                                    "native",
+                                    "delivery.injected",
+                                    &format!(
+                                        "Injected '{}' (len={}, inject_attempt={}, lease={:?})",
+                                        truncate_chars(&text, 40),
+                                        text.len(),
+                                        inject_attempt,
+                                        lease
+                                    ),
+                                );
+                                injected_text = text;
+                                attempt_lease = Some(lease);
+                                phase_started_at = Instant::now();
+                                enter_attempt = 0;
+                                delivery_state = State::WaitTextRender;
+                                continue; // Skip retry delay - now in WaitTextRender phase
+                            }
+                            Err(refusal) => {
+                                log_warn(
+                                    "native",
+                                    "delivery.inject_refused",
+                                    &format!("Guarded inject refused: {refusal}"),
+                                );
+                                attempt += 1;
+                            }
                         }
                     } else {
                         // Gate blocked - refresh heartbeat so we don't go stale while waiting
@@ -1744,7 +1828,6 @@ pub fn run_delivery_loop(
                             let user_active = state.is_user_active();
                             let screen = state.screen.read().unwrap();
                             let approval = screen.approval;
-                            let snapshot_gen = screen.user_gen;
                             let ownership =
                                 prompt_ownership(screen.input_text.as_deref(), &injected_text);
                             drop(screen);
@@ -1761,16 +1844,24 @@ pub fn run_delivery_loop(
                                 continue;
                             }
 
+                            // The lease was captured at the inject apply
+                            // point and is NEVER refreshed: human input since
+                            // the inject must refuse every submit of this
+                            // attempt, even if the prompt text matches again.
+                            let Some(lease) = attempt_lease else {
+                                delivery_state = State::Pending;
+                                continue;
+                            };
+
                             delivery_state = State::WaitTextClear;
                             phase_started_at = Instant::now();
                             enter_attempt = 0;
 
                             if !user_active && !approval {
-                                // Guarded submit: the proxy re-verifies gen +
-                                // exact text at the apply point and never
-                                // writes the CR on refusal. This closes the
-                                // snapshot→Enter TOCTOU window.
-                                match submit_if(state.inject_port, snapshot_gen, &injected_text) {
+                                // Guarded submit: the proxy re-verifies the
+                                // inject-time lease + exact text at the apply
+                                // point and never writes the CR on refusal.
+                                match submit_if(state.inject_port, lease, true, &injected_text) {
                                     GuardedSubmit::Sent => {
                                         log_info(
                                             "native",
@@ -1871,7 +1962,6 @@ pub fn run_delivery_loop(
                             let user_active = state.is_user_active();
                             let screen = state.screen.read().unwrap();
                             let approval = screen.approval;
-                            let snapshot_gen = screen.user_gen;
                             let ownership =
                                 prompt_ownership(screen.input_text.as_deref(), &injected_text);
                             drop(screen);
@@ -1891,6 +1981,15 @@ pub fn run_delivery_loop(
                                 continue;
                             }
 
+                            // Retries reuse the SAME inject-time lease (gen
+                            // only — our own first CR advanced the epoch).
+                            // Human input since the inject stays STALE here;
+                            // it is never re-baselined from a fresh snapshot.
+                            let Some(lease) = attempt_lease else {
+                                delivery_state = State::Pending;
+                                continue;
+                            };
+
                             let can_send = !user_active && !approval;
                             if can_send {
                                 log_info(
@@ -1901,7 +2000,7 @@ pub fn run_delivery_loop(
                                         enter_attempt, input_text
                                     ),
                                 );
-                                match submit_if(state.inject_port, snapshot_gen, &injected_text) {
+                                match submit_if(state.inject_port, lease, false, &injected_text) {
                                     GuardedSubmit::Sent => {}
                                     refusal => {
                                         let user_owned = refusal.is_user_owned_pause();
@@ -2333,6 +2432,68 @@ mod tests {
             prompt_ownership(Some("user draft"), "<hcom>"),
             PromptOwnership::Other,
         );
+    }
+
+    // ---- inject-time lease (guarded submit) ----
+
+    // The laundering regression: the human touches the session AFTER the
+    // inject (arrow key, type+backspace), the prompt ends up textually equal
+    // to the injected text again — every submit of this attempt must still
+    // be refused. The lease is the inject-apply generation and is never
+    // refreshed, so the proxy-side check sees gen 5 vs live gen 6.
+    #[test]
+    fn human_touch_after_inject_refuses_submit_even_if_text_matches_again() {
+        use crate::pty::guard::{
+            GuardSnapshot, InputObservation, RefuseReason, SubmitIfRequest, check_submit,
+        };
+
+        let lease = AttemptLease {
+            user_gen: 5,
+            first_submit_epoch: 8,
+        };
+        // Live proxy state after the human touched the session: gen advanced,
+        // prompt restored to exactly the injected text.
+        let live = GuardSnapshot {
+            user_gen: 6,
+            input_epoch: 8,
+            observation: InputObservation::Text("<hcom>".into()),
+            approval_waiting: false,
+        };
+
+        for first_submit in [true, false] {
+            let (user_gen, input_epoch) = lease.submit_args(first_submit);
+            let req = SubmitIfRequest {
+                user_gen,
+                input_epoch,
+                expected_text: "<hcom>".into(),
+            };
+            assert_eq!(
+                check_submit(&req, &live),
+                Err(RefuseReason::StaleUserGen),
+                "first_submit={first_submit}: a human touch since inject must never be laundered"
+            );
+        }
+    }
+
+    #[test]
+    fn attempt_lease_is_immutable_across_first_submit_and_retries() {
+        let lease = AttemptLease {
+            user_gen: 5,
+            first_submit_epoch: 8,
+        };
+        assert_eq!(lease.submit_args(true), (5, Some(8)));
+        // Retries keep the inject-time generation and drop only the epoch
+        // token (our own first CR advanced the epoch).
+        assert_eq!(lease.submit_args(false), (5, None));
+    }
+
+    #[test]
+    fn parse_ok_response_extracts_epoch_and_gen() {
+        assert_eq!(parse_ok_response("OK epoch=6 gen=1"), Some((6, 1)));
+        assert_eq!(parse_ok_response("OK gen=1 epoch=6"), Some((6, 1)));
+        assert_eq!(parse_ok_response("OK epoch=6"), None, "gen is required");
+        assert_eq!(parse_ok_response("REFUSED stale_user_gen"), None);
+        assert_eq!(parse_ok_response("error: unknown command"), None);
     }
 
     // ---- evaluate_gate tests ----

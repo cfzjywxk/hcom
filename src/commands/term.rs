@@ -95,11 +95,13 @@ fn guarded_rpc(port: i32, frame: &str) -> Result<String, String> {
     Ok(response.trim().to_string())
 }
 
-/// Parse `OK epoch=<n>` responses from guarded RPCs.
+/// Parse `OK epoch=<n> [gen=<g>]` responses from guarded RPCs.
 fn parse_ok_epoch(response: &str) -> Option<u64> {
     response
-        .strip_prefix("OK epoch=")
-        .and_then(|n| n.trim().parse().ok())
+        .strip_prefix("OK ")?
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix("epoch="))
+        .and_then(|n| n.parse().ok())
 }
 
 pub fn inject_text_remote_result(
@@ -794,9 +796,9 @@ mod tests {
             "luna",
             vec![
                 &screen_json("text", Some(""), 1, 5),
-                "OK epoch=6\n",
+                "OK epoch=6 gen=1\n",
                 &screen_json("text", Some("hello"), 1, 6),
-                "OK epoch=7\n",
+                "OK epoch=7 gen=1\n",
             ],
         );
 
@@ -876,7 +878,7 @@ mod tests {
             "luna",
             vec![
                 &screen_json("text", Some(""), 1, 5),
-                "OK epoch=6\n",
+                "OK epoch=6 gen=1\n",
                 &screen_json("text", Some("hello"), 1, 6),
                 "REFUSED stale_user_gen\n",
             ],
