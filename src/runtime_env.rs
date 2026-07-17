@@ -30,15 +30,12 @@ pub(crate) fn get_hcom_prefix() -> Vec<String> {
     HCOM_PREFIX.clone()
 }
 
-/// Get the base directory for tool config files (e.g. .codex/, .gemini/).
+/// Get the user's native base directory for tool config files.
+///
+/// HCOM_DIR owns hcom state only and must never redirect another tool's
+/// settings, login, sessions, skills, plugins, or transcripts.
 pub(crate) fn tool_config_root() -> std::path::PathBuf {
-    let env: std::collections::HashMap<String, String> = std::env::vars().collect();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let (hcom_dir, _) = crate::paths::resolve_hcom_dir_from_env(&env, &cwd);
-    hcom_dir
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default())
+    user_home().unwrap_or_default()
 }
 
 /// Build hcom command string for prompts, config, and hook commands.
@@ -182,7 +179,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn tool_config_root_uses_home_when_hcom_dir_has_no_parent() {
+    fn tool_config_root_uses_home_and_ignores_hcom_dir() {
         let _guard = EnvGuard::new();
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
@@ -190,7 +187,7 @@ mod tests {
 
         unsafe {
             std::env::set_var("HOME", &home);
-            std::env::set_var("HCOM_DIR", "/");
+            std::env::set_var("HCOM_DIR", temp.path().join("workspace/.hcom"));
         }
 
         assert_eq!(super::tool_config_root(), home);
@@ -198,15 +195,13 @@ mod tests {
 
     #[test]
     #[serial]
-    fn tool_config_root_uses_parent_of_resolved_hcom_dir() {
+    fn tool_config_root_does_not_follow_relative_hcom_dir() {
         let _guard = EnvGuard::new();
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         let home = temp.path().join("home");
-        let sandbox = workspace.join(".sandbox");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(&sandbox).unwrap();
 
         let prev_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(&workspace).unwrap();
@@ -216,10 +211,9 @@ mod tests {
         }
 
         let root = super::tool_config_root();
-        let expected = sandbox.canonicalize().unwrap();
 
         std::env::set_current_dir(prev_cwd).unwrap();
-        assert_eq!(root, expected);
+        assert_eq!(root, home);
     }
 
     #[test]

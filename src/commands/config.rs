@@ -432,7 +432,7 @@ pub fn config_get(key: &str) -> (String, &'static str) {
         "HCOM_TIMEOUT" => "86400",
         "HCOM_SUBAGENT_TIMEOUT" => "30",
         "HCOM_AUTO_APPROVE" => "true",
-        "HCOM_AUTO_TRUST_WORKSPACE" => "true",
+        "HCOM_AUTO_TRUST_WORKSPACE" => "false",
         _ => "",
     };
     (default.to_string(), "default")
@@ -1425,13 +1425,13 @@ Merged with launch-time cli args (launch args win on conflict).",
 
         "HCOM_CODEX_SANDBOX_MODE" => Some(
             "\
-HCOM_CODEX_SANDBOX_MODE - Permission flags hcom injects when launching codex
+HCOM_CODEX_SANDBOX_MODE - Optional Codex permission preset
 
-Default: workspace
+Default: none
 
-Codex's default sandbox blocks the writes and Unix sockets hcom needs,
-so hcom injects flags on every codex launch to reshape it. This knob
-picks which set.
+hcom normally preserves Codex's sandbox and approval configuration. It
+does not add writable roots or trust overrides. Set this key to opt into
+a complete hcom permission preset, including HCOM_DIR as an extra root.
 
 Values:
   workspace          Codex auto-runs; asks only when the model judges
@@ -1440,8 +1440,7 @@ Values:
                      known-safe read. Effectively read-only unless you
                      approve writes case-by-case.
   danger-full-access No sandbox, no approvals.
-  none               Inject nothing. Codex uses your own config; DB
-                     writes fail unless your config allows ~/.hcom.
+  none               Preserve your Codex sandbox and approval settings.
 
 Usage:
   hcom config codex_sandbox_mode untrusted

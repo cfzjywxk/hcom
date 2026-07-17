@@ -22,6 +22,22 @@ use crate::shared::platform;
 use crate::shared::terminal_presets::{ArgvTemplate, TERMINAL_ENV_MAP};
 use crate::shared::tool_detection::tool_marker_vars;
 
+fn hcom_tool_marker_vars() -> Vec<&'static str> {
+    tool_marker_vars()
+        .iter()
+        .copied()
+        .filter(|var| var.starts_with("HCOM_"))
+        .collect()
+}
+
+fn explicit_dev_path_prefix() -> Option<String> {
+    let dev_root = std::env::var("HCOM_DEV_ROOT").ok()?;
+    let binary = crate::shared::dev_root_binary(Path::new(&dev_root))?;
+    binary
+        .parent()
+        .map(|dir| dir.to_string_lossy().into_owned())
+}
+
 /// Result of kill_process().
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillResult {
@@ -947,40 +963,19 @@ pub fn create_bash_script(
     writeln!(f, "printf \"\\033]0;hcom: starting {}...\\007\"", tool_name)?;
     writeln!(f, "echo \"Starting {}...\"", tool_name)?;
 
-    // Unset tool markers and identity vars to prevent inheritance
-    writeln!(f, "unset {}", tool_marker_vars().join(" "))?;
+    // Replace only hcom-owned markers and identity. Native tool markers and
+    // every other parent variable remain untouched.
+    writeln!(f, "unset {}", hcom_tool_marker_vars().join(" "))?;
     writeln!(f, "unset {}", HCOM_IDENTITY_VARS.join(" "))?;
 
-    // Discover paths for minimal environments (kitty splits, etc.)
-    let mut paths_to_add: Vec<String> = Vec::new();
-
-    fn add_path(paths: &mut Vec<String>, binary_path: Option<String>) {
-        if let Some(bp) = binary_path
-            && let Some(dir) = Path::new(&bp).parent()
-        {
-            let dir_str = dir.to_string_lossy().to_string();
-            if !paths.contains(&dir_str) {
-                paths.push(dir_str);
-            }
-        }
+    // PATH is inherited byte-for-byte in normal operation. HCOM_DEV_ROOT is an
+    // explicit hcom development override, so only that mode may add a prefix.
+    if let Some(dev_path) = explicit_dev_path_prefix() {
+        writeln!(f, "export PATH=\"{}:$PATH\"", dev_path)?;
     }
 
-    // Always add hcom's own directory
-    add_path(&mut paths_to_add, which_bin("hcom"));
-    // Add python3 to PATH for agents that need it
-    add_path(&mut paths_to_add, which_bin("python3"));
-    // Detect tool from command and add its path
     let cmd_stripped = command_str.trim_start();
     let tool_cmd = cmd_stripped.split_whitespace().next().unwrap_or("");
-    add_path(&mut paths_to_add, which_bin(tool_cmd));
-    // Claude needs node
-    if tool_cmd == "claude" {
-        add_path(&mut paths_to_add, which_bin("node"));
-    }
-
-    if !paths_to_add.is_empty() {
-        writeln!(f, "export PATH=\"{}:$PATH\"", paths_to_add.join(":"))?;
-    }
 
     // Write env exports
     let env_str = build_env_string(env, "bash_export");
@@ -1065,9 +1060,8 @@ fn ps_env_assignments(env_vars: &HashMap<String, String>) -> Vec<String> {
 }
 
 /// Create a PowerShell launch script — the Windows-native equivalent of
-/// `create_bash_script`. Emits a `.ps1` that sets the window title, scrubs
-/// inherited tool/identity vars, prepends discovered tool directories to PATH,
-/// assigns the per-launch env, changes directory, then runs the tool command
+/// `create_bash_script`. Emits a `.ps1` that sets the window title, replaces
+/// hcom-owned identity vars, assigns the per-launch env, changes directory, then runs the tool command
 /// via the call operator. The window-open vs. run-once cleanup mirrors the
 /// bash version; the window is kept alive by launching with `powershell -NoExit`.
 pub fn create_powershell_script(
@@ -1094,11 +1088,11 @@ pub fn create_powershell_script(
     )?;
     writeln!(f, "Write-Host \"Starting {}...\"", tool_name)?;
 
-    // Scrub inherited tool markers and identity vars so the child can't inherit
-    // them (PowerShell ignores Env: entries that don't exist).
-    let scrub: Vec<String> = tool_marker_vars()
-        .iter()
-        .chain(HCOM_IDENTITY_VARS.iter())
+    // Replace only hcom-owned markers and identity. Native tool markers and
+    // every other parent variable remain untouched.
+    let scrub: Vec<String> = hcom_tool_marker_vars()
+        .into_iter()
+        .chain(HCOM_IDENTITY_VARS.iter().copied())
         .map(|v| format!("Env:{v}"))
         .collect();
     writeln!(
@@ -1107,34 +1101,18 @@ pub fn create_powershell_script(
         scrub.join(",")
     )?;
 
-    // Discover paths for minimal environments.
-    let mut paths_to_add: Vec<String> = Vec::new();
-
-    fn add_path(paths: &mut Vec<String>, binary_path: Option<String>) {
-        if let Some(bp) = binary_path
-            && let Some(dir) = Path::new(&bp).parent()
-        {
-            let dir_str = dir.to_string_lossy().to_string();
-            if !paths.contains(&dir_str) {
-                paths.push(dir_str);
-            }
-        }
+    // PATH is inherited byte-for-byte in normal operation. HCOM_DEV_ROOT is an
+    // explicit hcom development override, so only that mode may add a prefix.
+    if let Some(dev_path) = explicit_dev_path_prefix() {
+        writeln!(
+            f,
+            "$env:PATH = {} + $env:PATH",
+            ps_quote(&format!("{dev_path};"))
+        )?;
     }
 
-    add_path(&mut paths_to_add, which_bin("hcom"));
-    add_path(&mut paths_to_add, which_bin("python3"));
     let cmd_stripped = command_str.trim_start();
     let tool_cmd = cmd_stripped.split_whitespace().next().unwrap_or("");
-    add_path(&mut paths_to_add, which_bin(tool_cmd));
-    if tool_cmd == "claude" {
-        add_path(&mut paths_to_add, which_bin("node"));
-    }
-
-    if !paths_to_add.is_empty() {
-        // Windows PATH is `;`-separated.
-        let prefix = format!("{};", paths_to_add.join(";"));
-        writeln!(f, "$env:PATH = {} + $env:PATH", ps_quote(&prefix))?;
-    }
 
     for line in ps_env_assignments(env) {
         writeln!(f, "{line}")?;
@@ -1146,7 +1124,7 @@ pub fn create_powershell_script(
 
     // Resolve the tool to a full path and invoke it through the call operator so
     // a quoted path runs as a command. If the tool isn't found, fall through to
-    // the bare command name (resolved via the PATH we just prepended).
+    // the bare command name resolved via the inherited PATH.
     let mut final_command = command_str.to_string();
     if !tool_cmd.is_empty()
         && let Some(tool_path) = which_bin(tool_cmd)
@@ -1198,7 +1176,9 @@ pub fn create_powershell_script(
 
 /// Build clean env for terminal launcher subprocesses.
 ///
-/// Strips AI tool markers, hcom identity vars, and terminal context vars.
+/// Replaces hcom-owned identity and marker vars. A newly created terminal must
+/// establish its own terminal identity, so only terminal-context vars are also
+/// removed from the terminal-launcher process.
 fn get_launcher_env() -> HashMap<String, String> {
     get_launcher_env_from(std::env::vars())
 }
@@ -1208,7 +1188,7 @@ where
     I: IntoIterator<Item = (String, String)>,
 {
     let mut strip: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for v in tool_marker_vars() {
+    for v in hcom_tool_marker_vars() {
         strip.insert(v);
     }
     for v in HCOM_IDENTITY_VARS {
@@ -2199,13 +2179,11 @@ pub fn launch_terminal(
     }
 }
 
-/// Build full env from config env + shell env.
+/// Build the child env by overlaying explicit hcom launch values on the exact
+/// parent environment.
 fn build_full_env(config_env: &HashMap<String, String>) -> HashMap<String, String> {
     let mut full = config_env.clone();
     for (k, v) in std::env::vars() {
-        if tool_marker_vars().contains(&k.as_str()) {
-            continue;
-        }
         if k == "HCOM_TERMINAL" {
             continue;
         }
@@ -2708,6 +2686,8 @@ mod tests {
             ),
             ("ZELLIJ_PANE_ID".to_string(), "18".to_string()),
             ("HCOM_LAUNCHED_PRESET".to_string(), "zellij".to_string()),
+            ("CLAUDECODE".to_string(), "1".to_string()),
+            ("CODEX_THREAD_ID".to_string(), "thread-1".to_string()),
             ("PATH".to_string(), "/bin".to_string()),
         ]);
 
@@ -2717,7 +2697,33 @@ mod tests {
         );
         assert!(!env.contains_key("ZELLIJ_PANE_ID"));
         assert!(!env.contains_key("HCOM_LAUNCHED_PRESET"));
+        assert_eq!(env.get("CLAUDECODE").map(String::as_str), Some("1"));
+        assert_eq!(
+            env.get("CODEX_THREAD_ID").map(String::as_str),
+            Some("thread-1")
+        );
         assert_eq!(env.get("PATH").map(String::as_str), Some("/bin"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_build_full_env_preserves_native_tool_and_system_vars() {
+        let _guard = EnvGuard::clear(&["CLAUDECODE", "CODEX_HOME", "https_proxy"]);
+        unsafe {
+            std::env::set_var("CLAUDECODE", "1");
+            std::env::set_var("CODEX_HOME", "/native/codex");
+            std::env::set_var("https_proxy", "http://proxy.invalid");
+        }
+        let full = build_full_env(&HashMap::new());
+        assert_eq!(full.get("CLAUDECODE").map(String::as_str), Some("1"));
+        assert_eq!(
+            full.get("CODEX_HOME").map(String::as_str),
+            Some("/native/codex")
+        );
+        assert_eq!(
+            full.get("https_proxy").map(String::as_str),
+            Some("http://proxy.invalid")
+        );
     }
 
     #[test]
@@ -2887,6 +2893,24 @@ mod tests {
         assert!(content.contains("$hcom_status = $LASTEXITCODE"));
         assert!(content.contains("exit $hcom_status"));
         assert!(!content.contains("Set-Location"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn test_bash_wrapper_preserves_native_markers_and_path_by_default() {
+        let _guard = EnvGuard::clear(&["HCOM_DEV_ROOT"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("launch.sh");
+        let env = HashMap::from([("HCOM_TOOL".to_string(), "claude".to_string())]);
+        create_bash_script(&script, &env, None, "claude --foo", false, None, false).unwrap();
+
+        let content = std::fs::read_to_string(script).unwrap();
+        assert!(!content.lines().any(|line| {
+            line.starts_with("unset ")
+                && (line.contains("CLAUDECODE") || line.contains("CODEX_THREAD_ID"))
+        }));
+        assert!(!content.contains(":$PATH\""));
     }
 
     #[test]

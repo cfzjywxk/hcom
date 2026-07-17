@@ -502,14 +502,17 @@ pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
 
 /// Resolve the Codex config directory.
 ///
-/// Priority: CODEX_HOME env var → tool_config_root()/.codex
+/// Priority: CODEX_HOME env var → the user's normal ~/.codex.
+/// HCOM_DIR never participates in Codex config/state resolution.
 fn codex_config_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CODEX_HOME")
         && !dir.is_empty()
     {
         return PathBuf::from(dir);
     }
-    crate::runtime_env::tool_config_root().join(".codex")
+    crate::runtime_env::user_home()
+        .unwrap_or_default()
+        .join(".codex")
 }
 
 /// Get path to Codex config.toml.
@@ -803,23 +806,6 @@ fn hcom_hook_definition_hashes_from_hooks_json(
         .into_iter()
         .map(|entry| (entry.key, entry.definition_hash))
         .collect()
-}
-
-fn hcom_hook_definition_hashes_from_hooks_path(
-    hooks_path: &Path,
-) -> Result<HashMap<String, String>, VerifyFailReason> {
-    let hooks_content = std::fs::read_to_string(hooks_path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => {
-            VerifyFailReason::HooksPathMissing(hooks_path.to_path_buf())
-        }
-        _ => VerifyFailReason::HooksUnreadable(hooks_path.to_path_buf()),
-    })?;
-    let hooks_json: Value = serde_json::from_str(&hooks_content)
-        .map_err(|_| VerifyFailReason::HooksUnreadable(hooks_path.to_path_buf()))?;
-    Ok(hcom_hook_definition_hashes_from_hooks_json(
-        &hooks_json,
-        hooks_path,
-    ))
 }
 
 fn hcom_hook_local_entries_from_hooks_path(
@@ -1204,7 +1190,7 @@ fn write_hcom_hook_trust_state(
         std::fs::read_to_string(config_path)
             .map_err(|e| e.to_string())?
             .parse::<DocumentMut>()
-            .unwrap_or_default()
+            .map_err(|e| e.to_string())?
     } else {
         DocumentMut::new()
     };
@@ -1248,111 +1234,6 @@ fn write_hcom_hook_trust_state(
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     paths::atomic_write_io(config_path, &doc.to_string()).map_err(|e| e.to_string())
-}
-
-pub(crate) fn ensure_codex_hcom_hooks_trusted() -> Result<(), String> {
-    let Some(codex_cli_version) = codex_hook_trust_version()? else {
-        return Ok(());
-    };
-
-    let entries = fetch_codex_hcom_hook_entries()?;
-    let definition_hashes = hcom_hook_definition_hashes_from_hooks_path(&get_codex_hooks_path())
-        .map_err(|e| e.to_string())?;
-    let config_path = get_codex_config_path();
-    write_hcom_hook_trust_state(
-        &config_path,
-        &entries,
-        &HashSet::new(),
-        &codex_cli_version,
-        &definition_hashes,
-    )
-}
-
-pub(crate) fn codex_hcom_hooks_trusted_locally() -> bool {
-    let codex_cli_version = match codex_hook_trust_version() {
-        Ok(Some(version)) => version,
-        Ok(None) => {
-            return true;
-        }
-        Err(_) => {
-            return false;
-        }
-    };
-
-    codex_hcom_hooks_trusted_locally_for_version(&codex_cli_version)
-}
-
-fn codex_hcom_hooks_trusted_locally_for_version(codex_cli_version: &str) -> bool {
-    let hooks_path = get_codex_hooks_path();
-    let hooks_content = match std::fs::read_to_string(&hooks_path) {
-        Ok(content) => content,
-        Err(_) => return false,
-    };
-    let hooks_json: Value = match serde_json::from_str(&hooks_content) {
-        Ok(json) => json,
-        Err(_) => return false,
-    };
-    if verify_hooks_json_value(&hooks_json).is_err() {
-        return false;
-    }
-    let entries = hcom_hook_local_entries_from_hooks_json(&hooks_json, &hooks_path);
-    if entries.len() != CODEX_HOOK_COMMANDS.len() {
-        return false;
-    }
-    let definition_hashes: HashMap<String, String> = entries
-        .iter()
-        .map(|entry| (entry.key.clone(), entry.definition_hash.clone()))
-        .collect();
-    let keys: HashSet<String> = entries.into_iter().map(|entry| entry.key).collect();
-
-    codex_hcom_hook_keys_trusted_for_version(
-        &get_codex_config_path(),
-        &keys,
-        codex_cli_version,
-        &definition_hashes,
-    )
-}
-
-fn codex_hcom_hook_keys_trusted_for_version(
-    config_path: &Path,
-    keys: &HashSet<String>,
-    codex_cli_version: &str,
-    definition_hashes: &HashMap<String, String>,
-) -> bool {
-    let config_content = match std::fs::read_to_string(config_path) {
-        Ok(content) => content,
-        Err(_) => return false,
-    };
-    let doc = match config_content.parse::<DocumentMut>() {
-        Ok(doc) => doc,
-        Err(_) => return false,
-    };
-    let Some(state) = doc
-        .get("hooks")
-        .and_then(|hooks| hooks.get("state"))
-        .and_then(|state| state.as_table_like())
-    else {
-        return false;
-    };
-
-    keys.iter().all(|key| {
-        let Some(entry) = state.get(key) else {
-            return false;
-        };
-        let Some(trusted_hash) = entry.get("trusted_hash").and_then(|v| v.as_str()) else {
-            return false;
-        };
-        !trusted_hash.is_empty()
-            && entry.get("enabled").and_then(|v| v.as_bool()) != Some(false)
-            && entry
-                .get(HCOM_CODEX_CLI_VERSION_KEY)
-                .and_then(|v| v.as_str())
-                == Some(codex_cli_version)
-            && entry
-                .get(HCOM_HOOK_DEFINITION_HASH_KEY)
-                .and_then(|v| v.as_str())
-                == definition_hashes.get(key).map(String::as_str)
-    })
 }
 
 #[cfg(test)]
@@ -1451,7 +1332,7 @@ fn ensure_codex_feature_enabled(
         std::fs::read_to_string(config_path)
             .map_err(|e| e.to_string())?
             .parse::<DocumentMut>()
-            .unwrap_or_default()
+            .map_err(|e| e.to_string())?
     } else {
         DocumentMut::new()
     };
@@ -1809,6 +1690,18 @@ pub enum SetupError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to parse existing {}: {source}", path.display())]
+    HooksParseFailed {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("existing Codex hooks field '{field}' at {} must be {expected}", path.display())]
+    HooksFieldTypeInvalid {
+        path: PathBuf,
+        field: String,
+        expected: &'static str,
+    },
     #[error("JSON serialization failed: {0}")]
     SerializationFailed(#[from] serde_json::Error),
     #[error("failed to create parent dir {}: {source}", path.display())]
@@ -1830,7 +1723,7 @@ pub enum SetupError {
         reason: VerifyFailReason,
     },
     #[error(
-        "failed to trust Codex hooks: {reason}. hcom-wrapped Codex launches may fall back to --dangerously-bypass-hook-trust, but vanilla Codex will not run hcom hooks until trust succeeds"
+        "failed to trust Codex hooks: {reason}. hcom will not bypass trust for unrelated user hooks"
     )]
     HookTrustFailed { reason: String },
 }
@@ -1840,24 +1733,71 @@ pub fn try_setup_codex_hooks(include_permissions: bool) -> Result<(), SetupError
     let hooks_path = get_codex_hooks_path();
     let feature_key = detect_codex_hooks_feature_key();
 
-    ensure_codex_feature_enabled(&config_path, feature_key).map_err(|e| {
-        SetupError::EnsureFeatureFailed {
-            path: config_path.clone(),
-            reason: e,
-        }
-    })?;
-
     let mut hooks_json = if hooks_path.exists() {
         let content =
             std::fs::read_to_string(&hooks_path).map_err(|source| SetupError::HooksReadFailed {
                 path: hooks_path.clone(),
                 source,
             })?;
-        serde_json::from_str::<Value>(&content)
-            .unwrap_or_else(|_| serde_json::json!({ "hooks": {} }))
+        serde_json::from_str::<Value>(&content).map_err(|source| SetupError::HooksParseFailed {
+            path: hooks_path.clone(),
+            source,
+        })?
     } else {
         serde_json::json!({ "hooks": {} })
     };
+
+    if !hooks_json.is_object() {
+        return Err(SetupError::HooksFieldTypeInvalid {
+            path: hooks_path,
+            field: "<root>".into(),
+            expected: "a JSON object",
+        });
+    }
+    if hooks_json
+        .get("hooks")
+        .is_some_and(|value| !value.is_object())
+    {
+        return Err(SetupError::HooksFieldTypeInvalid {
+            path: hooks_path,
+            field: "hooks".into(),
+            expected: "a JSON object",
+        });
+    }
+    for event in build_expected_hook_json()["hooks"]
+        .as_object()
+        .expect("expected hooks object")
+        .keys()
+    {
+        let existing = hooks_json.get("hooks").and_then(|hooks| hooks.get(event));
+        if existing.is_some_and(|value| !value.is_array()) {
+            return Err(SetupError::HooksFieldTypeInvalid {
+                path: hooks_path,
+                field: format!("hooks.{event}"),
+                expected: "a JSON array",
+            });
+        }
+        if let Some(groups) = existing.and_then(Value::as_array) {
+            for (index, group) in groups.iter().enumerate() {
+                if !group.is_object() || group.get("hooks").is_none_or(|hooks| !hooks.is_array()) {
+                    return Err(SetupError::HooksFieldTypeInvalid {
+                        path: hooks_path,
+                        field: format!("hooks.{event}[{index}]"),
+                        expected: "an object containing a hooks array",
+                    });
+                }
+            }
+        }
+    }
+
+    // Validate both user-owned files before changing either one. A malformed
+    // hooks.json must not cause a partial config.toml rewrite.
+    ensure_codex_feature_enabled(&config_path, feature_key).map_err(|e| {
+        SetupError::EnsureFeatureFailed {
+            path: config_path.clone(),
+            reason: e,
+        }
+    })?;
     // Strip legacy "cmd"-keyed hcom entries written by pre-0.129 installs.
     // Only safe once Codex supports the current "command"-keyed format.
     if feature_key == CodexHooksFeatureKey::Hooks {
@@ -1914,7 +1854,7 @@ pub fn try_setup_codex_hooks(include_permissions: bool) -> Result<(), SetupError
             "hooks",
             "codex.hook_trust_version_warn",
             &format!(
-                "hooks installed but Codex version check failed; launch may fall back to Codex hook-trust bypass: {e}"
+                "hooks installed but Codex version check failed; verify hook support before launch: {e}"
             ),
         ),
     }
@@ -1975,8 +1915,9 @@ fn remove_codex_hooks_from_dir(base: &std::path::Path) -> bool {
     if hooks_path.exists() {
         match std::fs::read_to_string(&hooks_path) {
             Ok(content) => {
-                let mut json = serde_json::from_str::<Value>(&content)
-                    .unwrap_or_else(|_| serde_json::json!({ "hooks": {} }));
+                let Ok(mut json) = serde_json::from_str::<Value>(&content) else {
+                    return false;
+                };
                 remove_hcom_hooks_from_json(&mut json);
                 if json.get("hooks").is_none() && json.as_object().is_some_and(|o| o.is_empty()) {
                     ok &= std::fs::remove_file(&hooks_path).is_ok();
@@ -1999,7 +1940,7 @@ fn remove_codex_hooks_from_dir(base: &std::path::Path) -> bool {
 
 /// Remove hcom hooks from Codex config.
 ///
-/// Cleans the default (~/.codex), env-var (CODEX_HOME), and active HCOM_DIR-local paths.
+/// Cleans the default ~/.codex and an explicit CODEX_HOME override.
 pub fn remove_codex_hooks() -> bool {
     let default_dir = dirs::home_dir()
         .map(|h| h.join(".codex"))
@@ -2029,6 +1970,42 @@ mod tests {
     use super::*;
     use crate::hooks::test_helpers::{EnvGuard, isolated_test_env};
     use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn codex_config_path_uses_home_not_hcom_dir_parent() {
+        let (dir, _hcom_dir, test_home, _guard) = isolated_test_env();
+        let hcom_parent = dir.path().join("different-hcom-parent");
+        unsafe {
+            std::env::set_var("HCOM_DIR", hcom_parent.join("hcom"));
+            std::env::remove_var("CODEX_HOME");
+        }
+
+        assert_eq!(codex_config_dir(), test_home.join(".codex"));
+        assert_ne!(codex_config_dir(), hcom_parent.join(".codex"));
+
+        let explicit = dir.path().join("explicit-codex-home");
+        unsafe { std::env::set_var("CODEX_HOME", &explicit) };
+        assert_eq!(codex_config_dir(), explicit);
+    }
+
+    #[test]
+    #[serial]
+    fn setup_uses_native_codex_config_and_preserves_skills() {
+        let (dir, _hcom_dir, test_home, _guard) = isolated_test_env();
+        let hcom_parent = dir.path().join("different-hcom-parent");
+        let skill = test_home.join(".codex/skills/user-skill/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, "user skill").unwrap();
+        unsafe { std::env::set_var("HCOM_DIR", hcom_parent.join("hcom")) };
+
+        try_setup_codex_hooks(false).unwrap();
+
+        assert!(test_home.join(".codex/hooks.json").exists());
+        assert!(test_home.join(".codex/config.toml").exists());
+        assert!(!hcom_parent.join(".codex").exists());
+        assert_eq!(std::fs::read_to_string(skill).unwrap(), "user skill");
+    }
 
     #[test]
     fn test_hook_payload_factory_uses_native_fields() {
@@ -2270,6 +2247,68 @@ mod tests {
         let content = std::fs::read_to_string(hooks_path).unwrap();
         assert!(content.contains("other-hook"));
         assert!(content.contains("codex-posttooluse"));
+    }
+
+    #[test]
+    #[serial]
+    fn setup_refuses_to_overwrite_malformed_codex_files() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let config_path = get_codex_config_path();
+        let hooks_path = get_codex_hooks_path();
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+
+        let malformed_config = "[features\nhooks = true";
+        std::fs::write(&config_path, malformed_config).unwrap();
+        assert!(matches!(
+            try_setup_codex_hooks(false),
+            Err(SetupError::EnsureFeatureFailed { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            malformed_config
+        );
+
+        let valid_config = "model = \"user-model\"\n";
+        let malformed_hooks = "{ malformed user hooks";
+        std::fs::write(&config_path, valid_config).unwrap();
+        std::fs::write(&hooks_path, malformed_hooks).unwrap();
+        assert!(matches!(
+            try_setup_codex_hooks(false),
+            Err(SetupError::HooksParseFailed { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), valid_config);
+        assert_eq!(
+            std::fs::read_to_string(&hooks_path).unwrap(),
+            malformed_hooks
+        );
+
+        for malformed_shape in [
+            serde_json::json!([]),
+            serde_json::json!({"hooks": "user-data"}),
+            serde_json::json!({"hooks": {"PostToolUse": "user-data"}}),
+        ] {
+            let original = serde_json::to_string_pretty(&malformed_shape).unwrap();
+            std::fs::write(&hooks_path, &original).unwrap();
+            assert!(matches!(
+                try_setup_codex_hooks(false),
+                Err(SetupError::HooksFieldTypeInvalid { .. })
+            ));
+            assert_eq!(std::fs::read_to_string(&hooks_path).unwrap(), original);
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), valid_config);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn remove_refuses_to_overwrite_malformed_codex_hooks() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let hooks_path = get_codex_hooks_path();
+        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+        let original = "{ malformed user hooks";
+        std::fs::write(&hooks_path, original).unwrap();
+
+        assert!(!remove_codex_hooks());
+        assert_eq!(std::fs::read_to_string(hooks_path).unwrap(), original);
     }
 
     #[test]
@@ -2802,7 +2841,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn remove_codex_hooks_cleans_active_hcom_dir_local_path() {
+    fn remove_codex_hooks_does_not_touch_hcom_dir_parent() {
         let _guard = EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
@@ -2823,10 +2862,11 @@ mod tests {
         std::fs::write(local_dir.join("rules/hcom.rules"), "allow").unwrap();
 
         assert!(remove_codex_hooks());
-        assert!(!local_dir.join("rules/hcom.rules").exists());
-        if local_dir.join("hooks.json").exists() {
-            let content = std::fs::read_to_string(local_dir.join("hooks.json")).unwrap();
-            assert!(!content.contains("codex-"));
-        }
+        assert_eq!(
+            std::fs::read_to_string(local_dir.join("rules/hcom.rules")).unwrap(),
+            "allow"
+        );
+        let content = std::fs::read_to_string(local_dir.join("hooks.json")).unwrap();
+        assert!(content.contains("codex-"));
     }
 }

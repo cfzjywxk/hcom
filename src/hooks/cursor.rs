@@ -287,12 +287,6 @@ fn update_cursor_permissions_at(path: &Path, add: bool) -> Result<(), SetupError
         }
         return write_json(path, &Value::Object(root));
     }
-    if path.file_name().and_then(|name| name.to_str()) == Some("cli-config.json") {
-        root.entry("version".to_string())
-            .or_insert_with(|| json!(1));
-        root.entry("editor".to_string())
-            .or_insert_with(|| json!({ "vimMode": false }));
-    }
     let permissions = root
         .entry("permissions".to_string())
         .or_insert_with(|| json!({ "allow": [], "deny": [] }));
@@ -707,8 +701,8 @@ mod tests {
     #[test]
     #[serial]
     fn setup_is_idempotent_and_preserves_existing_hooks() {
-        let (_dir, workspace, _guard) = cursor_test_env();
-        let hooks_path = workspace.join(".cursor/hooks.json");
+        let (dir, _workspace, _guard) = cursor_test_env();
+        let hooks_path = dir.path().join("home/.cursor/hooks.json");
         std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
         std::fs::write(
             &hooks_path,
@@ -737,14 +731,14 @@ mod tests {
                 .iter()
                 .any(|hook| hook["command"] == "./custom-start.sh")
         );
-        assert!(!workspace.join(".cursor/cli.json").exists());
+        assert!(!dir.path().join("home/.cursor/cli-config.json").exists());
     }
 
     #[test]
     #[serial]
-    fn permissions_are_project_local_and_cleanup_preserves_other_rules() {
-        let (_dir, workspace, _guard) = cursor_test_env();
-        let permissions_path = workspace.join(".cursor/cli.json");
+    fn permissions_use_native_path_and_cleanup_preserves_other_rules() {
+        let (dir, _workspace, _guard) = cursor_test_env();
+        let permissions_path = dir.path().join("home/.cursor/cli-config.json");
         std::fs::create_dir_all(permissions_path.parent().unwrap()).unwrap();
         std::fs::write(
             &permissions_path,
@@ -771,8 +765,8 @@ mod tests {
     #[test]
     #[serial]
     fn setup_replaces_legacy_prefixes_with_scoped_permissions() {
-        let (_dir, workspace, _guard) = cursor_test_env();
-        let permissions_path = workspace.join(".cursor/cli.json");
+        let (dir, _workspace, _guard) = cursor_test_env();
+        let permissions_path = dir.path().join("home/.cursor/cli-config.json");
         std::fs::create_dir_all(permissions_path.parent().unwrap()).unwrap();
         std::fs::write(
             &permissions_path,
@@ -808,8 +802,8 @@ mod tests {
     #[test]
     #[serial]
     fn setup_removes_stale_hook_prefixes() {
-        let (_dir, workspace, _guard) = cursor_test_env();
-        let hooks_path = workspace.join(".cursor/hooks.json");
+        let (dir, _workspace, _guard) = cursor_test_env();
+        let hooks_path = dir.path().join("home/.cursor/hooks.json");
         std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
         std::fs::write(
             &hooks_path,
@@ -872,15 +866,16 @@ mod tests {
 
     #[test]
     #[serial]
-    fn isolated_mode_permissions_ignore_global_override() {
-        let (dir, workspace, _guard) = cursor_test_env();
+    fn hcom_dir_does_not_override_cursor_config_dir() {
+        let (dir, _workspace, _guard) = cursor_test_env();
+        let override_dir = dir.path().join("cursor-override");
         unsafe {
-            std::env::set_var("CURSOR_CONFIG_DIR", dir.path().join("cursor-override"));
+            std::env::set_var("CURSOR_CONFIG_DIR", &override_dir);
         }
 
         assert_eq!(
             get_cursor_permissions_path(),
-            workspace.join(".cursor/cli.json")
+            override_dir.join("cli-config.json")
         );
     }
 
@@ -913,8 +908,8 @@ mod tests {
     #[test]
     #[serial]
     fn remove_preserves_unrelated_hooks() {
-        let (_dir, workspace, _guard) = cursor_test_env();
-        let hooks_path = workspace.join(".cursor/hooks.json");
+        let (dir, _workspace, _guard) = cursor_test_env();
+        let hooks_path = dir.path().join("home/.cursor/hooks.json");
         std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
         std::fs::write(
             &hooks_path,
@@ -951,7 +946,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial]
-    fn remove_cleans_default_and_isolated_paths() {
+    fn remove_cleans_native_paths_without_touching_hcom_dir_parent() {
         let (dir, workspace, _guard) = cursor_test_env();
         let home = dir.path().join("home");
         let hooks_paths = [
@@ -994,18 +989,33 @@ mod tests {
 
         assert!(remove_cursor_hooks());
 
-        for path in hooks_paths {
-            let root: Value =
-                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-            assert_eq!(
-                root["hooks"]["stop"],
-                json!([{ "command": "./custom-stop.sh" }])
-            );
-        }
-        for path in permissions_paths {
-            let root: Value =
-                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-            assert_eq!(root["permissions"]["allow"], json!(["Shell(custom)"]));
-        }
+        let native_hooks: Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_paths[0]).unwrap()).unwrap();
+        assert_eq!(
+            native_hooks["hooks"]["stop"],
+            json!([{ "command": "./custom-stop.sh" }])
+        );
+        let hcom_parent_hooks: Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_paths[1]).unwrap()).unwrap();
+        assert_eq!(
+            hcom_parent_hooks["hooks"]["stop"],
+            json!([
+                { "command": "hcom cursor-stop" },
+                { "command": "./custom-stop.sh" }
+            ])
+        );
+
+        let native_permissions: Value =
+            serde_json::from_str(&std::fs::read_to_string(&permissions_paths[0]).unwrap()).unwrap();
+        assert_eq!(
+            native_permissions["permissions"]["allow"],
+            json!(["Shell(custom)"])
+        );
+        let hcom_parent_permissions: Value =
+            serde_json::from_str(&std::fs::read_to_string(&permissions_paths[1]).unwrap()).unwrap();
+        assert_eq!(
+            hcom_parent_permissions["permissions"]["allow"],
+            json!(["Shell(hcom)", "Shell(custom)"])
+        );
     }
 }

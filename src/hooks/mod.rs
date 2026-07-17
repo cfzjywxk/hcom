@@ -40,6 +40,7 @@ pub mod test_helpers {
     pub struct EnvGuard {
         saved_hcom: Option<String>,
         saved_home: Option<String>,
+        saved_claude_config_dir: Option<String>,
         saved_cursor_config_dir: Option<String>,
         saved_xdg_config_home: Option<String>,
         saved_xdg_data_home: Option<String>,
@@ -71,6 +72,7 @@ pub mod test_helpers {
             Self {
                 saved_hcom: std::env::var("HCOM_DIR").ok(),
                 saved_home: std::env::var("HOME").ok(),
+                saved_claude_config_dir: std::env::var("CLAUDE_CONFIG_DIR").ok(),
                 saved_cursor_config_dir: std::env::var("CURSOR_CONFIG_DIR").ok(),
                 saved_xdg_config_home: std::env::var("XDG_CONFIG_HOME").ok(),
                 saved_xdg_data_home: std::env::var("XDG_DATA_HOME").ok(),
@@ -101,6 +103,10 @@ pub mod test_helpers {
                 match &self.saved_home {
                     Some(v) => std::env::set_var("HOME", v),
                     None => std::env::remove_var("HOME"),
+                }
+                match &self.saved_claude_config_dir {
+                    Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+                    None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
                 }
                 match &self.saved_cursor_config_dir {
                     Some(v) => std::env::set_var("CURSOR_CONFIG_DIR", v),
@@ -175,6 +181,8 @@ pub mod test_helpers {
         unsafe {
             std::env::set_var("HCOM_DIR", &hcom_dir);
             std::env::set_var("HOME", &test_home);
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::remove_var("CODEX_HOME");
             std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.129.0");
         }
         crate::config::Config::reset();

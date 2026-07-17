@@ -277,7 +277,7 @@ impl Default for HcomConfig {
             cursor_args: String::new(),
             kimi_args: String::new(),
             copilot_args: String::new(),
-            codex_sandbox_mode: "workspace".to_string(),
+            codex_sandbox_mode: "none".to_string(),
             gemini_system_prompt: String::new(),
             codex_system_prompt: String::new(),
             relay: String::new(),
@@ -288,7 +288,7 @@ impl Default for HcomConfig {
             auto_approve: true,
             auto_subscribe: "collision".to_string(),
             name_export: String::new(),
-            auto_trust_workspace: true,
+            auto_trust_workspace: false,
         }
     }
 }
@@ -952,7 +952,7 @@ hints = ""
 notes = ""
 subagent_timeout = 30
 auto_subscribe = "collision"
-auto_trust_workspace = true
+auto_trust_workspace = false
 
 [launch.claude]
 args = ""
@@ -963,7 +963,7 @@ system_prompt = ""
 
 [launch.codex]
 args = ""
-sandbox_mode = "workspace"
+sandbox_mode = "none"
 system_prompt = ""
 
 [launch.opencode]
@@ -1647,10 +1647,11 @@ mod tests {
         assert_eq!(config.subagent_timeout, 30);
         assert_eq!(config.terminal, "default");
         assert_eq!(config.tag, "");
-        assert_eq!(config.codex_sandbox_mode, "workspace");
+        assert_eq!(config.codex_sandbox_mode, "none");
         assert!(config.relay_enabled);
         assert!(config.auto_approve);
         assert_eq!(config.auto_subscribe, "collision");
+        assert!(!config.auto_trust_workspace);
         assert!(config.collect_errors().is_empty());
     }
 
@@ -1981,7 +1982,7 @@ mod tests {
 
         let env = HashMap::new();
         let config = HcomConfig::load_from_sources(&file_config, Some(&env)).unwrap();
-        assert_eq!(config.codex_sandbox_mode, "workspace"); // Default, not empty
+        assert_eq!(config.codex_sandbox_mode, "none"); // Default, not empty
     }
 
     #[test]

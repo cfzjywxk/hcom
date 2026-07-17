@@ -892,18 +892,14 @@ mod tests {
 
     #[test]
     #[serial]
-    fn config_path_is_project_local_unless_explicitly_overridden() {
-        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+    fn config_path_uses_native_home_unless_explicitly_overridden() {
+        let (_dir, hcom_dir, home, _guard) = isolated_test_env();
         unsafe {
             std::env::remove_var("KIMI_CODE_HOME");
         }
         assert_eq!(
             get_kimi_settings_path(),
-            hcom_dir
-                .parent()
-                .unwrap()
-                .join(".kimi-code")
-                .join("config.toml")
+            home.join(".kimi-code").join("config.toml")
         );
 
         let explicit = hcom_dir.join("explicit-kimi");

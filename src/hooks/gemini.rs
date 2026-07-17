@@ -1056,7 +1056,7 @@ fn gemini_config_dir() -> PathBuf {
 /// Get path to Gemini policies directory.
 ///
 /// Respects GEMINI_CLI_HOME env var, then falls back to:
-/// If HCOM_DIR is set (sandbox), uses HCOM_DIR parent.
+/// HCOM_DIR never participates in Gemini config/state resolution.
 /// Otherwise uses global (~/.gemini/policies/).
 fn get_gemini_policies_path() -> PathBuf {
     gemini_config_dir().join("policies")
@@ -1127,7 +1127,7 @@ fn remove_policy_from_path(policies_dir: &Path) -> bool {
 /// Get path to Gemini settings file.
 ///
 /// Respects GEMINI_CLI_HOME env var, then falls back to:
-/// If HCOM_DIR is set (sandbox), uses HCOM_DIR parent.
+/// HCOM_DIR never participates in Gemini config/state resolution.
 /// Otherwise uses global (~/.gemini/settings.json).
 pub fn get_gemini_settings_path() -> PathBuf {
     gemini_config_dir().join("settings.json")
@@ -1272,7 +1272,7 @@ pub fn ensure_hooks_enabled() -> bool {
 
     let mut settings = match load_gemini_settings(&settings_path) {
         Some(s) => s,
-        None => serde_json::Map::new(),
+        None => return false,
     };
 
     let needs_migration = settings
@@ -1342,6 +1342,24 @@ pub enum SetupError {
         detected: (u32, u32, u32),
         required: (u32, u32, u32),
     },
+    #[error("failed to read existing {}: {source}", path.display())]
+    SettingsReadFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to parse existing {}: {source}", path.display())]
+    SettingsParseFailed {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("existing Gemini settings field '{field}' at {} must be {expected}", path.display())]
+    SettingsFieldTypeInvalid {
+        path: PathBuf,
+        field: String,
+        expected: &'static str,
+    },
     #[error("JSON serialization failed: {0}")]
     SerializationFailed(#[from] serde_json::Error),
     #[error("atomic write to {} failed: {source}", path.display())]
@@ -1404,7 +1422,76 @@ pub fn try_setup_gemini_hooks(include_permissions: bool) -> Result<(), SetupErro
         let _ = std::fs::create_dir_all(parent);
     }
 
-    let mut settings = load_gemini_settings(&settings_path).unwrap_or_default();
+    let mut settings = if settings_path.exists() {
+        let content = std::fs::read_to_string(&settings_path).map_err(|source| {
+            SetupError::SettingsReadFailed {
+                path: settings_path.clone(),
+                source,
+            }
+        })?;
+        let value: Value =
+            serde_json::from_str(&content).map_err(|source| SetupError::SettingsParseFailed {
+                path: settings_path.clone(),
+                source,
+            })?;
+        value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| SetupError::SettingsFieldTypeInvalid {
+                path: settings_path.clone(),
+                field: "<root>".into(),
+                expected: "a JSON object",
+            })?
+    } else {
+        serde_json::Map::new()
+    };
+
+    for (field, expected, valid) in [
+        (
+            "hooks",
+            "a JSON object",
+            settings.get("hooks").is_none_or(Value::is_object),
+        ),
+        (
+            "tools",
+            "a JSON object",
+            settings.get("tools").is_none_or(Value::is_object),
+        ),
+        (
+            "hooksConfig",
+            "a JSON object",
+            settings.get("hooksConfig").is_none_or(Value::is_object),
+        ),
+    ] {
+        if !valid {
+            return Err(SetupError::SettingsFieldTypeInvalid {
+                path: settings_path,
+                field: field.into(),
+                expected,
+            });
+        }
+    }
+    for &(hook_type, ..) in GEMINI_HOOK_CONFIGS {
+        let existing = settings.get("hooks").and_then(|hooks| hooks.get(hook_type));
+        if existing.is_some_and(|value| !value.is_array()) {
+            return Err(SetupError::SettingsFieldTypeInvalid {
+                path: settings_path,
+                field: format!("hooks.{hook_type}"),
+                expected: "a JSON array",
+            });
+        }
+        if let Some(groups) = existing.and_then(Value::as_array) {
+            for (index, group) in groups.iter().enumerate() {
+                if !group.is_object() || group.get("hooks").is_none_or(|hooks| !hooks.is_array()) {
+                    return Err(SetupError::SettingsFieldTypeInvalid {
+                        path: settings_path,
+                        field: format!("hooks.{hook_type}[{index}]"),
+                        expected: "an object containing a hooks array",
+                    });
+                }
+            }
+        }
+    }
 
     // Remove existing hcom hooks (clean slate)
     remove_hcom_hooks_from_settings(&mut settings);
@@ -2065,15 +2152,9 @@ mod tests {
     #[test]
     #[serial]
     fn test_setup_and_verify_gemini_hooks() {
-        let dir = tempfile::tempdir().unwrap();
-        let hcom_dir = dir.path().join(".hcom");
-        std::fs::create_dir_all(&hcom_dir).unwrap();
-        let settings_dir = dir.path().join(".gemini");
+        let (_dir, test_home, settings_path, _guard) = gemini_test_env();
+        let settings_dir = test_home.join(".gemini");
         std::fs::create_dir_all(&settings_dir).unwrap();
-
-        // Redirect paths via HCOM_DIR
-        let saved = std::env::var("HCOM_DIR").ok();
-        unsafe { std::env::set_var("HCOM_DIR", &hcom_dir) };
 
         let success = setup_gemini_hooks(true);
         assert!(success, "setup should succeed");
@@ -2082,7 +2163,6 @@ mod tests {
         assert!(verified, "verify should pass after setup");
 
         // Check settings file was written
-        let settings_path = dir.path().join(".gemini").join("settings.json");
         assert!(settings_path.exists());
         let content = std::fs::read_to_string(&settings_path).unwrap();
         assert!(content.contains("hcom-sessionstart"));
@@ -2090,11 +2170,7 @@ mod tests {
         assert!(content.contains("enableHooks"));
 
         // Check policy file was written
-        let policy_path = dir
-            .path()
-            .join(".gemini")
-            .join("policies")
-            .join("hcom.toml");
+        let policy_path = test_home.join(".gemini/policies/hcom.toml");
         assert!(policy_path.exists(), "policy file should be created");
 
         // Remove hooks
@@ -2102,13 +2178,6 @@ mod tests {
         assert!(remove_ok);
         let verify_after_remove = verify_hooks_at(&settings_path, false).is_ok();
         assert!(!verify_after_remove, "verify should fail after remove");
-
-        // Restore
-        if let Some(v) = saved {
-            unsafe { std::env::set_var("HCOM_DIR", v) };
-        } else {
-            unsafe { std::env::remove_var("HCOM_DIR") };
-        }
     }
 
     use crate::hooks::test_helpers::{EnvGuard, isolated_test_env};
@@ -2788,18 +2857,28 @@ mod tests {
                 "hooks": corrupt_hooks,
                 "ui": {"theme": "Dark"},
             });
-            std::fs::write(
-                &settings_path,
-                serde_json::to_string_pretty(&settings).unwrap(),
-            )
-            .unwrap();
+            let original = serde_json::to_string_pretty(&settings).unwrap();
+            std::fs::write(&settings_path, &original).unwrap();
 
-            // Should not crash
-            let _ = setup_gemini_hooks(false);
+            assert!(matches!(
+                try_setup_gemini_hooks(false),
+                Err(SetupError::SettingsFieldTypeInvalid { .. })
+            ));
+            assert_eq!(std::fs::read_to_string(&settings_path).unwrap(), original);
+        }
+    }
 
-            // User data should still be readable
-            let updated = read_json(&settings_path);
-            assert_eq!(updated["ui"]["theme"], "Dark");
+    #[test]
+    #[serial]
+    fn setup_and_migration_preserve_unreadable_gemini_settings() {
+        let (_dir, _test_home, settings_path, _guard) = gemini_test_env();
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+
+        for original in ["{ malformed user settings", "[]"] {
+            std::fs::write(&settings_path, original).unwrap();
+            assert!(try_setup_gemini_hooks(false).is_err());
+            assert!(!ensure_hooks_enabled());
+            assert_eq!(std::fs::read_to_string(&settings_path).unwrap(), original);
         }
     }
 

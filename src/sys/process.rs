@@ -163,49 +163,6 @@ pub fn exec_replace(mut cmd: Command) -> std::io::Error {
     }
 }
 
-/// Kill a child process together with its process group.
-///
-/// Unix: `killpg(SIGKILL)` on the child's group (set up via [`detach_session`]),
-/// falling back to `Child::kill` if the group signal fails. Windows: terminates
-/// the child's whole process tree ([`kill_tree_win`]).
-pub fn kill_child_group(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{Signal, killpg};
-        use nix::unistd::Pid;
-
-        if let Ok(raw_pid) = i32::try_from(child.id())
-            && killpg(Pid::from_raw(raw_pid), Signal::SIGKILL).is_ok()
-        {
-            return;
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        // kill_tree_win_checked terminates `child` itself (with the hcom-kill
-        // sentinel exit code 130, via terminate_win) and its whole descendant
-        // tree. If root's own termination is confirmed, return rather than
-        // falling through to child.kill() below: TerminateProcess only
-        // requests termination asynchronously, so a second call racing the
-        // first can overwrite the sentinel exit code with a different one,
-        // corrupting the EXIT_WAS_KILLED check that reads it back.
-        //
-        // If root's termination was NOT confirmed, it may just be that the
-        // fresh-by-PID OpenProcess inside terminate_win failed for a reason
-        // other than "already gone" (a handle-table limit, or AV/EDR hooking
-        // around freshly-opened handles, for instance) — fall through to
-        // child.kill() as a retry via the handle Command already has open,
-        // which a failing OpenProcess-by-PID wouldn't affect.
-        let (_, root_terminated) = kill_tree_win_checked(child.id());
-        if root_terminated {
-            return;
-        }
-    }
-
-    let _ = child.kill();
-}
-
 /// Put a not-yet-spawned [`Command`] into its own session / process group, so
 /// the resulting child can be signalled as a group and is detached from the
 /// parent's controlling terminal.
@@ -572,25 +529,5 @@ mod tests {
             "an open handle to an already-exited process must not count as alive"
         );
         drop(child);
-    }
-
-    // Reproduces the bug fixed above: kill_tree_win's terminate_win writes the
-    // hcom-kill sentinel exit code 130. A trailing child.kill() (a second,
-    // competing TerminateProcess on the same PID) could overwrite it before
-    // the OS settles on a final exit code.
-    #[cfg(windows)]
-    #[test]
-    fn test_kill_child_group_preserves_sentinel_exit_code() {
-        let mut child = std::process::Command::new("cmd")
-            .args(["/C", "timeout /T 30"])
-            .spawn()
-            .unwrap();
-        kill_child_group(&mut child);
-        let status = child.wait().unwrap();
-        assert_eq!(
-            status.code(),
-            Some(130),
-            "kill_child_group must not let a second kill overwrite the hcom-kill sentinel"
-        );
     }
 }

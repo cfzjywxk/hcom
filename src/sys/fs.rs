@@ -87,25 +87,6 @@ pub fn is_socket(path: &Path) -> bool {
     }
 }
 
-/// Restrict a file to owner-only read/write (`0o600` on Unix).
-///
-/// No-op on Windows, where Unix mode bits do not apply and files created under
-/// the user's profile are already private by default. Same caveat as
-/// `create_private_new`: a shared `HCOM_DIR`/`HOME` location isn't actually
-/// locked down on Windows until real ACL restriction is implemented.
-pub fn set_private(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
-    }
-}
-
 /// Mark a file as executable (`0o755` on Unix).
 ///
 /// No-op on Windows, where executability is determined by file extension rather

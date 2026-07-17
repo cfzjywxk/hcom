@@ -441,7 +441,7 @@ pub(crate) fn omp_session_roots() -> Vec<PathBuf> {
 /// The one session root Pi and OMP genuinely share: `PI_CODING_AGENT_DIR/sessions`
 /// (both tools read `PI_CODING_AGENT_DIR`). `None` when the var is unset. A match
 /// under this root carries no inherent tool provenance — attribute by the path's
-/// product marker only (managed configs carry `.pi`/`.omp`).
+/// product marker only (native product-specific roots carry `.pi`/`.omp`).
 pub(crate) fn shared_agent_dir_root() -> Option<PathBuf> {
     std::env::var("PI_CODING_AGENT_DIR")
         .ok()

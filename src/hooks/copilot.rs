@@ -587,14 +587,14 @@ mod tests {
             std::env::set_var("HCOM_DIR", workspace.join(".hcom"));
             std::env::remove_var("COPILOT_HOME");
         }
-        (dir, workspace, guard)
+        (dir, home, guard)
     }
 
     #[test]
     #[serial]
     fn setup_is_idempotent_and_preserves_other_hooks() {
-        let (_dir, workspace, _guard) = copilot_test_env();
-        let hooks_path = workspace.join(".copilot/hooks/hcom.json");
+        let (_dir, home, _guard) = copilot_test_env();
+        let hooks_path = home.join(".copilot/hooks/hcom.json");
         std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
         std::fs::write(
             &hooks_path,

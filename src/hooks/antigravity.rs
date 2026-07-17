@@ -1150,7 +1150,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial]
-    fn test_remove_cleans_default_and_active_hcom_dir_local_paths() {
+    fn test_remove_cleans_native_path_without_touching_hcom_dir_parent() {
         let _guard = EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
@@ -1190,17 +1190,34 @@ mod tests {
 
         assert!(remove_antigravity_hooks());
 
-        for gemini_dir in gemini_dirs {
+        let native_dir = &gemini_dirs[0];
+        let hooks: Value = serde_json::from_str(
+            &std::fs::read_to_string(antigravity_hooks_path(native_dir)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(hooks, json!({ "custom": true }));
+        let settings: Value = serde_json::from_str(
+            &std::fs::read_to_string(antigravity_settings_path(native_dir)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings["permissions"]["allow"], json!(["custom"]));
+
+        // A similarly shaped file beside HCOM_DIR is unrelated agent state.
+        // hcom must neither discover nor mutate it.
+        for gemini_dir in &gemini_dirs[1..] {
             let hooks: Value = serde_json::from_str(
-                &std::fs::read_to_string(antigravity_hooks_path(&gemini_dir)).unwrap(),
+                &std::fs::read_to_string(antigravity_hooks_path(gemini_dir)).unwrap(),
             )
             .unwrap();
-            assert_eq!(hooks, json!({ "custom": true }));
+            assert_eq!(hooks, json!({ "hcom-lifecycle": {}, "custom": true }));
             let settings: Value = serde_json::from_str(
-                &std::fs::read_to_string(antigravity_settings_path(&gemini_dir)).unwrap(),
+                &std::fs::read_to_string(antigravity_settings_path(gemini_dir)).unwrap(),
             )
             .unwrap();
-            assert_eq!(settings["permissions"]["allow"], json!(["custom"]));
+            assert_eq!(
+                settings["permissions"]["allow"],
+                json!(["command(hcom send)", "custom"])
+            );
         }
     }
 

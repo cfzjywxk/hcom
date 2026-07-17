@@ -1761,7 +1761,7 @@ fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
     //   - XDG-omp / `~/.omp` / OMP profile trees             => OMP-exclusive
     //   - `PI_CODING_AGENT_DIR/sessions`                     => genuinely shared
     // Exclusive roots are authoritative. The shared root is attributed only by
-    // the path's product marker (managed configs carry `.pi`/`.omp`); a
+    // the path's product marker (native product roots carry `.pi`/`.omp`); a
     // markerless arbitrary shared dir is genuinely ambiguous (both tools write
     // identical headers) and is surfaced as an error by the caller rather than
     // guessed. `PiOmpMatch::Ambiguous` carries the path so the caller can name it.
@@ -2470,8 +2470,7 @@ mod tests {
     fn test_find_session_on_disk_attributes_shared_agent_dir_by_path_marker() {
         // The genuinely-shared PI_CODING_AGENT_DIR: attribution must key on the
         // path's product marker (.pi vs .omp), not on which tool's root list or
-        // probe order found it. hcom isolates managed configs as <root>/.pi and
-        // <root>/.omp, so the marker is present.
+        // probe order found it. Native product-specific roots carry the marker.
         let (_dir, _hcom, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let base = tempfile::tempdir().unwrap();
         unsafe {

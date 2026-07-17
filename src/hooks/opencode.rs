@@ -477,7 +477,7 @@ pub fn dispatch_opencode_hook(hook_name: &str, argv: &[String]) -> (i32, String)
     let ctx = HcomContext::from_os();
 
     // Ensure hcom directories exist before opening DB.
-    // On clean HOME/HCOM_DIR the DB parent dir won't exist yet.
+    // Under a clean HOME the native DB parent directory may not exist yet.
     crate::paths::ensure_hcom_directories_at(&ctx.hcom_dir);
 
     // Open DB (includes schema migration/compat)
@@ -567,18 +567,22 @@ fn xdg_config_home() -> String {
 
 /// Get the canonical plugin install directory for an OpenCode-family app.
 ///
-/// Uses the XDG global plugin dir in the default HOME-backed case, and a
-/// project-local `.<app>/plugins/` dir when HCOM_DIR points at a project root.
+/// Uses the tool's explicit config-dir override when present, otherwise its
+/// native XDG global plugin directory. HCOM_DIR never participates.
 fn plugin_dir_for_app(app: &str) -> std::path::PathBuf {
-    let tool_root = crate::runtime_env::tool_config_root();
-    let home = current_home_dir();
-    if tool_root == home {
-        std::path::PathBuf::from(xdg_config_home())
-            .join(app)
-            .join("plugins")
+    let config_dir_env = if app == "kilo" {
+        "KILO_CONFIG_DIR"
     } else {
-        tool_root.join(format!(".{app}")).join("plugins")
+        "OPENCODE_CONFIG_DIR"
+    };
+    if let Ok(custom_dir) = std::env::var(config_dir_env)
+        && !custom_dir.is_empty()
+    {
+        return std::path::PathBuf::from(custom_dir).join("plugins");
     }
+    std::path::PathBuf::from(xdg_config_home())
+        .join(app)
+        .join("plugins")
 }
 
 pub fn get_opencode_plugin_dir() -> std::path::PathBuf {
@@ -596,8 +600,8 @@ pub fn get_kilo_plugin_path() -> std::path::PathBuf {
 
 /// Scan all directories where hcom.ts plugin might exist.
 ///
-/// Checks both plugin/ and plugins/ under the XDG global location and the
-/// project-local tool_config_root() location when applicable.
+/// Checks both plugin/ and plugins/ under the explicit native override and XDG
+/// global location.
 fn scan_plugin_dirs(app: &str) -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
     let xdg_base = std::path::PathBuf::from(xdg_config_home()).join(app);
@@ -613,14 +617,6 @@ fn scan_plugin_dirs(app: &str) -> Vec<std::path::PathBuf> {
         let custom_base = std::path::PathBuf::from(custom_dir);
         candidates.push(custom_base.join("plugin"));
         candidates.push(custom_base.join("plugins"));
-    }
-
-    let tool_root = crate::runtime_env::tool_config_root();
-    let home = current_home_dir();
-    if tool_root != home {
-        let tool_base = tool_root.join(format!(".{app}"));
-        candidates.push(tool_base.join("plugin"));
-        candidates.push(tool_base.join("plugins"));
     }
 
     let mut deduped = Vec::new();
@@ -709,18 +705,6 @@ fn remove_plugin(app: &str) -> std::io::Result<()> {
             }
         }
     }
-    let tool_root = crate::runtime_env::tool_config_root();
-    let home = current_home_dir();
-    if tool_root != home {
-        let tool_base = tool_root.join(format!(".{app}"));
-        for sub in &["plugin", "plugins"] {
-            let p = tool_base.join(sub).join(PLUGIN_FILENAME);
-            if !paths.contains(&p) {
-                paths.push(p);
-            }
-        }
-    }
-
     for p in paths {
         if p.exists() {
             std::fs::remove_file(&p)?;
@@ -958,7 +942,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_project_local_kilo_plugin_path_uses_kilo_dir() {
+    fn test_hcom_dir_does_not_redirect_kilo_plugin_path() {
         let _guard = EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
@@ -969,11 +953,13 @@ mod tests {
         unsafe {
             std::env::set_var("HCOM_DIR", &hcom_dir);
             std::env::set_var("HOME", &home);
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::remove_var("KILO_CONFIG_DIR");
         }
 
         assert_eq!(
             get_kilo_plugin_path(),
-            workspace.join(".kilo").join("plugins").join("hcom.ts")
+            home.join(".config/kilo/plugins/hcom.ts")
         );
     }
 
@@ -1013,7 +999,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_project_local_plugin_path_uses_hcom_dir_parent() {
+    fn test_hcom_dir_does_not_redirect_opencode_plugin_path() {
         let _guard = EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
@@ -1024,11 +1010,13 @@ mod tests {
         unsafe {
             std::env::set_var("HCOM_DIR", &hcom_dir);
             std::env::set_var("HOME", &home);
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::remove_var("OPENCODE_CONFIG_DIR");
         }
 
         assert_eq!(
             get_opencode_plugin_path(),
-            workspace.join(".opencode").join("plugins").join("hcom.ts")
+            home.join(".config/opencode/plugins/hcom.ts")
         );
     }
 

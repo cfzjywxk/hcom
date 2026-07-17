@@ -113,7 +113,7 @@ Each agent gets a queryable identity:
 
 Agents can subscribe to events and react instantly. Collision detection is on by default: if two agents edit the same file within 30 seconds, both get notified.
 
-Hooks go into config dirs under `~/` (or `HCOM_DIR`) on first run. If you aren't using hcom, the hooks do nothing.
+Hooks go additively into each tool's native config directory on first run. `HCOM_DIR` stores hcom state only. If you aren't using hcom, the hooks do nothing.
 
 Without hooks, any other AI tool can join by running `hcom start`. Any process can wake agents with `hcom send`.
 
@@ -345,9 +345,15 @@ HCOM_TAG=dev hcom 3 claude                      # per-launch env
 ### Per-project isolation
 
 ```bash
-export HCOM_DIR="$PWD/.hcom"    # isolate state + hooks to this folder
-hcom hooks remove && rm -rf "$HCOM_DIR"
+export HCOM_DIR="$PWD/.hcom"    # isolate hcom state only
+rm -rf "$HCOM_DIR"              # removes only that hcom state
 ```
+
+`HCOM_DIR` does not redirect any integrated tool's login, sessions, settings,
+skills, plugins, or transcripts. Tool-native overrides such as
+`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and `GEMINI_CLI_HOME` remain authoritative.
+Hooks are additive global integration entries; remove them separately with
+`hcom hooks remove` only when you intend to disable hcom integration.
 
 Run `hcom config <key> --info` or `hcom run docs --config` for the full per-key reference.
 

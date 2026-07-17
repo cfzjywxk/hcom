@@ -2017,21 +2017,22 @@ static RE_SH_HCOM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"sh\s+-c.*hcom
 
 /// Resolve the Claude config directory.
 ///
-/// Priority: CLAUDE_CONFIG_DIR env var → tool_config_root()/.claude
+/// Priority: CLAUDE_CONFIG_DIR env var → the user's normal ~/.claude.
+/// HCOM_DIR never participates in Claude config/state resolution.
 fn claude_config_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR")
         && !dir.is_empty()
     {
         return PathBuf::from(dir);
     }
-    paths::get_project_root().join(".claude")
+    crate::runtime_env::user_home()
+        .unwrap_or_default()
+        .join(".claude")
 }
 
 /// Get path to Claude settings.json.
 ///
-/// Respects CLAUDE_CONFIG_DIR env var, then falls back to:
-/// - HCOM_DIR set → project_root is HCOM_DIR parent → {parent}/.claude/settings.json
-/// - Otherwise → ~/.hcom parent = ~ → ~/.claude/settings.json
+/// Respects CLAUDE_CONFIG_DIR, otherwise uses ~/.claude/settings.json.
 pub fn get_claude_settings_path() -> PathBuf {
     claude_config_dir().join("settings.json")
 }
@@ -2307,6 +2308,26 @@ pub enum VerifyFailReason {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SetupError {
+    #[error("failed to read existing {}: {source}", path.display())]
+    SettingsReadFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to parse existing {}: {source}", path.display())]
+    SettingsParseFailed {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("existing Claude settings at {} must be a JSON object", .0.display())]
+    SettingsRootNotObject(PathBuf),
+    #[error("existing Claude settings field '{field}' at {} must be {expected}", path.display())]
+    SettingsFieldTypeInvalid {
+        path: PathBuf,
+        field: String,
+        expected: &'static str,
+    },
     #[error("JSON serialization failed: {0}")]
     SerializationFailed(#[from] serde_json::Error),
     #[error("atomic write to {} failed: {source}", path.display())]
@@ -2336,10 +2357,91 @@ pub fn try_setup_claude_hooks(include_permissions: bool) -> Result<(), SetupErro
         let _ = std::fs::create_dir_all(parent);
     }
 
-    let mut settings =
-        load_claude_settings(&settings_path).unwrap_or_else(|| serde_json::json!({}));
+    let mut settings = if settings_path.exists() {
+        let content = std::fs::read_to_string(&settings_path).map_err(|source| {
+            SetupError::SettingsReadFailed {
+                path: settings_path.clone(),
+                source,
+            }
+        })?;
+        serde_json::from_str(&content).map_err(|source| SetupError::SettingsParseFailed {
+            path: settings_path.clone(),
+            source,
+        })?
+    } else {
+        serde_json::json!({})
+    };
+    if !settings.is_object() {
+        return Err(SetupError::SettingsRootNotObject(settings_path));
+    }
 
-    // Normalize hooks dict
+    for (field, expected, valid) in [
+        (
+            "hooks",
+            "a JSON object",
+            settings.get("hooks").is_none_or(Value::is_object),
+        ),
+        (
+            "env",
+            "a JSON object",
+            settings.get("env").is_none_or(Value::is_object),
+        ),
+    ] {
+        if !valid {
+            return Err(SetupError::SettingsFieldTypeInvalid {
+                path: settings_path,
+                field: field.into(),
+                expected,
+            });
+        }
+    }
+    for &(hook_type, ..) in CLAUDE_HOOK_CONFIGS {
+        let existing = settings.get("hooks").and_then(|hooks| hooks.get(hook_type));
+        if existing.is_some_and(|value| !value.is_array()) {
+            return Err(SetupError::SettingsFieldTypeInvalid {
+                path: settings_path,
+                field: format!("hooks.{hook_type}"),
+                expected: "a JSON array",
+            });
+        }
+        if let Some(groups) = existing.and_then(Value::as_array) {
+            for (index, group) in groups.iter().enumerate() {
+                if !group.is_object() || group.get("hooks").is_none_or(|hooks| !hooks.is_array()) {
+                    return Err(SetupError::SettingsFieldTypeInvalid {
+                        path: settings_path,
+                        field: format!("hooks.{hook_type}[{index}]"),
+                        expected: "an object containing a hooks array",
+                    });
+                }
+            }
+        }
+    }
+    if include_permissions {
+        if settings
+            .get("permissions")
+            .is_some_and(|value| !value.is_object())
+        {
+            return Err(SetupError::SettingsFieldTypeInvalid {
+                path: settings_path,
+                field: "permissions".into(),
+                expected: "a JSON object",
+            });
+        }
+        if settings
+            .get("permissions")
+            .and_then(|permissions| permissions.get("allow"))
+            .is_some_and(|value| !value.is_array())
+        {
+            return Err(SetupError::SettingsFieldTypeInvalid {
+                path: settings_path,
+                field: "permissions.allow".into(),
+                expected: "a JSON array",
+            });
+        }
+    }
+
+    // Create only missing hcom-owned containers. Existing malformed user
+    // fields are rejected above rather than silently rewritten.
     if !settings.get("hooks").is_some_and(|v| v.is_object()) {
         settings["hooks"] = serde_json::json!({});
     }
@@ -2585,7 +2687,7 @@ fn remove_hooks_from_settings_path(settings_path: &Path) -> bool {
 
 /// Remove hcom hooks from Claude settings.
 ///
-/// Cleans both global (~/.claude/settings.json) and local (HCOM_DIR-based) paths.
+/// Cleans the normal Claude config and an explicit CLAUDE_CONFIG_DIR override.
 /// Only removes hcom-specific hooks, not the whole file.
 pub fn remove_claude_hooks() -> bool {
     let global_path = dirs::home_dir()
@@ -3251,6 +3353,42 @@ mod tests {
         (dir, test_home, settings_path, guard)
     }
 
+    #[test]
+    #[serial]
+    fn claude_config_path_uses_home_not_hcom_dir_parent() {
+        let (dir, test_home, settings_path, _guard) = claude_test_env();
+        let hcom_parent = dir.path().join("different-hcom-parent");
+        unsafe { std::env::set_var("HCOM_DIR", hcom_parent.join("hcom")) };
+
+        assert_eq!(get_claude_settings_path(), settings_path);
+        assert_ne!(
+            get_claude_settings_path(),
+            hcom_parent.join(".claude/settings.json")
+        );
+        assert_eq!(claude_config_dir(), test_home.join(".claude"));
+
+        let explicit = dir.path().join("explicit-claude-config");
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &explicit) };
+        assert_eq!(claude_config_dir(), explicit);
+    }
+
+    #[test]
+    #[serial]
+    fn setup_uses_native_claude_config_and_preserves_skills() {
+        let (dir, test_home, settings_path, _guard) = claude_test_env();
+        let hcom_parent = dir.path().join("different-hcom-parent");
+        let skill = test_home.join(".claude/skills/user-skill/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, "user skill").unwrap();
+        unsafe { std::env::set_var("HCOM_DIR", hcom_parent.join("hcom")) };
+
+        try_setup_claude_hooks(false).unwrap();
+
+        assert!(settings_path.exists());
+        assert!(!hcom_parent.join(".claude").exists());
+        assert_eq!(std::fs::read_to_string(skill).unwrap(), "user skill");
+    }
+
     fn read_json(path: &Path) -> Value {
         let content = std::fs::read_to_string(path).unwrap();
         serde_json::from_str(&content).unwrap()
@@ -3398,6 +3536,36 @@ mod tests {
         assert!(verify_claude_hooks_installed(Some(&settings_path), false));
 
         drop(_guard);
+    }
+
+    #[test]
+    #[serial]
+    fn setup_refuses_to_overwrite_malformed_claude_settings() {
+        let (_dir, _test_home, settings_path, _guard) = claude_test_env();
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        let original = "{ malformed user settings";
+        std::fs::write(&settings_path, original).unwrap();
+
+        assert!(matches!(
+            try_setup_claude_hooks(false),
+            Err(SetupError::SettingsParseFailed { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(settings_path).unwrap(), original);
+    }
+
+    #[test]
+    #[serial]
+    fn setup_refuses_to_overwrite_non_object_claude_settings() {
+        let (_dir, _test_home, settings_path, _guard) = claude_test_env();
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        let original = "[]";
+        std::fs::write(&settings_path, original).unwrap();
+
+        assert!(matches!(
+            try_setup_claude_hooks(false),
+            Err(SetupError::SettingsRootNotObject(_))
+        ));
+        assert_eq!(std::fs::read_to_string(settings_path).unwrap(), original);
     }
 
     #[test]
@@ -3621,18 +3789,14 @@ mod tests {
                 "hooks": corrupt_hooks,
                 "env": {"MY_VAR": "test"},
             });
-            std::fs::write(
-                &settings_path,
-                serde_json::to_string_pretty(&settings).unwrap(),
-            )
-            .unwrap();
+            let original = serde_json::to_string_pretty(&settings).unwrap();
+            std::fs::write(&settings_path, &original).unwrap();
 
-            // Should not crash
-            let _ = setup_claude_hooks(false);
-
-            // User data should still be there
-            let updated = read_json(&settings_path);
-            assert_eq!(updated["env"]["MY_VAR"], "test");
+            assert!(matches!(
+                try_setup_claude_hooks(false),
+                Err(SetupError::SettingsFieldTypeInvalid { .. })
+            ));
+            assert_eq!(std::fs::read_to_string(&settings_path).unwrap(), original);
         }
     }
 

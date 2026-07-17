@@ -478,15 +478,15 @@ const RESET_HELP: &[HelpEntry] = &[
     ("", "  export HCOM_DIR=\"$PWD/.hcom\""),
     (
         "",
-        "Hooks install under the parent of HCOM_DIR; state stays in HCOM_DIR.",
-    ),
-    (
-        "",
-        "  HCOM_DIR=$PWD/.hcom -> $PWD/.claude, .gemini, .codex, .opencode, .kilo, .pi, .omp, .antigravity, .cursor, .kimi, .copilot",
+        "HCOM_DIR changes hcom state only; integrated tools keep their native config, login, sessions, skills, and plugins.",
     ),
     ("", ""),
     ("", "To remove local setup:"),
-    ("", "  hcom hooks remove && rm -rf \"$HCOM_DIR\""),
+    ("", "  rm -rf \"$HCOM_DIR\""),
+    (
+        "",
+        "Hooks are global integration entries; remove them separately only if intended.",
+    ),
     ("", ""),
     ("", "Explicit location:"),
     ("", "  export HCOM_DIR=/your/path/.hcom"),
@@ -523,7 +523,7 @@ const CONFIG_HELP: &[HelpEntry] = &[
     ("  auto_subscribe", "Event auto-subscribe presets"),
     (
         "  auto_trust_workspace",
-        "Auto-trust launch dir (skip folder-trust prompt)",
+        "Opt in to trusting the launch dir",
     ),
     ("  name_export", "Export agent name to custom env var"),
     ("", "hcom config <key> --info for details"),
@@ -534,7 +534,7 @@ const CONFIG_HELP: &[HelpEntry] = &[
 // config help continued with dynamic config files hint
 const CONFIG_HELP_2: &[HelpEntry] = &[(
     "",
-    "HCOM_DIR: isolate per project (see 'hcom reset --help')",
+    "HCOM_DIR: relocate hcom state only (see 'hcom reset --help')",
 )];
 
 const RELAY_HELP: &[HelpEntry] = &[
@@ -659,10 +659,7 @@ const HOOKS_HELP: &[HelpEntry] = &[
         "Without hooks, use ad-hoc mode (run hcom start inside any AI tool).",
     ),
     ("", "Restart the tool after adding hooks to activate."),
-    (
-        "",
-        "Remove cleans both global (~/) and HCOM_DIR-local if set.",
-    ),
+    ("", "Remove deletes only hcom-owned hook entries."),
 ];
 
 const TERM_HELP: &[HelpEntry] = &[

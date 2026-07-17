@@ -191,25 +191,6 @@ pub struct IntegrationSpec {
     /// PTY ready-pattern bytes (empty for Adhoc).
     pub ready_pattern: &'static [u8],
     pub pty: PtySpec,
-    /// Environment variables specific to this tool's instance state that
-    /// will corrupt a same-tool child if leaked (session IDs, sandbox modes,
-    /// config-directory pointers, process-role assignments, per-instance
-    /// server URLs). Stripped before inheritance and `unset` in runner
-    /// scripts. Must NOT include auth/API-key env vars or user config
-    /// toggles (those forward). These are in ADDITION to TOOL_MARKER_VARS
-    /// which already covers the broad-detection markers.
-    ///
-    /// Entries must meet ALL THREE criteria:
-    /// (a) read as input on fresh start
-    /// (b) instance-specific (session/thread/sandbox/path/role)
-    /// (c) NOT re-set by the child's own launch
-    ///
-    /// This is a known-vars strip — NOT a completeness guarantee. Unknown
-    /// instance-state vars on closed-source tools, or future vars on any
-    /// tool, are a documented gap (same risk the PTY path already lives with
-    /// today). Recoverable by adding the var when discovered.
-    pub instance_state_env: &'static [&'static str],
-
     pub hooks: HooksSpec,
     pub gates: GatesSpec,
     pub launch: LaunchSpec,
@@ -417,7 +398,6 @@ pub static CLAUDE: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
-    instance_state_env: &[],
     hooks: HooksSpec {
         names: CLAUDE_HOOKS,
         shared_hooks_with: None,
@@ -471,7 +451,6 @@ pub static GEMINI: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 60,
     },
-    instance_state_env: &["GEMINI_PTY_INFO"],
     hooks: HooksSpec {
         names: GEMINI_HOOKS,
         shared_hooks_with: None,
@@ -524,7 +503,6 @@ pub static CODEX: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
-    instance_state_env: &["CODEX_EXEC_SERVER_URL"],
     hooks: HooksSpec {
         names: CODEX_HOOKS,
         shared_hooks_with: None,
@@ -577,7 +555,6 @@ pub static OPENCODE: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
-    instance_state_env: &["OPENCODE_RUN_ID", "OPENCODE_PROCESS_ROLE"],
     hooks: HooksSpec {
         names: OPENCODE_HOOKS,
         shared_hooks_with: None,
@@ -598,9 +575,8 @@ pub static OPENCODE: IntegrationSpec = IntegrationSpec {
         args_env: Some("HCOM_OPENCODE_ARGS"),
         // OPENCODE_CONFIG_DIR is read by the plugin install/verify/remove path
         // in hooks/opencode.rs; surface it for the launch diagnostic dump.
-        // This does NOT enable launcher config-isolation: isolated_tool_config_dir
-        // returns None for OpenCode (it isolates via OPENCODE_RUN_ID/_PROCESS_ROLE),
-        // so the auto-isolation arm in launcher.rs stays a no-op for this tool.
+        // hcom never synthesizes config-directory env vars; this field is for
+        // launch diagnostics and explicit native overrides only.
         config_dir_env: Some("OPENCODE_CONFIG_DIR"),
         initial_prompt: InitialPromptShape::Flag("--prompt"),
         uses_pty_default: true,
@@ -641,7 +617,6 @@ pub static KILO: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
-    instance_state_env: &["KILO_DB", "KILO_RUN_ID", "KILO_PROCESS_ROLE"],
     hooks: HooksSpec {
         names: OPENCODE_HOOKS,
         shared_hooks_with: Some(Tool::OpenCode),
@@ -694,7 +669,6 @@ pub static ANTIGRAVITY: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
-    instance_state_env: &["ANTIGRAVITY_EXECUTABLE_DATA_DIR", "GEMINI_PTY_INFO"],
     hooks: HooksSpec {
         names: GEMINI_HOOKS,
         // Antigravity reuses Gemini hook names; routing resolves those names
@@ -757,7 +731,6 @@ pub static CURSOR: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
-    instance_state_env: &[],
     hooks: HooksSpec {
         names: CURSOR_HOOKS,
         shared_hooks_with: None,
@@ -816,7 +789,6 @@ pub static KIMI: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
-    instance_state_env: &[],
     hooks: HooksSpec {
         names: KIMI_HOOKS,
         shared_hooks_with: None,
@@ -881,7 +853,6 @@ pub static PI: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
-    instance_state_env: &[],
     hooks: HooksSpec {
         names: PI_HOOKS,
         shared_hooks_with: None,
@@ -950,7 +921,6 @@ pub static OMP: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
-    instance_state_env: &[],
     hooks: HooksSpec {
         names: OMP_HOOKS,
         shared_hooks_with: None,
@@ -1018,7 +988,6 @@ pub static COPILOT: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 60,
     },
-    instance_state_env: &[],
     hooks: HooksSpec {
         names: COPILOT_HOOKS,
         shared_hooks_with: None,
@@ -1069,7 +1038,6 @@ pub static ADHOC: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 60,
     },
-    instance_state_env: &[],
     hooks: HooksSpec {
         names: &[],
         shared_hooks_with: None,
