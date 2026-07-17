@@ -20,7 +20,7 @@ use crate::instance_names;
 use crate::instances;
 use crate::paths;
 use crate::shared::constants::HCOM_IDENTITY_VARS;
-use crate::shared::tool_detection::tool_marker_vars;
+use crate::shared::tool_detection::hcom_owned_marker_vars;
 use crate::terminal;
 use crate::tools::launch_arg_validation::{
     ANTIGRAVITY_REJECTED_ARGS, GEMINI_REJECTED_ARGS, KILO_REJECTED_ARGS, KIMI_REJECTED_ARGS,
@@ -347,7 +347,7 @@ pub fn build_launch_env(
 ///
 /// Closed categories that hcom itself owns:
 /// 1. HCOM_IDENTITY_VARS
-/// 2. HCOM_* tool markers
+/// 2. hcom-owned tool markers (HCOM_* plus ANTIGRAVITY_AGENT)
 /// 3. TERMINAL_CONTEXT_VARS when a new terminal will establish fresh values
 fn env_strip_set() -> std::collections::HashSet<String> {
     let mut strip: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -366,18 +366,21 @@ fn run_here_env_strip_set() -> std::collections::HashSet<String> {
     for v in crate::shared::constants::HCOM_IDENTITY_VARS {
         strip.insert((*v).to_string());
     }
-    for v in hcom_tool_marker_vars() {
-        strip.insert((*v).to_string());
+    for v in hcom_owned_marker_vars() {
+        strip.insert(v.to_string());
     }
     strip.insert("HCOM_LAUNCHED_PRESET".to_string());
 
     strip
 }
 
-fn hcom_tool_marker_vars() -> Vec<&'static str> {
-    tool_marker_vars()
-        .iter()
-        .copied()
+/// Markers excluded from the runner sidecar: the HCOM_* subset only.
+/// ANTIGRAVITY_AGENT is deliberately kept sidecar-eligible — the runner
+/// script unsets every hcom-owned marker to drop inherited copies, and the
+/// sidecar is the channel that restores the value hcom set for this launch.
+fn sidecar_marker_strip() -> Vec<&'static str> {
+    hcom_owned_marker_vars()
+        .into_iter()
         .filter(|var| var.starts_with("HCOM_"))
         .collect()
 }
@@ -741,7 +744,10 @@ fn create_runner_script_windows(
 
     // Non-HCOM ambient env (may carry secrets) goes through a private sidecar
     // that is dot-sourced then deleted, matching the bash runner.
-    let mut sidecar_strip = hcom_tool_marker_vars();
+    // ANTIGRAVITY_AGENT stays sidecar-eligible: the unset below kills any
+    // inherited copy, and the sidecar restores the value hcom intentionally
+    // put into this launch's env (set only for antigravity launches).
+    let mut sidecar_strip = sidecar_marker_strip();
     sidecar_strip.extend(HCOM_IDENTITY_VARS.iter().copied());
     if !run_here {
         sidecar_strip.extend(crate::terminal::TERMINAL_COLOR_VARS.iter().copied());
@@ -773,7 +779,7 @@ fn create_runner_script_windows(
 
     // Replace only hcom-owned markers and identity. Native tool variables are
     // inherited exactly like a direct child process.
-    let unset_names: Vec<String> = hcom_tool_marker_vars()
+    let unset_names: Vec<String> = hcom_owned_marker_vars()
         .into_iter()
         .chain(HCOM_IDENTITY_VARS.iter().copied())
         .map(|v| format!("Env:{v}"))
@@ -916,7 +922,10 @@ pub fn create_runner_script(
         .filter(|(k, _)| k.starts_with("HCOM_"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    let mut sidecar_strip = hcom_tool_marker_vars();
+    // ANTIGRAVITY_AGENT stays sidecar-eligible: the runner's unset kills any
+    // inherited copy, and the sidecar restores the value hcom intentionally
+    // put into this launch's env (set only for antigravity launches).
+    let mut sidecar_strip = sidecar_marker_strip();
     sidecar_strip.extend(HCOM_IDENTITY_VARS.iter().copied());
     if !run_here {
         sidecar_strip.extend(crate::terminal::TERMINAL_COLOR_VARS.iter().copied());
@@ -983,7 +992,7 @@ pub fn create_runner_script(
         instance_name,
         native_bin_str,
         crate::tools::args_common::shell_quote(cwd),
-        hcom_tool_marker_vars().join(" "),
+        hcom_owned_marker_vars().join(" "),
         HCOM_IDENTITY_VARS.join(" "),
         env_block,
         sensitive_env_source,
@@ -2709,9 +2718,12 @@ mod tests {
         assert!(!strip.contains("CODEX_SANDBOX"));
         assert!(!strip.contains("CODEX_THREAD_ID"));
         assert!(!strip.contains("GEMINI_SYSTEM_MD"));
-        // hcom-owned tool markers are replaced.
+        // hcom-owned tool markers are replaced, including the unprefixed
+        // ANTIGRAVITY_AGENT that hcom itself sets at antigravity launch.
         assert!(strip.contains("HCOM_TOOL"));
         assert!(strip.contains("HCOM_PI"));
+        assert!(strip.contains("ANTIGRAVITY_AGENT"));
+        assert!(run_here_env_strip_set().contains("ANTIGRAVITY_AGENT"));
         assert!(!strip.contains("PI_CODING_AGENT_DIR"));
         // Terminal context
         assert!(strip.contains("KITTY_WINDOW_ID"));
@@ -2791,6 +2803,7 @@ mod tests {
     #[serial]
     fn test_build_launch_env_strips_closed_categories() {
         unsafe { std::env::set_var("HCOM_PROCESS_ID", "pid-stale") }
+        unsafe { std::env::set_var("ANTIGRAVITY_AGENT", "1") }
         unsafe { std::env::set_var("CLAUDECODE", "1") }
         unsafe { std::env::set_var("CODEX_THREAD_ID", "thread-stale") }
         unsafe { std::env::set_var("PI_CODING_AGENT_DIR", "/tmp/pi-config") }
@@ -2800,6 +2813,7 @@ mod tests {
         let env = build_launch_env(&config, LaunchEnvRegime::HumanShell);
 
         assert!(!env.contains_key("HCOM_PROCESS_ID"));
+        assert!(!env.contains_key("ANTIGRAVITY_AGENT"));
         assert_eq!(env.get("CLAUDECODE").map(String::as_str), Some("1"));
         assert_eq!(
             env.get("CODEX_THREAD_ID").map(String::as_str),
@@ -2812,6 +2826,7 @@ mod tests {
         assert!(!env.contains_key("KITTY_WINDOW_ID"));
 
         unsafe { std::env::remove_var("HCOM_PROCESS_ID") }
+        unsafe { std::env::remove_var("ANTIGRAVITY_AGENT") }
         unsafe { std::env::remove_var("CLAUDECODE") }
         unsafe { std::env::remove_var("CODEX_THREAD_ID") }
         unsafe { std::env::remove_var("PI_CODING_AGENT_DIR") }
@@ -2962,6 +2977,32 @@ mod tests {
         assert!(!sidecar.contains("FORCE_COLOR="));
         assert!(sidecar.contains("GEMINI_API_KEY"));
         assert!(sidecar.contains("RORI_MY_VAR"));
+
+        std::fs::remove_file(&script).ok();
+        std::fs::remove_file(env_file).ok();
+    }
+
+    // ANTIGRAVITY_AGENT round-trip: the runner unsets any inherited copy, and
+    // the sidecar restores the value hcom set for this antigravity launch.
+    #[cfg(unix)]
+    #[test]
+    fn test_runner_script_replaces_antigravity_marker_via_sidecar() {
+        let env = HashMap::from([("ANTIGRAVITY_AGENT".to_string(), "1".to_string())]);
+
+        let script =
+            create_runner_script("antigravity", "/tmp", "test-agy", &env, &[], false).unwrap();
+
+        let content = std::fs::read_to_string(&script).unwrap();
+        assert!(content.lines().any(|line| {
+            line.trim_start().starts_with("unset ") && line.contains("ANTIGRAVITY_AGENT")
+        }));
+        let env_file = content
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(". "))
+            .map(|path| path.trim_matches('\'').to_string())
+            .expect("runner script should source a sidecar env file");
+        let sidecar = std::fs::read_to_string(&env_file).unwrap();
+        assert!(sidecar.contains("ANTIGRAVITY_AGENT"));
 
         std::fs::remove_file(&script).ok();
         std::fs::remove_file(env_file).ok();

@@ -377,11 +377,23 @@ pub fn verify_pi_plugin_installed() -> bool {
     plugin_matches_source(&get_pi_plugin_path())
 }
 
+fn is_hcom_owned(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|content| content.contains("customType: \"hcom-bootstrap\""))
+        .unwrap_or(false)
+}
+
 pub fn install_pi_plugin() -> std::io::Result<bool> {
     let target_dir = pi_plugin_dir();
     let target = target_dir.join(PLUGIN_FILENAME);
     std::fs::create_dir_all(&target_dir)?;
     if target.is_symlink() || target.exists() {
+        if !plugin_matches_source(&target) && !is_hcom_owned(&target) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "A non-hcom hcom.ts file already exists and will not be overwritten",
+            ));
+        }
         std::fs::remove_file(&target)?;
     }
     std::fs::write(&target, PLUGIN_SOURCE)?;
@@ -397,7 +409,9 @@ pub fn ensure_pi_plugin_installed() -> bool {
 
 pub fn remove_pi_plugin() -> std::io::Result<()> {
     let path = get_pi_plugin_path();
-    if path.exists() {
+    if (path.exists() || path.is_symlink())
+        && (plugin_matches_source(&path) || is_hcom_owned(&path))
+    {
         std::fs::remove_file(path)?;
     }
     Ok(())
@@ -567,5 +581,63 @@ mod tests {
         assert_eq!(rebound.directory, temp.path().to_string_lossy());
 
         cleanup(path);
+    }
+
+    // Unix-only: redirects the home dir via $HOME, which `dirs::home_dir()`
+    // ignores on Windows.
+    #[cfg(unix)]
+    fn isolated_pi_plugin_env() -> (tempfile::TempDir, crate::hooks::test_helpers::EnvGuard) {
+        let guard = crate::hooks::test_helpers::EnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("HCOM_DIR", dir.path().join(".hcom"));
+            std::env::remove_var("PI_CODING_AGENT_DIR");
+        }
+        (dir, guard)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn install_refuses_to_overwrite_non_hcom_plugin_file() {
+        let (_dir, _guard) = isolated_pi_plugin_env();
+        let path = get_pi_plugin_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "// user's custom plugin").unwrap();
+
+        assert!(install_pi_plugin().is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "// user's custom plugin"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn install_upgrades_stale_hcom_owned_plugin() {
+        let (_dir, _guard) = isolated_pi_plugin_env();
+        let path = get_pi_plugin_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"const x = customType: "hcom-bootstrap";"#).unwrap();
+
+        assert!(install_pi_plugin().unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), PLUGIN_SOURCE);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn remove_preserves_non_hcom_plugin_file() {
+        let (_dir, _guard) = isolated_pi_plugin_env();
+        let path = get_pi_plugin_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "// user's custom plugin").unwrap();
+
+        remove_pi_plugin().unwrap();
+        assert!(path.exists(), "non-hcom file must not be removed");
     }
 }

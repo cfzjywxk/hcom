@@ -20,15 +20,7 @@ use crate::paths;
 use crate::shared::constants::HCOM_IDENTITY_VARS;
 use crate::shared::platform;
 use crate::shared::terminal_presets::{ArgvTemplate, TERMINAL_ENV_MAP};
-use crate::shared::tool_detection::tool_marker_vars;
-
-fn hcom_tool_marker_vars() -> Vec<&'static str> {
-    tool_marker_vars()
-        .iter()
-        .copied()
-        .filter(|var| var.starts_with("HCOM_"))
-        .collect()
-}
+use crate::shared::tool_detection::hcom_owned_marker_vars;
 
 fn explicit_dev_path_prefix() -> Option<String> {
     let dev_root = std::env::var("HCOM_DEV_ROOT").ok()?;
@@ -965,7 +957,7 @@ pub fn create_bash_script(
 
     // Replace only hcom-owned markers and identity. Native tool markers and
     // every other parent variable remain untouched.
-    writeln!(f, "unset {}", hcom_tool_marker_vars().join(" "))?;
+    writeln!(f, "unset {}", hcom_owned_marker_vars().join(" "))?;
     writeln!(f, "unset {}", HCOM_IDENTITY_VARS.join(" "))?;
 
     // PATH is inherited byte-for-byte in normal operation. HCOM_DEV_ROOT is an
@@ -1090,7 +1082,7 @@ pub fn create_powershell_script(
 
     // Replace only hcom-owned markers and identity. Native tool markers and
     // every other parent variable remain untouched.
-    let scrub: Vec<String> = hcom_tool_marker_vars()
+    let scrub: Vec<String> = hcom_owned_marker_vars()
         .into_iter()
         .chain(HCOM_IDENTITY_VARS.iter().copied())
         .map(|v| format!("Env:{v}"))
@@ -1188,7 +1180,7 @@ where
     I: IntoIterator<Item = (String, String)>,
 {
     let mut strip: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for v in hcom_tool_marker_vars() {
+    for v in hcom_owned_marker_vars() {
         strip.insert(v);
     }
     for v in HCOM_IDENTITY_VARS {
@@ -2910,6 +2902,12 @@ mod tests {
             line.starts_with("unset ")
                 && (line.contains("CLAUDECODE") || line.contains("CODEX_THREAD_ID"))
         }));
+        // hcom-owned markers are replaced, including unprefixed ANTIGRAVITY_AGENT.
+        assert!(
+            content
+                .lines()
+                .any(|line| line.starts_with("unset ") && line.contains("ANTIGRAVITY_AGENT"))
+        );
         assert!(!content.contains(":$PATH\""));
     }
 

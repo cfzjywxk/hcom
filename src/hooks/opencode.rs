@@ -659,6 +659,12 @@ fn install_plugin(app: &str) -> std::io::Result<bool> {
 
     // Remove stale symlinks before writing
     if target.is_symlink() || target.exists() {
+        if !plugin_matches_source(&target) && !is_hcom_owned(&target) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "A non-hcom hcom.ts file already exists and will not be overwritten",
+            ));
+        }
         std::fs::remove_file(&target)?;
     }
 
@@ -706,7 +712,7 @@ fn remove_plugin(app: &str) -> std::io::Result<()> {
         }
     }
     for p in paths {
-        if p.exists() {
+        if (p.exists() || p.is_symlink()) && (plugin_matches_source(&p) || is_hcom_owned(&p)) {
             std::fs::remove_file(&p)?;
         }
     }
@@ -726,6 +732,12 @@ fn plugin_matches_source(path: &std::path::Path) -> bool {
         Ok(content) => content == PLUGIN_SOURCE,
         Err(_) => false,
     }
+}
+
+fn is_hcom_owned(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|content| content.contains("hcom opencode-"))
+        .unwrap_or(false)
 }
 
 /// Ensure the hcom.ts plugin is installed and up to date.
@@ -1339,5 +1351,65 @@ mod tests {
         let (code, output) = handle_stop(&db, &sv(&[]));
         assert_eq!(code, 0);
         assert!(output.contains("Missing --name"));
+    }
+
+    // Unix-only: redirects the home dir via $HOME, which `dirs::home_dir()`
+    // ignores on Windows.
+    #[cfg(unix)]
+    fn isolated_opencode_plugin_env() -> (tempfile::TempDir, EnvGuard) {
+        let guard = EnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("HCOM_DIR", dir.path().join(".hcom"));
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::remove_var("OPENCODE_CONFIG_DIR");
+        }
+        (dir, guard)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn install_refuses_to_overwrite_non_hcom_plugin_file() {
+        let (_dir, _guard) = isolated_opencode_plugin_env();
+        let path = get_opencode_plugin_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "// user's custom plugin").unwrap();
+
+        assert!(install_opencode_plugin().is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "// user's custom plugin"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn install_upgrades_stale_hcom_owned_plugin() {
+        let (_dir, _guard) = isolated_opencode_plugin_env();
+        let path = get_opencode_plugin_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Old hcom plugin: has the ownership marker but doesn't match current source.
+        std::fs::write(&path, "await $`hcom opencode-read --name x`").unwrap();
+
+        assert!(install_opencode_plugin().unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), PLUGIN_SOURCE);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn remove_preserves_non_hcom_plugin_file() {
+        let (_dir, _guard) = isolated_opencode_plugin_env();
+        let path = get_opencode_plugin_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "// user's custom plugin").unwrap();
+
+        remove_opencode_plugin().unwrap();
+        assert!(path.exists(), "non-hcom file must not be removed");
     }
 }

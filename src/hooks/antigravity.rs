@@ -680,6 +680,8 @@ fn antigravity_permission_rules() -> Vec<String> {
 
 /// Merge hcom permission rules into `~/.gemini/antigravity-cli/settings.json`.
 /// Preserves any other keys and pre-existing entries in `permissions.allow`.
+/// Refuses (returns false, file untouched) when the existing file is
+/// unreadable, unparseable, or not a JSON object.
 fn setup_antigravity_permissions() -> bool {
     let path = get_antigravity_settings_path();
     if let Some(parent) = path.parent() {
@@ -688,10 +690,13 @@ fn setup_antigravity_permissions() -> bool {
 
     let mut root = if path.exists() {
         match std::fs::read_to_string(&path) {
-            Ok(s) => serde_json::from_str::<Value>(&s)
+            Ok(s) => match serde_json::from_str::<Value>(&s)
                 .ok()
                 .and_then(|v| v.as_object().cloned())
-                .unwrap_or_default(),
+            {
+                Some(existing) => existing,
+                None => return false,
+            },
             Err(_) => return false,
         }
     } else {
@@ -1142,6 +1147,25 @@ mod tests {
         std::fs::write(&hooks_path, "{not json").unwrap();
 
         assert!(!remove_antigravity_hooks());
+    }
+
+    #[test]
+    #[serial]
+    fn test_permission_setup_refuses_malformed_settings() {
+        let (_dir, _test_home, _hooks_path, _guard) = antigravity_test_env();
+        unsafe { std::env::remove_var("GEMINI_CLI_HOME") };
+        let settings_path = get_antigravity_settings_path();
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+
+        for original in ["{ malformed user settings", "[]"] {
+            std::fs::write(&settings_path, original).unwrap();
+            assert!(!setup_antigravity_permissions());
+            assert_eq!(
+                std::fs::read_to_string(&settings_path).unwrap(),
+                original,
+                "malformed settings must be preserved byte-for-byte"
+            );
+        }
     }
 
     // Unix-only: redirects the home dir via $HOME, but on Windows

@@ -1,4 +1,5 @@
-//! Canonical environment-based AI tool detection and child-env clearing.
+//! Canonical environment-based AI tool detection and the marker inventory
+//! from which hcom's own (replaced-at-launch) marker subset is derived.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -22,7 +23,12 @@ pub struct EnvPredicate {
 pub struct ToolDetectionRule {
     pub tool: Tool,
     pub predicates: &'static [EnvPredicate],
-    pub clear_for_child: &'static [&'static str],
+    /// Additional marker vars associated with this tool, beyond `predicates`.
+    /// Together they form the `tool_marker_vars()` inventory. Native tool
+    /// markers are inherited by children exactly like a bare child process;
+    /// only the hcom-owned subset (`hcom_owned_marker_vars()`) is replaced
+    /// at launch.
+    pub extra_marker_vars: &'static [&'static str],
 }
 
 const CLAUDE_NATIVE: &[EnvPredicate] = &[
@@ -128,22 +134,22 @@ pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
     ToolDetectionRule {
         tool: Tool::Claude,
         predicates: CLAUDE_NATIVE,
-        clear_for_child: &["CLAUDECODE", "CLAUDE_ENV_FILE"],
+        extra_marker_vars: &["CLAUDECODE", "CLAUDE_ENV_FILE"],
     },
     ToolDetectionRule {
         tool: Tool::Antigravity,
         predicates: ANTIGRAVITY_NATIVE,
-        clear_for_child: &["ANTIGRAVITY_AGENT"],
+        extra_marker_vars: &["ANTIGRAVITY_AGENT"],
     },
     ToolDetectionRule {
         tool: Tool::Gemini,
         predicates: GEMINI_NATIVE,
-        clear_for_child: &["GEMINI_CLI", "GEMINI_SYSTEM_MD"],
+        extra_marker_vars: &["GEMINI_CLI", "GEMINI_SYSTEM_MD"],
     },
     ToolDetectionRule {
         tool: Tool::Codex,
         predicates: CODEX_NATIVE,
-        clear_for_child: &[
+        extra_marker_vars: &[
             "CODEX_SANDBOX",
             "CODEX_SANDBOX_NETWORK_DISABLED",
             "CODEX_MANAGED_BY_NPM",
@@ -154,87 +160,87 @@ pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
     ToolDetectionRule {
         tool: Tool::OpenCode,
         predicates: OPENCODE_NATIVE,
-        clear_for_child: &["OPENCODE"],
+        extra_marker_vars: &["OPENCODE"],
     },
     ToolDetectionRule {
         tool: Tool::Kilo,
         predicates: KILO_NATIVE,
-        clear_for_child: &["KILO"],
+        extra_marker_vars: &["KILO"],
     },
     ToolDetectionRule {
         tool: Tool::Cursor,
         predicates: CURSOR_NATIVE,
-        clear_for_child: &["CURSOR_AGENT", "CURSOR_PROJECT_DIR"],
+        extra_marker_vars: &["CURSOR_AGENT", "CURSOR_PROJECT_DIR"],
     },
     ToolDetectionRule {
         tool: Tool::Kimi,
         predicates: KIMI_NATIVE,
-        clear_for_child: &["KIMI_CODE_CLI", "KIMI_SESSION_ID"],
+        extra_marker_vars: &["KIMI_CODE_CLI", "KIMI_SESSION_ID"],
     },
     ToolDetectionRule {
         tool: Tool::Pi,
         predicates: PI_NATIVE,
-        clear_for_child: &["HCOM_PI", "PI_CODING_AGENT", "PI_CODING_AGENT_SESSION_DIR"],
+        extra_marker_vars: &["HCOM_PI", "PI_CODING_AGENT", "PI_CODING_AGENT_SESSION_DIR"],
     },
     ToolDetectionRule {
         tool: Tool::Omp,
         predicates: OMP_NATIVE,
-        clear_for_child: &["HCOM_OMP", "PI_CODING_AGENT", "PI_CODING_AGENT_SESSION_DIR"],
+        extra_marker_vars: &["HCOM_OMP", "PI_CODING_AGENT", "PI_CODING_AGENT_SESSION_DIR"],
     },
     ToolDetectionRule {
         tool: Tool::Claude,
         predicates: HCOM_TOOL_CLAUDE,
-        clear_for_child: &["HCOM_TOOL"],
+        extra_marker_vars: &["HCOM_TOOL"],
     },
     ToolDetectionRule {
         tool: Tool::Antigravity,
         predicates: HCOM_TOOL_ANTIGRAVITY,
-        clear_for_child: &["HCOM_TOOL"],
+        extra_marker_vars: &["HCOM_TOOL"],
     },
     ToolDetectionRule {
         tool: Tool::Gemini,
         predicates: HCOM_TOOL_GEMINI,
-        clear_for_child: &["HCOM_TOOL"],
+        extra_marker_vars: &["HCOM_TOOL"],
     },
     ToolDetectionRule {
         tool: Tool::Codex,
         predicates: HCOM_TOOL_CODEX,
-        clear_for_child: &["HCOM_TOOL"],
+        extra_marker_vars: &["HCOM_TOOL"],
     },
     ToolDetectionRule {
         tool: Tool::OpenCode,
         predicates: HCOM_TOOL_OPENCODE,
-        clear_for_child: &["HCOM_TOOL"],
+        extra_marker_vars: &["HCOM_TOOL"],
     },
     ToolDetectionRule {
         tool: Tool::Kilo,
         predicates: HCOM_TOOL_KILO,
-        clear_for_child: &["HCOM_TOOL"],
+        extra_marker_vars: &["HCOM_TOOL"],
     },
     ToolDetectionRule {
         tool: Tool::Cursor,
         predicates: HCOM_TOOL_CURSOR,
-        clear_for_child: &["HCOM_TOOL"],
+        extra_marker_vars: &["HCOM_TOOL"],
     },
     ToolDetectionRule {
         tool: Tool::Kimi,
         predicates: HCOM_TOOL_KIMI,
-        clear_for_child: &["HCOM_TOOL"],
+        extra_marker_vars: &["HCOM_TOOL"],
     },
     ToolDetectionRule {
         tool: Tool::Copilot,
         predicates: HCOM_TOOL_COPILOT,
-        clear_for_child: &["HCOM_TOOL"],
+        extra_marker_vars: &["HCOM_TOOL"],
     },
     ToolDetectionRule {
         tool: Tool::Pi,
         predicates: HCOM_TOOL_PI,
-        clear_for_child: &["HCOM_TOOL"],
+        extra_marker_vars: &["HCOM_TOOL"],
     },
     ToolDetectionRule {
         tool: Tool::Omp,
         predicates: HCOM_TOOL_OMP,
-        clear_for_child: &["HCOM_TOOL"],
+        extra_marker_vars: &["HCOM_TOOL"],
     },
 ];
 
@@ -271,7 +277,7 @@ pub fn tool_marker_vars() -> &'static [&'static str] {
                 .predicates
                 .iter()
                 .map(|predicate| predicate.var)
-                .chain(rule.clear_for_child.iter().copied())
+                .chain(rule.extra_marker_vars.iter().copied())
             {
                 if seen.insert(var) {
                     vars.push(var);
@@ -281,6 +287,19 @@ pub fn tool_marker_vars() -> &'static [&'static str] {
         vars
     });
     VARS.as_slice()
+}
+
+/// Marker vars that hcom itself owns and replaces when spawning an agent:
+/// the `HCOM_*` markers plus `ANTIGRAVITY_AGENT`, which hcom sets at
+/// antigravity launch to attribute the shared Gemini hooks. Native tool
+/// markers are excluded — a wrapped tool inherits them exactly like a bare
+/// child process.
+pub fn hcom_owned_marker_vars() -> Vec<&'static str> {
+    tool_marker_vars()
+        .iter()
+        .copied()
+        .filter(|var| var.starts_with("HCOM_") || *var == "ANTIGRAVITY_AGENT")
+        .collect()
 }
 
 #[cfg(test)]
@@ -311,13 +330,13 @@ mod tests {
     }
 
     #[test]
-    fn every_detection_var_is_cleared_for_children() {
-        let clear: HashSet<&str> = tool_marker_vars().iter().copied().collect();
+    fn every_detection_var_is_in_marker_inventory() {
+        let inventory: HashSet<&str> = tool_marker_vars().iter().copied().collect();
         for rule in TOOL_DETECTION_RULES {
             for predicate in rule.predicates {
                 assert!(
-                    clear.contains(predicate.var),
-                    "{} detection marker must be cleared for child processes",
+                    inventory.contains(predicate.var),
+                    "{} detection marker must be in the marker inventory",
                     predicate.var
                 );
             }
@@ -325,8 +344,25 @@ mod tests {
     }
 
     #[test]
-    fn previously_missing_markers_are_in_child_clear_set() {
+    fn previously_missing_markers_are_in_marker_inventory() {
         assert!(tool_marker_vars().contains(&"CLAUDE_ENV_FILE"));
         assert!(tool_marker_vars().contains(&"HCOM_TOOL"));
+    }
+
+    #[test]
+    fn hcom_owned_marker_vars_covers_only_hcom_owned_markers() {
+        let owned = hcom_owned_marker_vars();
+        assert!(owned.contains(&"HCOM_TOOL"));
+        assert!(owned.contains(&"HCOM_PI"));
+        assert!(owned.contains(&"HCOM_OMP"));
+        assert!(owned.contains(&"ANTIGRAVITY_AGENT"));
+        for native in [
+            "CLAUDECODE",
+            "CLAUDE_ENV_FILE",
+            "GEMINI_CLI",
+            "CODEX_THREAD_ID",
+        ] {
+            assert!(!owned.contains(&native), "{native} is not hcom-owned");
+        }
     }
 }
