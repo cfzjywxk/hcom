@@ -28,6 +28,10 @@ pub struct QueryClient {
 #[derive(Debug)]
 pub enum QueryCommand {
     Screen,
+    /// Guarded text inject: JSON body per `guard::InjectIfRequest`.
+    InjectIf(String),
+    /// Guarded submit (Enter): JSON body per `guard::SubmitIfRequest`.
+    SubmitIf(String),
     Unknown,
 }
 
@@ -128,8 +132,14 @@ impl InjectServer {
                     if data.first() == Some(&QUERY_PREFIX) {
                         let cmd = std::str::from_utf8(&data[1..]).unwrap_or("").trim();
                         let (stream, _) = self.clients.remove(index);
-                        let command = match cmd {
+                        let (verb, body) = match cmd.split_once(' ') {
+                            Some((verb, body)) => (verb, body.trim()),
+                            None => (cmd, ""),
+                        };
+                        let command = match verb {
                             "SCREEN" => QueryCommand::Screen,
+                            "INJECT_IF" => QueryCommand::InjectIf(body.to_string()),
+                            "SUBMIT_IF" => QueryCommand::SubmitIf(body.to_string()),
                             _ => QueryCommand::Unknown,
                         };
                         return Ok(InjectResult::Query(QueryClient { stream, command }));

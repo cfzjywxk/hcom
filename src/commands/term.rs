@@ -76,55 +76,171 @@ fn inject_raw(port: i32, data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Send a guarded RPC frame and return the raw response line.
+fn guarded_rpc(port: i32, frame: &str) -> Result<String, String> {
+    let mut stream =
+        TcpStream::connect(format!("127.0.0.1:{port}")).map_err(|e| format!("connect: {e}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+    stream
+        .write_all(frame.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|e| format!("shutdown: {e}"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|e| format!("read: {e}"))?;
+    Ok(response.trim().to_string())
+}
+
+/// Parse `OK epoch=<n>` responses from guarded RPCs.
+fn parse_ok_epoch(response: &str) -> Option<u64> {
+    response
+        .strip_prefix("OK epoch=")
+        .and_then(|n| n.trim().parse().ok())
+}
+
 pub fn inject_text_remote_result(
     db: &HcomDb,
     name: &str,
     text: &str,
     enter: bool,
+    force: bool,
 ) -> Result<String, String> {
     let port = get_inject_port(db, name).ok_or_else(|| format!("No inject port for '{name}'."))?;
 
-    if !text.is_empty() {
-        inject_raw(port, text.as_bytes())?;
-    }
-    if enter {
+    // --force: legacy raw behavior, explicitly requested. This is the ONLY
+    // path that can write a CR without proving prompt ownership.
+    if force {
         if !text.is_empty() {
-            wait_for_text_rendered(port, text);
+            inject_raw(port, text.as_bytes())?;
         }
-        inject_raw(port, b"\r")?;
+        if enter {
+            if !text.is_empty() {
+                let _ = wait_for_exact_render(port, text, TEXT_RENDER_TIMEOUT);
+            }
+            inject_raw(port, b"\r")?;
+        }
+        let label = match (text.is_empty(), enter) {
+            (false, true) => format!("Injected {} chars + enter to {} (forced)", text.len(), name),
+            (false, false) => format!("Injected {} chars to {}", text.len(), name),
+            (true, _) => format!("Injected enter to {} (forced)", name),
+        };
+        return Ok(label);
     }
 
-    let label = match (text.is_empty(), enter) {
-        (false, true) => format!("Injected {} chars + enter to {}", text.len(), name),
-        (false, false) => format!("Injected {} chars to {}", text.len(), name),
-        (true, _) => format!("Injected enter to {}", name),
+    // Text-only inject: no submit at stake, keep raw semantics.
+    if !enter {
+        if text.is_empty() {
+            return Err("Nothing to inject".into());
+        }
+        inject_raw(port, text.as_bytes())?;
+        return Ok(format!("Injected {} chars to {}", text.len(), name));
+    }
+
+    // Guarded submit contract from here on: hcom must not press Enter unless
+    // it can prove the prompt contains exactly (and only) what it injected,
+    // with no human input in between. Every failure below sends NO Enter.
+    if text.is_empty() {
+        return Err(format!(
+            "enter-only cannot prove prompt ownership; use --force to send a raw enter to {name}"
+        ));
+    }
+
+    let screen = query_screen(port).ok_or_else(|| {
+        format!("screen query failed for '{name}'; enter NOT sent (use --force to bypass)")
+    })?;
+    match screen.get("input_state").and_then(|v| v.as_str()) {
+        Some("text") => {}
+        Some("unsupported") => {
+            return Err(format!(
+                "'{name}' has no prompt parser; ownership cannot be proven. Use --force for raw injection"
+            ));
+        }
+        Some("unavailable") => {
+            return Err(format!(
+                "prompt not detectable on '{name}' right now; enter NOT sent (retry, or --force)"
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "'{name}' does not support the guarded submit protocol; enter NOT sent (use --force)"
+            ));
+        }
+    }
+    if screen.get("input_text").and_then(|v| v.as_str()) != Some("") {
+        return Err(format!(
+            "prompt on '{name}' is not empty (a draft may be present); enter NOT sent"
+        ));
+    }
+    let user_gen = screen.get("user_gen").and_then(|v| v.as_u64());
+    let input_epoch = screen.get("input_epoch").and_then(|v| v.as_u64());
+    let (Some(user_gen), Some(input_epoch)) = (user_gen, input_epoch) else {
+        return Err(format!(
+            "'{name}' does not report guarded-input state; enter NOT sent (use --force)"
+        ));
     };
-    Ok(label)
+
+    let inject_req = serde_json::json!({
+        "user_gen": user_gen,
+        "input_epoch": input_epoch,
+        "require_empty": true,
+        "payload": text,
+    });
+    let response = guarded_rpc(port, &format!("\x00INJECT_IF {inject_req}\n"))?;
+    let Some(token_epoch) = parse_ok_epoch(&response) else {
+        return Err(format!("inject refused ({response}); nothing was written"));
+    };
+
+    // Wait until the tool actually rendered exactly our text before asking
+    // for the submit; on timeout the Enter is NOT sent.
+    if !wait_for_exact_render(port, text, TEXT_RENDER_TIMEOUT) {
+        return Err(format!(
+            "injected text was not confirmed rendered on '{name}'; enter NOT sent"
+        ));
+    }
+
+    let submit_req = serde_json::json!({
+        "user_gen": user_gen,
+        "input_epoch": token_epoch,
+        "expected_text": text,
+    });
+    let response = guarded_rpc(port, &format!("\x00SUBMIT_IF {submit_req}\n"))?;
+    if parse_ok_epoch(&response).is_none() {
+        return Err(format!("submit refused ({response}); enter NOT sent"));
+    }
+    Ok(format!(
+        "Injected {} chars + guarded enter to {}",
+        text.len(),
+        name
+    ))
 }
 
-/// Poll the screen until the injected text exclusively fills the input box
-/// before returning, so Enter is sent once the TUI has actually rendered it
-/// rather than after a guessed delay. Tools with no input-box parser (e.g.
-/// the OpenCode-family plugin-delivery tools) always report `input_text:
-/// null`, so this can never observe a match for them and simply falls
-/// through once the deadline passes — same best-effort behavior as before.
+/// Poll the screen until the injected text exclusively fills the input box.
+/// In the guarded flow a `false` return means the Enter is NOT sent; the
+/// `--force` path uses it best-effort only.
 const TEXT_RENDER_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn wait_for_text_rendered(port: i32, text: &str) {
-    let deadline = Instant::now() + TEXT_RENDER_TIMEOUT;
-    while Instant::now() < deadline {
+fn wait_for_exact_render(port: i32, text: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
         if let Some(screen) = query_screen(port)
             && screen.get("input_text").and_then(|v| v.as_str()) == Some(text)
         {
-            return;
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
         }
         std::thread::sleep(Duration::from_millis(30));
     }
 }
 
 /// Inject text into PTY via inject port (CLI wrapper).
-fn inject_text(db: &HcomDb, name: &str, text: &str, enter: bool) -> i32 {
-    match inject_text_remote_result(db, name, text, enter) {
+fn inject_text(db: &HcomDb, name: &str, text: &str, enter: bool, force: bool) -> i32 {
+    match inject_text_remote_result(db, name, text, enter, force) {
         Ok(msg) => {
             println!("{msg}");
             0
@@ -387,7 +503,10 @@ pub fn cmd_term(db: &HcomDb, args: &TermArgs, _ctx: Option<&CommandContext>) -> 
              hcom term <name>           Query specific instance screen\n  \
              hcom term <name> --json    JSON output\n  \
              hcom term <name> --clean   Plain text, no header or line numbers\n  \
-             hcom term inject <name> [text] [--enter]   Inject text/enter\n  \
+             hcom term inject <name> [text] [--enter]   Inject text; --enter submits only after\n  \
+                                                        the prompt provably shows exactly that text\n  \
+                                                        (guarded; refuses over human drafts)\n  \
+             hcom term inject <name> --enter --force    Raw enter without ownership proof\n  \
              hcom term debug on|off|logs                 PTY debug logging"
         );
         return 0;
@@ -395,13 +514,14 @@ pub fn cmd_term(db: &HcomDb, args: &TermArgs, _ctx: Option<&CommandContext>) -> 
 
     if sub == Some("inject") {
         let enter = argv.iter().any(|a| a == "--enter");
+        let force = argv.iter().any(|a| a == "--force");
         let args: Vec<&str> = argv[1..]
             .iter()
-            .filter(|a| a.as_str() != "--enter")
+            .filter(|a| a.as_str() != "--enter" && a.as_str() != "--force")
             .map(|s| s.as_str())
             .collect();
         if args.is_empty() {
-            println!("Usage: hcom term inject <name> [text] [--enter]");
+            println!("Usage: hcom term inject <name> [text] [--enter] [--force]");
             return 1;
         }
         let name = resolve_display_name(db, args[0]).unwrap_or_else(|| args[0].to_string());
@@ -420,13 +540,13 @@ pub fn cmd_term(db: &HcomDb, args: &TermArgs, _ctx: Option<&CommandContext>) -> 
                 device,
                 Some(&name),
                 crate::relay::control::rpc_action::TERM_INJECT,
-                &serde_json::json!({"target": base_name, "text": text, "enter": enter}),
+                &serde_json::json!({"target": base_name, "text": text, "enter": enter, "force": force}),
                 crate::relay::control::RPC_DEFAULT_TIMEOUT,
                 "message",
                 "Remote term inject completed",
             );
         }
-        return inject_text(db, &name, &text, enter);
+        return inject_text(db, &name, &text, enter, force);
     }
 
     if sub == Some("debug") {
@@ -548,7 +668,7 @@ mod tests {
             buf
         });
 
-        let result = inject_text_remote_result(&db, "luna", "status", false).unwrap();
+        let result = inject_text_remote_result(&db, "luna", "status", false, false).unwrap();
         let received = handle.join().unwrap();
 
         assert_eq!(result, "Injected 6 chars to luna");
@@ -595,5 +715,235 @@ mod tests {
         assert!(rendered.contains("ready=true  prompt_empty=false  input_text=\"status\""));
         assert!(rendered.contains("  0: hello"));
         assert!(rendered.contains("  2: world"));
+    }
+
+    // ---- guarded submit contract (client side) ----
+
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    /// Fake proxy: answers one scripted response per connection, records every
+    /// request frame. When the script runs out the listener closes, so further
+    /// client connects fail fast instead of hanging.
+    fn spawn_fake_proxy(
+        db: &HcomDb,
+        name: &str,
+        responses: Vec<&str>,
+    ) -> (Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port() as i32;
+        db.conn()
+            .execute(
+                "INSERT INTO notify_endpoints (instance, kind, port, updated_at) VALUES (?1, 'inject', ?2, 0)",
+                rusqlite::params![name, port],
+            )
+            .unwrap();
+        let mut script: VecDeque<String> = responses.into_iter().map(|s| s.to_string()).collect();
+        let frames: Arc<Mutex<Vec<String>>> = Arc::default();
+        let recorded = frames.clone();
+        let handle = thread::spawn(move || {
+            while let Some(response) = script.pop_front() {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut request = Vec::new();
+                let _ = stream.read_to_end(&mut request);
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request).into_owned());
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (frames, handle)
+    }
+
+    fn screen_json(
+        input_state: &str,
+        input_text: Option<&str>,
+        user_gen: u64,
+        epoch: u64,
+    ) -> String {
+        serde_json::json!({
+            "lines": [], "size": [24, 80], "cursor": [0, 0],
+            "ready": true,
+            "prompt_empty": input_text == Some(""),
+            "input_parser_supported": input_state != "unsupported",
+            "input_state": input_state,
+            "user_gen": user_gen,
+            "input_epoch": epoch,
+            "approval_waiting": false,
+            "input_text": input_text,
+        })
+        .to_string()
+    }
+
+    fn assert_no_cr(frames: &Arc<Mutex<Vec<String>>>) {
+        let frames = frames.lock().unwrap();
+        assert!(
+            !frames.iter().any(|f| f == "\r" || f.starts_with('\r')),
+            "a raw CR must never be written in the guarded flow: {frames:?}"
+        );
+    }
+
+    #[test]
+    fn guarded_enter_sends_submit_only_after_exact_render() {
+        let db = test_db();
+        let (frames, handle) = spawn_fake_proxy(
+            &db,
+            "luna",
+            vec![
+                &screen_json("text", Some(""), 1, 5),
+                "OK epoch=6\n",
+                &screen_json("text", Some("hello"), 1, 6),
+                "OK epoch=7\n",
+            ],
+        );
+
+        let result = inject_text_remote_result(&db, "luna", "hello", true, false).unwrap();
+        handle.join().unwrap();
+
+        assert!(result.contains("guarded enter"));
+        let recorded = frames.lock().unwrap();
+        assert!(recorded[1].starts_with("\u{0}INJECT_IF "));
+        assert!(recorded[1].contains("\"require_empty\":true"));
+        assert!(recorded[3].starts_with("\u{0}SUBMIT_IF "));
+        assert!(recorded[3].contains("\"expected_text\":\"hello\""));
+        assert!(recorded[3].contains("\"input_epoch\":6"));
+        assert!(!recorded.iter().any(|f| f == "\r"));
+    }
+
+    #[test]
+    fn guarded_enter_refuses_unsupported_tool_without_any_write() {
+        let db = test_db();
+        let (frames, handle) =
+            spawn_fake_proxy(&db, "luna", vec![&screen_json("unsupported", None, 0, 0)]);
+
+        let err = inject_text_remote_result(&db, "luna", "hello", true, false).unwrap_err();
+        handle.join().unwrap();
+
+        assert!(err.contains("no prompt parser"));
+        assert_eq!(frames.lock().unwrap().len(), 1, "only the screen query");
+        assert_no_cr(&frames);
+    }
+
+    #[test]
+    fn guarded_enter_refuses_unavailable_prompt() {
+        let db = test_db();
+        let (frames, handle) =
+            spawn_fake_proxy(&db, "luna", vec![&screen_json("unavailable", None, 0, 0)]);
+
+        let err = inject_text_remote_result(&db, "luna", "hello", true, false).unwrap_err();
+        handle.join().unwrap();
+
+        assert!(err.contains("enter NOT sent"));
+        assert_eq!(frames.lock().unwrap().len(), 1);
+        assert_no_cr(&frames);
+    }
+
+    #[test]
+    fn guarded_enter_refuses_nonempty_prompt() {
+        // A human draft is in the box: neither text nor CR may be written.
+        let db = test_db();
+        let (frames, handle) =
+            spawn_fake_proxy(&db, "luna", vec![&screen_json("text", Some("draft"), 1, 5)]);
+
+        let err = inject_text_remote_result(&db, "luna", "hello", true, false).unwrap_err();
+        handle.join().unwrap();
+
+        assert!(err.contains("not empty"));
+        assert_eq!(frames.lock().unwrap().len(), 1);
+        assert_no_cr(&frames);
+    }
+
+    #[test]
+    fn guarded_enter_only_requires_force() {
+        let db = test_db();
+        let (frames, handle) = spawn_fake_proxy(&db, "luna", vec![]);
+
+        let err = inject_text_remote_result(&db, "luna", "", true, false).unwrap_err();
+        drop(handle);
+
+        assert!(err.contains("--force"));
+        assert!(frames.lock().unwrap().is_empty(), "no connection at all");
+    }
+
+    #[test]
+    fn guarded_enter_propagates_server_refusal_without_cr() {
+        let db = test_db();
+        let (frames, handle) = spawn_fake_proxy(
+            &db,
+            "luna",
+            vec![
+                &screen_json("text", Some(""), 1, 5),
+                "OK epoch=6\n",
+                &screen_json("text", Some("hello"), 1, 6),
+                "REFUSED stale_user_gen\n",
+            ],
+        );
+
+        let err = inject_text_remote_result(&db, "luna", "hello", true, false).unwrap_err();
+        handle.join().unwrap();
+
+        assert!(err.contains("stale_user_gen"));
+        assert!(err.contains("enter NOT sent"));
+        assert_no_cr(&frames);
+    }
+
+    #[test]
+    fn guarded_enter_refuses_when_inject_is_refused() {
+        let db = test_db();
+        let (frames, handle) = spawn_fake_proxy(
+            &db,
+            "luna",
+            vec![
+                &screen_json("text", Some(""), 1, 5),
+                "REFUSED prompt_not_empty\n",
+            ],
+        );
+
+        let err = inject_text_remote_result(&db, "luna", "hello", true, false).unwrap_err();
+        handle.join().unwrap();
+
+        assert!(err.contains("nothing was written"));
+        assert_eq!(frames.lock().unwrap().len(), 2);
+        assert_no_cr(&frames);
+    }
+
+    #[test]
+    fn guarded_enter_refuses_legacy_proxy_without_contract_fields() {
+        // An old proxy answers SCREEN without input_state/user_gen: fail
+        // closed rather than guessing.
+        let db = test_db();
+        let legacy = serde_json::json!({
+            "lines": [], "size": [24, 80], "cursor": [0, 0],
+            "ready": true, "prompt_empty": true, "input_text": "",
+        })
+        .to_string();
+        let (frames, handle) = spawn_fake_proxy(&db, "luna", vec![&legacy]);
+
+        let err = inject_text_remote_result(&db, "luna", "hello", true, false).unwrap_err();
+        handle.join().unwrap();
+
+        assert!(err.contains("enter NOT sent") || err.contains("--force"));
+        assert_eq!(frames.lock().unwrap().len(), 1);
+        assert_no_cr(&frames);
+    }
+
+    #[test]
+    fn wait_for_exact_render_times_out_quickly_without_match() {
+        let db = test_db();
+        let (_frames, handle) =
+            spawn_fake_proxy(&db, "luna", vec![&screen_json("text", Some("other"), 1, 5)]);
+        let port = get_inject_port(&db, "luna").unwrap();
+
+        let start = Instant::now();
+        assert!(!wait_for_exact_render(
+            port,
+            "hello",
+            Duration::from_millis(80)
+        ));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        handle.join().unwrap();
     }
 }

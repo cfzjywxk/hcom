@@ -91,6 +91,7 @@ pub(super) fn update_delivery_state(
         };
         state.last_output = screen.last_output_instant();
         state.cols = screen.cols();
+        state.user_gen = screen.user_gen();
     }
 
     if let Some(approval) = approval_changed {

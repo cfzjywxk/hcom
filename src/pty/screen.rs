@@ -113,6 +113,12 @@ pub struct ScreenTracker {
     last_output: Instant,
     last_change: Instant,
     output_buffer: Vec<u8>,
+    // Guarded-input contract counters (see `pty::guard`): the proxy main
+    // loop bumps user_gen on every real user stdin chunk and input_epoch on
+    // every non-user PTY write. Reads/writes stay on the main loop thread;
+    // snapshots travel via ScreenState / screen-dump JSON.
+    user_gen: u64,
+    input_epoch: u64,
     // Debug mode fields
     debug_enabled: bool,
     debug_file: Option<File>,
@@ -150,6 +156,8 @@ impl ScreenTracker {
             last_output: Instant::now(),
             last_change: Instant::now(),
             output_buffer: Vec::with_capacity(4096),
+            user_gen: 0,
+            input_epoch: 0,
             debug_enabled,
             debug_file,
             debug_counter: 0,
@@ -500,6 +508,59 @@ impl ScreenTracker {
             Ok(Tool::Adhoc) => None,
             Err(_) => None,
         }
+    }
+
+    /// Whether `tool` has a prompt parser at all. Single source of truth is
+    /// the `get_input_box_text` dispatch above: exactly the arms that call a
+    /// parser. Keep the two in sync when adding a tool.
+    pub fn input_parser_supported(tool: &str) -> bool {
+        use crate::tool::Tool;
+        use std::str::FromStr;
+        matches!(
+            Tool::from_str(tool),
+            Ok(Tool::Claude
+                | Tool::Gemini
+                | Tool::Codex
+                | Tool::Antigravity
+                | Tool::Cursor
+                | Tool::Kimi
+                | Tool::Copilot)
+        )
+    }
+
+    /// Three-state input observation: distinguishes "this tool has no prompt
+    /// parser" (Unsupported) from "the parser found nothing in this frame"
+    /// (Unavailable). Collapsing both into `None` is what made naive
+    /// fail-closed logic impossible before.
+    pub(crate) fn input_observation(&self, tool: &str) -> super::guard::InputObservation {
+        use super::guard::InputObservation;
+        if !Self::input_parser_supported(tool) {
+            return InputObservation::Unsupported;
+        }
+        match self.get_input_box_text(tool) {
+            Some(text) => InputObservation::Text(text),
+            None => InputObservation::Unavailable,
+        }
+    }
+
+    /// Real user stdin activity (focus-only bytes excluded by the caller).
+    pub fn note_user_input(&mut self) {
+        self.user_gen = self.user_gen.wrapping_add(1);
+    }
+
+    /// Any non-user write into the PTY. Returns the new epoch, which a
+    /// guarded inject hands back to its caller as the submit token.
+    pub fn bump_input_epoch(&mut self) -> u64 {
+        self.input_epoch = self.input_epoch.wrapping_add(1);
+        self.input_epoch
+    }
+
+    pub fn user_gen(&self) -> u64 {
+        self.user_gen
+    }
+
+    pub fn input_epoch(&self) -> u64 {
+        self.input_epoch
     }
 
     /// Get all screen lines as strings
@@ -1023,6 +1084,24 @@ impl ScreenTracker {
             "  \"prompt_empty\": {},\n",
             self.is_prompt_empty(tool)
         ));
+        // Guarded-input contract fields. `input_text` keeps its legacy
+        // string-or-null shape; `input_state` disambiguates the null.
+        j.push_str(&format!(
+            "  \"input_parser_supported\": {},\n",
+            Self::input_parser_supported(tool)
+        ));
+        let input_state = match self.input_observation(tool) {
+            super::guard::InputObservation::Unsupported => "unsupported",
+            super::guard::InputObservation::Unavailable => "unavailable",
+            super::guard::InputObservation::Text(_) => "text",
+        };
+        j.push_str(&format!("  \"input_state\": \"{}\",\n", input_state));
+        j.push_str(&format!("  \"user_gen\": {},\n", self.user_gen));
+        j.push_str(&format!("  \"input_epoch\": {},\n", self.input_epoch));
+        j.push_str(&format!(
+            "  \"approval_waiting\": {},\n",
+            self.is_waiting_approval()
+        ));
         match input_text {
             Some(ref t) => j.push_str(&format!("  \"input_text\": {}\n", json_escape(t))),
             None => j.push_str("  \"input_text\": null\n"),
@@ -1047,6 +1126,8 @@ mod tests {
             last_output: Instant::now(),
             last_change: Instant::now(),
             output_buffer: Vec::new(),
+            user_gen: 0,
+            input_epoch: 0,
             debug_enabled: false,
             debug_file: None,
             debug_counter: 0,

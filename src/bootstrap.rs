@@ -72,7 +72,7 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
   each supports --help (set prompt, system, background, forward args, etc)
 - Run workflows: run <script> [args] [--help]
   {scripts}
-- View agent screen: term [name] | inject text/enter: term inject <name> ['text'] [--enter]
+- View agent screen: term [name] | inject: term inject <name> 'text' [--enter] (guarded submit; enter-only needs --force)
 - Other commands: status (diagnostics), config (set terminal, etc), relay (remote)
 
 If unsure about syntax, always run `hcom <command> --help` FIRST. Do not guess.

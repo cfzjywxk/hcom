@@ -826,6 +826,12 @@ impl Proxy {
                                         .unwrap_or_default();
                                     q.respond(&dump);
                                 }
+                                // The guarded-submit contract is not wired on
+                                // the ConPTY path; fail closed (never write a
+                                // CR that was not proven safe).
+                                QueryCommand::InjectIf(_) | QueryCommand::SubmitIf(_) => {
+                                    q.respond("REFUSED unsupported\n");
+                                }
                                 QueryCommand::Unknown => q.respond("error: unknown command\n"),
                             }
                             true

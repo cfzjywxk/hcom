@@ -3,7 +3,7 @@
 #[path = "delivery/antigravity.rs"]
 mod antigravity;
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -648,6 +648,10 @@ pub struct ScreenState {
     /// once output has settled. Antigravity keeps its immediate scrape.
     /// See `APPROVAL_SCRAPE_CLEAR_MS`.
     pub approval_scrape_latched: bool,
+    /// User-input generation observed when this snapshot was taken. The
+    /// delivery gate hands it to `SUBMIT_IF` so the proxy refuses the Enter
+    /// if the human typed after the gate decision (guarded-submit contract).
+    pub user_gen: u64,
 }
 
 impl Default for ScreenState {
@@ -663,6 +667,7 @@ impl Default for ScreenState {
             cols: 80,
             last_prompt_submit: None,
             approval_scrape_latched: false,
+            user_gen: 0,
         }
     }
 }
@@ -1007,6 +1012,59 @@ pub(crate) fn inject_enter(port: u16) -> bool {
     match TcpStream::connect(format!("127.0.0.1:{}", port)) {
         Ok(mut stream) => stream.write_all(b"\r").is_ok(),
         Err(_) => false,
+    }
+}
+
+/// Outcome of a guarded submit RPC against the proxy inject server.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GuardedSubmit {
+    Sent,
+    /// Refusal reason (`stale_user_gen`, `mismatch`, …) or transport error.
+    Refused(String),
+}
+
+impl GuardedSubmit {
+    /// The human owns the session right now (typed since the gate snapshot,
+    /// or an approval prompt is up). Correct response is to wait, not to
+    /// burn a destructive-retry attempt.
+    pub(crate) fn is_user_owned_pause(&self) -> bool {
+        matches!(
+            self,
+            GuardedSubmit::Refused(reason)
+                if reason.contains("stale_user_gen") || reason.contains("approval_waiting")
+        )
+    }
+}
+
+/// Ask the proxy to press Enter ONLY IF, at the apply point, no user input
+/// happened since `user_gen` and the prompt still shows exactly
+/// `expected_text`. The proxy never writes the CR on refusal — this replaces
+/// the raw `inject_enter` in the automatic delivery path so hcom cannot
+/// submit on the human's behalf (guarded-submit contract).
+pub(crate) fn submit_if(port: u16, user_gen: u64, expected_text: &str) -> GuardedSubmit {
+    let req = serde_json::json!({
+        "user_gen": user_gen,
+        "expected_text": expected_text,
+    });
+    let frame = format!("\x00SUBMIT_IF {req}\n");
+    let mut stream = match TcpStream::connect(format!("127.0.0.1:{port}")) {
+        Ok(stream) => stream,
+        Err(e) => return GuardedSubmit::Refused(format!("connect: {e}")),
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    if stream.write_all(frame.as_bytes()).is_err() {
+        return GuardedSubmit::Refused("write_failed".into());
+    }
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut response = String::new();
+    if stream.read_to_string(&mut response).is_err() {
+        return GuardedSubmit::Refused("read_failed".into());
+    }
+    if response.starts_with("OK") {
+        GuardedSubmit::Sent
+    } else {
+        GuardedSubmit::Refused(response.trim().to_string())
     }
 }
 
@@ -1686,6 +1744,7 @@ pub fn run_delivery_loop(
                             let user_active = state.is_user_active();
                             let screen = state.screen.read().unwrap();
                             let approval = screen.approval;
+                            let snapshot_gen = screen.user_gen;
                             let ownership =
                                 prompt_ownership(screen.input_text.as_deref(), &injected_text);
                             drop(screen);
@@ -1707,8 +1766,35 @@ pub fn run_delivery_loop(
                             enter_attempt = 0;
 
                             if !user_active && !approval {
-                                log_info("native", "delivery.send_enter", "Sending Enter key");
-                                inject_enter(state.inject_port);
+                                // Guarded submit: the proxy re-verifies gen +
+                                // exact text at the apply point and never
+                                // writes the CR on refusal. This closes the
+                                // snapshot→Enter TOCTOU window.
+                                match submit_if(state.inject_port, snapshot_gen, &injected_text) {
+                                    GuardedSubmit::Sent => {
+                                        log_info(
+                                            "native",
+                                            "delivery.send_enter",
+                                            "Enter sent via guarded submit",
+                                        );
+                                    }
+                                    refusal => {
+                                        let user_owned = refusal.is_user_owned_pause();
+                                        log_warn(
+                                            "native",
+                                            "delivery.guarded_submit_refused",
+                                            &format!(
+                                                "{refusal:?}; returning to pending without submitting"
+                                            ),
+                                        );
+                                        delivery_state = State::Pending;
+                                        if !user_owned {
+                                            inject_attempt += 1;
+                                            attempt += 1;
+                                        }
+                                        continue;
+                                    }
+                                }
                             } else if approval {
                                 log_info(
                                     "native",
@@ -1785,6 +1871,7 @@ pub fn run_delivery_loop(
                             let user_active = state.is_user_active();
                             let screen = state.screen.read().unwrap();
                             let approval = screen.approval;
+                            let snapshot_gen = screen.user_gen;
                             let ownership =
                                 prompt_ownership(screen.input_text.as_deref(), &injected_text);
                             drop(screen);
@@ -1814,7 +1901,25 @@ pub fn run_delivery_loop(
                                         enter_attempt, input_text
                                     ),
                                 );
-                                inject_enter(state.inject_port);
+                                match submit_if(state.inject_port, snapshot_gen, &injected_text) {
+                                    GuardedSubmit::Sent => {}
+                                    refusal => {
+                                        let user_owned = refusal.is_user_owned_pause();
+                                        log_warn(
+                                            "native",
+                                            "delivery.guarded_submit_refused",
+                                            &format!(
+                                                "{refusal:?}; returning to pending without submitting"
+                                            ),
+                                        );
+                                        delivery_state = State::Pending;
+                                        if !user_owned {
+                                            inject_attempt += 1;
+                                            attempt += 1;
+                                        }
+                                        continue;
+                                    }
+                                }
                                 enter_attempt += 1;
                                 phase_started_at = Instant::now();
                                 let backoff = Duration::from_millis(200 * (1 << enter_attempt));
@@ -2111,6 +2216,7 @@ mod tests {
             cols: 80,
             last_prompt_submit: None,
             approval_scrape_latched: false,
+            user_gen: 0,
         }
     }
 

@@ -7,6 +7,7 @@
 //! - Inject: TCP injection server
 //! - Delivery: Notify-driven message delivery (integrated)
 
+pub(crate) mod guard;
 mod inject;
 #[cfg(unix)]
 mod resize;
@@ -1202,6 +1203,10 @@ impl Proxy {
 
                             if has_user_input {
                                 self.last_user_input = Instant::now();
+                                // Guarded-input contract: any real user
+                                // keystroke invalidates outstanding leases
+                                // BEFORE the byte reaches the PTY.
+                                self.screen.note_user_input();
                                 // Genuine keystrokes answering a title-detected approval
                                 // clear it immediately. Cursor's approval is screen-scraped
                                 // and authoritative-by-prompt, so it clears only when the
@@ -1259,6 +1264,9 @@ impl Proxy {
                 {
                     match self.inject_server.read_client(i)? {
                         inject::InjectResult::Inject(text) => {
+                            // Raw (non-leased) writer: invalidates any
+                            // outstanding guarded-submit token.
+                            self.screen.bump_input_epoch();
                             write_all(&self.pty_master, text.as_bytes())?;
                             // Injected keystrokes reach the PTY master directly and
                             // bypass the interactive stdin handler. When one answers a
@@ -1281,6 +1289,14 @@ impl Proxy {
                                     self.inject_server.port(),
                                 );
                                 client.respond(&dump);
+                            }
+                            inject::QueryCommand::InjectIf(ref body) => {
+                                let response = self.handle_inject_if(body);
+                                client.respond(&response);
+                            }
+                            inject::QueryCommand::SubmitIf(ref body) => {
+                                let response = self.handle_submit_if(body);
+                                client.respond(&response);
                             }
                             inject::QueryCommand::Unknown => {
                                 client.respond("error: unknown command\n");
@@ -1364,6 +1380,69 @@ impl Proxy {
             self.config.instance_name.as_deref(),
             &self.current_status,
         );
+    }
+
+    /// Live guarded-input state at the apply point. Built and consumed on the
+    /// main loop thread, which also forwards user stdin — so a decision made
+    /// against this snapshot cannot race a human keystroke.
+    fn guard_snapshot(&self) -> guard::GuardSnapshot {
+        guard::GuardSnapshot {
+            user_gen: self.screen.user_gen(),
+            input_epoch: self.screen.input_epoch(),
+            observation: self.screen.input_observation(self.config.target.name()),
+            approval_waiting: self
+                .delivery_state
+                .read()
+                .map(|s| s.approval)
+                .unwrap_or(false),
+        }
+    }
+
+    /// Guarded text inject: refusal writes zero bytes.
+    fn handle_inject_if(&mut self, body: &str) -> String {
+        let req: guard::InjectIfRequest = match serde_json::from_str(body) {
+            Ok(req) => req,
+            Err(_) => return "ERROR bad_request\n".into(),
+        };
+        // Same control-character policy as delivery's raw inject: printable
+        // text plus tab only; the CR travels exclusively through SUBMIT_IF.
+        let payload: String = req
+            .payload
+            .chars()
+            .filter(|c| *c >= ' ' || *c == '\t')
+            .collect();
+        if payload.is_empty() {
+            return "ERROR empty_payload\n".into();
+        }
+        match guard::check_inject(&req, &self.guard_snapshot()) {
+            Ok(()) => {
+                if write_all(&self.pty_master, payload.as_bytes()).is_err() {
+                    return "ERROR write_failed\n".into();
+                }
+                let epoch = self.screen.bump_input_epoch();
+                format!("OK epoch={epoch}\n")
+            }
+            Err(reason) => format!("REFUSED {}\n", reason.wire()),
+        }
+    }
+
+    /// Guarded submit: the only sanctioned way hcom writes CR to a tool with
+    /// a prompt parser. Refusal never writes the CR.
+    fn handle_submit_if(&mut self, body: &str) -> String {
+        let req: guard::SubmitIfRequest = match serde_json::from_str(body) {
+            Ok(req) => req,
+            Err(_) => return "ERROR bad_request\n".into(),
+        };
+        match guard::check_submit(&req, &self.guard_snapshot()) {
+            Ok(()) => {
+                if write_all(&self.pty_master, b"\r").is_err() {
+                    return "ERROR write_failed\n".into();
+                }
+                let epoch = self.screen.bump_input_epoch();
+                format!("OK epoch={epoch}\n")
+            }
+            Err(reason) => format!("REFUSED {}\n", reason.wire()),
+        }
     }
 
     /// Apply the current outer terminal size to the inner PTY. Debouncing is

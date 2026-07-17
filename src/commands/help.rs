@@ -670,7 +670,11 @@ const TERM_HELP: &[HelpEntry] = &[
     ("term inject <name> [text]", "Inject text into agent PTY"),
     (
         "  --enter",
-        "Append \\r (submit). Works alone or with text.",
+        "Guarded submit: only after the prompt provably shows exactly the injected text",
+    ),
+    (
+        "  --force",
+        "Raw legacy behavior; required for enter-only (no ownership proof)",
     ),
     ("", ""),
     ("term debug on", "Enable PTY debug logging (all instances)"),

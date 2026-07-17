@@ -971,7 +971,10 @@ fn handle_remote_term_inject(
     let target = required_param(params, "target")?;
     let text = optional_param(params, "text").unwrap_or("");
     let enter = bool_param(params, "enter", false);
-    let message = crate::commands::term::inject_text_remote_result(db, target, text, enter)?;
+    // Remote injects get the same guarded-submit contract; `force` must be
+    // explicit on the sending side.
+    let force = bool_param(params, "force", false);
+    let message = crate::commands::term::inject_text_remote_result(db, target, text, enter, force)?;
     Ok(json!({"target": target, "message": message}))
 }
 

@@ -1242,8 +1242,11 @@ fn push_agent_command_suggestions(s: &mut Vec<CommandSuggestion>, agent: &Agent)
             command: format!("term {}", name),
             description: "view terminal",
         });
+        // Enter-only cannot prove prompt ownership; the TUI suggestion is an
+        // explicit human action, so it carries --force per the guarded-submit
+        // contract.
         s.push(CommandSuggestion {
-            command: format!("term inject {} --enter", name),
+            command: format!("term inject {} --enter --force", name),
             description: "send enter to terminal",
         });
     }
