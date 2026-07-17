@@ -968,8 +968,11 @@ pub fn create_runner_script(
         String::new()
     };
 
-    let use_exec = if run_here { "" } else { "exec " };
-
+    // Always exec (run_here included): the runner bash contributes nothing
+    // after this line, and exec removes a pure-wait() process from the tree
+    // so signals reach the PTY wrapper directly. The script unlinks itself
+    // first — bash keeps reading from the already-open fd, and the outer
+    // wrapper still sees `hcom pty`'s real exit status through the exec.
     let content = format!(
         "#!/bin/bash\n\
          # {} hcom native PTY runner ({})\n\
@@ -982,7 +985,8 @@ pub fn create_runner_script(
          {}\n\
          {}\n\
          \n\
-         {}{} pty {} {}\n",
+         rm -f -- {}\n\
+         exec {} pty {} {}\n",
         tool.chars()
             .next()
             .unwrap_or('?')
@@ -997,7 +1001,7 @@ pub fn create_runner_script(
         env_block,
         sensitive_env_source,
         path_export,
-        use_exec,
+        crate::tools::args_common::shell_quote(&script_file.to_string_lossy()),
         crate::tools::args_common::shell_quote(&native_bin_str),
         tool,
         tool_args_str,
@@ -2980,6 +2984,40 @@ mod tests {
 
         std::fs::remove_file(&script).ok();
         std::fs::remove_file(env_file).ok();
+    }
+
+    // The runner must exec the PTY wrapper in BOTH modes (no pure-wait bash
+    // left in the tree) and unlink itself before the exec.
+    #[cfg(unix)]
+    #[test]
+    fn test_runner_script_always_execs_and_self_deletes() {
+        for run_here in [false, true] {
+            let script =
+                create_runner_script("codex", "/tmp", "test-exec", &HashMap::new(), &[], run_here)
+                    .unwrap();
+            let content = std::fs::read_to_string(&script).unwrap();
+
+            let exec_line = content
+                .lines()
+                .position(|line| line.starts_with("exec "))
+                .unwrap_or_else(|| panic!("run_here={run_here}: no exec line:\n{content}"));
+            let rm_line = content
+                .lines()
+                .position(|line| line.starts_with("rm -f -- ") && line.contains("test-exec"))
+                .unwrap_or_else(|| panic!("run_here={run_here}: no self-delete line:\n{content}"));
+            assert!(
+                rm_line < exec_line,
+                "self-delete must precede exec (run_here={run_here})"
+            );
+            assert!(
+                !content.lines().any(|line| {
+                    line.contains(" pty ") && !line.starts_with("exec ") && !line.starts_with('#')
+                }),
+                "pty wrapper must only be started via exec (run_here={run_here})"
+            );
+
+            std::fs::remove_file(&script).ok();
+        }
     }
 
     // ANTIGRAVITY_AGENT round-trip: the runner unsets any inherited copy, and
