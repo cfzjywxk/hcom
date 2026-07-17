@@ -8,6 +8,8 @@
 //! - Delivery: Notify-driven message delivery (integrated)
 
 mod inject;
+#[cfg(unix)]
+mod resize;
 pub mod screen;
 #[cfg(any(unix, windows))]
 mod shared;
@@ -542,6 +544,10 @@ impl TitleOscFilter {
     }
 }
 
+/// Resize debounce window; the trailing edge is redelivered (see `resize`).
+#[cfg(unix)]
+const RESIZE_DEBOUNCE_MS: u64 = 50;
+
 // Signal flags (set by signal handlers, checked in main loop)
 #[cfg(unix)]
 static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
@@ -618,8 +624,8 @@ pub struct Proxy {
     launch_phase_active: Arc<AtomicBool>,
     /// Running flag for delivery thread
     running: Arc<AtomicBool>,
-    /// Last resize time for debouncing (fix #3)
-    last_resize: Option<Instant>,
+    /// Resize debounce with trailing-edge redelivery
+    resize_debounce: resize::ResizeDebouncer,
     /// Delivery thread handle (for cleanup on drop)
     delivery_handle: Option<std::thread::JoinHandle<()>>,
     /// Notify port for waking delivery thread on shutdown
@@ -753,7 +759,9 @@ impl Proxy {
             delivery_state: Arc::new(RwLock::new(ScreenState::default())),
             launch_phase_active: Arc::new(AtomicBool::new(true)),
             running: Arc::new(AtomicBool::new(true)),
-            last_resize: None,
+            resize_debounce: resize::ResizeDebouncer::new(Duration::from_millis(
+                RESIZE_DEBOUNCE_MS,
+            )),
             delivery_handle: None,
             notify_port: Arc::new(AtomicU16::new(0)),
             current_name,
@@ -809,7 +817,17 @@ impl Proxy {
 
         loop {
             // Handle signals
-            if SIGWINCH_RECEIVED.swap(false, Ordering::AcqRel) {
+            if SIGWINCH_RECEIVED.swap(false, Ordering::AcqRel)
+                && matches!(
+                    self.resize_debounce.on_signal(Instant::now()),
+                    resize::ResizeAction::ApplyNow
+                )
+            {
+                self.forward_winsize()?;
+            }
+            // Trailing edge: a resize coalesced by the debounce must still be
+            // applied at its deadline even if no further SIGWINCH arrives.
+            if self.resize_debounce.take_due(Instant::now()) {
                 self.forward_winsize()?;
             }
             if SIGINT_RECEIVED.swap(false, Ordering::AcqRel) {
@@ -882,6 +900,13 @@ impl Proxy {
             if !include_listener {
                 poll_timeout = poll_timeout.min(100u16);
             }
+            // A pending trailing resize must not sleep out the full base
+            // timeout — cap so the wakeup lands at the debounce deadline.
+            poll_timeout = resize::poll_timeout_capped(
+                poll_timeout,
+                self.resize_debounce.pending_deadline(),
+                Instant::now(),
+            );
             match poll(&mut poll_fds, PollTimeout::from(poll_timeout)) {
                 Ok(0) => {
                     // Timeout - still update delivery state for time-based checks
@@ -1310,16 +1335,10 @@ impl Proxy {
         );
     }
 
+    /// Apply the current outer terminal size to the inner PTY. Debouncing is
+    /// decided by the caller via `resize_debounce`; the size is re-queried at
+    /// apply time so a trailing apply always uses the latest geometry.
     fn forward_winsize(&mut self) -> Result<()> {
-        // Fix #3: Debounce resize signals by 50ms to avoid races during rapid resize
-        const RESIZE_DEBOUNCE_MS: u64 = 50;
-        if let Some(last) = self.last_resize
-            && last.elapsed().as_millis() < RESIZE_DEBOUNCE_MS as u128
-        {
-            return Ok(()); // Skip if too recent
-        }
-        self.last_resize = Some(Instant::now());
-
         if let Ok(winsize) = terminal::get_terminal_size() {
             self.screen.resize(winsize.ws_row, winsize.ws_col);
 
