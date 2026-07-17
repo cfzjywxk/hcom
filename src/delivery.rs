@@ -550,6 +550,11 @@ impl ToolConfig {
 pub struct GateResult {
     pub safe: bool,
     pub reason: &'static str,
+    /// User-input generation from the SAME locked snapshot that produced
+    /// this decision. A safe gate hands it to the guarded inject as the
+    /// required lease: any human byte after the gate read makes the inject
+    /// (and therefore every later submit) stale at the proxy.
+    pub snapshot_gen: u64,
 }
 
 /// Shared state for delivery thread
@@ -735,26 +740,25 @@ pub(crate) fn evaluate_gate(
     is_idle: bool,
 ) -> GateResult {
     let screen = state.screen.read().unwrap();
+    // One lock guard covers every check below AND the generation capture, so
+    // snapshot_gen is coherent with the decision it accompanies.
+    let snapshot_gen = screen.user_gen;
+    let blocked = |reason: &'static str| GateResult {
+        safe: false,
+        reason,
+        snapshot_gen,
+    };
 
     // Check idle FIRST - if agent is busy, that's normal, don't alert
     if config.require_idle && !is_idle {
-        return GateResult {
-            safe: false,
-            reason: "not_idle",
-        };
+        return blocked("not_idle");
     }
     // Approval check only runs if agent is idle (passed require_idle)
     if config.block_on_approval && screen.approval {
-        return GateResult {
-            safe: false,
-            reason: "approval",
-        };
+        return blocked("approval");
     }
     if config.block_on_user_activity && state.is_user_active_with_guard(&screen) {
-        return GateResult {
-            safe: false,
-            reason: "user_active",
-        };
+        return blocked("user_active");
     }
     // Submit-edge cooldown: after the screen shows the input clearing, the
     // tool's hook hasn't yet flipped DB status to active. Without this,
@@ -765,27 +769,19 @@ pub(crate) fn evaluate_gate(
         && let Some(submit_at) = screen.last_prompt_submit
         && submit_at.elapsed().as_millis() < SUBMIT_SETTLE_COOLDOWN_MS as u128
     {
-        return GateResult {
-            safe: false,
-            reason: "submit_settle",
-        };
+        return blocked("submit_settle");
     }
     if config.require_ready_prompt && !screen.ready {
-        return GateResult {
-            safe: false,
-            reason: "not_ready",
-        };
+        return blocked("not_ready");
     }
     if config.require_prompt_empty && !screen.prompt_empty {
-        return GateResult {
-            safe: false,
-            reason: "prompt_has_text",
-        };
+        return blocked("prompt_has_text");
     }
 
     GateResult {
         safe: true,
         reason: "ok",
+        snapshot_gen,
     }
 }
 
@@ -1078,20 +1074,31 @@ fn parse_ok_response(response: &str) -> Option<(u64, u64)> {
     Some((epoch?, user_gen?))
 }
 
-/// Guarded delivery inject: the proxy verifies the prompt is empty at the
-/// apply point, writes the payload, and returns the lease this attempt must
-/// use for every submit. Refusal writes zero bytes.
-pub(crate) fn inject_if_leased(port: u16, payload: &str) -> Result<AttemptLease, String> {
+/// Guarded delivery inject. `gate_gen` is the user generation from the SAME
+/// snapshot the gate-pass decision used; the proxy refuses the inject (zero
+/// bytes) if any human byte arrived after that snapshot, even one the prompt
+/// does not render. On success the returned lease is exactly `gate_gen` plus
+/// the apply-point epoch token — never a newer, laundered generation.
+pub(crate) fn inject_if_leased(
+    port: u16,
+    gate_gen: u64,
+    payload: &str,
+) -> Result<AttemptLease, String> {
     let req = serde_json::json!({
+        "user_gen": gate_gen,
         "require_empty": true,
         "payload": payload,
     });
     let response = guarded_frame(port, &format!("\x00INJECT_IF {req}\n"))?;
     match parse_ok_response(&response) {
-        Some((epoch, user_gen)) => Ok(AttemptLease {
-            user_gen,
+        // Defensive: the apply-point gen equals gate_gen by construction
+        // (the proxy refused otherwise); reject any disagreement instead of
+        // adopting it.
+        Some((epoch, user_gen)) if user_gen == gate_gen => Ok(AttemptLease {
+            user_gen: gate_gen,
             first_submit_epoch: epoch,
         }),
+        Some(_) => Err(format!("lease_mismatch: {response}")),
         None => Err(response),
     }
 }
@@ -1600,10 +1607,12 @@ pub fn run_delivery_loop(
                             _ => build_wake_inject_text(db, &current_name, input_box_width),
                         };
 
-                        // Guarded inject: the proxy re-verifies prompt
-                        // emptiness at the apply point and returns the
-                        // immutable lease every submit of this attempt uses.
-                        match inject_if_leased(state.inject_port, &text) {
+                        // Guarded inject: the proxy re-verifies, at the apply
+                        // point, that no human byte arrived since the gate's
+                        // locked snapshot (gate.snapshot_gen) and that the
+                        // prompt is still empty; the returned lease is that
+                        // same generation, immutable for the whole attempt.
+                        match inject_if_leased(state.inject_port, gate.snapshot_gen, &text) {
                             Ok(lease) => {
                                 log_info(
                                     "native",
@@ -2485,6 +2494,29 @@ mod tests {
         // Retries keep the inject-time generation and drop only the epoch
         // token (our own first CR advanced the epoch).
         assert_eq!(lease.submit_args(false), (5, None));
+    }
+
+    // The gate's snapshot_gen must come from the SAME locked snapshot as the
+    // decision — it is the lease baseline the guarded inject requires, so a
+    // human byte after the gate read stales the whole attempt at the proxy.
+    #[test]
+    fn gate_snapshot_gen_comes_from_the_decision_snapshot() {
+        let mut screen = safe_screen();
+        screen.user_gen = 7;
+        let state = make_state(screen, 500);
+        let config = ToolConfig::claude();
+
+        let gate = evaluate_gate(&config, &state, true);
+        assert!(gate.safe);
+        assert_eq!(gate.snapshot_gen, 7);
+
+        // Blocked results carry it too (harmless; unused on that path).
+        let mut busy = safe_screen();
+        busy.user_gen = 9;
+        busy.prompt_empty = false;
+        let blocked = evaluate_gate(&ToolConfig::claude(), &make_state(busy, 500), true);
+        assert!(!blocked.safe);
+        assert_eq!(blocked.snapshot_gen, 9);
     }
 
     #[test]

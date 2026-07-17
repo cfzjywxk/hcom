@@ -42,13 +42,16 @@ pub(crate) struct GuardSnapshot {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct InjectIfRequest {
-    /// Client-observed lease. `None` skips the precondition: the caller takes
-    /// the apply-point value returned in the response as its lease instead
-    /// (delivery does this — the proxy main loop has already counted every
-    /// forwarded human byte into `user_gen` by the time this op applies, so
-    /// the returned value is the authoritative "no human touch up to here").
-    #[serde(default)]
-    pub user_gen: Option<u64>,
+    /// REQUIRED decision-point generation: the user_gen from the snapshot the
+    /// caller based its "safe to inject" decision on (delivery: the gate-pass
+    /// snapshot; term: its SCREEN read). Any human byte after that point makes
+    /// the inject stale at apply — there is deliberately no way to inject
+    /// without proving this, so a later generation can never be adopted as a
+    /// laundered baseline.
+    pub user_gen: u64,
+    /// Optional writer-epoch lease; absent for callers that cannot track
+    /// non-user writers before their inject (delivery). Exact-render checks
+    /// cover competing writers at submit time.
     #[serde(default)]
     pub input_epoch: Option<u64>,
     #[serde(default)]
@@ -104,9 +107,7 @@ pub(crate) fn check_inject(req: &InjectIfRequest, snap: &GuardSnapshot) -> Decis
         InputObservation::Unavailable => return Err(RefuseReason::Unavailable),
         InputObservation::Text(text) => text,
     };
-    if let Some(user_gen) = req.user_gen
-        && snap.user_gen != user_gen
-    {
+    if snap.user_gen != req.user_gen {
         return Err(RefuseReason::StaleUserGen);
     }
     if let Some(input_epoch) = req.input_epoch
@@ -166,7 +167,7 @@ mod tests {
 
     fn inject_req(user_gen: u64, epoch: u64, payload: &str) -> InjectIfRequest {
         InjectIfRequest {
-            user_gen: Some(user_gen),
+            user_gen,
             input_epoch: Some(epoch),
             require_empty: true,
             payload: payload.into(),
@@ -311,22 +312,27 @@ mod tests {
     }
 
     #[test]
-    fn inject_without_lease_takes_apply_point_as_baseline() {
-        // Delivery's shape: no client lease, require_empty only. The apply
-        // point still refuses a visibly non-empty prompt; the caller adopts
-        // the returned gen/epoch as its immutable lease.
-        let open = InjectIfRequest {
-            user_gen: None,
+    // nato's round-2 regression: a human byte lands between the caller's
+    // decision snapshot (gate pass) and the inject apply, while the prompt
+    // still OBSERVES empty (arrow key / unrendered byte). The inject must
+    // refuse — zero payload written, so no CR can ever follow this attempt.
+    fn inject_refuses_human_touch_between_decision_and_apply_even_on_empty_prompt() {
+        let req = InjectIfRequest {
+            user_gen: 5,
             input_epoch: None,
             require_empty: true,
-            payload: "hi".into(),
+            payload: "<hcom>".into(),
         };
-        let empty = snap(9, 4, InputObservation::Text(String::new()));
-        assert_eq!(check_inject(&open, &empty), Ok(()));
-        let drafted = snap(9, 4, InputObservation::Text("draft".into()));
-        assert_eq!(
-            check_inject(&open, &drafted),
-            Err(RefuseReason::PromptNotEmpty)
-        );
+        let live = snap(6, 4, InputObservation::Text(String::new()));
+        assert_eq!(check_inject(&req, &live), Err(RefuseReason::StaleUserGen));
+    }
+
+    // There is deliberately NO gen-less inject: a request omitting user_gen
+    // must fail to parse, so no code path can adopt a post-decision
+    // generation as a laundered lease baseline.
+    #[test]
+    fn inject_request_without_user_gen_does_not_parse() {
+        let body = r#"{"require_empty": true, "payload": "<hcom>"}"#;
+        assert!(serde_json::from_str::<InjectIfRequest>(body).is_err());
     }
 }
