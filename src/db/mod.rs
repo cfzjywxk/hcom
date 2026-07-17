@@ -36,16 +36,74 @@ pub use instances::InstanceRow;
 pub use instances::InstanceStatus;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 17;
+const SCHEMA_VERSION: i32 = 18;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
-const MIGRATIONS: &[(i32, &str)] = &[(
-    17,
-    "ALTER TABLE instances ADD COLUMN terminal_preset_requested TEXT DEFAULT '';
+const REVIEW_SCHEMA_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS review_runs (
+        id                    TEXT PRIMARY KEY,
+        task                  TEXT NOT NULL,
+        workspace             TEXT NOT NULL,
+        thread                TEXT NOT NULL UNIQUE,
+        developer_name        TEXT NOT NULL,
+        developer_session_id  TEXT NOT NULL,
+        reviewer_name         TEXT NOT NULL,
+        reviewer_session_id   TEXT NOT NULL,
+        state                 TEXT NOT NULL CHECK (state IN (
+                                  'awaiting_review',
+                                  'awaiting_developer',
+                                  'max_rounds',
+                                  'approved',
+                                  'canceled'
+                              )),
+        round                 INTEGER NOT NULL,
+        max_rounds            INTEGER NOT NULL,
+        version               INTEGER NOT NULL DEFAULT 0,
+        last_message_event_id INTEGER,
+        created_at            REAL NOT NULL,
+        updated_at            REAL NOT NULL,
+        CHECK (round >= 1 AND round <= max_rounds AND max_rounds <= 20),
+        FOREIGN KEY (last_message_event_id) REFERENCES events(id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_review_runs_active_pair
+        ON review_runs(developer_session_id, reviewer_session_id, state);
+
+    CREATE TABLE IF NOT EXISTS review_transitions (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        workflow_id      TEXT NOT NULL,
+        from_version     INTEGER NOT NULL,
+        to_version       INTEGER NOT NULL,
+        round            INTEGER NOT NULL,
+        actor_name       TEXT NOT NULL,
+        actor_session_id TEXT NOT NULL,
+        actor_role       TEXT NOT NULL CHECK (actor_role IN ('developer', 'reviewer')),
+        action           TEXT NOT NULL CHECK (action IN (
+                             'start', 'request_changes', 'lgtm',
+                             'fixed', 'rebut', 'extend', 'cancel'
+                         )),
+        from_state       TEXT,
+        to_state         TEXT NOT NULL,
+        summary          TEXT NOT NULL DEFAULT '',
+        payload_hash     TEXT NOT NULL,
+        message_event_id INTEGER,
+        created_at       REAL NOT NULL,
+        UNIQUE (workflow_id, from_version),
+        FOREIGN KEY (workflow_id) REFERENCES review_runs(id) ON DELETE CASCADE,
+        FOREIGN KEY (message_event_id) REFERENCES events(id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_review_transitions_workflow
+        ON review_transitions(workflow_id, to_version);
+";
+const MIGRATIONS: &[(i32, &str)] = &[
+    (
+        17,
+        "ALTER TABLE instances ADD COLUMN terminal_preset_requested TEXT DEFAULT '';
      ALTER TABLE instances ADD COLUMN terminal_preset_effective TEXT DEFAULT '';
      UPDATE instances
      SET terminal_preset_effective = json_extract(launch_context, '$.terminal_preset')
      WHERE launch_context != '' AND json_valid(launch_context) AND json_extract(launch_context, '$.terminal_preset') IS NOT NULL;",
-)];
+    ),
+    (18, REVIEW_SCHEMA_SQL),
+];
 
 /// Schema compatibility check result
 enum SchemaCompat {
@@ -321,6 +379,8 @@ impl HcomDb {
             ",
         )?;
 
+        self.conn.execute_batch(REVIEW_SCHEMA_SQL)?;
+
         // Set schema version
         self.conn
             .execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))?;
@@ -567,6 +627,24 @@ impl HcomDb {
             return Ok(false);
         }
         let tx = self.conn.unchecked_transaction()?;
+        // v17 was briefly stamped onto v16-shaped databases before its two
+        // terminal columns had actually been added (issue #16). Once code
+        // advances beyond v17 this repair still has to run before later
+        // migrations, otherwise the old data-preserving guard is bypassed.
+        if old_version == 17 {
+            let has_v17_columns = tx
+                .prepare("PRAGMA table_info(instances)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(|row| row.ok())
+                .any(|column| column == "terminal_preset_requested");
+            if !has_v17_columns {
+                let (_, migration) = MIGRATIONS
+                    .iter()
+                    .find(|(version, _)| *version == 17)
+                    .expect("v17 migration must exist");
+                tx.execute_batch(migration)?;
+            }
+        }
         for next_version in (old_version + 1)..=SCHEMA_VERSION {
             if next_version == 17 {
                 let has_launch_context = tx
@@ -882,6 +960,8 @@ pub(super) mod tests {
         assert!(tables.contains(&"notify_endpoints".to_string()));
         assert!(tables.contains(&"process_bindings".to_string()));
         assert!(tables.contains(&"session_bindings".to_string()));
+        assert!(tables.contains(&"review_runs".to_string()));
+        assert!(tables.contains(&"review_transitions".to_string()));
 
         cleanup_test_db(db_path);
     }
@@ -1134,6 +1214,71 @@ pub(super) mod tests {
             )
             .unwrap();
         assert_eq!(launch_context, r#"{"terminal_preset":"ghostty-tab"}"#);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_ensure_schema_migrates_v17_to_v18_in_place() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES ('2026-01-01T00:00:00Z', 'message', 'luna', '{}')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, created_at)
+                 VALUES ('luna', 'session-luna', 'claude', 1.0)",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO kv (key, value) VALUES ('preserved', 'yes')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "DROP TABLE review_transitions;
+                 DROP TABLE review_runs;
+                 PRAGMA user_version = 17;",
+            )
+            .unwrap();
+        drop(db);
+
+        let db = HcomDb::open_at(&db_path).unwrap();
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let preserved: (i64, i64, String) = db
+            .conn
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM events WHERE instance = 'luna'),
+                     (SELECT COUNT(*) FROM instances WHERE name = 'luna'),
+                     (SELECT value FROM kv WHERE key = 'preserved')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved, (1, 1, "yes".to_string()));
+        for table in ["review_runs", "review_transitions"] {
+            let exists: bool = db
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "missing table {table}");
+        }
 
         cleanup_test_db(db_path);
     }

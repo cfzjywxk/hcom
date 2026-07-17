@@ -22,6 +22,7 @@ fn is_hook(name: &str) -> bool {
 
 const COMMANDS: &[&str] = &[
     "send",
+    "review",
     "list",
     "events",
     "stop",
@@ -584,6 +585,7 @@ pub fn dispatch() -> anyhow::Result<()> {
             if matches!(
                 cmd.as_str(),
                 "send"
+                    | "review"
                     | "list"
                     | "stop"
                     | "listen"
@@ -816,6 +818,12 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
                 if e.use_stderr() { 1 } else { 0 }
             }
         },
+        "review" => clap_dispatch!(
+            crate::commands::review::ReviewArgs,
+            cmd,
+            &cmd_argv,
+            |args| crate::commands::review::cmd_review(&db, &args, Some(&ctx))
+        ),
         "list" => clap_dispatch!(crate::commands::list::ListArgs, cmd, &cmd_argv, |args| {
             crate::commands::list::cmd_list(&db, &args, Some(&ctx))
         }),

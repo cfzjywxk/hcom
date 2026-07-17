@@ -66,6 +66,7 @@ Prompt:
 
 - `ask the other agent their favorite cake`
 - `review what claude did and send it fixes`
+- `ask codex to review, keep fixing and re-reviewing until LGTM, at most 3 rounds`
 - `spawn 3x gemini, split work, collect results`
 - `fork yourself to investigate the bug and report back`
 
@@ -80,6 +81,8 @@ hcom
 ## What agents can do
 
 **Message** each other in real-time: intent, replies, bundled context for handoffs.
+
+**Review loop** with deterministic `review → fix/rebut → re-review` state until LGTM or a configured round limit. Agents can start it from a natural-language request; only structured `hcom review` commands advance its state.
 
 **Observe** each other: transcripts, file edits, terminal screens, command history.
 

@@ -50,6 +50,7 @@ pub(crate) fn dispatch_with_panic_guard<R>(
 /// admin-level and require explicit user approval.
 pub(crate) const SAFE_HCOM_COMMANDS: &[&str] = &[
     "send",
+    "review",
     "start",
     "help",
     "--help",

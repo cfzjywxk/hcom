@@ -267,6 +267,45 @@ const SEND_HELP: &[HelpEntry] = &[
     ("  EOF", ""),
 ];
 
+const REVIEW_HELP: &[HelpEntry] = &[
+    (
+        "  review start @REVIEWER [--max-rounds N] -- TASK",
+        "Start a persistent review loop (default: 3 rounds)",
+    ),
+    (
+        "  review verdict ID --round N --lgtm -- SUMMARY",
+        "Approve as the bound reviewer",
+    ),
+    (
+        "  review verdict ID --round N --request-changes -- SUMMARY",
+        "Request changes as the bound reviewer",
+    ),
+    (
+        "  review fixed ID --round N -- SUMMARY",
+        "Submit fixes and request the next review",
+    ),
+    (
+        "  review rebut ID --round N -- SUMMARY",
+        "Submit a rebuttal and request the next review",
+    ),
+    ("  review status ID [--json]", "Show one workflow"),
+    ("  review list [--json]", "List your active workflows"),
+    (
+        "  review cancel ID -- REASON",
+        "Cancel as either participant",
+    ),
+    (
+        "  review extend ID --max-rounds NEW_TOTAL",
+        "Increase the total limit after max rounds",
+    ),
+    ("", ""),
+    (
+        "",
+        "Only structured review commands change state; ordinary message text never does.",
+    ),
+    ("", "Supports local top-level Claude/Codex agents in v1."),
+];
+
 const BUNDLE_HELP: &[HelpEntry] = &[
     ("bundle", "List recent bundles (alias: bundle list)"),
     ("bundle list", "List recent bundles"),
@@ -827,6 +866,7 @@ fn format_entries(entries: &[HelpEntry]) -> Vec<String> {
 /// The `command_names_covers_released_tools` test guards against drift.
 pub const COMMAND_NAMES: &[&str] = &[
     "send",
+    "review",
     "list",
     "events",
     "stop",
@@ -905,6 +945,7 @@ Launch:\n\
 \n\
 Commands:\n\
   send         Send message to your buddies\n\
+  review       Review/fix/re-review until LGTM or a round limit\n\
   listen       Block until message or event arrives\n\
   list         Show agents, status, unread counts\n\
   events       Query event stream, manage subscriptions\n\
@@ -1024,6 +1065,7 @@ pub fn get_command_help(name: &str) -> String {
     let entries: Option<&[HelpEntry]> = match name {
         "list" => Some(LIST_HELP),
         "send" => Some(SEND_HELP),
+        "review" => Some(REVIEW_HELP),
         "bundle" => Some(BUNDLE_HELP),
         "stop" => Some(STOP_HELP),
         "start" => Some(START_HELP),
@@ -1135,6 +1177,7 @@ mod tests {
     fn all_commands_have_help() {
         let commands = [
             "send",
+            "review",
             "list",
             "events",
             "stop",

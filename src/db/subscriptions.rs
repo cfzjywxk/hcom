@@ -24,7 +24,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{Connection, params};
 use serde_json::json;
 
 use super::HcomDb;
@@ -440,13 +440,28 @@ pub(crate) fn add_thread_memberships(
     sender: Option<&str>,
     recipients: &[String],
 ) {
+    let last_id = db.get_last_event_id();
+    let _ = add_thread_memberships_on(db.conn(), thread, sender, recipients, last_id);
+}
+
+/// Transaction-friendly thread membership upsert.
+///
+/// Review workflows use this in the same transaction as their state and
+/// message event. Unlike the public best-effort wrapper, errors propagate so
+/// a partially committed workflow cannot lose its delivery routing state.
+pub(crate) fn add_thread_memberships_on(
+    conn: &Connection,
+    thread: &str,
+    sender: Option<&str>,
+    recipients: &[String],
+    last_id: i64,
+) -> Result<()> {
     let mut members = recipients.to_vec();
     if let Some(sender) = sender {
         members.push(sender.to_string());
     }
 
     let now = crate::shared::time::now_epoch_f64();
-    let last_id = db.get_last_event_id();
     let mut seen = HashSet::new();
     for (idx, member) in members.into_iter().enumerate() {
         if !seen.insert(member.clone()) {
@@ -465,8 +480,13 @@ pub(crate) fn add_thread_memberships(
             "last_id": last_id,
             "once": false,
         });
-        let _ = db.kv_set(&key, Some(&data.to_string()));
+        conn.execute(
+            "INSERT INTO kv (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, data.to_string()],
+        )?;
     }
+    Ok(())
 }
 
 /// Check subscriptions and send matching notifications.
