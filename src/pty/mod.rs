@@ -14,6 +14,8 @@ pub mod screen;
 #[cfg(any(unix, windows))]
 mod shared;
 #[cfg(unix)]
+mod sigwake;
+#[cfg(unix)]
 mod terminal;
 #[cfg(windows)]
 mod win;
@@ -563,24 +565,31 @@ static SIGHUP_RECEIVED: AtomicBool = AtomicBool::new(false);
 #[cfg(unix)]
 use crate::delivery::EXIT_WAS_KILLED;
 
+// Each handler sets its flag AND writes the self-pipe: a signal landing
+// between the loop's flag check and poll() entering the kernel would
+// otherwise sit unnoticed for the full poll timeout (see `sigwake`).
 #[cfg(unix)]
 pub extern "C" fn handle_sigwinch(_: libc::c_int) {
     SIGWINCH_RECEIVED.store(true, Ordering::Release);
+    sigwake::notify_from_handler();
 }
 
 #[cfg(unix)]
 pub extern "C" fn handle_sigint(_: libc::c_int) {
     SIGINT_RECEIVED.store(true, Ordering::Release);
+    sigwake::notify_from_handler();
 }
 
 #[cfg(unix)]
 pub extern "C" fn handle_sigterm(_: libc::c_int) {
     SIGTERM_RECEIVED.store(true, Ordering::Release);
+    sigwake::notify_from_handler();
 }
 
 #[cfg(unix)]
 extern "C" fn handle_sighup(_: libc::c_int) {
     SIGHUP_RECEIVED.store(true, Ordering::Release);
+    sigwake::notify_from_handler();
 }
 
 /// Configuration for the PTY proxy
@@ -626,6 +635,8 @@ pub struct Proxy {
     running: Arc<AtomicBool>,
     /// Resize debounce with trailing-edge redelivery
     resize_debounce: resize::ResizeDebouncer,
+    /// Self-pipe waking poll() for signals that land before it starts
+    signal_wake: sigwake::SignalWakePipe,
     /// Delivery thread handle (for cleanup on drop)
     delivery_handle: Option<std::thread::JoinHandle<()>>,
     /// Notify port for waking delivery thread on shutdown
@@ -762,6 +773,7 @@ impl Proxy {
             resize_debounce: resize::ResizeDebouncer::new(Duration::from_millis(
                 RESIZE_DEBOUNCE_MS,
             )),
+            signal_wake: sigwake::SignalWakePipe::install()?,
             delivery_handle: None,
             notify_port: Arc::new(AtomicU16::new(0)),
             current_name,
@@ -849,13 +861,21 @@ impl Proxy {
             let master_raw = self.pty_master.as_raw_fd();
             let stdin_raw = stdin_fd.as_raw_fd();
             let inject_listener_raw = self.inject_server.listener_raw_fd();
+            let signal_wake_raw = self.signal_wake.read_fd().as_raw_fd();
 
             // Build poll fds from raw values
             let master_fd = unsafe { BorrowedFd::borrow_raw(master_raw) };
             let stdin_borrowed = unsafe { BorrowedFd::borrow_raw(stdin_raw) };
             let inject_listener_fd = unsafe { BorrowedFd::borrow_raw(inject_listener_raw) };
+            let signal_wake_fd = unsafe { BorrowedFd::borrow_raw(signal_wake_raw) };
 
-            let mut poll_fds = vec![PollFd::new(master_fd, PollFlags::POLLIN)];
+            let mut poll_fds = vec![
+                PollFd::new(master_fd, PollFlags::POLLIN),
+                // Index 1: signal wake pipe — a handler writes here when its
+                // signal lands after the flag checks above but before poll()
+                // enters the kernel, so the sleep ends immediately.
+                PollFd::new(signal_wake_fd, PollFlags::POLLIN),
+            ];
 
             // Only include stdin in poll set while we're actively polling it.
             // When stdin is a non-TTY (e.g. /dev/null in headless mode), we stop
@@ -978,6 +998,16 @@ impl Proxy {
                 Err(e) => {
                     bail!("poll failed: {}", e)
                 }
+            }
+
+            // Drain the signal wake pipe (index 1) so its level-triggered
+            // POLLIN doesn't spin; the flags it signals are re-checked at the
+            // top of the next iteration.
+            if poll_fds[1]
+                .revents()
+                .is_some_and(|revents| revents.contains(PollFlags::POLLIN))
+            {
+                self.signal_wake.drain();
             }
 
             // Handle PTY output — drain all available data before writing to stdout.
@@ -1133,8 +1163,9 @@ impl Proxy {
                 }
             }
 
-            // Handle stdin (only if we're still polling it)
-            if poll_stdin && let Some(revents) = poll_fds[1].revents() {
+            // Handle stdin (only if we're still polling it; index 2 — after
+            // the PTY master and the signal wake pipe)
+            if poll_stdin && let Some(revents) = poll_fds[2].revents() {
                 if revents.contains(PollFlags::POLLNVAL) {
                     // Some headless launch paths can inherit a stdin fd that poll()
                     // reports as invalid instead of readable EOF. Drop it from the
