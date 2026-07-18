@@ -20,6 +20,8 @@ mod sigwake;
 mod terminal;
 #[cfg(windows)]
 mod win;
+#[cfg(unix)]
+mod write_queue;
 
 #[cfg(windows)]
 pub use win::Proxy;
@@ -638,6 +640,8 @@ pub struct Proxy {
     resize_debounce: resize::ResizeDebouncer,
     /// Self-pipe waking poll() for signals that land before it starts
     signal_wake: sigwake::SignalWakePipe,
+    /// Event-driven master writes with backpressure (no EAGAIN spinning)
+    pty_writer: write_queue::PtyWriteQueue,
     /// Delivery thread handle (for cleanup on drop)
     delivery_handle: Option<std::thread::JoinHandle<()>>,
     /// Notify port for waking delivery thread on shutdown
@@ -775,6 +779,7 @@ impl Proxy {
                 RESIZE_DEBOUNCE_MS,
             )),
             signal_wake: sigwake::SignalWakePipe::install()?,
+            pty_writer: write_queue::PtyWriteQueue::new(),
             delivery_handle: None,
             notify_port: Arc::new(AtomicU16::new(0)),
             current_name,
@@ -870,8 +875,15 @@ impl Proxy {
             let inject_listener_fd = unsafe { BorrowedFd::borrow_raw(inject_listener_raw) };
             let signal_wake_fd = unsafe { BorrowedFd::borrow_raw(signal_wake_raw) };
 
+            // Backpressure: while master writes are pending, also poll the
+            // master for writability so the flush is event-driven.
+            let master_events = if self.pty_writer.has_pending() {
+                PollFlags::POLLIN | PollFlags::POLLOUT
+            } else {
+                PollFlags::POLLIN
+            };
             let mut poll_fds = vec![
-                PollFd::new(master_fd, PollFlags::POLLIN),
+                PollFd::new(master_fd, master_events),
                 // Index 1: signal wake pipe — a handler writes here when its
                 // signal lands after the flag checks above but before poll()
                 // enters the kernel, so the sleep ends immediately.
@@ -884,7 +896,13 @@ impl Proxy {
             // the poll set, not just pass empty events, because some platforms
             // (macOS) may still return immediately for a readable fd even with
             // events=0.
-            if poll_stdin {
+            //
+            // Backpressure also pauses stdin: while master writes are pending,
+            // reading more outer input would only grow the queue, so the bytes
+            // stay in the kernel tty buffer until the child drains (child
+            // output, signals, and inject queries keep being processed).
+            let stdin_in_poll = poll_stdin && !self.pty_writer.has_pending();
+            if stdin_in_poll {
                 poll_fds.push(PollFd::new(stdin_borrowed, PollFlags::POLLIN));
             }
 
@@ -1009,6 +1027,15 @@ impl Proxy {
                 .is_some_and(|revents| revents.contains(PollFlags::POLLIN))
             {
                 self.signal_wake.drain();
+            }
+
+            // Master became writable: push pending backpressured bytes. Once
+            // the queue empties, the next iteration resumes polling stdin.
+            if poll_fds[0]
+                .revents()
+                .is_some_and(|revents| revents.contains(PollFlags::POLLOUT))
+            {
+                self.pty_writer.flush(&self.pty_master)?;
             }
 
             // Handle PTY output — drain all available data before writing to stdout.
@@ -1164,9 +1191,9 @@ impl Proxy {
                 }
             }
 
-            // Handle stdin (only if we're still polling it; index 2 — after
-            // the PTY master and the signal wake pipe)
-            if poll_stdin && let Some(revents) = poll_fds[2].revents() {
+            // Handle stdin (only if it was in THIS iteration's poll set;
+            // index 2 — after the PTY master and the signal wake pipe)
+            if stdin_in_poll && let Some(revents) = poll_fds[2].revents() {
                 if revents.contains(PollFlags::POLLNVAL) {
                     // Some headless launch paths can inherit a stdin fd that poll()
                     // reports as invalid instead of readable EOF. Drop it from the
@@ -1228,9 +1255,9 @@ impl Proxy {
                             if self.config.target.name() == "copilot"
                                 && let Some(filtered) = focus_filtered
                             {
-                                write_all(&self.pty_master, &filtered)?;
+                                self.pty_writer.write_user(&self.pty_master, &filtered)?;
                             } else {
-                                write_all(&self.pty_master, &buf[..n])?;
+                                self.pty_writer.write_user(&self.pty_master, &buf[..n])?;
                             }
                         }
                         Err(Errno::EAGAIN) => {}
@@ -1267,7 +1294,20 @@ impl Proxy {
                             // Raw (non-leased) writer: invalidates any
                             // outstanding guarded-submit token.
                             self.screen.bump_input_epoch();
-                            write_all(&self.pty_master, text.as_bytes())?;
+                            if !self
+                                .pty_writer
+                                .write_injected(&self.pty_master, text.as_bytes())?
+                            {
+                                crate::log::log_warn(
+                                    "pty",
+                                    "pty.inject_backpressure_drop",
+                                    &format!(
+                                        "dropped {}B raw inject: pending-write cap reached \
+                                         (child not draining); sender retries apply",
+                                        text.len()
+                                    ),
+                                );
+                            }
                             // Injected keystrokes reach the PTY master directly and
                             // bypass the interactive stdin handler. When one answers a
                             // pending approval, publish the cleared edge synchronously
@@ -1404,6 +1444,11 @@ impl Proxy {
             Ok(req) => req,
             Err(_) => return "ERROR bad_request\n".into(),
         };
+        // Fail closed under backpressure: with writes pending the prompt
+        // observation is stale by definition (bytes are still in flight).
+        if self.pty_writer.has_pending() {
+            return "REFUSED backpressured\n".into();
+        }
         // Same control-character policy as delivery's raw inject: printable
         // text plus tab only; the CR travels exclusively through SUBMIT_IF.
         let payload: String = req
@@ -1416,8 +1461,15 @@ impl Proxy {
         }
         match guard::check_inject(&req, &self.guard_snapshot()) {
             Ok(()) => {
-                if write_all(&self.pty_master, payload.as_bytes()).is_err() {
-                    return "ERROR write_failed\n".into();
+                // The queue is empty here, so this either writes through or
+                // retains a tail that flushes before any other byte can be
+                // accepted (stdin pauses while pending) — ordering holds.
+                match self
+                    .pty_writer
+                    .write_injected(&self.pty_master, payload.as_bytes())
+                {
+                    Ok(true) => {}
+                    _ => return "ERROR write_failed\n".into(),
                 }
                 let epoch = self.screen.bump_input_epoch();
                 // gen is the apply-point user generation: every human byte
@@ -1437,10 +1489,14 @@ impl Proxy {
             Ok(req) => req,
             Err(_) => return "ERROR bad_request\n".into(),
         };
+        if self.pty_writer.has_pending() {
+            return "REFUSED backpressured\n".into();
+        }
         match guard::check_submit(&req, &self.guard_snapshot()) {
             Ok(()) => {
-                if write_all(&self.pty_master, b"\r").is_err() {
-                    return "ERROR write_failed\n".into();
+                match self.pty_writer.write_injected(&self.pty_master, b"\r") {
+                    Ok(true) => {}
+                    _ => return "ERROR write_failed\n".into(),
                 }
                 let epoch = self.screen.bump_input_epoch();
                 format!("OK epoch={epoch} gen={}\n", self.screen.user_gen())
