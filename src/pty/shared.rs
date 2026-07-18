@@ -571,9 +571,34 @@ pub(super) fn finalize_launch_failure_after_exit(
 }
 
 /// Build the OSC 1/2 title-set escape for `name`/`status` under `tool_name`.
+// Classic title without composition — production caller is the Windows
+// ConPTY path (the Unix loop always goes through the format-aware variant).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(super) fn build_title_escape(name: &str, status: &str, tool_name: &str) -> String {
-    let title = crate::shared::format_pane_title(status, name, tool_name);
-    format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title)
+    build_title_escape_with_format(name, status, tool_name, "", "")
+}
+
+/// Compose the pane title. An empty `format` is exactly the classic hcom
+/// title; otherwise `{hcom}` substitutes that title and `{tool_title}` the
+/// tool's most recent OSC title. Control characters are stripped so a
+/// tool-supplied title can never smuggle escape sequences into the stream.
+pub(super) fn build_title_escape_with_format(
+    name: &str,
+    status: &str,
+    tool_name: &str,
+    format: &str,
+    tool_title: &str,
+) -> String {
+    let hcom_title = crate::shared::format_pane_title(status, name, tool_name);
+    let title = if format.is_empty() {
+        hcom_title
+    } else {
+        format
+            .replace("{hcom}", &hcom_title)
+            .replace("{tool_title}", tool_title)
+    };
+    let sanitized: String = title.chars().filter(|c| !c.is_control()).collect();
+    format!("\x1b]1;{}\x07\x1b]2;{}\x07", sanitized, sanitized)
 }
 
 /// Build minimal launch_context JSON from env vars available in the PTY process.
@@ -1186,6 +1211,38 @@ mod tests {
         assert!(esc.starts_with("\x1b]1;"));
         assert!(esc.contains("\x07\x1b]2;"));
         assert!(esc.ends_with('\x07'));
+    }
+
+    #[test]
+    fn build_title_escape_with_format_composes_and_sanitizes() {
+        let icon = status_icon("listening");
+        let hcom_title = format!("{} alpha [claude]", icon);
+
+        // Empty format == classic title, byte for byte.
+        assert_eq!(
+            build_title_escape_with_format("alpha", "listening", "claude", "", "ignored"),
+            build_title_escape("alpha", "listening", "claude")
+        );
+
+        let esc = build_title_escape_with_format(
+            "alpha",
+            "listening",
+            "claude",
+            "{hcom} - {tool_title}",
+            "My Tool",
+        );
+        let expected = format!("{hcom_title} - My Tool");
+        assert_eq!(esc, format!("\x1b]1;{expected}\x07\x1b]2;{expected}\x07"));
+
+        // A malicious tool title cannot smuggle escapes into the stream.
+        let esc = build_title_escape_with_format(
+            "alpha",
+            "listening",
+            "claude",
+            "{tool_title}",
+            "bad\x1b]0;x\x07title",
+        );
+        assert_eq!(esc, "\x1b]1;bad]0;xtitle\x07\x1b]2;bad]0;xtitle\x07");
     }
 
     #[test]

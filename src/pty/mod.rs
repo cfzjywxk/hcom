@@ -452,6 +452,12 @@ enum TitleFilterState {
 struct TitleOscFilter {
     state: TitleFilterState,
     discard_count: usize,
+    /// Bytes of the title sequence currently being consumed.
+    pending_title: Vec<u8>,
+    /// Most recent complete tool title (sanitized). Consumed by the optional
+    /// `pane_title_format` composition; without that config the payload is
+    /// simply retained instead of dropped.
+    last_title: Option<String>,
 }
 
 #[cfg(unix)]
@@ -460,7 +466,23 @@ impl TitleOscFilter {
         Self {
             state: TitleFilterState::Pass,
             discard_count: 0,
+            pending_title: Vec::new(),
+            last_title: None,
         }
+    }
+
+    /// The tool's most recent complete OSC 0/1/2 title text.
+    fn last_title(&self) -> Option<&str> {
+        self.last_title.as_deref()
+    }
+
+    fn finish_title(&mut self) {
+        let text = String::from_utf8_lossy(&self.pending_title)
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect::<String>();
+        self.last_title = Some(text);
+        self.pending_title.clear();
     }
 
     /// Filter data, stripping title OSC sequences. Returns (filtered_output, had_title).
@@ -499,9 +521,10 @@ impl TitleOscFilter {
                 }
                 TitleFilterState::SawDigit(digit) => {
                     if byte == b';' {
-                        // Confirmed title OSC — discard until terminator
+                        // Confirmed title OSC — strip from output, capture payload
                         self.state = TitleFilterState::InTitle;
                         self.discard_count = 0;
+                        self.pending_title.clear();
                         found_title = true;
                     } else {
                         // Multi-digit OSC number (10, 11, etc.) or malformed — pass through
@@ -515,18 +538,24 @@ impl TitleOscFilter {
                 TitleFilterState::InTitle => {
                     self.discard_count += 1;
                     if byte == 0x07 {
+                        self.finish_title();
                         self.state = TitleFilterState::Pass;
                     } else if byte == 0x1b {
                         self.state = TitleFilterState::InTitleSawEsc;
                     } else if self.discard_count > 256 {
                         // Safety: abort on absurdly long unterminated sequence
+                        // (partial payload dropped, last complete title kept)
+                        self.pending_title.clear();
                         self.state = TitleFilterState::Pass;
+                    } else {
+                        self.pending_title.push(byte);
                     }
                 }
                 TitleFilterState::InTitleSawEsc => {
                     self.discard_count += 1;
                     if byte == b'\\' {
                         // ST terminator (ESC \)
+                        self.finish_title();
                         self.state = TitleFilterState::Pass;
                     } else {
                         self.state = TitleFilterState::InTitle;
@@ -562,6 +591,8 @@ static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
 static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
 #[cfg(unix)]
 static SIGHUP_RECEIVED: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
+static SIGCONT_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 // Exit reason flag lives in `delivery` so the delivery loop compiles without
 // the PTY wrapper; the proxy sets it here.
@@ -592,6 +623,12 @@ pub extern "C" fn handle_sigterm(_: libc::c_int) {
 #[cfg(unix)]
 extern "C" fn handle_sighup(_: libc::c_int) {
     SIGHUP_RECEIVED.store(true, Ordering::Release);
+    sigwake::notify_from_handler();
+}
+
+#[cfg(unix)]
+pub(super) extern "C" fn handle_sigcont(_: libc::c_int) {
+    SIGCONT_RECEIVED.store(true, Ordering::Release);
     sigwake::notify_from_handler();
 }
 
@@ -803,6 +840,12 @@ impl Proxy {
         // Track last written title to detect changes (delivery thread updates Arcs)
         let mut last_written_name = String::new();
         let mut last_written_status = String::new();
+        let mut last_written_tool_title = String::new();
+        // Optional pane-title composition ({hcom}, {tool_title}); empty keeps
+        // the classic hcom-identity title exactly.
+        let pane_title_format = crate::config::HcomConfig::load(None)
+            .map(|config| config.pane_title_format)
+            .unwrap_or_default();
 
         // Track incomplete UTF-8 sequences to defer title writes.
         // When PTY output ends with partial multi-byte character, writing our title OSC
@@ -846,6 +889,13 @@ impl Proxy {
             // Trailing edge: a resize coalesced by the debounce must still be
             // applied at its deadline even if no further SIGWINCH arrives.
             if self.resize_debounce.take_due(Instant::now()) {
+                self.forward_winsize()?;
+            }
+            // Continued after an external stop: the shell's `fg` restored its
+            // cooked-mode view of the termios and the window may have been
+            // resized while we were stopped — re-assert both.
+            if SIGCONT_RECEIVED.swap(false, Ordering::AcqRel) {
+                terminal::reassert_raw_mode();
                 self.forward_winsize()?;
             }
             if SIGINT_RECEIVED.swap(false, Ordering::AcqRel) {
@@ -1369,13 +1419,27 @@ impl Proxy {
                         .unwrap_or_default();
                     (n, s)
                 };
-                if !name.is_empty() && (name != last_written_name || status != last_written_status)
+                let tool_title = if pane_title_format.is_empty() {
+                    ""
+                } else {
+                    title_filter.last_title().unwrap_or("")
+                };
+                if !name.is_empty()
+                    && (name != last_written_name
+                        || status != last_written_status
+                        || tool_title != last_written_tool_title)
                 {
-                    let escape =
-                        shared::build_title_escape(&name, &status, self.config.target.name());
+                    let escape = shared::build_title_escape_with_format(
+                        &name,
+                        &status,
+                        self.config.target.name(),
+                        &pane_title_format,
+                        tool_title,
+                    );
                     write_all(&stdout_fd, escape.as_bytes())?;
                     last_written_name = name;
                     last_written_status = status;
+                    last_written_tool_title = tool_title.to_string();
                 }
             }
         }
@@ -2013,6 +2077,46 @@ mod tests {
         }
         data.push(0xE2); // Start of next ─
         assert_eq!(pending_utf8_bytes(&data), 2);
+    }
+
+    // ---- TitleOscFilter capture (pane_title_format source) ----
+
+    #[cfg(unix)]
+    #[test]
+    fn test_title_filter_captures_bel_and_st_terminated_titles() {
+        let mut filter = super::TitleOscFilter::new();
+        let (out, had) = filter.filter(b"pre\x1b]0;My Tool\x07post");
+        assert_eq!(out, b"prepost");
+        assert!(had);
+        assert_eq!(filter.last_title(), Some("My Tool"));
+
+        // ST-terminated (ESC \) title replaces the previous one.
+        let (_, had) = filter.filter(b"\x1b]2;Second\x1b\\");
+        assert!(had);
+        assert_eq!(filter.last_title(), Some("Second"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_title_filter_captures_across_chunk_boundaries() {
+        let mut filter = super::TitleOscFilter::new();
+        let (_, _) = filter.filter(b"\x1b]0;Sp");
+        let (_, _) = filter.filter(b"lit");
+        let (_, _) = filter.filter(b"\x07");
+        assert_eq!(filter.last_title(), Some("Split"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_title_filter_keeps_last_complete_title_on_aborted_sequence() {
+        let mut filter = super::TitleOscFilter::new();
+        filter.filter(b"\x1b]0;Good\x07");
+        // Unterminated garbage beyond the safety cap: partial payload dropped.
+        let long = vec![b'x'; 300];
+        let mut seq = b"\x1b]0;".to_vec();
+        seq.extend_from_slice(&long);
+        filter.filter(&seq);
+        assert_eq!(filter.last_title(), Some("Good"));
     }
 
     // ---- title_write_safe tests ----

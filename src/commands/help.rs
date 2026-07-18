@@ -526,6 +526,10 @@ const CONFIG_HELP: &[HelpEntry] = &[
         "Opt in to trusting the launch dir",
     ),
     ("  name_export", "Export agent name to custom env var"),
+    (
+        "  pane_title_format",
+        "Compose pane title ({hcom}, {tool_title})",
+    ),
     ("", "hcom config <key> --info for details"),
     ("", ""),
     ("", "Precedence: defaults < config.toml < env vars"),

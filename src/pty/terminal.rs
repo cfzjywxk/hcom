@@ -59,6 +59,22 @@ fn setup_raw_mode() -> Result<Option<Termios>> {
     Ok(Some(original))
 }
 
+/// Re-assert raw mode after the proxy is continued from an external stop
+/// (`kill -STOP`/`-CONT`, shell job control): the shell restores ITS view of
+/// the termios on `fg`, which is cooked mode, and nobody else puts raw back.
+/// Best-effort — a non-TTY stdin is a no-op.
+pub fn reassert_raw_mode() {
+    let stdin = io::stdin();
+    if !isatty(&stdin).unwrap_or(false) {
+        return;
+    }
+    if let Ok(current) = tcgetattr(&stdin) {
+        let mut raw = current.clone();
+        cfmakeraw(&mut raw);
+        let _ = tcsetattr(&stdin, SetArg::TCSANOW, &raw);
+    }
+}
+
 /// Get current terminal size
 pub fn get_terminal_size() -> Result<Winsize> {
     // SAFETY: Winsize is a C struct with no invariants beyond being properly initialized.
@@ -110,5 +126,8 @@ pub fn setup_signal_handlers() -> Result<()> {
     // SIGTERM/SIGHUP: DON'T restart - we need poll() to return EINTR so we can exit
     setup_signal_handler(Signal::SIGTERM, handle_sigterm, false)?;
     setup_signal_handler(Signal::SIGHUP, handle_sighup, false)?;
+    // SIGCONT: after an external stop/continue the loop re-asserts raw mode
+    // and re-applies the window size (both may have changed while stopped)
+    setup_signal_handler(Signal::SIGCONT, super::handle_sigcont, true)?;
     Ok(())
 }

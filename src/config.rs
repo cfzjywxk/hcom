@@ -107,6 +107,7 @@ const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("timeout", "preferences.timeout"),
     ("auto_approve", "preferences.auto_approve"),
     ("name_export", "preferences.name_export"),
+    ("pane_title_format", "preferences.pane_title_format"),
     ("auto_trust_workspace", "launch.auto_trust_workspace"),
 ];
 
@@ -144,6 +145,7 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     ("auto_approve", "HCOM_AUTO_APPROVE"),
     ("auto_subscribe", "HCOM_AUTO_SUBSCRIBE"),
     ("name_export", "HCOM_NAME_EXPORT"),
+    ("pane_title_format", "HCOM_PANE_TITLE_FORMAT"),
     ("auto_trust_workspace", "HCOM_AUTO_TRUST_WORKSPACE"),
 ];
 
@@ -255,6 +257,7 @@ pub struct HcomConfig {
     pub auto_approve: bool,
     pub auto_subscribe: String,
     pub name_export: String,
+    pub pane_title_format: String,
     pub auto_trust_workspace: bool,
 }
 
@@ -288,6 +291,7 @@ impl Default for HcomConfig {
             auto_approve: true,
             auto_subscribe: "collision".to_string(),
             name_export: String::new(),
+            pane_title_format: String::new(),
             auto_trust_workspace: false,
         }
     }
@@ -460,6 +464,7 @@ impl HcomConfig {
             "auto_approve" => Some(if self.auto_approve { "1" } else { "0" }.into()),
             "auto_subscribe" => Some(self.auto_subscribe.clone()),
             "name_export" => Some(self.name_export.clone()),
+            "pane_title_format" => Some(self.pane_title_format.clone()),
             "auto_trust_workspace" => {
                 Some(if self.auto_trust_workspace { "1" } else { "0" }.into())
             }
@@ -512,6 +517,7 @@ impl HcomConfig {
             "auto_approve" => self.auto_approve = !is_falsy(value),
             "auto_subscribe" => self.auto_subscribe = value.to_string(),
             "name_export" => self.name_export = value.to_string(),
+            "pane_title_format" => self.pane_title_format = value.to_string(),
             "auto_trust_workspace" => self.auto_trust_workspace = !is_falsy(value),
             _ => return Err(format!("unknown field: {field}")),
         }
@@ -626,6 +632,7 @@ impl HcomConfig {
             "codex_system_prompt",
             "auto_subscribe",
             "name_export",
+            "pane_title_format",
         ];
         for str_field in &str_fields {
             if let Some(val) = get_var(str_field) {
@@ -988,6 +995,7 @@ args = ""
 timeout = 86400
 auto_approve = true
 name_export = ""
+pane_title_format = ""
 "#;
     toml::Value::Table(toml_str.parse::<toml::Table>().unwrap())
 }

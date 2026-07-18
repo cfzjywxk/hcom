@@ -71,7 +71,7 @@ pub struct GatesSpec {
 /// Tool background-launch capability.
 ///
 /// Captures the spectrum currently expressed by `released_background: bool` and
-/// the dispatch table in [`LaunchBackend::resolve`]. Used to:
+/// the `claude_native_print` backend decision in the launcher. Used to:
 ///
 /// - Drive `released_background_tool_names()` (filters for `NativePrint`).
 /// - Document, in one place, how each tool behaves when `--headless` is set.

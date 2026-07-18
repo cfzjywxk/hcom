@@ -221,6 +221,7 @@ fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
         "timeout" => Some("preferences.timeout"),
         "auto_approve" => Some("preferences.auto_approve"),
         "name_export" => Some("preferences.name_export"),
+        "pane_title_format" => Some("preferences.pane_title_format"),
         _ => None,
     }
 }
@@ -1552,6 +1553,28 @@ Notes:
   - Only affects hcom-launched instances (hcom N claude/gemini/codex/opencode/kilo/pi/omp/agy/cursor/kimi/copilot)
   - Variable name must be a valid shell identifier
   - Works alongside HCOM_PROCESS_ID (always set) for identity",
+        ),
+
+        "HCOM_PANE_TITLE_FORMAT" => Some(
+            "\
+HCOM_PANE_TITLE_FORMAT - Compose the terminal pane title
+
+Default: \"\" (hcom's own status title, unchanged behavior)
+
+The PTY proxy owns the pane title and normally shows hcom identity
+(status icon + name + tool). Tools' own title escapes are captured
+instead of dropped; this format string lets you blend them in:
+
+  {hcom}        hcom's formatted title (icon + name + tool)
+  {tool_title}  the tool's most recent OSC 0/1/2 title text
+
+Usage:
+  hcom config pane_title_format \"{hcom} - {tool_title}\"
+  hcom config pane_title_format \"\"    # Back to default
+
+Notes:
+  - Control characters are stripped before writing the title
+  - {tool_title} is empty until the tool first sets a title",
         ),
 
         "HCOM_OPENCODE_ARGS" => Some(

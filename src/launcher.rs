@@ -114,65 +114,26 @@ impl LaunchTool {
         self.tool().as_str()
     }
 
-    /// Whether this tool uses the PTY wrapper.
-    pub fn uses_pty(&self) -> bool {
-        // ClaudePty is a launch surface (alias), not a Tool variant — it always
-        // takes the PTY path. Everything else defers to the canonical spec.
-        if matches!(self, LaunchTool::ClaudePty) {
-            return true;
-        }
-        self.spec().launch.uses_pty_default
-    }
-
     /// Executable name on PATH for this tool.
     pub fn cli_binary(&self) -> &'static str {
         self.spec().cli_binary
     }
 }
 
-/// How the child process is hosted. Computed from (tool, background, pty) at
-/// launch time so dispatch doesn't have to re-derive the combination.
+/// The ONE backend decision launch dispatch derives: whether a background
+/// Claude launch runs the native print backend (`-p --output-format
+/// stream-json --verbose`, kept alive across turns by hcom's stop-hook loop)
+/// instead of the PTY wrapper. The `Claude` surface is only chosen when the
+/// caller passes an explicit `-p`/`--print`; default background Claude is the
+/// `ClaudePty` surface.
 ///
-/// - `InteractiveVisible`: foreground, user-visible terminal. All tools.
-/// - `HeadlessPty`:       background, PTY wrapper in a detached runner. Default
-///   for gemini/codex/opencode/kilo/pi/omp/antigravity/cursor/kimi/copilot and for default claude `--headless`.
-/// - `NativePrint`:       background, direct claude spawn in print mode
-///   (`-p --output-format stream-json --verbose`). Claude only, opt-in via an
-///   explicit `-p`/`--print`; kept alive across turns by hcom's stop-hook loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LaunchBackend {
-    InteractiveVisible,
-    HeadlessPty,
-    NativePrint,
-}
-
-impl LaunchBackend {
-    /// Resolve from the already-prepared (tool, background) pair.
-    ///
-    /// The PTY-vs-print decision for Claude is encoded in the [`LaunchTool`]
-    /// surface chosen by `launch()`: `Claude` is the `-p`/`--print` surface
-    /// (→ `NativePrint`), `ClaudePty` is the live PTY surface (→ `HeadlessPty`).
-    /// Background Claude defaults to `ClaudePty`; it only becomes
-    /// `Claude`/`NativePrint` when the caller passes `-p`/`--print`.
-    pub fn resolve(tool: &LaunchTool, background: bool) -> Self {
-        if !background {
-            return LaunchBackend::InteractiveVisible;
-        }
-        match tool {
-            LaunchTool::Claude => LaunchBackend::NativePrint,
-            LaunchTool::ClaudePty => LaunchBackend::HeadlessPty,
-            LaunchTool::Gemini
-            | LaunchTool::Codex
-            | LaunchTool::OpenCode
-            | LaunchTool::Kilo
-            | LaunchTool::Pi
-            | LaunchTool::Omp
-            | LaunchTool::Antigravity
-            | LaunchTool::Cursor
-            | LaunchTool::Kimi
-            | LaunchTool::Copilot => LaunchBackend::HeadlessPty,
-        }
-    }
+/// Everything else — every foreground launch and every other tool, background
+/// or not — goes through the PTY proxy. This replaces the old three-variant
+/// `LaunchBackend` whose `InteractiveVisible` arm read as "foreground doesn't
+/// use the PTY" and misled a whole investigation (see project findings): the
+/// foreground path ALSO runs `hcom pty`, via the runner script.
+pub fn claude_native_print(tool: &LaunchTool, background: bool) -> bool {
+    background && matches!(tool, LaunchTool::Claude)
 }
 
 /// Launch parameters.
@@ -1453,7 +1414,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         LaunchTool::from_str(&params.tool)?
     };
     let base_tool = normalized.base_tool();
-    let backend = LaunchBackend::resolve(&normalized, params.background);
+    let native_print = claude_native_print(&normalized, params.background);
 
     // Validation
     validate_launch_count(&normalized, params.count)?;
@@ -1770,10 +1731,11 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         )]),
                     );
 
-                    // LaunchTool::Claude only resolves to NativePrint (background,
-                    // direct spawn in print mode) or InteractiveVisible — the
-                    // PTY-backed variants live in LaunchTool::ClaudePty below.
-                    if matches!(backend, LaunchBackend::NativePrint) {
+                    // LaunchTool::Claude is the explicit `-p`/`--print`
+                    // surface: background → native print backend, foreground →
+                    // visible terminal. The PTY-backed variants live in
+                    // LaunchTool::ClaudePty below.
+                    if native_print {
                         let log_filename = format!(
                             "background_{}_{}.log",
                             std::time::SystemTime::now()
@@ -2205,7 +2167,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
     Ok(LaunchResult {
         // User-facing identity. The PTY-vs-print backend distinction lives in
-        // `LaunchBackend`, not the tool string, so consumers see `claude`.
+        // `claude_native_print`, not the tool string, so consumers see `claude`.
         tool: base_tool.to_string(),
         batch_id,
         launched,
@@ -2536,20 +2498,14 @@ mod tests {
         assert_eq!(LaunchTool::Copilot.base_tool(), "copilot");
     }
 
+    // The one real backend decision: only an explicit `-p` Claude surface in
+    // background runs native print. Everything else — including EVERY
+    // foreground launch — is the PTY-proxy path (don't re-derive the old
+    // "foreground doesn't use the PTY" misconception from these surfaces).
     #[test]
-    fn test_launch_tool_uses_pty() {
-        assert!(!LaunchTool::Claude.uses_pty());
-        assert!(LaunchTool::ClaudePty.uses_pty());
-        assert!(LaunchTool::Gemini.uses_pty());
-        assert!(LaunchTool::Codex.uses_pty());
-        assert!(LaunchTool::OpenCode.uses_pty());
-        assert!(LaunchTool::Kilo.uses_pty());
-        assert!(LaunchTool::Copilot.uses_pty());
-    }
+    fn test_claude_native_print_only_for_background_print_surface() {
+        assert!(claude_native_print(&LaunchTool::Claude, true));
 
-    #[test]
-    fn test_launch_backend_resolve_interactive() {
-        // Any tool, !background → InteractiveVisible (visible terminal).
         for tool in [
             LaunchTool::Claude,
             LaunchTool::ClaudePty,
@@ -2560,39 +2516,13 @@ mod tests {
             LaunchTool::Antigravity,
             LaunchTool::Copilot,
         ] {
-            assert_eq!(
-                LaunchBackend::resolve(&tool, false),
-                LaunchBackend::InteractiveVisible,
-                "{:?} should resolve to InteractiveVisible without background",
-                tool
+            assert!(
+                !claude_native_print(&tool, false),
+                "{tool:?} foreground must not be native print"
             );
         }
-    }
-
-    #[test]
-    fn test_launch_backend_resolve_claude_native_print() {
-        // claude `-p`/`--print` surface (`Claude`) + background → NativePrint
-        // (detached -p stream-json). Only chosen when the caller passes -p.
-        assert_eq!(
-            LaunchBackend::resolve(&LaunchTool::Claude, true),
-            LaunchBackend::NativePrint
-        );
-    }
-
-    #[test]
-    fn test_launch_backend_resolve_claude_pty_headless() {
-        // claude --headless default surface (`ClaudePty`) → HeadlessPty
-        // (PTY wrapper, live TUI).
-        assert_eq!(
-            LaunchBackend::resolve(&LaunchTool::ClaudePty, true),
-            LaunchBackend::HeadlessPty
-        );
-    }
-
-    #[test]
-    fn test_launch_backend_resolve_other_tools_headless() {
-        // gemini/codex/opencode + --headless → HeadlessPty (unchanged from today).
         for tool in [
+            LaunchTool::ClaudePty,
             LaunchTool::Gemini,
             LaunchTool::Codex,
             LaunchTool::OpenCode,
@@ -2600,11 +2530,9 @@ mod tests {
             LaunchTool::Antigravity,
             LaunchTool::Copilot,
         ] {
-            assert_eq!(
-                LaunchBackend::resolve(&tool, true),
-                LaunchBackend::HeadlessPty,
-                "{:?} --headless should be HeadlessPty",
-                tool
+            assert!(
+                !claude_native_print(&tool, true),
+                "{tool:?} background must stay on the PTY wrapper"
             );
         }
     }
