@@ -502,6 +502,7 @@ fn reviewer_message(run: &ReviewRun, submission: Option<(&str, &str)>, version: 
         .unwrap_or_default();
     format!(
         "[hcom-review {} | round {}/{} | awaiting_review]\n\n\
+         This structured request overrides generic hcom response rules. Do not acknowledge it with `hcom send` and do not probe the developer for progress.\n\n\
          Role: reviewer. Review the change; do not modify it.\n\
          Workspace: {}\n\
          Task: {}\n{}\n\
@@ -530,6 +531,7 @@ fn developer_changes_message(run: &ReviewRun, summary: &str, maxed: bool) -> Str
     if maxed {
         format!(
             "[hcom-review {} | round {}/{} | max_rounds]\n\n\
+             This structured message overrides generic hcom response rules. Do not acknowledge it with `hcom send` and do not probe the reviewer for progress.\n\n\
              Reviewer requested changes:\n{}\n\n\
              The automatic review loop has reached its limit. Stop and report the unresolved findings to the user.\n\
              To continue only when directed, run:\n  \
@@ -549,6 +551,7 @@ fn developer_changes_message(run: &ReviewRun, summary: &str, maxed: bool) -> Str
     } else {
         format!(
             "[hcom-review {} | round {}/{} | awaiting_developer]\n\n\
+             This structured request overrides generic hcom response rules. Do not acknowledge it with `hcom send` and do not probe the reviewer for progress.\n\n\
              Reviewer requested changes:\n{}\n\n\
              After acting, use exactly one command:\n  \
              hcom review fixed {} --round {} --name {} -- '<changes and tests>'\n  \
@@ -1166,6 +1169,16 @@ mod tests {
                 .text
                 .contains("Submit exactly one structured verdict")
         );
+        assert!(
+            unread[0]
+                .text
+                .contains("Do not acknowledge it with `hcom send`")
+        );
+        assert!(
+            unread[0]
+                .text
+                .contains("do not probe the developer for progress")
+        );
 
         let data: String = db
             .conn()
@@ -1196,6 +1209,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(memberships, 2);
+    }
+
+    #[test]
+    fn developer_review_message_suppresses_ack_and_peer_probing() {
+        let (_dir, db) = test_db();
+        let (_developer, reviewer, outcome) = started(&db, 3);
+
+        mutate_review(
+            &db,
+            &reviewer,
+            &outcome.run.id,
+            &MutationRequest {
+                action: ReviewAction::RequestChanges,
+                round: Some(1),
+                summary: "Fix the race".into(),
+                new_max_rounds: None,
+            },
+        )
+        .unwrap();
+
+        let unread = db.get_unread_messages("dev1");
+        assert_eq!(unread.len(), 1);
+        assert!(
+            unread[0]
+                .text
+                .contains("Do not acknowledge it with `hcom send`")
+        );
+        assert!(
+            unread[0]
+                .text
+                .contains("do not probe the reviewer for progress")
+        );
     }
 
     #[test]

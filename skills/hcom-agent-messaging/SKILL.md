@@ -120,6 +120,12 @@ agents follow these rules from their bootstrap:
 - `--intent inform` -> agent responds only if useful
 - `--intent ack` -> agent does not respond
 
+`[hcom-review]` is the exception: it is a structured protocol, so use only the exact
+`hcom review` command in the message. Do not ACK it with `hcom send`. After a successful
+review command leaves the peer responsible for the next action, end the turn and wait for
+automatic delivery; do not run any hcom command merely to check progress. Status, events,
+listen, and send remain available for explicit troubleshooting and recovery.
+
 ### sandbox / permission issues
 
 ```bash

@@ -20,6 +20,8 @@ Examples:
 
 Only these structured commands change review state. Ordinary message text does not.";
 
+const REVIEW_QUIET_WAIT: &str = "The peer notification is queued for automatic delivery. End your turn now; hcom will wake you if another [hcom-review] message arrives. Do not run any hcom command—including `hcom status`, `hcom review status`, `hcom events`, `hcom listen`, or `hcom send`—merely to check progress.";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "review",
@@ -259,48 +261,73 @@ fn mutate(
     mutate_review(db, actor, id, &request)
 }
 
-fn print_mutation(action: ReviewAction, outcome: &ReviewOutcome) {
+fn mutation_output(action: ReviewAction, outcome: &ReviewOutcome) -> String {
     let replay = if outcome.replayed { " (replayed)" } else { "" };
     let run = &outcome.run;
     match action {
         ReviewAction::RequestChanges => {
-            println!(
+            let mut output = format!(
                 "Recorded request changes for {} round {}/{}; state={}{}.",
                 run.id, run.round, run.max_rounds, run.state, replay
             );
             if matches!(run.state.as_str(), "awaiting_developer" | "max_rounds") {
-                println!(
-                    "While the workflow remains on this round, you may withdraw the finding with:\n  hcom review verdict {} --round {} --lgtm --name {} -- '<summary>'",
+                output.push_str(&format!(
+                    "\nWhile the workflow remains on this round, you may withdraw the finding with:\n  hcom review verdict {} --round {} --lgtm --name {} -- '<summary>'",
                     run.id, run.round, run.reviewer_name
-                );
+                ));
+                output.push_str(&format!("\n{REVIEW_QUIET_WAIT}"));
             }
+            output
         }
-        ReviewAction::Lgtm => println!(
+        ReviewAction::Lgtm => format!(
             "Approved {} at round {}/{}{}.",
             run.id, run.round, run.max_rounds, replay
         ),
-        ReviewAction::Fixed | ReviewAction::Rebut => println!(
-            "Submitted {} for {}; state={} round={}/{}{}.",
+        ReviewAction::Fixed | ReviewAction::Rebut => format!(
+            "Submitted {} for {}; state={} round={}/{}{}.\n{}",
             action.as_str(),
             run.id,
             run.state,
             run.round,
             run.max_rounds,
-            replay
+            replay,
+            REVIEW_QUIET_WAIT
         ),
-        ReviewAction::Cancel => println!("Canceled {}{}.", run.id, replay),
+        ReviewAction::Cancel => format!("Canceled {}{}.", run.id, replay),
         ReviewAction::Extend => {
-            println!(
-                "Extended {} to {} rounds; state={}{}.",
-                run.id, run.max_rounds, run.state, replay
-            );
-            println!(
-                "Next:\n  hcom review fixed {} --round {} --name {} -- '<what changed>'\n  hcom review rebut {} --round {} --name {} -- '<why no change>'",
-                run.id, run.round, run.developer_name, run.id, run.round, run.developer_name
-            );
+            format!(
+                "Extended {} to {} rounds; state={}{}.\nNext:\n  hcom review fixed {} --round {} --name {} -- '<what changed>'\n  hcom review rebut {} --round {} --name {} -- '<why no change>'",
+                run.id,
+                run.max_rounds,
+                run.state,
+                replay,
+                run.id,
+                run.round,
+                run.developer_name,
+                run.id,
+                run.round,
+                run.developer_name
+            )
         }
         ReviewAction::Start => unreachable!(),
     }
+}
+
+fn start_output(outcome: &ReviewOutcome) -> String {
+    format!(
+        "Started {} reviewer=@{} state={} round={}/{}.\nThread: {}\n{}",
+        outcome.run.id,
+        outcome.run.reviewer_name,
+        outcome.run.state,
+        outcome.run.round,
+        outcome.run.max_rounds,
+        outcome.run.thread,
+        REVIEW_QUIET_WAIT
+    )
+}
+
+fn print_mutation(action: ReviewAction, outcome: &ReviewOutcome) {
+    println!("{}", mutation_output(action, outcome));
 }
 
 pub fn cmd_review(db: &HcomDb, args: &ReviewArgs, ctx: Option<&CommandContext>) -> i32 {
@@ -332,15 +359,7 @@ pub fn cmd_review(db: &HcomDb, args: &ReviewArgs, ctx: Option<&CommandContext>) 
                 start.max_rounds,
             ) {
                 Ok(outcome) => {
-                    println!(
-                        "Started {} reviewer=@{} state={} round={}/{}.",
-                        outcome.run.id,
-                        outcome.run.reviewer_name,
-                        outcome.run.state,
-                        outcome.run.round,
-                        outcome.run.max_rounds
-                    );
-                    println!("Thread: {}", outcome.run.thread);
+                    println!("{}", start_output(&outcome));
                     0
                 }
                 Err(error) => print_error(error),
@@ -477,7 +496,50 @@ pub fn cmd_review(db: &HcomDb, args: &ReviewArgs, ctx: Option<&CommandContext>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::review::ReviewState;
     use clap::Parser;
+
+    fn outcome(state: ReviewState) -> ReviewOutcome {
+        let round = if state == ReviewState::MaxRounds {
+            3
+        } else {
+            1
+        };
+        ReviewOutcome {
+            run: ReviewRun {
+                id: "rv-test".into(),
+                task: "Review implementation".into(),
+                workspace: "/tmp/workspace".into(),
+                thread: "review-rv-test".into(),
+                developer_name: "dev1".into(),
+                developer_session_id: "session-dev1".into(),
+                reviewer_name: "dev2".into(),
+                reviewer_session_id: "session-dev2".into(),
+                state,
+                round,
+                max_rounds: 3,
+                version: 0,
+                last_message_event_id: None,
+                created_at: 0.0,
+                updated_at: 0.0,
+            },
+            replayed: false,
+        }
+    }
+
+    fn assert_quiet_wait(output: &str) {
+        assert!(output.contains("queued for automatic delivery"));
+        assert!(output.contains("End your turn now"));
+        for command in [
+            "`hcom status`",
+            "`hcom review status`",
+            "`hcom events`",
+            "`hcom listen`",
+            "`hcom send`",
+        ] {
+            assert!(output.contains(command), "missing command guard: {command}");
+        }
+    }
 
     #[test]
     fn parses_natural_language_protocol_commands() {
@@ -523,5 +585,22 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn peer_handoffs_end_the_turn_without_polling() {
+        let awaiting_review = outcome(ReviewState::AwaitingReview);
+        assert_quiet_wait(&start_output(&awaiting_review));
+        assert_quiet_wait(&mutation_output(ReviewAction::Fixed, &awaiting_review));
+        assert_quiet_wait(&mutation_output(ReviewAction::Rebut, &awaiting_review));
+
+        let awaiting_developer = outcome(ReviewState::AwaitingDeveloper);
+        assert_quiet_wait(&mutation_output(
+            ReviewAction::RequestChanges,
+            &awaiting_developer,
+        ));
+
+        let max_rounds = outcome(ReviewState::MaxRounds);
+        assert_quiet_wait(&mutation_output(ReviewAction::RequestChanges, &max_rounds));
     }
 }

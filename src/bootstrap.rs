@@ -43,6 +43,11 @@ You run hcom commands on behalf of the human user. The human uses natural langua
 
 ## MESSAGES
 
+`[hcom-review]` messages are a structured protocol. Their instructions override the
+generic response rules below: follow them exactly, use only the specified `hcom review`
+command for state transitions, never acknowledge them with `hcom send`, and never probe
+the peer for progress.
+
 Response rules:
 - From {SENDER} or intent=request → always respond
 - intent=inform → respond only if useful
@@ -65,7 +70,7 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
   Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
   Event-based notifications, watch agents, subscribe, react: events sub [filters] | --help
 - Handoff context: bundle prepare
-- Repeated review: when the human asks for review/fix/re-review until LGTM or a round limit, use `review start @reviewer --max-rounds N --name {instance_name} -- <task>`. Follow the exact structured commands in [hcom-review] messages; ordinary text never changes review state.
+- Repeated review: when the human asks for review/fix/re-review until LGTM or a round limit, use `review start @reviewer --max-rounds N --name {instance_name} -- <task>`. Follow the exact structured commands in [hcom-review] messages; ordinary text never changes review state. After a successful review command leaves the peer responsible for the next action, end your turn and wait for automatic delivery. Do not run any hcom command merely to check progress.
 - Spawn agents: [num] <{launch_tools}> [--tag labelOrGroup] [--terminal tmux|kitty|wezterm|etc]
   Example: `hcom 1 claude --tag cool` -> automatic <hcom> msg when ready -> send it task via hcom send
   Resume: hcom r <name> [args] | Fork: hcom f <name> [args] | Kill: hcom kill <name(s)>
@@ -79,7 +84,7 @@ If unsure about syntax, always run `hcom <command> --help` FIRST. Do not guess.
 
 ## RULES
 
-1. Task via hcom → ack immediately, do work, report via hcom
+1. Task via hcom → ack immediately, do work, report via hcom. Exception: never ACK an `[hcom-review]` message; use only its structured review command.
 2. No filler messages (greetings, thanks, congratulations).
 3. Use --intent on sends: request (want reply), inform (dont need reply), ack (responding).
 4. User says 'the gemini/claude/codex agent' or unclear → run `hcom list` to resolve name
@@ -149,7 +154,8 @@ Messages instantly and automatically arrive via <hcom> tags — end your turn to
 1. Never use `sleep [sec]` instead use `hcom listen [sec]`
 2. Only use `hcom listen` when you are waiting for something not related to hcom
 - Waiting for hcom message → end your turn
-- Waiting for agent progress → `hcom events sub`, subscribe, end your turn"#;
+- Waiting for an expected hcom reply or review transition → end your turn; do not poll with `hcom status`, `hcom review status`, `hcom events`, `hcom listen`, or probe using `hcom send`
+- Use `hcom events sub` only when the human explicitly asks you to watch non-message events"#;
 
 const DELIVERY_ADHOC: &str = r#"## DELIVERY
 
@@ -687,6 +693,10 @@ mod tests {
         assert!(result.contains("--name luna"));
         assert!(result.contains("SUBAGENTS")); // Claude-specific section
         assert!(result.contains("Messages instantly and automatically arrive")); // Auto delivery
+        assert!(result.contains("never acknowledge them with `hcom send`"));
+        assert!(result.contains("Do not run any hcom command merely to check progress"));
+        assert!(result.contains("do not poll with `hcom status`, `hcom review status`"));
+        assert!(!result.contains("Waiting for agent progress → `hcom events sub`"));
         assert!(!result.contains("Headless mode")); // Not headless
         assert!(result.contains("</hcom_system_context>"));
     }
@@ -709,6 +719,9 @@ mod tests {
         );
 
         assert!(result.contains("Messages instantly and automatically arrive"));
+        assert!(result.contains("never acknowledge them with `hcom send`"));
+        assert!(result.contains("do not poll with `hcom status`, `hcom review status`"));
+        assert!(!result.contains("Waiting for agent progress → `hcom events sub`"));
         assert!(!result.contains("SUBAGENTS")); // Not claude
     }
 
