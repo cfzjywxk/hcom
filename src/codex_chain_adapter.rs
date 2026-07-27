@@ -12,6 +12,7 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -22,19 +23,20 @@ use hcom::chain_pty::{
     send_process_group_signal,
 };
 use hcom::chain_supervisor::{
-    ChainSignal, CleanupEvidence, DeliveryExitContext, ExitEvidence, FinishAttempt,
-    GenerationAdapter, GenerationEvent, GenerationIdentity, OuterTerminalIdentity,
+    ChainSignal, ChainTitleState, CleanupEvidence, DeliveryExitContext, ExitEvidence,
+    FinishAttempt, GenerationAdapter, GenerationEvent, GenerationIdentity, OuterTerminalIdentity,
     PreparedGeneration, ResourceCleanupEvidence, ShutdownReason, SignalSendResult,
     TargetReservation, linux_process_birth_identity,
 };
 
 use crate::codex_chain::{
-    CODEX_VERSION_ENV, CodexLaunchProfile, HANDOFF_ID_ENV, SUPPORTED_CODEX_VERSION,
-    validate_codex_version_output,
+    CODEX_VERSION_ENV, CODEX_VERSION_PROBE_ARGS, CodexLaunchProfile, HANDOFF_ID_ENV,
+    SUPPORTED_CODEX_VERSION, validate_codex_version_output,
 };
 use crate::handoff::TerminalChain;
 
 #[cfg(test)]
+#[allow(dead_code)]
 #[path = "../tests/support/mock_http.rs"]
 mod phase3_mock_http;
 
@@ -45,6 +47,7 @@ const MSG_REAP: i64 = 4;
 const MAX_PROXY_QUEUE_BYTES: usize = 1024 * 1024;
 const CHILD_START_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+const TITLE_CONTROL_TIMEOUT: Duration = Duration::from_millis(50);
 
 static SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
@@ -89,6 +92,11 @@ struct LaunchSpec {
     workspace: PathBuf,
 }
 
+pub(crate) struct CodexAdapterPreflight {
+    executable: PathBuf,
+    profile: CodexLaunchProfile,
+}
+
 pub(crate) struct CodexPrepared {
     identity: GenerationIdentity,
     gate_write: RawFd,
@@ -113,6 +121,7 @@ pub(crate) struct CodexActive {
     master: RawFd,
     to_child: VecDeque<u8>,
     to_outer: VecDeque<u8>,
+    output_filter: crate::pty::ChainTitleOutputFilter,
     exit: Option<ExitEvidence>,
 }
 
@@ -126,12 +135,15 @@ pub(crate) struct CodexGenerationAdapter {
     executable: PathBuf,
     profile: CodexLaunchProfile,
     chain_id: String,
+    title_stack_pushed: bool,
+    current_title: Option<Vec<u8>>,
+    pending_title: Option<Vec<u8>>,
 }
 
 impl CodexGenerationAdapter {
-    /// Construct the private adapter before it owns a child. Version, pinned
-    /// profile, outer-TTY identity, and raw-mode setup all fail before spawn.
-    pub(crate) fn new(chain: &TerminalChain, outer: OuterTerminalIdentity) -> io::Result<Self> {
+    /// Resolve and verify the one supported executable/profile without opening
+    /// a PTY, changing terminal mode, or taking process ownership.
+    pub(crate) fn preflight(chain: &TerminalChain) -> io::Result<CodexAdapterPreflight> {
         if chain.tool != "codex" {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -149,7 +161,15 @@ impl CodexGenerationAdapter {
                     "supported Codex executable is unavailable",
                 )
             })?;
-        let version = Command::new(&executable).arg("--version").output()?;
+        let mut version_command = Command::new(&executable);
+        version_command.args(CODEX_VERSION_PROBE_ARGS);
+        let parent_pid = unsafe { libc::getpid() };
+        // SAFETY: this pre-exec closure only applies the same async-signal-safe
+        // Linux parent-death guard used by the wrapper and inner child.
+        unsafe {
+            version_command.pre_exec(move || arm_parent_death_hangup(parent_pid));
+        }
+        let version = version_command.output()?;
         if !version.status.success() {
             return Err(io::Error::other(
                 "supported Codex version probe did not succeed",
@@ -159,7 +179,27 @@ impl CodexGenerationAdapter {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid Codex version"))?;
         validate_codex_version_output(stdout)
             .map_err(|error| io::Error::new(io::ErrorKind::Unsupported, error))?;
+        Ok(CodexAdapterPreflight {
+            executable,
+            profile,
+        })
+    }
 
+    /// Construct the adapter only after the public chain reservation is
+    /// durable. Raw-mode and signal ownership begin here; no child exists yet.
+    pub(crate) fn from_preflight(
+        chain: &TerminalChain,
+        outer: OuterTerminalIdentity,
+        preflight: CodexAdapterPreflight,
+    ) -> io::Result<Self> {
+        let pinned = CodexLaunchProfile::from_chain(chain)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        if pinned != preflight.profile {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Codex chain profile changed after preflight",
+            ));
+        }
         let outer_fd = open_exact_outer_tty(outer)?;
         // SAFETY: open_exact_outer_tty returned a fresh owned descriptor.
         let outer_fd = unsafe { OwnedFd::from_raw_fd(outer_fd) };
@@ -182,6 +222,7 @@ impl CodexGenerationAdapter {
                 return Err(error);
             }
         };
+        let title_stack_pushed = write_terminal_control(outer_fd.as_raw_fd(), b"\x1b[22;0t");
         Ok(Self {
             outer,
             outer_fd: outer_fd.into_raw_fd(),
@@ -189,10 +230,22 @@ impl CodexGenerationAdapter {
             signal_read: signal_read.into_raw_fd(),
             signal_write: signal_write.into_raw_fd(),
             saved_signals,
-            executable,
-            profile,
+            executable: preflight.executable,
+            profile: preflight.profile,
             chain_id: chain.id.clone(),
+            title_stack_pushed,
+            current_title: None,
+            pending_title: None,
         })
+    }
+
+    /// Private test/characterization convenience. The production CLI performs
+    /// preflight only after its durable reservation, then calls
+    /// `from_preflight`.
+    #[cfg(test)]
+    pub(crate) fn new(chain: &TerminalChain, outer: OuterTerminalIdentity) -> io::Result<Self> {
+        let preflight = Self::preflight(chain)?;
+        Self::from_preflight(chain, outer, preflight)
     }
 
     fn launch_spec(
@@ -200,13 +253,21 @@ impl CodexGenerationAdapter {
         reservation: &TargetReservation,
         identity: &GenerationIdentity,
     ) -> io::Result<LaunchSpec> {
-        let argv = self
-            .profile
-            .argv(&reservation.handoff_id)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        self.profile
-            .validate_exact_argv(&reservation.handoff_id, &argv)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let initial_protocol = reservation.handoff_id == self.chain_id;
+        let argv = if initial_protocol {
+            self.profile.initial_argv(&self.chain_id)
+        } else {
+            self.profile.argv(&reservation.handoff_id)
+        }
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        if initial_protocol {
+            self.profile
+                .validate_exact_initial_argv(&self.chain_id, &argv)
+        } else {
+            self.profile
+                .validate_exact_argv(&reservation.handoff_id, &argv)
+        }
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let environment = exact_generation_environment(
             &self.chain_id,
             reservation,
@@ -381,6 +442,7 @@ impl CodexGenerationAdapter {
             master: prepared.master,
             to_child: VecDeque::new(),
             to_outer: VecDeque::new(),
+            output_filter: crate::pty::ChainTitleOutputFilter::new(),
             exit: None,
         })
     }
@@ -407,6 +469,8 @@ impl CodexGenerationAdapter {
         timeout: Duration,
     ) -> io::Result<GenerationEvent> {
         flush_queue(active.master, &mut active.to_child)?;
+        flush_queue(self.outer_fd, &mut active.to_outer)?;
+        self.queue_pending_title(active);
         flush_queue(self.outer_fd, &mut active.to_outer)?;
         if let Some(message) = try_read_message(active.report_read)? {
             return self.handle_report(active, message);
@@ -502,7 +566,7 @@ impl CodexGenerationAdapter {
             return Ok(GenerationEvent::Hangup);
         }
         if descriptors[3].revents & libc::POLLIN != 0 {
-            let _ = read_into_queue(active.master, &mut active.to_outer)?;
+            let _ = read_child_into_queue(active)?;
         }
         if descriptors[3].revents & libc::POLLOUT != 0 {
             flush_queue(active.master, &mut active.to_child)?;
@@ -516,6 +580,18 @@ impl CodexGenerationAdapter {
             return Err(io::Error::other("Codex PTY proxy queue exceeded its bound"));
         }
         Ok(GenerationEvent::ControlWake)
+    }
+
+    fn queue_pending_title(&mut self, active: &mut CodexActive) {
+        if !self.title_stack_pushed
+            || !active.to_outer.is_empty()
+            || !active.output_filter.title_write_safe()
+        {
+            return;
+        }
+        if let Some(title) = self.pending_title.take() {
+            active.to_outer.extend(title);
+        }
     }
 
     fn finish_owned(
@@ -615,6 +691,9 @@ impl Drop for CodexGenerationAdapter {
         unsafe {
             libc::tcsetattr(self.outer_fd, libc::TCSANOW, &self.saved_termios);
         }
+        if self.title_stack_pushed {
+            let _ = write_terminal_control(self.outer_fd, b"\x1b[23;0t");
+        }
         close_many(&[self.signal_read, self.signal_write, self.outer_fd]);
     }
 }
@@ -651,7 +730,32 @@ impl GenerationAdapter for CodexGenerationAdapter {
 
     fn reassert_outer_terminal(&mut self) -> Result<(), Self::Error> {
         verify_outer_tty(self.outer_fd, self.outer)?;
-        set_raw(self.outer_fd)
+        set_raw(self.outer_fd)?;
+        self.pending_title.clone_from(&self.current_title);
+        Ok(())
+    }
+
+    fn set_chain_title(
+        &mut self,
+        generation: u64,
+        state: ChainTitleState,
+    ) -> Result<(), Self::Error> {
+        if !self.title_stack_pushed {
+            return Ok(());
+        }
+        let title = chain_title_sequence(generation, state);
+        if self.current_title.as_deref() == Some(title.as_slice()) {
+            return Ok(());
+        }
+        self.current_title = Some(title.clone());
+        self.pending_title = Some(title);
+        Ok(())
+    }
+
+    fn flush_chain_title(&mut self, active: &mut Self::Active) -> Result<(), Self::Error> {
+        flush_queue(self.outer_fd, &mut active.to_outer)?;
+        self.queue_pending_title(active);
+        flush_queue(self.outer_fd, &mut active.to_outer)
     }
 
     fn finish_after_exit(
@@ -707,6 +811,7 @@ impl GenerationAdapter for CodexGenerationAdapter {
                 "outer terminal identity changed before Codex prepare",
             ));
         }
+        verify_outer_tty(self.outer_fd, self.outer)?;
         self.spawn_prepared(reservation)
     }
 
@@ -793,9 +898,14 @@ where
         ("HCOM_CHAIN_GENERATION", generation.as_str()),
         ("HCOM_CHAIN_LAUNCH_NONCE", &reservation.launch_nonce),
         (CODEX_VERSION_ENV, version),
-        (HANDOFF_ID_ENV, &reservation.handoff_id),
     ] {
         environment.push((OsString::from(key), OsString::from(value)));
+    }
+    if reservation.handoff_id != chain_id {
+        environment.push((
+            OsString::from(HANDOFF_ID_ENV),
+            OsString::from(&reservation.handoff_id),
+        ));
     }
     environment
 }
@@ -1302,13 +1412,18 @@ fn wait_wrapper(pid: i32) -> io::Result<()> {
 fn drain_after_exit(outer_fd: RawFd, active: &mut CodexActive) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(1);
     let mut master_closed = false;
+    let mut filter_flushed = false;
     loop {
         while !master_closed && active.to_outer.len() < MAX_PROXY_QUEUE_BYTES {
-            match read_into_queue(active.master, &mut active.to_outer)? {
+            match read_child_into_queue(active)? {
                 QueueRead::Data => continue,
                 QueueRead::Pending => break,
                 QueueRead::Closed => master_closed = true,
             }
+        }
+        if master_closed && !filter_flushed {
+            active.to_outer.extend(active.output_filter.flush());
+            filter_flushed = true;
         }
         flush_queue(outer_fd, &mut active.to_outer)?;
         flush_queue(active.master, &mut active.to_child)?;
@@ -1384,6 +1499,34 @@ fn all_resources_clean() -> ResourceCleanupEvidence {
     }
 }
 
+fn read_child_into_queue(active: &mut CodexActive) -> io::Result<QueueRead> {
+    let available = MAX_PROXY_QUEUE_BYTES.saturating_sub(active.to_outer.len());
+    if available == 0 {
+        return Ok(QueueRead::Pending);
+    }
+    let mut buffer = [0u8; 8192];
+    let limit = available.min(buffer.len());
+    // SAFETY: buffer is writable for `limit` bytes and the active generation
+    // owns its master descriptor.
+    let read = unsafe { libc::read(active.master, buffer.as_mut_ptr().cast(), limit) };
+    if read == -1 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Ok(QueueRead::Pending);
+        }
+        if error.raw_os_error() == Some(libc::EIO) {
+            return Ok(QueueRead::Closed);
+        }
+        return Err(error);
+    }
+    if read == 0 {
+        return Ok(QueueRead::Closed);
+    }
+    let filtered = active.output_filter.filter(&buffer[..read as usize]);
+    active.to_outer.extend(filtered);
+    Ok(QueueRead::Data)
+}
+
 fn read_into_queue(fd: RawFd, queue: &mut VecDeque<u8>) -> io::Result<QueueRead> {
     let available = MAX_PROXY_QUEUE_BYTES.saturating_sub(queue.len());
     if available == 0 {
@@ -1407,6 +1550,70 @@ fn read_into_queue(fd: RawFd, queue: &mut VecDeque<u8>) -> io::Result<QueueRead>
     }
     queue.extend(&buffer[..read as usize]);
     Ok(QueueRead::Data)
+}
+
+fn write_terminal_control(fd: RawFd, bytes: &[u8]) -> bool {
+    if fd < 0 || bytes.is_empty() {
+        return false;
+    }
+    // These controls are shorter than a TTY's atomic write bound, but the
+    // exact outer descriptor is intentionally nonblocking. Give a transient
+    // EAGAIN a small bounded POLLOUT window so a successful title-stack push
+    // is paired with a reliable pop during teardown. Failure still only
+    // disables title management; it never affects durable state or ownership.
+    let deadline = Instant::now() + TITLE_CONTROL_TIMEOUT;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let written =
+            unsafe { libc::write(fd, bytes[offset..].as_ptr().cast(), bytes.len() - offset) };
+        if written > 0 {
+            offset += written as usize;
+            continue;
+        }
+        if written == 0 {
+            return false;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() != io::ErrorKind::WouldBlock {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let timeout_ms = remaining.as_millis().clamp(1, libc::c_int::MAX as u128) as libc::c_int;
+        let mut descriptor = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if ready == 0 {
+            return false;
+        }
+        if ready == -1 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn chain_title_sequence(generation: u64, state: ChainTitleState) -> Vec<u8> {
+    let title = if state == ChainTitleState::NeedsRecovery {
+        "hcom codex needs-recovery".to_string()
+    } else {
+        format!("hcom codex g{} {}", generation.max(1), state.as_str())
+    };
+    format!("\x1b]0;{title}\x07").into_bytes()
 }
 
 fn flush_queue(fd: RawFd, queue: &mut VecDeque<u8>) -> io::Result<()> {
@@ -1734,7 +1941,6 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
-    use std::os::unix::process::CommandExt as _;
     use std::path::Path;
     use std::process::Stdio;
     use std::time::Duration;
@@ -1790,6 +1996,7 @@ mod tests {
             master: source.as_raw_fd(),
             to_child: VecDeque::new(),
             to_outer: VecDeque::new(),
+            output_filter: crate::pty::ChainTitleOutputFilter::new(),
             exit: None,
         };
 
@@ -1852,6 +2059,150 @@ mod tests {
         );
         assert!(!environment.iter().any(|(key, _)| key == "CODEX_THREAD_ID"));
         assert!(environment.iter().any(|(key, _)| key == "HCOM_DIR"));
+    }
+
+    #[test]
+    fn initial_environment_and_titles_are_bounded_and_private() {
+        let chain_id = "tc-initial-opaque";
+        let reservation = TargetReservation {
+            handoff_id: chain_id.to_string(),
+            expected_version: 0,
+            generation: 1,
+            launch_nonce: "initial-launch-nonce".to_string(),
+        };
+        let identity = GenerationIdentity {
+            generation: 1,
+            launch_nonce: reservation.launch_nonce.clone(),
+            wrapper_pid: 10,
+            wrapper_pgid: 11,
+            child_pid: 12,
+            child_pgid: 12,
+            child_process_birth_identity: "child-birth".to_string(),
+            process_id: "initial-process".to_string(),
+            process_birth_identity: "wrapper-birth".to_string(),
+            instance_name: "chain-g1".to_string(),
+            hcom_session_id: "initial-hcom-session".to_string(),
+            native_session_id: None,
+        };
+        let environment = exact_generation_environment_from(
+            [(OsString::from("PATH"), OsString::from("/usr/bin"))],
+            chain_id,
+            &reservation,
+            &identity,
+            SUPPORTED_CODEX_VERSION,
+        );
+        assert!(!environment.iter().any(|(key, _)| key == HANDOFF_ID_ENV));
+        for (key, value) in [
+            ("HCOM_CHAIN_ID", chain_id),
+            ("HCOM_CHAIN_GENERATION", "1"),
+            ("HCOM_CHAIN_LAUNCH_NONCE", "initial-launch-nonce"),
+            (CODEX_VERSION_ENV, SUPPORTED_CODEX_VERSION),
+        ] {
+            assert!(
+                environment.iter().any(|(actual_key, actual_value)| {
+                    actual_key == key && actual_value == value
+                })
+            );
+        }
+
+        let secret = "PRIVATE_NATIVE_OR_BUNDLE_SENTINEL";
+        for (generation, state, expected) in [
+            (
+                1,
+                ChainTitleState::Active,
+                "\u{1b}]0;hcom codex g1 active\u{7}",
+            ),
+            (
+                2,
+                ChainTitleState::AwaitingAcceptance,
+                "\u{1b}]0;hcom codex g2 awaiting-acceptance\u{7}",
+            ),
+            (
+                0,
+                ChainTitleState::NeedsRecovery,
+                "\u{1b}]0;hcom codex needs-recovery\u{7}",
+            ),
+        ] {
+            let title = chain_title_sequence(generation, state);
+            assert_eq!(title, expected.as_bytes());
+            assert!(title.len() < 128);
+            assert!(!String::from_utf8_lossy(&title).contains(secret));
+            assert!(!String::from_utf8_lossy(&title).contains(chain_id));
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn adapter_drop_restores_the_terminal_title_stack() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(directory.path()).unwrap();
+        let chain = TerminalChain {
+            id: "tc-title".to_string(),
+            workspace: workspace.to_string_lossy().into_owned(),
+            tool: "codex".to_string(),
+            model_ref: "gpt-test".to_string(),
+            reasoning_ref: "high".to_string(),
+            permission_policy_ref: "approval=never;sandbox=read-only".to_string(),
+            policy_ref: "codex-0.145.0-foreground-v1".to_string(),
+            supervisor_process_id: "supervisor".to_string(),
+            supervisor_process_birth_identity: "birth".to_string(),
+            supervisor_pid: Some(10),
+            supervisor_pgid: Some(10),
+            outer_foreground_pgid: Some(10),
+            outer_tty_device: Some(7),
+            outer_tty_inode: Some(11),
+            current_generation: 1,
+            state: ChainState::Active,
+            version: 0,
+            created_at: 0.0,
+            updated_at: 0.0,
+        };
+        let profile = CodexLaunchProfile::from_chain(&chain).unwrap();
+        let size = libc::winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let (master, slave) = openpty_owned(size).unwrap();
+        set_nonblocking(master.as_raw_fd()).unwrap();
+        let saved_termios = tcgetattr(slave.as_raw_fd()).unwrap();
+        assert!(write_terminal_control(slave.as_raw_fd(), b"\x1b[22;0t"));
+        let adapter = CodexGenerationAdapter {
+            outer: OuterTerminalIdentity {
+                supervisor_pid: 10,
+                supervisor_pgid: 10,
+                foreground_pgid: 10,
+                tty_device: 7,
+                tty_inode: 11,
+            },
+            outer_fd: slave.into_raw_fd(),
+            saved_termios,
+            signal_read: -1,
+            signal_write: -1,
+            saved_signals: Vec::new(),
+            executable: PathBuf::from("/usr/bin/false"),
+            profile,
+            chain_id: chain.id,
+            title_stack_pushed: true,
+            current_title: None,
+            pending_title: None,
+        };
+        drop(adapter);
+
+        let mut output = Vec::new();
+        let mut buffer = [0u8; 128];
+        loop {
+            let read =
+                unsafe { libc::read(master.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+            if read > 0 {
+                output.extend_from_slice(&buffer[..read as usize]);
+            } else {
+                break;
+            }
+        }
+        assert!(output.windows(7).any(|window| window == b"\x1b[22;0t"));
+        assert!(output.windows(7).any(|window| window == b"\x1b[23;0t"));
     }
 
     #[derive(Clone, Debug)]

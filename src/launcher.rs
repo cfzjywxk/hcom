@@ -2317,6 +2317,7 @@ mod tests {
     #[test]
     #[serial]
     fn hcom_dir_does_not_synthesize_any_tool_config_env() {
+        let _shared_env = crate::hooks::test_helpers::EnvGuard::new();
         let config_vars: Vec<&str> = crate::integration_spec::ALL
             .iter()
             .filter_map(|spec| spec.launch.config_dir_env)

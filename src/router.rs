@@ -52,6 +52,14 @@ fn is_launch_tool(name: &str) -> bool {
     matches!(name, "f" | "r") || name.parse::<Tool>().is_ok_and(|tool| tool.spec().released)
 }
 
+fn action_allows_update_notice(action: &Action) -> bool {
+    match action {
+        Action::Command { cmd, .. } => !matches!(cmd.as_str(), "update" | "chain"),
+        Action::Launch { .. } | Action::Version | Action::Help => true,
+        _ => false,
+    }
+}
+
 fn maybe_external_send_name_hint(
     cmd: &str,
     explicit_name: Option<&str>,
@@ -502,14 +510,10 @@ pub fn dispatch() -> anyhow::Result<()> {
 
     let action = resolve_action(argv);
 
-    // Check for updates on CLI commands (not hooks/pty/relay — those need to be fast/silent).
-    // Skip for `hcom update` itself — it handles its own output.
-    let is_update_cmd = matches!(&action, Action::Command { cmd, .. } if cmd == "update");
-    if !is_update_cmd
-        && matches!(
-            action,
-            Action::Command { .. } | Action::Launch { .. } | Action::Version | Action::Help
-        )
+    // Check for updates on ordinary CLI commands (not hooks/pty/relay/chain —
+    // those need to be fast, silent, and free of unowned background children).
+    // `hcom update` handles its own output.
+    if action_allows_update_notice(&action)
         && let Some(notice) = crate::update::get_update_notice()
     {
         eprintln!("{notice}");
@@ -1024,6 +1028,22 @@ mod tests {
     fn no_args_runs_tui() {
         let action = resolve_action(&[]);
         assert_eq!(action, Action::Tui);
+    }
+
+    #[test]
+    fn chain_commands_do_not_spawn_update_notices() {
+        assert!(!action_allows_update_notice(&resolve_action(&sv(&[
+            "chain", "codex"
+        ]))));
+        assert!(!action_allows_update_notice(&resolve_action(&sv(&[
+            "chain", "status"
+        ]))));
+        assert!(!action_allows_update_notice(&resolve_action(&sv(&[
+            "update"
+        ]))));
+        assert!(action_allows_update_notice(&resolve_action(&sv(&[
+            "status"
+        ]))));
     }
 
     #[test]

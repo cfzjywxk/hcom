@@ -6,10 +6,10 @@
 //! becoming a hidden production launcher.
 
 use hcom::chain_supervisor::{
-    CleanupEvidence, DeliveryExitContext as CoreDeliveryExitContext, DurableControl,
-    DurableDirective, ExitEvidence, GenerationIdentity, OuterTerminalIdentity, PostCleanup,
-    QuiesceApply, QuiesceAuthorization, ShutdownReason, SignalSendResult, SigtermEvidence,
-    TargetReservation,
+    ChainTitleState, CleanupEvidence, DeliveryExitContext as CoreDeliveryExitContext,
+    DurableControl, DurableDirective, ExitEvidence, GenerationIdentity, OuterTerminalIdentity,
+    PostCleanup, QuiesceApply, QuiesceAuthorization, ShutdownReason, SignalSendResult,
+    SigtermEvidence, TargetReservation,
 };
 
 use crate::codex_chain::terminal_record_persisted;
@@ -35,14 +35,15 @@ impl HcomChainControl {
         supervisor: SupervisorActor,
         outer: OuterTerminalIdentity,
     ) -> Result<Self, HandoffError> {
-        let chain = handoff::get_chain(&db, &chain_id)?.ok_or(HandoffError::NotManaged)?;
-        if chain.supervisor_process_id != supervisor.process_id
-            || chain.supervisor_process_birth_identity != supervisor.process_birth_identity
-            || chain.supervisor_pid != Some(i64::from(outer.supervisor_pid))
-            || chain.supervisor_pgid != Some(i64::from(outer.supervisor_pgid))
-            || chain.outer_foreground_pgid != Some(i64::from(outer.foreground_pgid))
-            || chain.outer_tty_device != Some(outer.tty_device as i64)
-            || chain.outer_tty_inode != Some(outer.tty_inode as i64)
+        let _chain = handoff::get_chain(&db, &chain_id)?.ok_or(HandoffError::NotManaged)?;
+        let binding = handoff::current_supervisor_binding(&db, &chain_id)?;
+        if binding.process_id != supervisor.process_id
+            || binding.process_birth_identity != supervisor.process_birth_identity
+            || binding.pid != i64::from(outer.supervisor_pid)
+            || binding.pgid != i64::from(outer.supervisor_pgid)
+            || binding.outer_foreground_pgid != i64::from(outer.foreground_pgid)
+            || binding.outer_tty_device != outer.tty_device as i64
+            || binding.outer_tty_inode != outer.tty_inode as i64
         {
             return Err(HandoffError::Conflict(
                 "HANDOFF_CONFLICT durable supervisor/outer-TTY evidence does not match".to_string(),
@@ -70,12 +71,15 @@ impl HcomChainControl {
             })?,
         )?
         .ok_or(HandoffError::NotManaged)?;
+        let binding = handoff::current_supervisor_binding(&self.db, &self.chain_id)?;
         if chain.current_generation != active.generation as i64
-            || chain.supervisor_pid != Some(i64::from(self.outer.supervisor_pid))
-            || chain.supervisor_pgid != Some(i64::from(self.outer.supervisor_pgid))
-            || chain.outer_foreground_pgid != Some(i64::from(self.outer.foreground_pgid))
-            || chain.outer_tty_device != Some(self.outer.tty_device as i64)
-            || chain.outer_tty_inode != Some(self.outer.tty_inode as i64)
+            || binding.process_id != self.supervisor.process_id
+            || binding.process_birth_identity != self.supervisor.process_birth_identity
+            || binding.pid != i64::from(self.outer.supervisor_pid)
+            || binding.pgid != i64::from(self.outer.supervisor_pgid)
+            || binding.outer_foreground_pgid != i64::from(self.outer.foreground_pgid)
+            || binding.outer_tty_device != self.outer.tty_device as i64
+            || binding.outer_tty_inode != self.outer.tty_inode as i64
             || generation.launch_nonce != active.launch_nonce
             || generation.wrapper_process_id.as_deref() != Some(active.process_id.as_str())
             || generation.process_birth_identity.as_deref()
@@ -132,6 +136,21 @@ fn map_exit(exit: &ExitEvidence) -> ChildExitEvidence {
 
 impl DurableControl for HcomChainControl {
     type Error = HandoffError;
+
+    fn title_state(&mut self, active: &GenerationIdentity) -> Result<ChainTitleState, Self::Error> {
+        self.exact_generation(active)?;
+        let chain =
+            handoff::get_chain(&self.db, &self.chain_id)?.ok_or(HandoffError::NotManaged)?;
+        Ok(match chain.state {
+            ChainState::QuiescingSource | ChainState::StopObserved => ChainTitleState::Quiescing,
+            ChainState::LaunchingTarget => ChainTitleState::Launching,
+            ChainState::AwaitingAcceptance => ChainTitleState::AwaitingAcceptance,
+            ChainState::NeedsRecovery => ChainTitleState::NeedsRecovery,
+            ChainState::Active | ChainState::Prepared | ChainState::Committed => {
+                ChainTitleState::Active
+            }
+        })
+    }
 
     fn read_directive(
         &mut self,
@@ -339,6 +358,19 @@ impl DurableControl for HcomChainControl {
         Ok(())
     }
 
+    fn begin_target_prepare(&mut self, reservation: &TargetReservation) -> Result<(), Self::Error> {
+        handoff::begin_generation_prepare(
+            &self.db,
+            &self.supervisor,
+            &self.chain_id,
+            i64::try_from(reservation.generation).map_err(|_| {
+                HandoffError::Invalid("generation exceeds the durable integer bound".to_string())
+            })?,
+            reservation.expected_version,
+            &reservation.launch_nonce,
+        )
+    }
+
     fn materialize_target(
         &mut self,
         reservation: &TargetReservation,
@@ -355,6 +387,11 @@ impl DurableControl for HcomChainControl {
                 hcom_session_id: identity.hcom_session_id.clone(),
                 process_id: identity.process_id.clone(),
                 process_birth_identity: identity.process_birth_identity.clone(),
+                wrapper_pid: i64::from(identity.wrapper_pid),
+                wrapper_pgid: i64::from(identity.wrapper_pgid),
+                child_pid: i64::from(identity.child_pid),
+                child_pgid: i64::from(identity.child_pgid),
+                child_process_birth_identity: identity.child_process_birth_identity.clone(),
             },
         )?;
         Ok(())
@@ -405,9 +442,10 @@ impl DurableControl for HcomChainControl {
         .ok_or(HandoffError::NotManaged)?;
         let chain =
             handoff::get_chain(&self.db, &handoff.chain_id)?.ok_or(HandoffError::NotManaged)?;
+        let effective_target = handoff::effective_handoff_target_generation(&self.db, &handoff.id)?;
         if handoff.chain_id != self.chain_id
             || handoff.state != HandoffState::LaunchingTarget
-            || handoff.target_generation != reservation.generation as i64
+            || effective_target != reservation.generation as i64
             || chain.state != ChainState::LaunchingTarget
             || chain.current_generation != reservation.generation as i64
             || generation.state != GenerationState::Launching
@@ -442,8 +480,9 @@ impl DurableControl for HcomChainControl {
         })?;
         let target = handoff::get_generation(&self.db, &handoff.chain_id, target_generation)?
             .ok_or(HandoffError::Storage)?;
+        let effective_target = handoff::effective_handoff_target_generation(&self.db, &handoff.id)?;
         if handoff.chain_id != self.chain_id
-            || handoff.target_generation != target_generation
+            || effective_target != target_generation
             || target.launch_nonce != reservation.launch_nonce
         {
             return Err(HandoffError::Conflict(
@@ -812,6 +851,7 @@ mod tests {
             PostCleanup::Advance(reservation) => reservation,
             PostCleanup::NeedsRecovery => panic!("complete cleanup must advance"),
         };
+        control.begin_target_prepare(&reservation).unwrap();
         let mut target = GenerationIdentity {
             generation: 2,
             launch_nonce: reservation.launch_nonce.clone(),

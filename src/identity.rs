@@ -22,7 +22,11 @@ static DANGEROUS_CHARS_WITH_AT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[|&;$`<>@]").unwrap());
 
 /// Commands that require a resolved identity to operate.
-const REQUIRE_IDENTITY: &[&str] = &["send", "listen", "review", "handoff", "chain"];
+// `chain` and `handoff` perform their own typed split between exact managed
+// actors and foreground terminal owners. Their mutation subcommands still
+// reject an absent managed actor, while read-only status and public
+// start/recovery intentionally originate in a human shell.
+const REQUIRE_IDENTITY: &[&str] = &["send", "listen", "review"];
 
 /// Check if value looks like a UUID (agent_id format).
 pub fn looks_like_uuid(value: &str) -> bool {
@@ -840,8 +844,10 @@ mod tests {
         assert!(requires_identity("send"));
         assert!(requires_identity("listen"));
         assert!(requires_identity("review"));
-        assert!(requires_identity("handoff"));
-        assert!(requires_identity("chain"));
+        // These split public read/recovery entry points from managed mutations,
+        // so their command handlers perform the narrower identity checks.
+        assert!(!requires_identity("handoff"));
+        assert!(!requires_identity("chain"));
         assert!(!requires_identity("list"));
         assert!(!requires_identity("status"));
         assert!(!requires_identity("events"));

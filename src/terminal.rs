@@ -2700,6 +2700,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_build_full_env_preserves_native_tool_and_system_vars() {
+        let _shared_env = crate::hooks::test_helpers::EnvGuard::new();
         let _guard = EnvGuard::clear(&["CLAUDECODE", "CODEX_HOME", "https_proxy"]);
         unsafe {
             std::env::set_var("CLAUDECODE", "1");

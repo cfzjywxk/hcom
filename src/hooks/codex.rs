@@ -4,6 +4,8 @@ use std::collections::{HashMap, HashSet};
 #[cfg(not(test))]
 use std::io::{BufRead, BufReader};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use std::process::Stdio;
@@ -21,8 +23,8 @@ use serde_json::Value;
 use toml_edit::{DocumentMut, Item, value};
 
 use crate::codex_chain::{
-    CODEX_VERSION_ENV, CodexLaunchProfile, HANDOFF_ID_ENV, MAX_CHAIN_HOOK_PAYLOAD_BYTES,
-    SUPPORTED_CODEX_VERSION, exact_transcript_path,
+    CODEX_VERSION_ENV, CODEX_VERSION_PROBE_ARGS, CodexLaunchProfile, HANDOFF_ID_ENV,
+    MAX_CHAIN_HOOK_PAYLOAD_BYTES, SUPPORTED_CODEX_VERSION, exact_transcript_path,
 };
 use crate::db::{HcomDb, InstanceRow};
 use crate::handoff::{
@@ -73,8 +75,24 @@ const HCOM_HOOK_DEFINITION_HASH_KEY: &str = "hcom_hook_definition_hash";
 #[cfg(not(test))]
 const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(not(test))]
+const CODEX_APP_SERVER_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(not(test))]
 const CODEX_APP_SERVER_STDERR_LIMIT: usize = 8192;
 type CodexHookHandler = fn(&HcomDb, &HcomContext, &HookPayload) -> HookResult;
+
+fn owned_codex_subprocess() -> std::process::Command {
+    let mut command = crate::terminal::executable_command("codex");
+    #[cfg(unix)]
+    {
+        let parent_pid = unsafe { libc::getpid() };
+        // SAFETY: the pre-exec closure only performs the Linux prctl/getppid
+        // sequence used by the chain's already-tested parent-death guard.
+        unsafe {
+            command.pre_exec(move || hcom::chain_pty::arm_parent_death_hangup(parent_pid));
+        }
+    }
+    command
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -294,7 +312,7 @@ fn update_codex_position(
     // and pins the native Codex thread separately in typed generation state.
     // Ordinary UserPromptSubmit/PreToolUse/PostToolUse hooks still run for status
     // and delivery, but must not overwrite that stable hcom identity.
-    if !has_chain_markers()
+    if !has_complete_parseable_chain_markers()
         && let Some(session_id) = payload.session_id.as_ref().filter(|s| !s.is_empty())
     {
         updates.insert("session_id".into(), Value::String(session_id.clone()));
@@ -452,10 +470,67 @@ fn get_codex_handler(hook_name: &str) -> Option<CodexHookHandler> {
     }
 }
 
-fn has_chain_markers() -> bool {
+fn has_any_chain_marker() -> bool {
     CHAIN_MARKER_VARS
         .iter()
         .any(|key| std::env::var_os(key).is_some())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainHookRoute {
+    Ordinary,
+    Exact,
+    Reject,
+}
+
+fn chain_hook_route(hook_name: &str) -> ChainHookRoute {
+    if !matches!(hook_name, "codex-sessionstart" | "codex-stop") {
+        return ChainHookRoute::Ordinary;
+    }
+    if !has_any_chain_marker() {
+        return ChainHookRoute::Ordinary;
+    }
+    let marker_count = CHAIN_MARKER_VARS
+        .iter()
+        .filter(|key| std::env::var_os(key).is_some())
+        .count();
+    if marker_count <= 1 {
+        ChainHookRoute::Ordinary
+    } else if has_complete_parseable_chain_markers() {
+        ChainHookRoute::Exact
+    } else {
+        ChainHookRoute::Reject
+    }
+}
+
+fn has_complete_parseable_chain_markers() -> bool {
+    let Some(chain_id) = std::env::var("HCOM_CHAIN_ID").ok() else {
+        return false;
+    };
+    let Some(_generation) = std::env::var("HCOM_CHAIN_GENERATION")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+    else {
+        return false;
+    };
+    let Some(launch_nonce) = std::env::var("HCOM_CHAIN_LAUNCH_NONCE").ok() else {
+        return false;
+    };
+    let Some(process_birth) = std::env::var("HCOM_CHAIN_PROCESS_BIRTH_IDENTITY").ok() else {
+        return false;
+    };
+    let Some(process_id) = std::env::var("HCOM_PROCESS_ID").ok() else {
+        return false;
+    };
+    let version_matches =
+        std::env::var(CODEX_VERSION_ENV).ok().as_deref() == Some(SUPPORTED_CODEX_VERSION);
+    version_matches
+        && bounded_chain_text(&chain_id, handoff::MAX_OPAQUE_ID_BYTES)
+        && bounded_chain_text(&launch_nonce, handoff::MAX_OPAQUE_ID_BYTES)
+        && bounded_chain_text(&process_id, handoff::MAX_PROCESS_ID_BYTES)
+        && bounded_chain_text(&process_birth, handoff::MAX_IDENTITY_BYTES)
+        && hcom::chain_supervisor::verify_current_process_scope(&process_birth).is_ok()
 }
 
 fn bounded_chain_text(value: &str, max: usize) -> bool {
@@ -537,6 +612,11 @@ fn exact_chain_hook_context(
     db: &HcomDb,
     session_start: bool,
 ) -> Result<ExactChainHookContext, HandoffError> {
+    if !has_complete_parseable_chain_markers() {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT incomplete or malformed managed Codex markers".to_string(),
+        ));
+    }
     if std::env::var(CODEX_VERSION_ENV).ok().as_deref() != Some(SUPPORTED_CODEX_VERSION) {
         return Err(HandoffError::Conflict(
             "HANDOFF_CONFLICT unsupported Codex hook version".to_string(),
@@ -651,15 +731,15 @@ fn validate_exact_hook_profile(
     Ok(profile)
 }
 
-fn advisory_chain_wake(chain: &handoff::TerminalChain) {
-    let Some(pid) = chain
-        .supervisor_pid
-        .and_then(|value| i32::try_from(value).ok())
-    else {
+fn advisory_chain_wake(db: &HcomDb, chain: &handoff::TerminalChain) {
+    let Ok(binding) = handoff::current_supervisor_binding(db, &chain.id) else {
+        return;
+    };
+    let Ok(pid) = i32::try_from(binding.pid) else {
         return;
     };
     if hcom::chain_supervisor::linux_process_birth_identity(pid)
-        .is_ok_and(|identity| identity == chain.supervisor_process_birth_identity)
+        .is_ok_and(|identity| identity == binding.process_birth_identity)
     {
         // SAFETY: the durable PID and birth identity were revalidated. SIGUSR1
         // only wakes the supervisor self-pipe; it is never sent to a tool.
@@ -681,13 +761,20 @@ fn handle_exact_chain_session_start(
         &payload.permission_mode,
     )?;
     if context.actor.generation > 1 {
-        let handoff_id = std::env::var(HANDOFF_ID_ENV).map_err(|_| HandoffError::NotManaged)?;
-        let open = handoff::get_open_handoff_for_chain(db, &context.chain.id)?
-            .ok_or(HandoffError::NotManaged)?;
-        if open.id != handoff_id
-            || open.target_generation != context.actor.generation
-            || open.state != HandoffState::LaunchingTarget
-        {
+        if let Ok(handoff_id) = std::env::var(HANDOFF_ID_ENV) {
+            let open = handoff::get_open_handoff_for_chain(db, &context.chain.id)?
+                .ok_or(HandoffError::NotManaged)?;
+            let effective_target = handoff::effective_handoff_target_generation(db, &open.id)?;
+            if open.id != handoff_id
+                || effective_target != context.actor.generation
+                || open.state != HandoffState::LaunchingTarget
+            {
+                return Err(HandoffError::NotManaged);
+            }
+        } else if handoff::get_open_handoff_for_chain(db, &context.chain.id)?.is_some() {
+            // A generation without a handoff marker is only eligible for the
+            // initial-chain protocol. pin_native_session performs the exact
+            // public-claim/recovery-attempt authorization.
             return Err(HandoffError::NotManaged);
         }
     }
@@ -720,7 +807,7 @@ fn handle_exact_chain_session_start(
             Default::default(),
         );
     }
-    advisory_chain_wake(&context.chain);
+    advisory_chain_wake(db, &context.chain);
     Ok(())
 }
 
@@ -789,7 +876,7 @@ fn handle_exact_chain_stop(db: &HcomDb, payload: ExactStopPayload) -> Result<(),
             Default::default(),
         );
     }
-    advisory_chain_wake(&context.chain);
+    advisory_chain_wake(db, &context.chain);
     Ok(())
 }
 
@@ -873,10 +960,8 @@ fn dispatch_result_to_stdout(db: &HcomDb, hook_name: &str, result: HookResult) -
 /// Main entry point for native Codex hooks.
 pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
     let start = std::time::Instant::now();
-    let exact_chain =
-        has_chain_markers() && matches!(hook_name, "codex-sessionstart" | "codex-stop");
-    let exact_payload = if exact_chain {
-        match read_exact_chain_payload(hook_name) {
+    let exact_payload = match chain_hook_route(hook_name) {
+        ChainHookRoute::Exact => match read_exact_chain_payload(hook_name) {
             Ok(payload) => Some(payload),
             Err(code) => {
                 log::log_warn(
@@ -889,9 +974,19 @@ pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
                     .write_all(b"hcom managed Codex hook payload rejected");
                 return 2;
             }
+        },
+        ChainHookRoute::Reject => {
+            log::log_warn(
+                "hooks",
+                "codex.chain_markers_rejected",
+                &format!("hook={hook_name} code=incomplete_or_malformed"),
+            );
+            let _ = std::io::stderr()
+                .lock()
+                .write_all(b"hcom managed Codex hook markers rejected");
+            return 2;
         }
-    } else {
-        None
+        ChainHookRoute::Ordinary => None,
     };
     let raw: Option<Value> = if exact_payload.is_none() {
         match serde_json::from_reader(std::io::stdin().lock()) {
@@ -1386,8 +1481,8 @@ fn fetch_codex_hcom_hook_entries() -> Result<Vec<CodexHookTrustEntry>, String> {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         // TODO: If Codex changes hooks/list discovery to depend on each launch
         // cwd, pass the target launch cwd through instead of using hcom's cwd.
-        let mut child = crate::terminal::executable_command("codex")
-            .args(["app-server", "--listen", "stdio://"])
+        let mut child = owned_codex_subprocess()
+            .args(["--disable", "plugins", "app-server", "--listen", "stdio://"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1399,59 +1494,109 @@ fn fetch_codex_hcom_hook_entries() -> Result<Vec<CodexHookTrustEntry>, String> {
             .take()
             .map(spawn_bounded_stderr_reader)
             .unwrap_or_else(|| Arc::new(Mutex::new(String::new())));
+        let exchange = (|| -> Result<Value, String> {
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| "failed to capture codex app-server stdout".to_string())?;
+            let (tx, rx) = mpsc::channel::<String>();
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines().map_while(Result::ok) {
+                    let _ = tx.send(line);
+                }
+            });
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "failed to capture codex app-server stdout".to_string())?;
-        let (tx, rx) = mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines().map_while(Result::ok) {
-                let _ = tx.send(line);
-            }
-        });
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| "failed to capture codex app-server stdin".to_string())?;
+            let initialize = serde_json::json!({
+                "method": "initialize",
+                "id": 1,
+                "params": {
+                    "clientInfo": {
+                        "name": "hcom",
+                        "title": "hcom",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "capabilities": { "experimentalApi": true }
+                }
+            });
+            writeln!(stdin, "{initialize}").map_err(|e| e.to_string())?;
+            read_jsonrpc_response(&rx, 1).map_err(|e| with_app_server_stderr(e, &stderr_buf))?;
 
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "failed to capture codex app-server stdin".to_string())?;
-        let initialize = serde_json::json!({
-            "method": "initialize",
-            "id": 1,
-            "params": {
-                "clientInfo": {
-                    "name": "hcom",
-                    "title": "hcom",
-                    "version": env!("CARGO_PKG_VERSION")
-                },
-                "capabilities": { "experimentalApi": true }
-            }
-        });
-        writeln!(stdin, "{initialize}").map_err(|e| e.to_string())?;
-        read_jsonrpc_response(&rx, 1).map_err(|e| with_app_server_stderr(e, &stderr_buf))?;
-
-        writeln!(
-            stdin,
-            "{}",
-            serde_json::json!({"method":"initialized","params":{}})
-        )
-        .map_err(|e| e.to_string())?;
-        let request = serde_json::json!({
-            "method": "hooks/list",
-            "id": 2,
-            "params": { "cwds": [cwd] }
-        });
-        writeln!(stdin, "{request}").map_err(|e| e.to_string())?;
-        stdin.flush().map_err(|e| e.to_string())?;
-
-        let response =
-            read_jsonrpc_response(&rx, 2).map_err(|e| with_app_server_stderr(e, &stderr_buf));
-        drop(stdin);
-        let _ = child.kill();
-        let _ = child.wait();
-        parse_hcom_hook_entries_from_hooks_list(&response?)
+            writeln!(
+                stdin,
+                "{}",
+                serde_json::json!({"method":"initialized","params":{}})
+            )
+            .map_err(|e| e.to_string())?;
+            let request = serde_json::json!({
+                "method": "hooks/list",
+                "id": 2,
+                "params": { "cwds": [cwd] }
+            });
+            writeln!(stdin, "{request}").map_err(|e| e.to_string())?;
+            stdin.flush().map_err(|e| e.to_string())?;
+            read_jsonrpc_response(&rx, 2).map_err(|e| with_app_server_stderr(e, &stderr_buf))
+        })();
+        let cleanup = finish_codex_app_server(&mut child);
+        match (exchange, cleanup) {
+            (Ok(response), Ok(())) => parse_hcom_hook_entries_from_hooks_list(&response),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
     }
+}
+
+#[cfg(not(test))]
+fn finish_codex_app_server(child: &mut std::process::Child) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + CODEX_APP_SERVER_EXIT_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(format!(
+                    "codex app-server exited unsuccessfully after stdin EOF: {status}"
+                ));
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => break,
+            Err(error) => return Err(format!("failed waiting for codex app-server: {error}")),
+        }
+    }
+
+    let sigterm_sent = crate::sys::process::terminate(child.id());
+    let deadline = std::time::Instant::now() + CODEX_APP_SERVER_EXIT_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return Err(if sigterm_sent {
+                    "codex app-server required SIGTERM after its protocol completed".to_string()
+                } else {
+                    "codex app-server exited while graceful termination raced".to_string()
+                });
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => break,
+            Err(error) => return Err(format!("failed waiting for codex app-server: {error}")),
+        }
+    }
+
+    // Never return while an owned helper is live. There is deliberately no
+    // SIGKILL escalation: retain and reap it, or let the parent-death SIGHUP
+    // close it if the foreground hcom process itself is interrupted.
+    let status = child
+        .wait()
+        .map_err(|error| format!("failed reaping codex app-server: {error}"))?;
+    Err(format!(
+        "codex app-server exceeded its graceful-exit deadline and later exited as {status}"
+    ))
 }
 
 #[cfg(not(test))]
@@ -1553,8 +1698,8 @@ fn codex_cli_version_output_for_hook_trust() -> Result<String, String> {
         static CACHE: OnceLock<Result<String, String>> = OnceLock::new();
         CACHE
             .get_or_init(|| {
-                let output = crate::terminal::executable_command("codex")
-                    .arg("--version")
+                let output = owned_codex_subprocess()
+                    .args(CODEX_VERSION_PROBE_ARGS)
                     .output()
                     .map_err(|e| {
                         format!("could not run codex --version for hook trust check: {e}")
@@ -1606,8 +1751,8 @@ fn detect_codex_hooks_feature_key() -> CodexHooksFeatureKey {
     }
 
     *CODEX_HOOKS_FEATURE_KEY_CACHE.get_or_init(|| {
-        let output = match crate::terminal::executable_command("codex")
-            .arg("--version")
+        let output = match owned_codex_subprocess()
+            .args(CODEX_VERSION_PROBE_ARGS)
             .output()
         {
             Ok(o) => o,
@@ -2649,6 +2794,109 @@ mod tests {
 
     #[test]
     #[serial]
+    fn ordinary_position_requires_complete_parseable_chain_marker_set_to_skip_rebinding() {
+        let fixture = exact_hook_fixture();
+        unsafe {
+            for key in CHAIN_MARKER_VARS {
+                std::env::remove_var(key);
+            }
+            std::env::set_var("HCOM_CHAIN_ID", "tc-stale-single-marker");
+        }
+        assert!(has_any_chain_marker());
+        assert!(!has_complete_parseable_chain_markers());
+        assert_eq!(
+            chain_hook_route("codex-sessionstart"),
+            ChainHookRoute::Ordinary
+        );
+        assert_eq!(chain_hook_route("codex-stop"), ChainHookRoute::Ordinary);
+        let payload = HookPayload::from_codex_native(
+            "UserPromptSubmit",
+            serde_json::json!({
+                "cwd": fixture.workspace.to_string_lossy(),
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "ordinary",
+                "session_id": "ordinary-native-session",
+            }),
+        );
+        update_codex_position(
+            &fixture.db,
+            &HcomContext::from_os(),
+            &payload,
+            &fixture.source.instance_name,
+        );
+        assert_eq!(
+            fixture
+                .db
+                .get_instance_full(&fixture.source.instance_name)
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("ordinary-native-session")
+        );
+        assert!(matches!(
+            exact_chain_hook_context(&fixture.db, true),
+            Err(HandoffError::Conflict(_))
+        ));
+
+        fixture
+            .db
+            .conn()
+            .execute(
+                "UPDATE instances SET session_id = ?1 WHERE name = ?2",
+                rusqlite::params![fixture.source.hcom_session_id, fixture.source.instance_name],
+            )
+            .unwrap();
+        set_exact_hook_env(
+            &fixture,
+            &fixture.source.process_id,
+            1,
+            "nonce-source",
+            None,
+        );
+        assert!(has_complete_parseable_chain_markers());
+        assert_eq!(
+            chain_hook_route("codex-sessionstart"),
+            ChainHookRoute::Exact
+        );
+        update_codex_position(
+            &fixture.db,
+            &HcomContext::from_os(),
+            &payload,
+            &fixture.source.instance_name,
+        );
+        assert_eq!(
+            fixture
+                .db
+                .get_instance_full(&fixture.source.instance_name)
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some(fixture.source.hcom_session_id.as_str())
+        );
+
+        unsafe {
+            std::env::set_var("HCOM_CHAIN_GENERATION", "malformed");
+        }
+        assert!(has_any_chain_marker());
+        assert!(!has_complete_parseable_chain_markers());
+        assert_eq!(
+            chain_hook_route("codex-sessionstart"),
+            ChainHookRoute::Reject
+        );
+        assert_eq!(
+            chain_hook_route("codex-userpromptsubmit"),
+            ChainHookRoute::Ordinary
+        );
+        assert!(matches!(
+            exact_chain_hook_context(&fixture.db, true),
+            Err(HandoffError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    #[serial]
     fn exact_chain_hooks_pin_fresh_sessions_and_replay_stop_without_partial_writes() {
         let fixture = exact_hook_fixture();
         set_exact_hook_env(
@@ -2951,6 +3199,15 @@ mod tests {
         let target_generation = get_generation(&fixture.db, &fixture.chain.id, 2)
             .unwrap()
             .unwrap();
+        handoff::begin_generation_prepare(
+            &fixture.db,
+            &supervisor,
+            &fixture.chain.id,
+            target_generation.generation,
+            launching.handoff.version,
+            &target_generation.launch_nonce,
+        )
+        .unwrap();
         materialize_target_generation(
             &fixture.db,
             &supervisor,
@@ -2962,6 +3219,11 @@ mod tests {
                 hcom_session_id: "hcom-target".to_string(),
                 process_id: "process-target".to_string(),
                 process_birth_identity: fixture.process_birth.clone(),
+                wrapper_pid: 999_997,
+                wrapper_pgid: 999_999,
+                child_pid: 999_998,
+                child_pgid: 999_998,
+                child_process_birth_identity: "linux-v1:999998:1:missing".to_string(),
             },
         )
         .unwrap();
@@ -3219,6 +3481,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_derive_transcript_finds_file() {
+        let _guard = EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let sessions = dir.path().join("sessions").join("project");
         std::fs::create_dir_all(&sessions).unwrap();
@@ -3226,18 +3489,11 @@ mod tests {
         let transcript = sessions.join("rollout-1-abc-123-def.jsonl");
         std::fs::File::create(&transcript).unwrap();
 
-        let saved = std::env::var("CODEX_HOME").ok();
         unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
 
         let result = derive_codex_transcript_path("abc-123-def");
         assert!(result.is_some(), "should find transcript file");
         assert!(result.unwrap().contains("rollout-1-abc-123-def.jsonl"));
-
-        if let Some(v) = saved {
-            unsafe { std::env::set_var("CODEX_HOME", v) };
-        } else {
-            unsafe { std::env::remove_var("CODEX_HOME") };
-        }
     }
 
     // -- build_codex_rules --

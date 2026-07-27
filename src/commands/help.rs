@@ -338,19 +338,31 @@ const HANDOFF_HELP: &[HelpEntry] = &[
     ("", ""),
     (
         "",
-        "Phase 3 exposes typed transitions only; it has no chain launcher or recovery command.",
+        "Mutations require the exact managed generation; status also supports the owning foreground terminal.",
     ),
 ];
 
 const CHAIN_HELP: &[HelpEntry] = &[
     (
+        "chain codex --model MODEL --reasoning LEVEL --sandbox MODE --approval MODE",
+        "Start one fresh Codex 0.145.0 in this exact foreground terminal",
+    ),
+    (
         "chain status [CHAIN_ID] [--json]",
         "Show sanitized typed chain metadata",
+    ),
+    (
+        "chain recover CHAIN_ID --version VERSION [--json]",
+        "Re-enter after exact old-process absence proof",
     ),
     ("", ""),
     (
         "",
-        "Phase 3 has no chain start, Codex launch, recovery, or hidden initialization command.",
+        "Fresh create only: no resume, fork, background, remote, relay, or new terminal.",
+    ),
+    (
+        "",
+        "Handoffs occur only after an explicit typed request and the exact Stop/task_complete gates.",
     ),
 ];
 

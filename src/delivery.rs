@@ -316,6 +316,7 @@ mod host_label {
 
         #[test]
         fn pane_title_label_skips_when_tool_empty() {
+            let _env = crate::hooks::test_helpers::EnvGuard::new();
             let dir = tempfile::tempdir().unwrap();
             // SAFETY: test-local HCOM_DIR.
             unsafe { std::env::set_var("HCOM_DIR", dir.path()) };

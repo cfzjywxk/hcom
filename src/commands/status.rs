@@ -660,6 +660,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_antigravity_install_fallback_checks_home_bin() {
+        let _env = crate::hooks::test_helpers::EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let bin_dir = dir.path().join(".antigravity/antigravity/bin");
         std::fs::create_dir_all(&bin_dir).unwrap();

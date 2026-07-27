@@ -468,6 +468,135 @@ pub struct ChainSpec {
 }
 
 #[derive(Debug, Clone)]
+pub struct PublicChainReservation {
+    pub chain: TerminalChain,
+    pub generation: TerminalGeneration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentSupervisorBinding {
+    pub process_id: String,
+    pub process_birth_identity: String,
+    pub pid: i64,
+    pub pgid: i64,
+    pub outer_foreground_pgid: i64,
+    pub outer_tty_device: i64,
+    pub outer_tty_inode: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenerationProcessEvidence {
+    pub chain_id: String,
+    pub generation: i64,
+    pub wrapper_pid: i64,
+    pub wrapper_pgid: i64,
+    pub wrapper_birth_identity: String,
+    pub child_pid: i64,
+    pub child_pgid: i64,
+    pub child_birth_identity: String,
+    pub materialized_at: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GenerationPrepareIntent {
+    launch_nonce: String,
+    supervisor_process_id: String,
+    supervisor_process_birth_identity: String,
+    control_object_kind: String,
+    control_object_id: String,
+    control_version: i64,
+    generation_version: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalOwnerEvidence {
+    pub workspace: PathBuf,
+    pub supervisor: SupervisorActor,
+    pub supervisor_pid: i64,
+    pub supervisor_pgid: i64,
+    pub outer_foreground_pgid: i64,
+    pub outer_tty_device: i64,
+    pub outer_tty_inode: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryPlanCode {
+    RetryInitialGeneration,
+    ContinueAfterSourceAbsence,
+    RetryUnmaterializedTarget,
+    ReplaceDeadTarget,
+    ReplaceDeadAwaitingAcceptance,
+    SourceDeadBeforeCommit,
+    LiveProcessConflict,
+    ProcessIdentityReused,
+    AbsenceUnknown,
+    UnsupportedRecoveryState,
+}
+
+impl RecoveryPlanCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RetryInitialGeneration => "retry_initial_generation",
+            Self::ContinueAfterSourceAbsence => "continue_after_source_absence",
+            Self::RetryUnmaterializedTarget => "retry_unmaterialized_target",
+            Self::ReplaceDeadTarget => "replace_dead_target",
+            Self::ReplaceDeadAwaitingAcceptance => "replace_dead_awaiting_acceptance",
+            Self::SourceDeadBeforeCommit => "source_dead_before_commit",
+            Self::LiveProcessConflict => "old_process_still_live",
+            Self::ProcessIdentityReused => "process_identity_reused",
+            Self::AbsenceUnknown => "process_absence_unknown",
+            Self::UnsupportedRecoveryState => "manual_intervention_required",
+        }
+    }
+
+    pub fn permits_spawn(self) -> bool {
+        matches!(
+            self,
+            Self::RetryInitialGeneration
+                | Self::ContinueAfterSourceAbsence
+                | Self::RetryUnmaterializedTarget
+                | Self::ReplaceDeadTarget
+                | Self::ReplaceDeadAwaitingAcceptance
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RecoveryReservation {
+    pub attempt_id: String,
+    pub chain: TerminalChain,
+    pub plan: RecoveryPlanCode,
+    pub handoff_id: Option<String>,
+    pub handoff_version: Option<i64>,
+    pub generation: TerminalGeneration,
+}
+
+#[derive(Debug, Clone)]
+pub enum RecoveryOutcome {
+    Launch(Box<RecoveryReservation>),
+    Manual {
+        chain: Box<TerminalChain>,
+        reason: RecoveryPlanCode,
+    },
+}
+
+impl GenerationProcessEvidence {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            chain_id: row.get("chain_id")?,
+            generation: row.get("generation")?,
+            wrapper_pid: row.get("wrapper_pid")?,
+            wrapper_pgid: row.get("wrapper_pgid")?,
+            wrapper_birth_identity: row.get("wrapper_birth_identity")?,
+            child_pid: row.get("child_pid")?,
+            child_pgid: row.get("child_pgid")?,
+            child_birth_identity: row.get("child_birth_identity")?,
+            materialized_at: row.get("materialized_at")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct HandoffOutcome {
     pub handoff: TerminalHandoff,
     pub replayed: bool,
@@ -569,6 +698,11 @@ pub struct TargetMaterialization {
     pub hcom_session_id: String,
     pub process_id: String,
     pub process_birth_identity: String,
+    pub wrapper_pid: i64,
+    pub wrapper_pgid: i64,
+    pub child_pid: i64,
+    pub child_pgid: i64,
+    pub child_process_birth_identity: String,
 }
 
 #[derive(Debug, Clone)]
@@ -650,6 +784,11 @@ pub enum HandoffError {
     Invalid(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("{message}")]
+    TypedConflict {
+        code: &'static str,
+        message: &'static str,
+    },
     #[error("database operation failed")]
     Storage,
 }
@@ -658,7 +797,7 @@ impl HandoffError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Invalid(_) | Self::Storage => 1,
-            Self::Conflict(_) => 2,
+            Self::Conflict(_) | Self::TypedConflict { .. } => 2,
             Self::NotManaged => 3,
         }
     }
@@ -667,10 +806,15 @@ impl HandoffError {
         match self {
             Self::Invalid(_) => "invalid_request",
             Self::Conflict(_) => "conflict",
+            Self::TypedConflict { code, .. } => code,
             Self::NotManaged => "not_managed",
             Self::Storage => "storage_error",
         }
     }
+}
+
+fn typed_conflict(code: &'static str, message: &'static str) -> HandoffError {
+    HandoffError::TypedConflict { code, message }
 }
 
 impl From<rusqlite::Error> for HandoffError {
@@ -721,9 +865,9 @@ fn sanitize_reason(value: &str) -> Result<String, HandoffError> {
 }
 
 fn validate_expected_version(expected_version: i64) -> Result<(), HandoffError> {
-    if expected_version < 0 {
+    if !(0..i64::MAX).contains(&expected_version) {
         return Err(HandoffError::Invalid(
-            "expected version must be non-negative".to_string(),
+            "expected version must be non-negative and incrementable".to_string(),
         ));
     }
     Ok(())
@@ -881,6 +1025,49 @@ fn load_generation(
     .map_err(Into::into)
 }
 
+fn load_generation_process(
+    conn: &Connection,
+    chain_id: &str,
+    generation: i64,
+) -> Result<Option<GenerationProcessEvidence>, HandoffError> {
+    conn.query_row(
+        "SELECT * FROM terminal_generation_processes
+         WHERE chain_id = ?1 AND generation = ?2",
+        params![chain_id, generation],
+        GenerationProcessEvidence::from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn load_generation_prepare_intent(
+    conn: &Connection,
+    chain_id: &str,
+    generation: i64,
+) -> Result<Option<GenerationPrepareIntent>, HandoffError> {
+    conn.query_row(
+        "SELECT launch_nonce, supervisor_process_id,
+                supervisor_process_birth_identity, control_object_kind,
+                control_object_id, control_version, generation_version
+         FROM terminal_generation_prepare_intents
+         WHERE chain_id = ?1 AND generation = ?2",
+        params![chain_id, generation],
+        |row| {
+            Ok(GenerationPrepareIntent {
+                launch_nonce: row.get(0)?,
+                supervisor_process_id: row.get(1)?,
+                supervisor_process_birth_identity: row.get(2)?,
+                control_object_kind: row.get(3)?,
+                control_object_id: row.get(4)?,
+                control_version: row.get(5)?,
+                generation_version: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 fn load_handoff(conn: &Connection, id: &str) -> Result<Option<TerminalHandoff>, HandoffError> {
     conn.query_row(
         "SELECT * FROM terminal_handoffs WHERE id = ?1",
@@ -897,13 +1084,79 @@ fn load_handoff_for_target_generation(
     generation: i64,
 ) -> Result<Option<TerminalHandoff>, HandoffError> {
     conn.query_row(
-        "SELECT * FROM terminal_handoffs
-         WHERE chain_id = ?1 AND target_generation = ?2
-           AND state NOT IN ('accepted', 'aborted')",
+        "SELECT h.*
+         FROM terminal_handoffs h
+         WHERE h.chain_id = ?1
+           AND h.state NOT IN ('accepted', 'aborted')
+           AND (
+               h.target_generation = ?2
+               OR EXISTS(
+                   SELECT 1 FROM terminal_recovery_attempts r
+                   WHERE r.handoff_id = h.id AND r.target_generation = ?2
+               )
+           )",
         params![chain_id, generation],
         TerminalHandoff::from_row,
     )
     .optional()
+    .map_err(Into::into)
+}
+
+fn effective_target_generation(
+    conn: &Connection,
+    handoff: &TerminalHandoff,
+) -> Result<i64, HandoffError> {
+    conn.query_row(
+        "SELECT target_generation
+         FROM terminal_recovery_attempts
+         WHERE handoff_id = ?1 AND target_generation IS NOT NULL
+         ORDER BY sequence DESC LIMIT 1",
+        params![handoff.id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map(|value| value.unwrap_or(handoff.target_generation))
+    .map_err(Into::into)
+}
+
+pub fn effective_handoff_target_generation(
+    db: &HcomDb,
+    handoff_id: &str,
+) -> Result<i64, HandoffError> {
+    let handoff_id = validate_opaque_id(handoff_id, "handoff ID")?;
+    let handoff = load_handoff(db.conn(), &handoff_id)?.ok_or(HandoffError::NotManaged)?;
+    effective_target_generation(db.conn(), &handoff)
+}
+
+fn is_initial_protocol_generation(
+    conn: &Connection,
+    chain: &TerminalChain,
+    generation: &TerminalGeneration,
+) -> Result<bool, HandoffError> {
+    let public_claim: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM terminal_chain_claims
+             WHERE chain_id = ?1 AND state = 'active'
+         )",
+        params![chain.id],
+        |row| row.get(0),
+    )?;
+    if !public_claim || get_open_handoff_for_chain_tx(conn, &chain.id)?.is_some() {
+        return Ok(false);
+    }
+    if generation.generation == 1 {
+        return Ok(true);
+    }
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM terminal_recovery_attempts
+             WHERE chain_id = ?1 AND target_generation = ?2
+               AND handoff_id IS NULL
+               AND state IN ('intent', 'authorized', 'materialized')
+         )",
+        params![chain.id, generation.generation],
+        |row| row.get(0),
+    )
     .map_err(Into::into)
 }
 
@@ -926,6 +1179,69 @@ pub fn get_generation(
     load_generation(db.conn(), &chain_id, generation)
 }
 
+pub fn get_generation_process(
+    db: &HcomDb,
+    chain_id: &str,
+    generation: i64,
+) -> Result<Option<GenerationProcessEvidence>, HandoffError> {
+    let chain_id = validate_opaque_id(chain_id, "chain ID")?;
+    if generation < 1 {
+        return Err(HandoffError::Invalid(
+            "generation must be a positive integer".to_string(),
+        ));
+    }
+    load_generation_process(db.conn(), &chain_id, generation)
+}
+
+fn load_current_supervisor_binding(
+    conn: &Connection,
+    chain: &TerminalChain,
+) -> Result<CurrentSupervisorBinding, HandoffError> {
+    if let Some(binding) = conn
+        .query_row(
+            "SELECT supervisor_process_id, supervisor_process_birth_identity,
+                    supervisor_pid, supervisor_pgid, outer_foreground_pgid,
+                    outer_tty_device, outer_tty_inode
+             FROM terminal_recovery_attempts
+             WHERE chain_id = ?1 AND state != 'manual'
+             ORDER BY sequence DESC LIMIT 1",
+            params![chain.id],
+            |row| {
+                Ok(CurrentSupervisorBinding {
+                    process_id: row.get(0)?,
+                    process_birth_identity: row.get(1)?,
+                    pid: row.get(2)?,
+                    pgid: row.get(3)?,
+                    outer_foreground_pgid: row.get(4)?,
+                    outer_tty_device: row.get(5)?,
+                    outer_tty_inode: row.get(6)?,
+                })
+            },
+        )
+        .optional()?
+    {
+        return Ok(binding);
+    }
+    Ok(CurrentSupervisorBinding {
+        process_id: chain.supervisor_process_id.clone(),
+        process_birth_identity: chain.supervisor_process_birth_identity.clone(),
+        pid: chain.supervisor_pid.ok_or(HandoffError::Storage)?,
+        pgid: chain.supervisor_pgid.ok_or(HandoffError::Storage)?,
+        outer_foreground_pgid: chain.outer_foreground_pgid.ok_or(HandoffError::Storage)?,
+        outer_tty_device: chain.outer_tty_device.ok_or(HandoffError::Storage)?,
+        outer_tty_inode: chain.outer_tty_inode.ok_or(HandoffError::Storage)?,
+    })
+}
+
+pub fn current_supervisor_binding(
+    db: &HcomDb,
+    chain_id: &str,
+) -> Result<CurrentSupervisorBinding, HandoffError> {
+    let chain_id = validate_opaque_id(chain_id, "chain ID")?;
+    let chain = load_chain(db.conn(), &chain_id)?.ok_or(HandoffError::NotManaged)?;
+    load_current_supervisor_binding(db.conn(), &chain)
+}
+
 pub fn get_handoff(db: &HcomDb, id: &str) -> Result<Option<TerminalHandoff>, HandoffError> {
     let id = validate_opaque_id(id, "handoff ID")?;
     load_handoff(db.conn(), &id)
@@ -936,15 +1252,21 @@ pub fn get_open_handoff_for_chain(
     chain_id: &str,
 ) -> Result<Option<TerminalHandoff>, HandoffError> {
     let chain_id = validate_opaque_id(chain_id, "chain ID")?;
-    db.conn()
-        .query_row(
-            "SELECT * FROM terminal_handoffs
-             WHERE chain_id = ?1 AND state NOT IN ('accepted', 'aborted')",
-            params![chain_id],
-            TerminalHandoff::from_row,
-        )
-        .optional()
-        .map_err(Into::into)
+    get_open_handoff_for_chain_tx(db.conn(), &chain_id)
+}
+
+fn get_open_handoff_for_chain_tx(
+    conn: &Connection,
+    chain_id: &str,
+) -> Result<Option<TerminalHandoff>, HandoffError> {
+    conn.query_row(
+        "SELECT * FROM terminal_handoffs
+         WHERE chain_id = ?1 AND state NOT IN ('accepted', 'aborted')",
+        params![chain_id],
+        TerminalHandoff::from_row,
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 fn live_binding_matches(conn: &Connection, actor: &HandoffActor) -> Result<bool, HandoffError> {
@@ -1424,6 +1746,8 @@ fn load_current_instructions(
     workspace: &str,
     bundle: &serde_json::Value,
 ) -> Result<(Vec<ProjectInstruction>, String), HandoffError> {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
     let workspace = PathBuf::from(workspace);
     let canonical_workspace = std::fs::canonicalize(&workspace).map_err(|_| {
         HandoffError::Conflict(
@@ -1834,6 +2158,184 @@ pub fn create_chain(
     create_chain_with_id(db, actor, spec, &generate_id("tc"))
 }
 
+/// Reserve the only public foreground chain before the adapter opens a PTY or
+/// forks either wrapper process. The public claim indexes make workspace and
+/// outer-TTY acquisition single-winner across concurrent callers.
+pub fn create_public_chain_reservation(
+    db: &HcomDb,
+    spec: &ChainSpec,
+) -> Result<PublicChainReservation, HandoffError> {
+    if spec.tool != "codex" {
+        return Err(HandoffError::Invalid(
+            "same-terminal handoff chains only support codex".to_string(),
+        ));
+    }
+    let workspace = canonical_workspace(&spec.workspace)?;
+    let model_ref = validate_text(
+        &spec.model_ref,
+        "model reference",
+        MAX_MODEL_REF_BYTES,
+        false,
+    )?;
+    let reasoning_ref = validate_text(
+        &spec.reasoning_ref,
+        "reasoning reference",
+        MAX_REASONING_REF_BYTES,
+        false,
+    )?;
+    let permission_policy_ref = validate_text(
+        &spec.permission_policy_ref,
+        "permission policy reference",
+        MAX_POLICY_REF_BYTES,
+        false,
+    )?;
+    let policy_ref = validate_text(
+        &spec.policy_ref,
+        "policy reference",
+        MAX_POLICY_REF_BYTES,
+        false,
+    )?;
+    let supervisor_process_id = validate_text(
+        &spec.supervisor_process_id,
+        "supervisor process identity",
+        MAX_PROCESS_ID_BYTES,
+        false,
+    )?;
+    let supervisor_process_birth_identity = validate_text(
+        &spec.supervisor_process_birth_identity,
+        "supervisor process birth identity",
+        MAX_IDENTITY_BYTES,
+        false,
+    )?;
+    if spec.supervisor_pid <= 1
+        || spec.supervisor_pgid <= 0
+        || spec.outer_foreground_pgid <= 0
+        || spec.outer_tty_device <= 0
+        || spec.outer_tty_inode <= 0
+        || spec.supervisor_pgid != spec.outer_foreground_pgid
+    {
+        return Err(HandoffError::Invalid(
+            "supervisor must have exact foreground PID/PGID/TTY evidence".to_string(),
+        ));
+    }
+    let launch_nonce = validate_opaque_id(&spec.launch_nonce, "launch nonce")?;
+    let chain_id = generate_id("tc");
+    let actor = HandoffActor {
+        instance_name: "chain-supervisor".to_string(),
+        hcom_session_id: chain_id.clone(),
+        native_session_id: None,
+        process_id: supervisor_process_id.clone(),
+        process_birth_identity: supervisor_process_birth_identity.clone(),
+        generation: 1,
+    };
+    let request_hash = hash_request(
+        "reserve_public_chain",
+        &chain_id,
+        -1,
+        &actor,
+        &[
+            workspace.as_bytes(),
+            model_ref.as_bytes(),
+            reasoning_ref.as_bytes(),
+            permission_policy_ref.as_bytes(),
+            policy_ref.as_bytes(),
+            launch_nonce.as_bytes(),
+        ],
+    );
+    let now = now_epoch_f64();
+    let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
+    tx.execute(
+        "INSERT INTO terminal_chains (
+             id, workspace, tool, model_ref, reasoning_ref,
+             permission_policy_ref, policy_ref, supervisor_process_id,
+             supervisor_process_birth_identity, supervisor_pid,
+             supervisor_pgid, outer_foreground_pgid, outer_tty_device,
+             outer_tty_inode, current_generation, state, version,
+             created_at, updated_at
+         ) VALUES (
+             ?1, ?2, 'codex', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+             ?12, ?13, 1, 'launching_target', 0, ?14, ?14
+         )",
+        params![
+            chain_id,
+            workspace,
+            model_ref,
+            reasoning_ref,
+            permission_policy_ref,
+            policy_ref,
+            supervisor_process_id,
+            supervisor_process_birth_identity,
+            spec.supervisor_pid,
+            spec.supervisor_pgid,
+            spec.outer_foreground_pgid,
+            spec.outer_tty_device,
+            spec.outer_tty_inode,
+            now,
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO terminal_generations (
+             chain_id, generation, launch_nonce, state, version,
+             created_at, updated_at
+         ) VALUES (?1, 1, ?2, 'reserved', 0, ?3, ?3)",
+        params![chain_id, launch_nonce, now],
+    )?;
+    if tx
+        .execute(
+            "INSERT INTO terminal_chain_claims (
+                 chain_id, workspace, outer_tty_device, outer_tty_inode,
+                 state, version, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, 'active', 0, ?5, ?5)",
+            params![
+                chain_id,
+                workspace,
+                spec.outer_tty_device,
+                spec.outer_tty_inode,
+                now,
+            ],
+        )
+        .is_err()
+    {
+        return Err(HandoffError::Conflict(
+            "CHAIN_START_CONFLICT an active public chain already owns this workspace or terminal"
+                .to_string(),
+        ));
+    }
+    insert_audit(
+        &tx,
+        &chain_id,
+        "chain",
+        &chain_id,
+        -1,
+        None,
+        ChainState::LaunchingTarget.as_str(),
+        &actor,
+        "supervisor",
+        "reserve_public_chain",
+        &request_hash,
+        now,
+    )?;
+    insert_audit(
+        &tx,
+        &chain_id,
+        "generation",
+        &generation_object_id(&chain_id, 1),
+        -1,
+        None,
+        GenerationState::Reserved.as_str(),
+        &actor,
+        "supervisor",
+        "reserve_public_generation",
+        &request_hash,
+        now,
+    )?;
+    tx.commit()?;
+    Ok(PublicChainReservation {
+        chain: load_chain(db.conn(), &chain_id)?.ok_or(HandoffError::Storage)?,
+        generation: load_generation(db.conn(), &chain_id, 1)?.ok_or(HandoffError::Storage)?,
+    })
+}
+
 /// Allocate the opaque identity consumed by the private Phase 3 factory before
 /// its initial Codex is released from the bootstrap gate.
 #[cfg(test)]
@@ -2024,6 +2526,506 @@ pub(crate) fn create_chain_with_id(
     load_chain(db.conn(), &chain_id)?.ok_or(HandoffError::Storage)
 }
 
+fn validate_process_materialization(
+    materialization: &TargetMaterialization,
+    supervisor: &CurrentSupervisorBinding,
+) -> Result<(), HandoffError> {
+    if materialization.wrapper_pid <= 1
+        || materialization.wrapper_pgid <= 0
+        || materialization.child_pid <= 1
+        || materialization.child_pgid <= 1
+        || materialization.wrapper_pid == materialization.child_pid
+        || materialization.wrapper_pgid != supervisor.pgid
+        || materialization.child_pid != materialization.child_pgid
+        || materialization.child_pgid == supervisor.pgid
+    {
+        return Err(HandoffError::Invalid(
+            "generation process topology does not match the foreground chain".to_string(),
+        ));
+    }
+    validate_text(
+        &materialization.child_process_birth_identity,
+        "child process birth identity",
+        MAX_IDENTITY_BYTES,
+        false,
+    )?;
+    Ok(())
+}
+
+fn process_evidence_matches_materialization(
+    evidence: &GenerationProcessEvidence,
+    materialization: &TargetMaterialization,
+) -> bool {
+    evidence.wrapper_pid == materialization.wrapper_pid
+        && evidence.wrapper_pgid == materialization.wrapper_pgid
+        && evidence.wrapper_birth_identity == materialization.process_birth_identity
+        && evidence.child_pid == materialization.child_pid
+        && evidence.child_pgid == materialization.child_pgid
+        && evidence.child_birth_identity == materialization.child_process_birth_identity
+}
+
+fn insert_generation_process(
+    tx: &Transaction<'_>,
+    chain_id: &str,
+    generation: i64,
+    materialization: &TargetMaterialization,
+    now: f64,
+) -> Result<(), HandoffError> {
+    tx.execute(
+        "INSERT INTO terminal_generation_processes (
+             chain_id, generation, wrapper_pid, wrapper_pgid,
+             wrapper_birth_identity, child_pid, child_pgid,
+             child_birth_identity, materialized_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            chain_id,
+            generation,
+            materialization.wrapper_pid,
+            materialization.wrapper_pgid,
+            materialization.process_birth_identity,
+            materialization.child_pid,
+            materialization.child_pgid,
+            materialization.child_process_birth_identity,
+            now,
+        ],
+    )
+    .map_err(|_| {
+        HandoffError::Conflict(
+            "HANDOFF_CONFLICT immutable generation process evidence already exists".to_string(),
+        )
+    })?;
+    Ok(())
+}
+
+/// Record the irreversible boundary immediately before the adapter may fork a
+/// wrapper. An absent process row is safe evidence of "never materialized"
+/// only when this append-only intent is also absent.
+pub fn begin_generation_prepare(
+    db: &HcomDb,
+    supervisor: &SupervisorActor,
+    chain_id: &str,
+    generation_number: i64,
+    expected_control_version: i64,
+    launch_nonce: &str,
+) -> Result<(), HandoffError> {
+    let chain_id = validate_opaque_id(chain_id, "chain ID")?;
+    validate_supervisor_actor(supervisor)?;
+    validate_expected_version(expected_control_version)?;
+    if generation_number < 1 {
+        return Err(HandoffError::Invalid(
+            "generation must be a positive integer".to_string(),
+        ));
+    }
+    let launch_nonce = validate_opaque_id(launch_nonce, "launch nonce")?;
+    let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
+    let chain = load_chain(&tx, &chain_id)?.ok_or(HandoffError::NotManaged)?;
+    let generation =
+        load_generation(&tx, &chain_id, generation_number)?.ok_or(HandoffError::NotManaged)?;
+    let binding = load_current_supervisor_binding(&tx, &chain)?;
+    if binding.process_id != supervisor.process_id
+        || binding.process_birth_identity != supervisor.process_birth_identity
+        || chain.current_generation != generation_number
+        || generation.launch_nonce != launch_nonce
+        || generation.wrapper_process_id.is_some()
+        || generation.process_birth_identity.is_some()
+        || generation.instance_name.is_some()
+        || generation.hcom_session_id.is_some()
+        || generation.native_session_id.is_some()
+        || load_generation_process(&tx, &chain_id, generation_number)?.is_some()
+        || load_generation_prepare_intent(&tx, &chain_id, generation_number)?.is_some()
+    {
+        return Err(typed_conflict(
+            "prepare_intent_conflict",
+            "generation process preparation is not an unused exact reservation",
+        ));
+    }
+
+    let handoff = get_open_handoff_for_chain_tx(&tx, &chain_id)?;
+    let (control_kind, control_id, control_version) = if let Some(handoff) = handoff {
+        if handoff.state != HandoffState::LaunchingTarget
+            || handoff.version != expected_control_version
+            || chain.state != ChainState::LaunchingTarget
+            || generation.state != GenerationState::Launching
+            || effective_target_generation(&tx, &handoff)? != generation_number
+        {
+            return Err(typed_conflict(
+                "wrong_expected_version_or_state",
+                "handoff state or expected version does not permit target preparation",
+            ));
+        }
+        ("handoff", handoff.id, handoff.version)
+    } else {
+        if chain.state != ChainState::LaunchingTarget
+            || chain.version != expected_control_version
+            || generation.state != GenerationState::Reserved
+            || !is_initial_protocol_generation(&tx, &chain, &generation)?
+        {
+            return Err(typed_conflict(
+                "wrong_expected_version_or_state",
+                "chain state or expected version does not permit initial preparation",
+            ));
+        }
+        ("chain", chain.id.clone(), chain.version)
+    };
+
+    let recovery_state = tx
+        .query_row(
+            "SELECT state FROM terminal_recovery_attempts
+             WHERE chain_id = ?1 AND target_generation = ?2
+             ORDER BY sequence DESC LIMIT 1",
+            params![chain_id, generation_number],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if recovery_state
+        .as_deref()
+        .is_some_and(|state| state != "authorized")
+    {
+        return Err(typed_conflict(
+            "recovery_intent_changed",
+            "recovery must be revalidated before target preparation",
+        ));
+    }
+
+    let now = now_epoch_f64();
+    tx.execute(
+        "INSERT INTO terminal_generation_prepare_intents (
+             chain_id, generation, launch_nonce, supervisor_process_id,
+             supervisor_process_birth_identity, control_object_kind,
+             control_object_id, control_version, generation_version,
+             started_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            chain_id,
+            generation_number,
+            launch_nonce,
+            supervisor.process_id,
+            supervisor.process_birth_identity,
+            control_kind,
+            control_id,
+            control_version,
+            generation.version,
+            now,
+        ],
+    )
+    .map_err(|_| {
+        typed_conflict(
+            "prepare_intent_conflict",
+            "generation process preparation was already authorized",
+        )
+    })?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Bind a gated public source or initial-recovery wrapper before its child is
+/// released. The chain remains non-active until the exact SessionStart hook
+/// pins the native identity.
+pub fn materialize_initial_generation(
+    db: &HcomDb,
+    supervisor: &SupervisorActor,
+    chain_id: &str,
+    expected_chain_version: i64,
+    materialization: &TargetMaterialization,
+) -> Result<GenerationOutcome, HandoffError> {
+    let chain_id = validate_opaque_id(chain_id, "chain ID")?;
+    validate_supervisor_actor(supervisor)?;
+    validate_expected_version(expected_chain_version)?;
+    validate_expected_version(materialization.expected_version)?;
+    let launch_nonce = validate_opaque_id(&materialization.launch_nonce, "launch nonce")?;
+    let instance_name = validate_text(
+        &materialization.instance_name,
+        "instance identity",
+        MAX_INSTANCE_NAME_BYTES,
+        false,
+    )?;
+    let hcom_session_id = validate_text(
+        &materialization.hcom_session_id,
+        "hcom session identity",
+        MAX_IDENTITY_BYTES,
+        false,
+    )?;
+    let process_id = validate_text(
+        &materialization.process_id,
+        "process identity",
+        MAX_PROCESS_ID_BYTES,
+        false,
+    )?;
+    let process_birth_identity = validate_text(
+        &materialization.process_birth_identity,
+        "process birth identity",
+        MAX_IDENTITY_BYTES,
+        false,
+    )?;
+
+    let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
+    let chain = load_chain(&tx, &chain_id)?.ok_or(HandoffError::NotManaged)?;
+    let supervisor_binding = load_current_supervisor_binding(&tx, &chain)?;
+    if supervisor_binding.process_id != supervisor.process_id
+        || supervisor_binding.process_birth_identity != supervisor.process_birth_identity
+    {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT current recovery supervisor identity changed".to_string(),
+        ));
+    }
+    validate_process_materialization(materialization, &supervisor_binding)?;
+    let mut generation =
+        load_generation(&tx, &chain_id, chain.current_generation)?.ok_or(HandoffError::Storage)?;
+    let prepare_intent = load_generation_prepare_intent(&tx, &chain_id, generation.generation)?
+        .ok_or_else(|| {
+            typed_conflict(
+                "prepare_intent_required",
+                "initial process materialization requires a durable prepare intent",
+            )
+        })?;
+    if chain.state != ChainState::LaunchingTarget
+        || chain.version != expected_chain_version
+        || generation.state != GenerationState::Reserved
+        || generation.version != materialization.expected_version
+        || generation.launch_nonce != launch_nonce
+        || generation.wrapper_process_id.is_some()
+        || get_open_handoff_for_chain_tx(&tx, &chain_id)?.is_some()
+        || prepare_intent.launch_nonce != launch_nonce
+        || prepare_intent.supervisor_process_id != supervisor.process_id
+        || prepare_intent.supervisor_process_birth_identity != supervisor.process_birth_identity
+        || prepare_intent.control_object_kind != "chain"
+        || prepare_intent.control_object_id != chain_id
+        || prepare_intent.control_version != expected_chain_version
+        || prepare_intent.generation_version != generation.version
+    {
+        return Err(conflict(
+            &chain_id,
+            expected_chain_version,
+            chain.state.as_str(),
+            chain.version,
+        ));
+    }
+    let now = now_epoch_f64();
+    tx.execute(
+        "INSERT INTO instances (
+             name, session_id, status, tool, created_at, parent_name,
+             origin_device_id, launch_context
+         ) VALUES (?1, ?2, 'launching', 'codex', ?3, '', '', ?4)",
+        params![
+            instance_name,
+            hcom_session_id,
+            now,
+            serde_json::json!({
+                "chain_id": chain_id,
+                "generation": generation.generation,
+                "launch_nonce": launch_nonce,
+            })
+            .to_string(),
+        ],
+    )
+    .map_err(|_| {
+        HandoffError::Conflict(
+            "HANDOFF_CONFLICT exact initial instance materialization already exists".to_string(),
+        )
+    })?;
+    tx.execute(
+        "INSERT INTO process_bindings (
+             process_id, session_id, instance_name, updated_at
+         ) VALUES (?1, ?2, ?3, ?4)",
+        params![process_id, hcom_session_id, instance_name, now],
+    )
+    .map_err(|_| {
+        HandoffError::Conflict(
+            "HANDOFF_CONFLICT exact initial process materialization already exists".to_string(),
+        )
+    })?;
+    let from_version = generation.version;
+    let updated = tx.execute(
+        "UPDATE terminal_generations
+         SET wrapper_process_id = ?1, process_birth_identity = ?2,
+             instance_name = ?3, hcom_session_id = ?4, state = 'launching',
+             version = ?5, updated_at = ?6
+         WHERE chain_id = ?7 AND generation = ?8
+           AND state = 'reserved' AND version = ?9
+           AND wrapper_process_id IS NULL
+           AND process_birth_identity IS NULL
+           AND instance_name IS NULL AND hcom_session_id IS NULL
+           AND native_session_id IS NULL AND launch_nonce = ?10",
+        params![
+            process_id,
+            process_birth_identity,
+            instance_name,
+            hcom_session_id,
+            from_version + 1,
+            now,
+            chain_id,
+            generation.generation,
+            from_version,
+            launch_nonce,
+        ],
+    )?;
+    if updated != 1 {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT initial reservation changed during materialization".to_string(),
+        ));
+    }
+    insert_generation_process(&tx, &chain_id, generation.generation, materialization, now)?;
+    let audit_actor = HandoffActor {
+        instance_name: instance_name.clone(),
+        hcom_session_id: hcom_session_id.clone(),
+        native_session_id: None,
+        process_id: supervisor.process_id.clone(),
+        process_birth_identity: supervisor.process_birth_identity.clone(),
+        generation: generation.generation,
+    };
+    let request_hash = hash_request(
+        "materialize_initial",
+        &generation_object_id(&chain_id, generation.generation),
+        from_version,
+        &audit_actor,
+        &[
+            launch_nonce.as_bytes(),
+            process_id.as_bytes(),
+            process_birth_identity.as_bytes(),
+            materialization.wrapper_pid.to_string().as_bytes(),
+            materialization.wrapper_pgid.to_string().as_bytes(),
+            materialization.child_pid.to_string().as_bytes(),
+            materialization.child_pgid.to_string().as_bytes(),
+            materialization.child_process_birth_identity.as_bytes(),
+        ],
+    );
+    insert_audit(
+        &tx,
+        &chain_id,
+        "generation",
+        &generation_object_id(&chain_id, generation.generation),
+        from_version,
+        Some(GenerationState::Reserved.as_str()),
+        GenerationState::Launching.as_str(),
+        &audit_actor,
+        "supervisor",
+        "materialize_initial",
+        &request_hash,
+        now,
+    )?;
+    let recovery_authorized = tx.execute(
+        "UPDATE terminal_recovery_attempts
+         SET state = 'materialized', version = version + 1, updated_at = ?1
+         WHERE chain_id = ?2 AND target_generation = ?3
+           AND handoff_id IS NULL AND state = 'authorized'",
+        params![now, chain_id, generation.generation],
+    )?;
+    if generation.generation > 1 && recovery_authorized != 1 {
+        return Err(typed_conflict(
+            "recovery_intent_changed",
+            "initial recovery was not revalidated before process materialization",
+        ));
+    }
+    tx.commit()?;
+    generation = load_generation(db.conn(), &chain_id, generation.generation)?
+        .ok_or(HandoffError::Storage)?;
+    Ok(GenerationOutcome {
+        generation,
+        replayed: false,
+    })
+}
+
+/// Persist fail-closed initial-generation intent before aborting or shutting
+/// down any process that escaped the private bootstrap gate. Recovery never
+/// turns this into normal waitpid/resource-cleanup evidence.
+pub fn fail_initial_generation(
+    db: &HcomDb,
+    supervisor: &SupervisorActor,
+    chain_id: &str,
+    expected_chain_version: i64,
+    expected_generation_version: i64,
+    failure_kind: &str,
+    failure_reason: &str,
+) -> Result<GenerationOutcome, HandoffError> {
+    let chain_id = validate_opaque_id(chain_id, "chain ID")?;
+    validate_supervisor_actor(supervisor)?;
+    validate_expected_version(expected_chain_version)?;
+    validate_expected_version(expected_generation_version)?;
+    let failure_kind = validate_text(failure_kind, "failure kind", MAX_FAILURE_KIND_BYTES, false)?;
+    let failure_reason = validate_text(
+        failure_reason,
+        "failure reason",
+        MAX_FAILURE_REASON_BYTES,
+        false,
+    )?;
+    let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
+    let mut chain = load_chain(&tx, &chain_id)?.ok_or(HandoffError::NotManaged)?;
+    let binding = load_current_supervisor_binding(&tx, &chain)?;
+    if binding.process_id != supervisor.process_id
+        || binding.process_birth_identity != supervisor.process_birth_identity
+    {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT current supervisor identity changed".to_string(),
+        ));
+    }
+    let mut generation =
+        load_generation(&tx, &chain_id, chain.current_generation)?.ok_or(HandoffError::Storage)?;
+    if chain.state != ChainState::LaunchingTarget
+        || chain.version != expected_chain_version
+        || generation.version != expected_generation_version
+        || !matches!(
+            generation.state,
+            GenerationState::Reserved | GenerationState::Launching
+        )
+        || get_open_handoff_for_chain_tx(&tx, &chain_id)?.is_some()
+    {
+        return Err(typed_conflict(
+            "wrong_expected_version_or_state",
+            "initial chain state or expected version changed",
+        ));
+    }
+    let actor = HandoffActor {
+        instance_name: "chain-supervisor".to_string(),
+        hcom_session_id: chain_id.clone(),
+        native_session_id: None,
+        process_id: supervisor.process_id.clone(),
+        process_birth_identity: supervisor.process_birth_identity.clone(),
+        generation: generation.generation,
+    };
+    let request_hash = hash_request(
+        "fail_initial_generation",
+        &generation_object_id(&chain_id, generation.generation),
+        expected_generation_version,
+        &actor,
+        &[failure_kind.as_bytes(), failure_reason.as_bytes()],
+    );
+    let now = now_epoch_f64();
+    update_generation_state(
+        &tx,
+        &mut generation,
+        GenerationState::NeedsRecovery,
+        &actor,
+        "supervisor",
+        "fail_initial_generation",
+        &request_hash,
+        now,
+    )?;
+    let current_generation = chain.current_generation;
+    update_chain_state(
+        &tx,
+        &mut chain,
+        ChainState::NeedsRecovery,
+        current_generation,
+        &actor,
+        "supervisor",
+        "fail_initial_generation",
+        &request_hash,
+        now,
+    )?;
+    tx.execute(
+        "UPDATE terminal_recovery_attempts
+         SET state = 'failed', version = version + 1, updated_at = ?1
+         WHERE chain_id = ?2 AND target_generation = ?3
+           AND state IN ('intent', 'authorized', 'materialized')",
+        params![now, chain_id, generation.generation],
+    )?;
+    tx.commit()?;
+    Ok(GenerationOutcome {
+        generation,
+        replayed: false,
+    })
+}
+
 pub fn pin_native_session(
     db: &HcomDb,
     chain_id: &str,
@@ -2095,11 +3097,14 @@ pub fn pin_native_session(
     let valid_initial = actor.generation == 1
         && generation.state == GenerationState::Active
         && chain.state == ChainState::Active;
+    let valid_starting_initial = generation.state == GenerationState::Launching
+        && chain.state == ChainState::LaunchingTarget
+        && is_initial_protocol_generation(&tx, &chain, &generation)?;
     let valid_target = generation.state == GenerationState::Launching
         && chain.state == ChainState::LaunchingTarget
         && load_handoff_for_target_generation(&tx, &chain_id, actor.generation)?
             .is_some_and(|handoff| handoff.state == HandoffState::LaunchingTarget);
-    if !valid_initial && !valid_target {
+    if !valid_initial && !valid_starting_initial && !valid_target {
         return Err(HandoffError::Conflict(
             "HANDOFF_CONFLICT SessionStart does not match an active initial or launching target generation"
                 .to_string(),
@@ -2120,13 +3125,19 @@ pub fn pin_native_session(
         ));
     }
     let now = now_epoch_f64();
+    let next_generation_state = if valid_starting_initial {
+        GenerationState::Active
+    } else {
+        generation.state
+    };
     let updated = tx.execute(
         "UPDATE terminal_generations
-         SET native_session_id = ?1, version = ?2, updated_at = ?3
-         WHERE chain_id = ?4 AND generation = ?5
-           AND native_session_id IS NULL AND state = ?6 AND version = ?7",
+         SET native_session_id = ?1, state = ?2, version = ?3, updated_at = ?4
+         WHERE chain_id = ?5 AND generation = ?6
+           AND native_session_id IS NULL AND state = ?7 AND version = ?8",
         params![
             native_session_id,
+            next_generation_state.as_str(),
             expected_version + 1,
             now,
             chain_id,
@@ -2150,14 +3161,37 @@ pub fn pin_native_session(
         &generation_object_id(&chain_id, actor.generation),
         expected_version,
         Some(generation.state.as_str()),
-        generation.state.as_str(),
+        next_generation_state.as_str(),
         actor,
         if valid_target { "target" } else { "source" },
         "pin_native_session",
         &request_hash,
         now,
     )?;
+    if valid_starting_initial {
+        let mut starting_chain = chain;
+        let current_generation = starting_chain.current_generation;
+        update_chain_state(
+            &tx,
+            &mut starting_chain,
+            ChainState::Active,
+            current_generation,
+            actor,
+            "supervisor",
+            "pin_initial_native_session",
+            &request_hash,
+            now,
+        )?;
+        tx.execute(
+            "UPDATE terminal_recovery_attempts
+             SET state = 'active', version = version + 1, updated_at = ?1
+             WHERE chain_id = ?2 AND target_generation = ?3
+               AND state IN ('intent', 'authorized', 'materialized')",
+            params![now, chain_id, actor.generation],
+        )?;
+    }
     generation.native_session_id = Some(native_session_id);
+    generation.state = next_generation_state;
     generation.version += 1;
     generation.updated_at = now;
     tx.commit()?;
@@ -2193,9 +3227,10 @@ pub fn begin_chain_shutdown(
     let mut chain = load_chain(&tx, &chain_id)?.ok_or(HandoffError::NotManaged)?;
     let mut generation =
         load_generation(&tx, &chain_id, actor.generation)?.ok_or(HandoffError::NotManaged)?;
+    let supervisor_binding = load_current_supervisor_binding(&tx, &chain)?;
     if chain.current_generation != actor.generation
-        || chain.supervisor_process_id != supervisor.process_id
-        || chain.supervisor_process_birth_identity != supervisor.process_birth_identity
+        || supervisor_binding.process_id != supervisor.process_id
+        || supervisor_binding.process_birth_identity != supervisor.process_birth_identity
         || !generation_matches_actor(&generation, actor, true)
     {
         return Err(HandoffError::Conflict(
@@ -2732,6 +3767,7 @@ fn load_supervisor_source_context(
     let handoff = load_handoff(tx, handoff_id)?
         .ok_or_else(|| HandoffError::Invalid("handoff was not found".to_string()))?;
     let chain = load_chain(tx, &handoff.chain_id)?.ok_or(HandoffError::Storage)?;
+    let supervisor_binding = load_current_supervisor_binding(tx, &chain)?;
     let source = load_generation(tx, &handoff.chain_id, handoff.source_generation)?
         .ok_or(HandoffError::Storage)?;
     let exact_source_snapshot = source.generation == handoff.source_generation
@@ -2744,8 +3780,8 @@ fn load_supervisor_source_context(
         && source.native_session_id.as_deref() == Some(handoff.source_native_session_id.as_str());
     if (require_current && chain.current_generation != handoff.source_generation)
         || !exact_source_snapshot
-        || chain.supervisor_process_id != supervisor.process_id
-        || chain.supervisor_process_birth_identity != supervisor.process_birth_identity
+        || supervisor_binding.process_id != supervisor.process_id
+        || supervisor_binding.process_birth_identity != supervisor.process_birth_identity
     {
         return Err(HandoffError::Conflict(
             "HANDOFF_CONFLICT caller does not match the immutable chain supervisor".to_string(),
@@ -4072,9 +5108,20 @@ pub fn materialize_target_generation(
     let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
     let (mut handoff, mut chain, _source, audit_actor) =
         load_supervisor_source_context(&tx, &handoff_id, supervisor, false)?;
+    let supervisor_binding = load_current_supervisor_binding(&tx, &chain)?;
+    validate_process_materialization(materialization, &supervisor_binding)?;
+    let effective_target = effective_target_generation(&tx, &handoff)?;
     let mut target =
-        load_generation(&tx, &chain.id, handoff.target_generation)?.ok_or(HandoffError::Storage)?;
-    let target_generation = handoff.target_generation.to_string();
+        load_generation(&tx, &chain.id, effective_target)?.ok_or(HandoffError::Storage)?;
+    let process_evidence = load_generation_process(&tx, &chain.id, effective_target)?;
+    let prepare_intent = load_generation_prepare_intent(&tx, &chain.id, effective_target)?
+        .ok_or_else(|| {
+            typed_conflict(
+                "prepare_intent_required",
+                "target process materialization requires a durable prepare intent",
+            )
+        })?;
+    let target_generation = effective_target.to_string();
     let request_hash = hash_request(
         "materialize_target",
         &handoff_id,
@@ -4087,6 +5134,11 @@ pub fn materialize_target_generation(
             hcom_session_id.as_bytes(),
             process_id.as_bytes(),
             process_birth_identity.as_bytes(),
+            materialization.wrapper_pid.to_string().as_bytes(),
+            materialization.wrapper_pgid.to_string().as_bytes(),
+            materialization.child_pid.to_string().as_bytes(),
+            materialization.child_pgid.to_string().as_bytes(),
+            materialization.child_process_birth_identity.as_bytes(),
         ],
     );
     let exact_materialization = target.launch_nonce == launch_nonce
@@ -4094,7 +5146,10 @@ pub fn materialize_target_generation(
         && target.process_birth_identity.as_deref() == Some(process_birth_identity.as_str())
         && target.instance_name.as_deref() == Some(instance_name.as_str())
         && target.hcom_session_id.as_deref() == Some(hcom_session_id.as_str())
-        && target.native_session_id.is_none();
+        && target.native_session_id.is_none()
+        && process_evidence.as_ref().is_some_and(|evidence| {
+            process_evidence_matches_materialization(evidence, materialization)
+        });
     if exact_materialization
         && transition_is_replay(
             &tx,
@@ -4112,7 +5167,8 @@ pub fn materialize_target_generation(
             replayed: true,
         });
     }
-    let cleanup_proved = handoff.sigterm_request_result == SigtermRequestResult::Sent.as_str()
+    let normal_cleanup_proved = handoff.sigterm_request_result
+        == SigtermRequestResult::Sent.as_str()
         && handoff.child_exit_observed_wall_at.is_some()
         && handoff.waitpid_reaped == Some(true)
         && handoff.inject_cleanup_succeeded == Some(true)
@@ -4121,10 +5177,31 @@ pub fn materialize_target_generation(
         && handoff.screen_cleanup_succeeded == Some(true)
         && handoff.write_queue_cleanup_succeeded == Some(true)
         && handoff.cleanup_completed_at.is_some();
+    let recovery_absence_proved = tx
+        .query_row(
+            "SELECT r.replaced_generation,
+                    (SELECT COUNT(*)
+                     FROM terminal_recovery_absence_evidence e
+                     WHERE e.recovery_attempt_id = r.id)
+             FROM terminal_recovery_attempts r
+             WHERE r.handoff_id = ?1 AND r.target_generation = ?2
+               AND r.state IN ('authorized', 'materialized')
+             ORDER BY r.sequence DESC LIMIT 1",
+            params![handoff_id, effective_target],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?
+        .is_some_and(|(replaced_generation, evidence_count)| {
+            let process_exists = load_generation_process(&tx, &chain.id, replaced_generation)
+                .ok()
+                .flatten()
+                .is_some();
+            evidence_count == if process_exists { 5 } else { 2 }
+        });
     if handoff.state != HandoffState::LaunchingTarget
         || handoff.version != materialization.expected_version
         || chain.state != ChainState::LaunchingTarget
-        || chain.current_generation != handoff.target_generation
+        || chain.current_generation != effective_target
         || target.state != GenerationState::Launching
         || target.launch_nonce != launch_nonce
         || target.wrapper_process_id.is_some()
@@ -4132,7 +5209,14 @@ pub fn materialize_target_generation(
         || target.instance_name.is_some()
         || target.hcom_session_id.is_some()
         || target.native_session_id.is_some()
-        || !cleanup_proved
+        || prepare_intent.launch_nonce != launch_nonce
+        || prepare_intent.supervisor_process_id != supervisor.process_id
+        || prepare_intent.supervisor_process_birth_identity != supervisor.process_birth_identity
+        || prepare_intent.control_object_kind != "handoff"
+        || prepare_intent.control_object_id != handoff_id
+        || prepare_intent.control_version != materialization.expected_version
+        || prepare_intent.generation_version != target.version
+        || (!normal_cleanup_proved && !recovery_absence_proved)
     {
         return Err(conflict(
             &handoff_id,
@@ -4154,7 +5238,7 @@ pub fn materialize_target_generation(
             now,
             serde_json::json!({
                 "chain_id": handoff.chain_id,
-                "generation": handoff.target_generation,
+                "generation": effective_target,
                 "launch_nonce": launch_nonce,
             })
             .to_string(),
@@ -4273,6 +5357,13 @@ pub fn materialize_target_generation(
         &request_hash,
         now,
     )?;
+    insert_generation_process(&tx, &chain.id, target.generation, materialization, now)?;
+    tx.execute(
+        "UPDATE terminal_recovery_attempts
+         SET state = 'materialized', version = version + 1, updated_at = ?1
+         WHERE handoff_id = ?2 AND target_generation = ?3 AND state = 'authorized'",
+        params![now, handoff_id, effective_target],
+    )?;
     tx.commit()?;
     handoff = load_handoff(db.conn(), &handoff_id)?.ok_or(HandoffError::Storage)?;
     Ok(HandoffOutcome {
@@ -4346,8 +5437,9 @@ pub fn fail_target_launch(
     let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
     let (mut handoff, mut chain, _source, audit_actor) =
         load_supervisor_source_context(&tx, &handoff_id, supervisor, false)?;
+    let effective_target = effective_target_generation(&tx, &handoff)?;
     let mut target =
-        load_generation(&tx, &chain.id, handoff.target_generation)?.ok_or(HandoffError::Storage)?;
+        load_generation(&tx, &chain.id, effective_target)?.ok_or(HandoffError::Storage)?;
     let target_unmaterialized = target.wrapper_process_id.is_none()
         && target.process_birth_identity.is_none()
         && target.instance_name.is_none()
@@ -4420,7 +5512,7 @@ pub fn fail_target_launch(
     if handoff.state != HandoffState::LaunchingTarget
         || handoff.version != observation.expected_version
         || chain.state != ChainState::LaunchingTarget
-        || chain.current_generation != handoff.target_generation
+        || chain.current_generation != effective_target
         || target.state != GenerationState::Launching
         || target.launch_nonce != launch_nonce
     {
@@ -4539,6 +5631,13 @@ pub fn fail_target_launch(
         &request_hash,
         now,
     )?;
+    tx.execute(
+        "UPDATE terminal_recovery_attempts
+         SET state = 'failed', version = version + 1, updated_at = ?1
+         WHERE handoff_id = ?2 AND target_generation = ?3
+           AND state IN ('intent', 'authorized', 'materialized')",
+        params![now, handoff_id, effective_target],
+    )?;
     tx.commit()?;
     handoff = load_handoff(db.conn(), &handoff_id)?.ok_or(HandoffError::Storage)?;
     Ok(HandoffOutcome {
@@ -4556,12 +5655,24 @@ fn load_target_context(
     let handoff = load_handoff(tx, handoff_id)?
         .ok_or_else(|| HandoffError::Invalid("handoff was not found".to_string()))?;
     let chain = load_chain(tx, &handoff.chain_id)?.ok_or(HandoffError::Storage)?;
-    let generation = load_generation(tx, &handoff.chain_id, handoff.target_generation)?
-        .ok_or(HandoffError::Storage)?;
-    authorize_generation(tx, &chain, &generation, actor, true, require_live, true)?;
-    if handoff.target_generation != actor.generation {
-        return Err(HandoffError::Conflict(
-            "HANDOFF_CONFLICT caller does not match the immutable target identity".to_string(),
+    let effective_target = effective_target_generation(tx, &handoff)?;
+    let generation =
+        load_generation(tx, &handoff.chain_id, effective_target)?.ok_or(HandoffError::Storage)?;
+    if let Err(error) =
+        authorize_generation(tx, &chain, &generation, actor, true, require_live, true)
+    {
+        return match error {
+            HandoffError::Storage => Err(HandoffError::Storage),
+            _ => Err(typed_conflict(
+                "wrong_target_actor",
+                "target actor does not match the exact current generation",
+            )),
+        };
+    }
+    if effective_target != actor.generation {
+        return Err(typed_conflict(
+            "wrong_target_actor",
+            "target actor does not match the exact current generation",
         ));
     }
     Ok((handoff, chain, generation))
@@ -4585,10 +5696,11 @@ pub fn target_ready(
     let mut handoff = load_handoff(&tx, &handoff_id)?
         .ok_or_else(|| HandoffError::Invalid("handoff was not found".to_string()))?;
     let mut chain = load_chain(&tx, &handoff.chain_id)?.ok_or(HandoffError::Storage)?;
-    let mut target = load_generation(&tx, &handoff.chain_id, handoff.target_generation)?
-        .ok_or(HandoffError::Storage)?;
-    if actor.generation != handoff.target_generation
-        || chain.current_generation != handoff.target_generation
+    let effective_target = effective_target_generation(&tx, &handoff)?;
+    let mut target =
+        load_generation(&tx, &handoff.chain_id, effective_target)?.ok_or(HandoffError::Storage)?;
+    if actor.generation != effective_target
+        || chain.current_generation != effective_target
         || target.launch_nonce != launch_nonce
         || native_session == handoff.source_native_session_id
         || actor.hcom_session_id == handoff.source_hcom_session_id
@@ -4733,6 +5845,13 @@ pub fn target_ready(
         &request_hash,
         now,
     )?;
+    tx.execute(
+        "UPDATE terminal_recovery_attempts
+         SET state = 'awaiting_acceptance', version = version + 1, updated_at = ?1
+         WHERE handoff_id = ?2 AND target_generation = ?3
+           AND state = 'materialized'",
+        params![now, handoff_id, effective_target],
+    )?;
     tx.commit()?;
     handoff = load_handoff(db.conn(), &handoff_id)?.ok_or(HandoffError::Storage)?;
     Ok(HandoffOutcome {
@@ -4775,6 +5894,61 @@ pub fn inspect_handoff(
     )
 }
 
+#[derive(Debug, Clone)]
+struct TargetValidationSnapshot {
+    token: String,
+    instructions_digest: String,
+    validated_at: f64,
+}
+
+fn load_target_validation(
+    conn: &Connection,
+    handoff: &TerminalHandoff,
+    target_generation: i64,
+) -> Result<Option<TargetValidationSnapshot>, HandoffError> {
+    if target_generation == handoff.target_generation
+        && let (Some(token), Some(instructions_digest), Some(validated_at)) = (
+            handoff.target_validation_token.clone(),
+            handoff.target_instructions_digest.clone(),
+            handoff.target_validated_at,
+        )
+    {
+        return Ok(Some(TargetValidationSnapshot {
+            token,
+            instructions_digest,
+            validated_at,
+        }));
+    }
+    conn.query_row(
+        "SELECT validation_token, instructions_digest, validated_at
+         FROM terminal_target_validations
+         WHERE handoff_id = ?1 AND target_generation = ?2",
+        params![handoff.id, target_generation],
+        |row| {
+            Ok(TargetValidationSnapshot {
+                token: row.get(0)?,
+                instructions_digest: row.get(1)?,
+                validated_at: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn map_target_actor_error(error: HandoffError) -> HandoffError {
+    match error {
+        HandoffError::Storage => HandoffError::Storage,
+        HandoffError::Invalid(message) => HandoffError::Invalid(message),
+        HandoffError::NotManaged
+        | HandoffError::Conflict(_)
+        | HandoffError::TypedConflict { .. } => typed_conflict(
+            "wrong_target_actor",
+            "caller does not match the exact current target generation",
+        ),
+    }
+}
+
 fn inspect_handoff_with_snapshot_provider<F>(
     db: &HcomDb,
     actor: &HandoffActor,
@@ -4789,25 +5963,85 @@ where
     let handoff_id = validate_opaque_id(handoff_id, "handoff ID")?;
     validate_actor(actor)?;
     validate_expected_version(expected_version)?;
-    let workspace = snapshot_provider(cwd)?;
+    {
+        let auth = Transaction::new_unchecked(db.conn(), TransactionBehavior::Deferred)?;
+        let (handoff, chain, target) =
+            load_target_context(&auth, &handoff_id, actor, true).map_err(map_target_actor_error)?;
+        let validation = load_target_validation(&auth, &handoff, target.generation)?;
+        let fresh_inspection = handoff.version == expected_version && validation.is_none();
+        let replay_candidate = handoff.version == expected_version + 1 && validation.is_some();
+        if handoff.state != HandoffState::AwaitingAcceptance
+            || chain.state != ChainState::AwaitingAcceptance
+            || target.state != GenerationState::AwaitingAcceptance
+            || (!fresh_inspection && !replay_candidate)
+        {
+            return Err(typed_conflict(
+                "wrong_expected_version_or_state",
+                "handoff state or expected version does not permit inspection",
+            ));
+        }
+        auth.commit()?;
+    }
+    let workspace = snapshot_provider(cwd).map_err(|error| {
+        if matches!(error, HandoffError::Storage) {
+            HandoffError::Storage
+        } else {
+            typed_conflict(
+                "target_validation_changed",
+                "bundle, workspace, or project instructions changed after inspection",
+            )
+        }
+    })?;
     let preliminary = load_handoff(db.conn(), &handoff_id)?.ok_or(HandoffError::NotManaged)?;
     if !workspace_matches_handoff(&workspace, &preliminary) {
         return Err(HandoffError::Conflict(
             "HANDOFF_CONFLICT target workspace does not match the prepared snapshot".to_string(),
         ));
     }
-    let preliminary_bundle = verify_pinned_bundle(db.conn(), &preliminary)?;
+    let preliminary_bundle = verify_pinned_bundle(db.conn(), &preliminary).map_err(|error| {
+        if matches!(error, HandoffError::Storage) {
+            HandoffError::Storage
+        } else {
+            typed_conflict(
+                "target_validation_changed",
+                "bundle, workspace, or project instructions changed after inspection",
+            )
+        }
+    })?;
     let (instructions, instructions_digest) =
-        load_current_instructions(&preliminary.workspace, &preliminary_bundle.value)?;
+        load_current_instructions(&preliminary.workspace, &preliminary_bundle.value).map_err(
+            |error| {
+                if matches!(error, HandoffError::Storage) {
+                    HandoffError::Storage
+                } else {
+                    typed_conflict(
+                        "target_validation_changed",
+                        "bundle, workspace, or project instructions changed after inspection",
+                    )
+                }
+            },
+        )?;
 
     let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
-    let (mut handoff, chain, target) = load_target_context(&tx, &handoff_id, actor, true)?;
+    let (mut handoff, chain, target) =
+        load_target_context(&tx, &handoff_id, actor, true).map_err(map_target_actor_error)?;
+    let target_generation = target.generation;
+    let existing_validation = load_target_validation(&tx, &handoff, target_generation)?;
     if !workspace_matches_handoff(&workspace, &handoff) {
         return Err(HandoffError::Conflict(
             "HANDOFF_CONFLICT target workspace changed during validation".to_string(),
         ));
     }
-    let bundle = verify_pinned_bundle(&tx, &handoff)?;
+    let bundle = verify_pinned_bundle(&tx, &handoff).map_err(|error| {
+        if matches!(error, HandoffError::Storage) {
+            HandoffError::Storage
+        } else {
+            typed_conflict(
+                "target_validation_changed",
+                "bundle, workspace, or project instructions changed after inspection",
+            )
+        }
+    })?;
     if bundle.digest != preliminary_bundle.digest
         || bundle.size_bytes != preliminary_bundle.size_bytes
     {
@@ -4839,11 +6073,13 @@ where
         "inspect_target",
         &request_hash,
     )? {
-        if handoff.target_validation_token.is_none()
-            || handoff.target_instructions_digest.as_deref() != Some(instructions_digest.as_str())
+        if existing_validation
+            .as_ref()
+            .is_none_or(|validation| validation.instructions_digest != instructions_digest)
         {
-            return Err(HandoffError::Conflict(
-                "HANDOFF_CONFLICT project instructions changed after validation".to_string(),
+            return Err(typed_conflict(
+                "target_validation_changed",
+                "bundle, workspace, or project instructions changed after inspection",
             ));
         }
         tx.commit()?;
@@ -4859,9 +6095,7 @@ where
         || handoff.version != expected_version
         || chain.state != ChainState::AwaitingAcceptance
         || target.state != GenerationState::AwaitingAcceptance
-        || handoff.target_validation_token.is_some()
-        || handoff.target_instructions_digest.is_some()
-        || handoff.target_validated_at.is_some()
+        || existing_validation.is_some()
     {
         return Err(conflict(
             &handoff_id,
@@ -4872,24 +6106,52 @@ where
     }
     let validation_token = generate_id("validation");
     let now = now_epoch_f64();
-    let updated = tx.execute(
-        "UPDATE terminal_handoffs
-         SET version = ?1, target_validation_token = ?2,
-             target_instructions_digest = ?3, target_validated_at = ?4,
-             updated_at = ?4
-         WHERE id = ?5 AND state = 'awaiting_acceptance' AND version = ?6
-           AND target_validation_token IS NULL
-           AND target_instructions_digest IS NULL
-           AND target_validated_at IS NULL",
-        params![
-            expected_version + 1,
-            validation_token,
-            instructions_digest,
-            now,
-            handoff_id,
-            expected_version,
-        ],
-    )?;
+    let updated = if target_generation == handoff.target_generation {
+        tx.execute(
+            "UPDATE terminal_handoffs
+             SET version = ?1, target_validation_token = ?2,
+                 target_instructions_digest = ?3, target_validated_at = ?4,
+                 updated_at = ?4
+             WHERE id = ?5 AND state = 'awaiting_acceptance' AND version = ?6
+               AND target_validation_token IS NULL
+               AND target_instructions_digest IS NULL
+               AND target_validated_at IS NULL",
+            params![
+                expected_version + 1,
+                validation_token,
+                instructions_digest,
+                now,
+                handoff_id,
+                expected_version,
+            ],
+        )?
+    } else {
+        tx.execute(
+            "INSERT INTO terminal_target_validations (
+                 handoff_id, target_generation, validation_token,
+                 instructions_digest, validated_at
+             ) SELECT ?1, ?2, ?3, ?4, ?5
+               WHERE EXISTS(
+                   SELECT 1 FROM terminal_handoffs
+                   WHERE id = ?1 AND state = 'awaiting_acceptance'
+                     AND version = ?6
+               )",
+            params![
+                handoff_id,
+                target_generation,
+                validation_token,
+                instructions_digest,
+                now,
+                expected_version,
+            ],
+        )?;
+        tx.execute(
+            "UPDATE terminal_handoffs
+             SET version = ?1, updated_at = ?2
+             WHERE id = ?3 AND state = 'awaiting_acceptance' AND version = ?4",
+            params![expected_version + 1, now, handoff_id, expected_version],
+        )?
+    };
     if updated != 1 {
         return Err(conflict(
             &handoff_id,
@@ -4937,19 +6199,94 @@ where
     let handoff_id = validate_opaque_id(handoff_id, "handoff ID")?;
     validate_actor(actor)?;
     validate_expected_version(expected_version)?;
-    let workspace = snapshot_provider(cwd)?;
+    {
+        let auth = Transaction::new_unchecked(db.conn(), TransactionBehavior::Deferred)?;
+        let (handoff, chain, target) =
+            load_target_context(&auth, &handoff_id, actor, true).map_err(map_target_actor_error)?;
+        if handoff.state == HandoffState::AwaitingAcceptance {
+            if handoff.version != expected_version
+                || chain.state != ChainState::AwaitingAcceptance
+                || target.state != GenerationState::AwaitingAcceptance
+            {
+                return Err(typed_conflict(
+                    "wrong_expected_version_or_state",
+                    "handoff state or expected version does not permit acceptance",
+                ));
+            }
+        } else if handoff.state != HandoffState::Accepted
+            || chain.state != ChainState::Active
+            || target.state != GenerationState::Active
+        {
+            return Err(typed_conflict(
+                "wrong_expected_version_or_state",
+                "handoff state or expected version does not permit acceptance",
+            ));
+        }
+        if load_target_validation(&auth, &handoff, target.generation)?
+            .is_none_or(|value| value.validated_at <= 0.0)
+        {
+            return Err(typed_conflict(
+                "durable_inspection_required",
+                "target must inspect the durable bundle and instructions before acceptance",
+            ));
+        }
+        auth.commit()?;
+    }
+    let workspace = snapshot_provider(cwd).map_err(|error| {
+        if matches!(error, HandoffError::Storage) {
+            HandoffError::Storage
+        } else {
+            typed_conflict(
+                "target_validation_changed",
+                "bundle, workspace, or project instructions changed after inspection",
+            )
+        }
+    })?;
     let preliminary = load_handoff(db.conn(), &handoff_id)?.ok_or(HandoffError::NotManaged)?;
-    let preliminary_bundle = verify_pinned_bundle(db.conn(), &preliminary)?;
+    let preliminary_bundle = verify_pinned_bundle(db.conn(), &preliminary).map_err(|error| {
+        if matches!(error, HandoffError::Storage) {
+            HandoffError::Storage
+        } else {
+            typed_conflict(
+                "target_validation_changed",
+                "bundle, workspace, or project instructions changed after inspection",
+            )
+        }
+    })?;
     let (_, instructions_digest) =
-        load_current_instructions(&preliminary.workspace, &preliminary_bundle.value)?;
+        load_current_instructions(&preliminary.workspace, &preliminary_bundle.value).map_err(
+            |error| {
+                if matches!(error, HandoffError::Storage) {
+                    HandoffError::Storage
+                } else {
+                    typed_conflict(
+                        "target_validation_changed",
+                        "bundle, workspace, or project instructions changed after inspection",
+                    )
+                }
+            },
+        )?;
     let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
-    let (mut handoff, mut chain, mut target) = load_target_context(&tx, &handoff_id, actor, true)?;
+    let (mut handoff, mut chain, mut target) =
+        load_target_context(&tx, &handoff_id, actor, true).map_err(map_target_actor_error)?;
+    let target_generation = target.generation;
+    let validation = load_target_validation(&tx, &handoff, target_generation)?;
     if !workspace_matches_handoff(&workspace, &handoff) || workspace.workspace != chain.workspace {
-        return Err(HandoffError::Conflict(
-            "HANDOFF_CONFLICT target workspace does not match the prepared snapshot".to_string(),
+        return Err(typed_conflict(
+            "target_validation_changed",
+            "bundle, workspace, or project instructions changed after inspection",
         ));
     }
-    let bundle = verify_pinned_bundle(&tx, &handoff)?;
+    let bundle = verify_pinned_bundle(&tx, &handoff).map_err(|error| {
+        if matches!(error, HandoffError::Storage) {
+            HandoffError::Storage
+        } else {
+            typed_conflict(
+                "target_validation_changed",
+                "bundle, workspace, or project instructions changed after inspection",
+            )
+        }
+    })?;
     let bundle_event_id = bundle.event_id.to_string();
     let bundle_size = bundle.size_bytes.to_string();
     let request_hash = hash_request(
@@ -4966,9 +6303,9 @@ where
             bundle.digest.as_bytes(),
             bundle_size.as_bytes(),
             handoff.policy_ref.as_bytes(),
-            handoff
-                .target_validation_token
-                .as_deref()
+            validation
+                .as_ref()
+                .map(|value| value.token.as_str())
                 .unwrap_or("")
                 .as_bytes(),
             instructions_digest.as_bytes(),
@@ -4993,15 +6330,28 @@ where
         || handoff.version != expected_version
         || chain.state != ChainState::AwaitingAcceptance
         || target.state != GenerationState::AwaitingAcceptance
-        || handoff.target_validation_token.is_none()
-        || handoff.target_instructions_digest.as_deref() != Some(instructions_digest.as_str())
-        || handoff.target_validated_at.is_none()
     {
-        return Err(conflict(
-            &handoff_id,
-            expected_version,
-            handoff.state.as_str(),
-            handoff.version,
+        return Err(typed_conflict(
+            "wrong_expected_version_or_state",
+            "handoff state or expected version does not permit acceptance",
+        ));
+    }
+    if validation
+        .as_ref()
+        .is_none_or(|value| value.validated_at <= 0.0)
+    {
+        return Err(typed_conflict(
+            "durable_inspection_required",
+            "target must inspect the durable bundle and instructions before acceptance",
+        ));
+    }
+    if validation
+        .as_ref()
+        .is_none_or(|value| value.instructions_digest != instructions_digest)
+    {
+        return Err(typed_conflict(
+            "target_validation_changed",
+            "bundle, workspace, or project instructions changed after inspection",
         ));
     }
     let now = now_epoch_f64();
@@ -5054,6 +6404,13 @@ where
         "accept",
         &request_hash,
         now,
+    )?;
+    tx.execute(
+        "UPDATE terminal_recovery_attempts
+         SET state = 'active', version = version + 1, updated_at = ?1
+         WHERE handoff_id = ?2 AND target_generation = ?3
+           AND state = 'awaiting_acceptance'",
+        params![now, handoff_id, target_generation],
     )?;
     tx.commit()?;
     handoff = load_handoff(db.conn(), &handoff_id)?.ok_or(HandoffError::Storage)?;
@@ -5228,6 +6585,990 @@ pub fn handoff_status_for_actor(
     handoff.ok_or_else(|| HandoffError::Invalid("handoff was not found".to_string()))
 }
 
+fn terminal_owner_error() -> HandoffError {
+    typed_conflict(
+        "not_found_or_not_owner",
+        "chain was not found or is not owned by this foreground terminal",
+    )
+}
+
+fn public_chain_for_terminal_owner(
+    db: &HcomDb,
+    requested_id: Option<&str>,
+    owner: &TerminalOwnerEvidence,
+    require_old_supervisor_absent: bool,
+) -> Result<TerminalChain, HandoffError> {
+    if owner.supervisor_pid <= 1
+        || owner.supervisor_pgid <= 0
+        || owner.outer_foreground_pgid <= 0
+        || owner.supervisor_pgid != owner.outer_foreground_pgid
+        || owner.outer_tty_device <= 0
+        || owner.outer_tty_inode <= 0
+    {
+        return Err(terminal_owner_error());
+    }
+    let workspace = canonical_workspace(&owner.workspace).map_err(|_| terminal_owner_error())?;
+    let chain = if let Some(id) = requested_id {
+        let id = validate_opaque_id(id, "chain ID").map_err(|_| terminal_owner_error())?;
+        db.conn()
+            .query_row(
+                "SELECT c.*
+                 FROM terminal_chains c
+                 JOIN terminal_chain_claims p ON p.chain_id = c.id
+                 WHERE c.id = ?1 AND p.state IN ('active', 'released')
+                   AND p.workspace = ?2
+                   AND p.outer_tty_device = ?3
+                   AND p.outer_tty_inode = ?4",
+                params![id, workspace, owner.outer_tty_device, owner.outer_tty_inode,],
+                TerminalChain::from_row,
+            )
+            .optional()?
+    } else {
+        db.conn()
+            .query_row(
+                "SELECT c.*
+                 FROM terminal_chains c
+                 JOIN terminal_chain_claims p ON p.chain_id = c.id
+                 WHERE p.state IN ('active', 'released') AND p.workspace = ?1
+                   AND p.outer_tty_device = ?2 AND p.outer_tty_inode = ?3
+                 ORDER BY CASE p.state WHEN 'active' THEN 0 ELSE 1 END,
+                          p.updated_at DESC
+                 LIMIT 1",
+                params![workspace, owner.outer_tty_device, owner.outer_tty_inode,],
+                TerminalChain::from_row,
+            )
+            .optional()?
+    }
+    .ok_or_else(terminal_owner_error)?;
+    if chain.workspace != workspace {
+        return Err(terminal_owner_error());
+    }
+    let binding = load_current_supervisor_binding(db.conn(), &chain)?;
+    if binding.outer_tty_device != owner.outer_tty_device
+        || binding.outer_tty_inode != owner.outer_tty_inode
+    {
+        return Err(terminal_owner_error());
+    }
+    if require_old_supervisor_absent {
+        match hcom::chain_supervisor::exact_process_status(
+            i32::try_from(binding.pid).map_err(|_| terminal_owner_error())?,
+            &binding.process_birth_identity,
+        ) {
+            hcom::chain_supervisor::ExactProcessStatus::Absent
+            | hcom::chain_supervisor::ExactProcessStatus::Reused => {}
+            _ => return Err(terminal_owner_error()),
+        }
+    }
+    Ok(chain)
+}
+
+pub fn public_chain_claim_released(db: &HcomDb, chain_id: &str) -> Result<bool, HandoffError> {
+    let chain_id = validate_opaque_id(chain_id, "chain ID")?;
+    db.conn()
+        .query_row(
+            "SELECT state = 'released' FROM terminal_chain_claims WHERE chain_id = ?1",
+            params![chain_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(HandoffError::NotManaged)
+}
+
+pub fn chain_status_for_terminal_owner(
+    db: &HcomDb,
+    requested_id: Option<&str>,
+    owner: &TerminalOwnerEvidence,
+) -> Result<TerminalChain, HandoffError> {
+    public_chain_for_terminal_owner(db, requested_id, owner, true)
+}
+
+pub fn handoff_status_for_terminal_owner(
+    db: &HcomDb,
+    requested_id: Option<&str>,
+    owner: &TerminalOwnerEvidence,
+) -> Result<TerminalHandoff, HandoffError> {
+    if let Some(id) = requested_id {
+        let id = validate_opaque_id(id, "handoff ID").map_err(|_| terminal_owner_error())?;
+        let handoff = load_handoff(db.conn(), &id)?.ok_or_else(terminal_owner_error)?;
+        let chain = public_chain_for_terminal_owner(db, Some(&handoff.chain_id), owner, true)?;
+        if handoff.chain_id != chain.id {
+            return Err(terminal_owner_error());
+        }
+        return Ok(handoff);
+    }
+    let chain = public_chain_for_terminal_owner(db, None, owner, true)?;
+    db.conn()
+        .query_row(
+            "SELECT * FROM terminal_handoffs
+             WHERE chain_id = ?1 ORDER BY created_at DESC LIMIT 1",
+            params![chain.id],
+            TerminalHandoff::from_row,
+        )
+        .optional()?
+        .ok_or_else(terminal_owner_error)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryAbsenceEntry {
+    subject: &'static str,
+    generation: Option<i64>,
+    pid: Option<i64>,
+    pgid: Option<i64>,
+    process_birth_identity: Option<String>,
+    method: &'static str,
+}
+
+fn recovery_process_error(status: hcom::chain_supervisor::ExactProcessStatus) -> HandoffError {
+    use hcom::chain_supervisor::ExactProcessStatus;
+    match status {
+        ExactProcessStatus::LiveExact => typed_conflict(
+            RecoveryPlanCode::LiveProcessConflict.as_str(),
+            "old supervisor or generation process is still live; recovery performed no action",
+        ),
+        ExactProcessStatus::Reused => typed_conflict(
+            RecoveryPlanCode::ProcessIdentityReused.as_str(),
+            "a durable PID or process group identity was reused; manual intervention is required",
+        ),
+        ExactProcessStatus::Unknown | ExactProcessStatus::Absent => typed_conflict(
+            RecoveryPlanCode::AbsenceUnknown.as_str(),
+            "old process absence could not be proved; manual intervention is required",
+        ),
+    }
+}
+
+fn observe_exact_recovery_absence(
+    conn: &Connection,
+    chain: &TerminalChain,
+    generation: &TerminalGeneration,
+) -> Result<Vec<RecoveryAbsenceEntry>, HandoffError> {
+    use hcom::chain_supervisor::{ExactProcessStatus, exact_process_status, process_group_status};
+
+    let supervisor = load_current_supervisor_binding(conn, chain)?;
+    let supervisor_pid = i32::try_from(supervisor.pid)
+        .map_err(|_| recovery_process_error(ExactProcessStatus::Unknown))?;
+    match exact_process_status(supervisor_pid, &supervisor.process_birth_identity) {
+        ExactProcessStatus::Absent => {}
+        status => return Err(recovery_process_error(status)),
+    }
+    let mut evidence = vec![RecoveryAbsenceEntry {
+        subject: "supervisor",
+        generation: None,
+        pid: Some(supervisor.pid),
+        pgid: None,
+        process_birth_identity: Some(supervisor.process_birth_identity),
+        method: "proc_birth_missing",
+    }];
+    let supervisor_pgid = i32::try_from(supervisor.pgid)
+        .map_err(|_| recovery_process_error(ExactProcessStatus::Unknown))?;
+    match process_group_status(supervisor_pgid) {
+        ExactProcessStatus::Absent => evidence.push(RecoveryAbsenceEntry {
+            subject: "supervisor_process_group",
+            generation: None,
+            pid: None,
+            pgid: Some(supervisor.pgid),
+            process_birth_identity: None,
+            method: "process_group_missing",
+        }),
+        status => return Err(recovery_process_error(status)),
+    }
+
+    let identities_absent = generation.wrapper_process_id.is_none()
+        && generation.process_birth_identity.is_none()
+        && generation.instance_name.is_none()
+        && generation.hcom_session_id.is_none()
+        && generation.native_session_id.is_none();
+    let process = load_generation_process(conn, &chain.id, generation.generation)?;
+    if identities_absent {
+        if process.is_some() {
+            return Err(recovery_process_error(ExactProcessStatus::Unknown));
+        }
+        return Ok(evidence);
+    }
+    let process = process.ok_or_else(|| recovery_process_error(ExactProcessStatus::Unknown))?;
+    if generation.process_birth_identity.as_deref() != Some(process.wrapper_birth_identity.as_str())
+        || process.chain_id != chain.id
+        || process.generation != generation.generation
+    {
+        return Err(recovery_process_error(ExactProcessStatus::Unknown));
+    }
+    if let Some((session_id, instance_name)) = conn
+        .query_row(
+            "SELECT session_id, instance_name
+             FROM process_bindings WHERE process_id = ?1",
+            params![generation.wrapper_process_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()?
+        && (session_id.as_deref() != generation.hcom_session_id.as_deref()
+            || instance_name.as_deref() != generation.instance_name.as_deref())
+    {
+        return Err(recovery_process_error(ExactProcessStatus::Unknown));
+    }
+
+    for (subject, pid, birth) in [
+        (
+            "wrapper",
+            process.wrapper_pid,
+            process.wrapper_birth_identity.as_str(),
+        ),
+        (
+            "child",
+            process.child_pid,
+            process.child_birth_identity.as_str(),
+        ),
+    ] {
+        let pid32 =
+            i32::try_from(pid).map_err(|_| recovery_process_error(ExactProcessStatus::Unknown))?;
+        match exact_process_status(pid32, birth) {
+            ExactProcessStatus::Absent => evidence.push(RecoveryAbsenceEntry {
+                subject,
+                generation: Some(generation.generation),
+                pid: Some(pid),
+                pgid: None,
+                process_birth_identity: Some(birth.to_string()),
+                method: "proc_birth_missing",
+            }),
+            status => return Err(recovery_process_error(status)),
+        }
+    }
+    let child_pgid = i32::try_from(process.child_pgid)
+        .map_err(|_| recovery_process_error(ExactProcessStatus::Unknown))?;
+    match process_group_status(child_pgid) {
+        ExactProcessStatus::Absent => evidence.push(RecoveryAbsenceEntry {
+            subject: "child_process_group",
+            generation: Some(generation.generation),
+            pid: None,
+            pgid: Some(process.child_pgid),
+            process_birth_identity: None,
+            method: "process_group_missing",
+        }),
+        status => return Err(recovery_process_error(status)),
+    }
+    Ok(evidence)
+}
+
+fn recovery_plan(
+    chain: &TerminalChain,
+    generation: &TerminalGeneration,
+    handoff: Option<&TerminalHandoff>,
+    prepare_started: bool,
+) -> RecoveryPlanCode {
+    match (chain.state, handoff.map(|value| value.state)) {
+        (ChainState::Active | ChainState::Prepared, _) | (_, Some(HandoffState::Prepared)) => {
+            RecoveryPlanCode::SourceDeadBeforeCommit
+        }
+        (
+            ChainState::Committed | ChainState::StopObserved | ChainState::QuiescingSource,
+            Some(
+                HandoffState::Committed
+                | HandoffState::StopObserved
+                | HandoffState::QuiescingSource,
+            ),
+        ) => RecoveryPlanCode::ContinueAfterSourceAbsence,
+        (ChainState::LaunchingTarget, Some(HandoffState::LaunchingTarget)) => {
+            if generation.wrapper_process_id.is_none() && !prepare_started {
+                RecoveryPlanCode::RetryUnmaterializedTarget
+            } else if generation.wrapper_process_id.is_some() && prepare_started {
+                RecoveryPlanCode::ReplaceDeadTarget
+            } else {
+                RecoveryPlanCode::AbsenceUnknown
+            }
+        }
+        (ChainState::AwaitingAcceptance, Some(HandoffState::AwaitingAcceptance)) => {
+            if generation.wrapper_process_id.is_some() && prepare_started {
+                RecoveryPlanCode::ReplaceDeadAwaitingAcceptance
+            } else {
+                RecoveryPlanCode::AbsenceUnknown
+            }
+        }
+        (ChainState::LaunchingTarget | ChainState::NeedsRecovery, None)
+            if matches!(
+                generation.state,
+                GenerationState::Reserved
+                    | GenerationState::Launching
+                    | GenerationState::NeedsRecovery
+            ) && generation.native_session_id.is_none()
+                && generation.wrapper_process_id.is_none()
+                && !prepare_started =>
+        {
+            RecoveryPlanCode::RetryInitialGeneration
+        }
+        (ChainState::LaunchingTarget | ChainState::NeedsRecovery, None)
+            if matches!(
+                generation.state,
+                GenerationState::Reserved
+                    | GenerationState::Launching
+                    | GenerationState::NeedsRecovery
+            ) =>
+        {
+            RecoveryPlanCode::AbsenceUnknown
+        }
+        (ChainState::NeedsRecovery, Some(_))
+            if handoff.is_some_and(|handoff| {
+                handoff.failure_kind == "exit_without_stop"
+                    || handoff.failure_kind == "sigterm_timeout"
+                    || handoff.failure_kind == "supervisor_shutdown"
+                    || handoff.failure_kind == "outer_hangup"
+                    || handoff.failure_kind == "target_rejected"
+                    || handoff.failure_kind.starts_with("target_")
+            }) =>
+        {
+            let handoff = handoff.expect("guard requires a handoff");
+            if generation.generation == handoff.source_generation {
+                RecoveryPlanCode::ContinueAfterSourceAbsence
+            } else if generation.wrapper_process_id.is_none() && !prepare_started {
+                RecoveryPlanCode::RetryUnmaterializedTarget
+            } else if generation.wrapper_process_id.is_some()
+                && prepare_started
+                && generation.state == GenerationState::AwaitingAcceptance
+            {
+                RecoveryPlanCode::ReplaceDeadAwaitingAcceptance
+            } else if generation.wrapper_process_id.is_some() && prepare_started {
+                RecoveryPlanCode::ReplaceDeadTarget
+            } else {
+                RecoveryPlanCode::AbsenceUnknown
+            }
+        }
+        _ => RecoveryPlanCode::UnsupportedRecoveryState,
+    }
+}
+
+fn insert_recovery_absence_evidence(
+    tx: &Transaction<'_>,
+    attempt_id: &str,
+    evidence: &[RecoveryAbsenceEntry],
+    observed_at: f64,
+) -> Result<(), HandoffError> {
+    for entry in evidence {
+        tx.execute(
+            "INSERT INTO terminal_recovery_absence_evidence (
+                 recovery_attempt_id, subject, generation, pid, pgid,
+                 process_birth_identity, observation, method, observed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'absent', ?7, ?8)",
+            params![
+                attempt_id,
+                entry.subject,
+                entry.generation,
+                entry.pid,
+                entry.pgid,
+                entry.process_birth_identity,
+                entry.method,
+                observed_at,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn delete_exact_absent_generic_binding(
+    tx: &Transaction<'_>,
+    generation: &TerminalGeneration,
+) -> Result<(), HandoffError> {
+    let (Some(process_id), Some(session_id), Some(instance_name)) = (
+        generation.wrapper_process_id.as_deref(),
+        generation.hcom_session_id.as_deref(),
+        generation.instance_name.as_deref(),
+    ) else {
+        return Ok(());
+    };
+    tx.execute(
+        "DELETE FROM process_bindings
+         WHERE process_id = ?1 AND session_id = ?2 AND instance_name = ?3",
+        params![process_id, session_id, instance_name],
+    )?;
+    tx.execute(
+        "DELETE FROM instances
+         WHERE name = ?1 AND session_id = ?2 AND tool = 'codex'",
+        params![instance_name, session_id],
+    )?;
+    Ok(())
+}
+
+pub fn begin_public_recovery(
+    db: &HcomDb,
+    chain_id: &str,
+    expected_chain_version: i64,
+    owner: &TerminalOwnerEvidence,
+) -> Result<RecoveryOutcome, HandoffError> {
+    let chain_id = validate_opaque_id(chain_id, "chain ID")?;
+    validate_expected_version(expected_chain_version)?;
+    validate_supervisor_actor(&owner.supervisor)?;
+    let preliminary = public_chain_for_terminal_owner(db, Some(&chain_id), owner, false)?;
+    if preliminary.version != expected_chain_version {
+        return Err(typed_conflict(
+            "wrong_expected_version_or_state",
+            "chain state or expected version does not permit recovery",
+        ));
+    }
+    if public_chain_claim_released(db, &chain_id)? {
+        return Ok(RecoveryOutcome::Manual {
+            chain: Box::new(preliminary),
+            reason: RecoveryPlanCode::SourceDeadBeforeCommit,
+        });
+    }
+    let preliminary_generation =
+        load_generation(db.conn(), &chain_id, preliminary.current_generation)?
+            .ok_or(HandoffError::Storage)?;
+    let preliminary_handoff = get_open_handoff_for_chain_tx(db.conn(), &chain_id)?;
+    let preliminary_prepare_started =
+        load_generation_prepare_intent(db.conn(), &chain_id, preliminary.current_generation)?
+            .is_some();
+    let plan = recovery_plan(
+        &preliminary,
+        &preliminary_generation,
+        preliminary_handoff.as_ref(),
+        preliminary_prepare_started,
+    );
+    let absence = observe_exact_recovery_absence(db.conn(), &preliminary, &preliminary_generation)?;
+    let now = now_epoch_f64();
+    let attempt_id = generate_id("recovery");
+    let launch_nonce = generate_id("launch");
+
+    let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
+    let mut chain = load_chain(&tx, &chain_id)?.ok_or_else(terminal_owner_error)?;
+    let mut generation =
+        load_generation(&tx, &chain_id, chain.current_generation)?.ok_or(HandoffError::Storage)?;
+    let mut handoff = get_open_handoff_for_chain_tx(&tx, &chain_id)?;
+    let transaction_prepare_started =
+        load_generation_prepare_intent(&tx, &chain_id, chain.current_generation)?.is_some();
+    let binding = load_current_supervisor_binding(&tx, &chain)?;
+    let preliminary_binding = load_current_supervisor_binding(db.conn(), &preliminary)?;
+    if chain.version != expected_chain_version
+        || chain.state != preliminary.state
+        || chain.current_generation != preliminary.current_generation
+        || generation.version != preliminary_generation.version
+        || transaction_prepare_started != preliminary_prepare_started
+        || binding != preliminary_binding
+        || handoff
+            .as_ref()
+            .map(|value| (&value.id, value.version, value.state))
+            != preliminary_handoff
+                .as_ref()
+                .map(|value| (&value.id, value.version, value.state))
+    {
+        return Err(typed_conflict(
+            "wrong_expected_version_or_state",
+            "chain state or expected version does not permit recovery",
+        ));
+    }
+    if recovery_plan(
+        &chain,
+        &generation,
+        handoff.as_ref(),
+        transaction_prepare_started,
+    ) != plan
+    {
+        return Err(typed_conflict(
+            "wrong_expected_version_or_state",
+            "chain recovery plan changed during authorization",
+        ));
+    }
+    let transaction_absence = observe_exact_recovery_absence(&tx, &chain, &generation)?;
+    if transaction_absence != absence {
+        return Err(typed_conflict(
+            RecoveryPlanCode::AbsenceUnknown.as_str(),
+            "old process absence changed during recovery authorization",
+        ));
+    }
+    let sequence: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(sequence), 0) + 1
+         FROM terminal_recovery_attempts WHERE chain_id = ?1",
+        params![chain_id],
+        |row| row.get(0),
+    )?;
+    let audit_actor = HandoffActor {
+        instance_name: "chain-recovery".to_string(),
+        hcom_session_id: chain_id.clone(),
+        native_session_id: None,
+        process_id: owner.supervisor.process_id.clone(),
+        process_birth_identity: owner.supervisor.process_birth_identity.clone(),
+        generation: generation.generation,
+    };
+    let request_hash = hash_request(
+        "begin_public_recovery",
+        &chain_id,
+        expected_chain_version,
+        &audit_actor,
+        &[
+            plan.as_str().as_bytes(),
+            attempt_id.as_bytes(),
+            generation.launch_nonce.as_bytes(),
+        ],
+    );
+
+    if !plan.permits_spawn() {
+        tx.execute(
+            "INSERT INTO terminal_recovery_attempts (
+                 id, chain_id, sequence, requested_chain_version, handoff_id,
+                 replaced_generation, target_generation, plan_code, state,
+                 version, supervisor_process_id,
+                 supervisor_process_birth_identity, supervisor_pid,
+                 supervisor_pgid, outer_foreground_pgid, outer_tty_device,
+                 outer_tty_inode, created_at, updated_at
+             ) VALUES (
+                 ?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, 'manual', 0,
+                 ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15
+             )",
+            params![
+                attempt_id,
+                chain_id,
+                sequence,
+                expected_chain_version,
+                handoff.as_ref().map(|value| value.id.as_str()),
+                generation.generation,
+                plan.as_str(),
+                owner.supervisor.process_id,
+                owner.supervisor.process_birth_identity,
+                owner.supervisor_pid,
+                owner.supervisor_pgid,
+                owner.outer_foreground_pgid,
+                owner.outer_tty_device,
+                owner.outer_tty_inode,
+                now,
+            ],
+        )?;
+        insert_recovery_absence_evidence(&tx, &attempt_id, &transaction_absence, now)?;
+        if let Some(current) = handoff.as_mut()
+            && current.state != HandoffState::NeedsRecovery
+        {
+            let from_state = current.state;
+            let from_version = current.version;
+            tx.execute(
+                "UPDATE terminal_handoffs
+                 SET state = 'needs_recovery', version = ?1,
+                     failure_kind = 'source_absent_before_commit',
+                     failure_reason = 'source absence requires explicit operator action',
+                     updated_at = ?2
+                 WHERE id = ?3 AND state = ?4 AND version = ?5",
+                params![
+                    from_version + 1,
+                    now,
+                    current.id,
+                    from_state.as_str(),
+                    from_version,
+                ],
+            )?;
+            insert_audit(
+                &tx,
+                &chain_id,
+                "handoff",
+                &current.id,
+                from_version,
+                Some(from_state.as_str()),
+                HandoffState::NeedsRecovery.as_str(),
+                &audit_actor,
+                "supervisor",
+                "begin_public_recovery_manual",
+                &request_hash,
+                now,
+            )?;
+        }
+        if generation.state != GenerationState::NeedsRecovery {
+            update_generation_state(
+                &tx,
+                &mut generation,
+                GenerationState::NeedsRecovery,
+                &audit_actor,
+                "supervisor",
+                "begin_public_recovery_manual",
+                &request_hash,
+                now,
+            )?;
+        }
+        let current_generation = chain.current_generation;
+        update_chain_state(
+            &tx,
+            &mut chain,
+            ChainState::NeedsRecovery,
+            current_generation,
+            &audit_actor,
+            "supervisor",
+            "begin_public_recovery_manual",
+            &request_hash,
+            now,
+        )?;
+        if plan == RecoveryPlanCode::SourceDeadBeforeCommit {
+            let claim_version: i64 = tx.query_row(
+                "SELECT version FROM terminal_chain_claims
+                 WHERE chain_id = ?1 AND state = 'active'",
+                params![chain_id],
+                |row| row.get(0),
+            )?;
+            let released = tx.execute(
+                "UPDATE terminal_chain_claims
+                 SET state = 'released', version = ?1,
+                     updated_at = ?2, released_at = ?2
+                 WHERE chain_id = ?3 AND state = 'active' AND version = ?4",
+                params![claim_version + 1, now, chain_id, claim_version],
+            )?;
+            if released != 1 {
+                return Err(typed_conflict(
+                    "recovery_intent_changed",
+                    "public chain claim changed before explicit abandonment",
+                ));
+            }
+            insert_audit(
+                &tx,
+                &chain_id,
+                "chain",
+                &format!("{chain_id}:claim"),
+                claim_version,
+                Some("active"),
+                "released",
+                &audit_actor,
+                "supervisor",
+                "release_public_chain_claim",
+                &request_hash,
+                now,
+            )?;
+        }
+        delete_exact_absent_generic_binding(&tx, &generation)?;
+        tx.commit()?;
+        return Ok(RecoveryOutcome::Manual {
+            chain: Box::new(load_chain(db.conn(), &chain_id)?.ok_or(HandoffError::Storage)?),
+            reason: plan,
+        });
+    }
+
+    let target_generation: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(generation), 0) + 1
+         FROM terminal_generations WHERE chain_id = ?1",
+        params![chain_id],
+        |row| row.get(0),
+    )?;
+    let target_state = if plan == RecoveryPlanCode::RetryInitialGeneration {
+        GenerationState::Reserved
+    } else {
+        GenerationState::Launching
+    };
+    tx.execute(
+        "INSERT INTO terminal_generations (
+             chain_id, generation, launch_nonce, state, version,
+             created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)",
+        params![
+            chain_id,
+            target_generation,
+            launch_nonce,
+            target_state.as_str(),
+            now,
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO terminal_recovery_attempts (
+             id, chain_id, sequence, requested_chain_version, handoff_id,
+             replaced_generation, target_generation, plan_code, state,
+             version, supervisor_process_id,
+             supervisor_process_birth_identity, supervisor_pid,
+             supervisor_pgid, outer_foreground_pgid, outer_tty_device,
+             outer_tty_inode, created_at, updated_at
+         ) VALUES (
+             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'intent', 0,
+             ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16
+         )",
+        params![
+            attempt_id,
+            chain_id,
+            sequence,
+            expected_chain_version,
+            handoff.as_ref().map(|value| value.id.as_str()),
+            generation.generation,
+            target_generation,
+            plan.as_str(),
+            owner.supervisor.process_id,
+            owner.supervisor.process_birth_identity,
+            owner.supervisor_pid,
+            owner.supervisor_pgid,
+            owner.outer_foreground_pgid,
+            owner.outer_tty_device,
+            owner.outer_tty_inode,
+            now,
+        ],
+    )?;
+    insert_recovery_absence_evidence(&tx, &attempt_id, &transaction_absence, now)?;
+    if generation.state != GenerationState::NeedsRecovery {
+        update_generation_state(
+            &tx,
+            &mut generation,
+            GenerationState::NeedsRecovery,
+            &audit_actor,
+            "supervisor",
+            "begin_public_recovery",
+            &request_hash,
+            now,
+        )?;
+    }
+    if let Some(current) = handoff.as_mut() {
+        let from_state = current.state;
+        let from_version = current.version;
+        let updated = tx.execute(
+            "UPDATE terminal_handoffs
+             SET state = 'launching_target', version = ?1, updated_at = ?2
+             WHERE id = ?3 AND state = ?4 AND version = ?5",
+            params![
+                from_version + 1,
+                now,
+                current.id,
+                from_state.as_str(),
+                from_version,
+            ],
+        )?;
+        if updated != 1 {
+            return Err(typed_conflict(
+                "wrong_expected_version_or_state",
+                "chain state or expected version does not permit recovery",
+            ));
+        }
+        insert_audit(
+            &tx,
+            &chain_id,
+            "handoff",
+            &current.id,
+            from_version,
+            Some(from_state.as_str()),
+            HandoffState::LaunchingTarget.as_str(),
+            &audit_actor,
+            "supervisor",
+            "begin_public_recovery",
+            &request_hash,
+            now,
+        )?;
+        current.state = HandoffState::LaunchingTarget;
+        current.version += 1;
+    }
+    let replaced_generation = chain.current_generation;
+    update_chain_state(
+        &tx,
+        &mut chain,
+        ChainState::LaunchingTarget,
+        target_generation,
+        &audit_actor,
+        "supervisor",
+        "begin_public_recovery",
+        &request_hash,
+        now,
+    )?;
+    let target_audit_actor = HandoffActor {
+        generation: target_generation,
+        ..audit_actor.clone()
+    };
+    insert_audit(
+        &tx,
+        &chain_id,
+        "generation",
+        &generation_object_id(&chain_id, target_generation),
+        -1,
+        None,
+        target_state.as_str(),
+        &target_audit_actor,
+        "supervisor",
+        "reserve_recovery_generation",
+        &request_hash,
+        now,
+    )?;
+    delete_exact_absent_generic_binding(&tx, &generation)?;
+    tx.commit()?;
+
+    let chain = load_chain(db.conn(), &chain_id)?.ok_or(HandoffError::Storage)?;
+    debug_assert_eq!(replaced_generation, preliminary.current_generation);
+    let generation =
+        load_generation(db.conn(), &chain_id, target_generation)?.ok_or(HandoffError::Storage)?;
+    let handoff = get_open_handoff_for_chain_tx(db.conn(), &chain_id)?;
+    Ok(RecoveryOutcome::Launch(Box::new(RecoveryReservation {
+        attempt_id,
+        chain,
+        plan,
+        handoff_id: handoff.as_ref().map(|value| value.id.clone()),
+        handoff_version: handoff.as_ref().map(|value| value.version),
+        generation,
+    })))
+}
+
+/// Recheck the append-only absence proof immediately before a recovery caller
+/// prepares any wrapper. The durable intent is necessary but not sufficient:
+/// a reused PID/process group or contradictory generic binding that appears
+/// after the intent still blocks all process action.
+pub fn revalidate_recovery_absence(
+    db: &HcomDb,
+    attempt_id: &str,
+    supervisor: &SupervisorActor,
+) -> Result<(), HandoffError> {
+    use hcom::chain_supervisor::{ExactProcessStatus, exact_process_status, process_group_status};
+
+    let attempt_id = validate_opaque_id(attempt_id, "recovery attempt ID")?;
+    validate_supervisor_actor(supervisor)?;
+    let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
+    let (
+        chain_id,
+        replaced_generation,
+        target_generation,
+        state,
+        process_id,
+        process_birth,
+        supervisor_pid,
+    ): (String, i64, i64, String, String, String, i64) = tx
+        .query_row(
+            "SELECT chain_id, replaced_generation, target_generation, state,
+                    supervisor_process_id, supervisor_process_birth_identity,
+                    supervisor_pid
+             FROM terminal_recovery_attempts WHERE id = ?1",
+            params![attempt_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(terminal_owner_error)?;
+    if state != "intent"
+        || process_id != supervisor.process_id
+        || process_birth != supervisor.process_birth_identity
+        || exact_process_status(
+            i32::try_from(supervisor_pid).map_err(|_| terminal_owner_error())?,
+            &process_birth,
+        ) != ExactProcessStatus::LiveExact
+    {
+        return Err(typed_conflict(
+            "recovery_intent_changed",
+            "recovery intent or new supervisor identity changed before process preparation",
+        ));
+    }
+    let chain = load_chain(&tx, &chain_id)?.ok_or_else(terminal_owner_error)?;
+    let binding = load_current_supervisor_binding(&tx, &chain)?;
+    if chain.current_generation != target_generation
+        || binding.process_id != supervisor.process_id
+        || binding.process_birth_identity != supervisor.process_birth_identity
+    {
+        return Err(typed_conflict(
+            "recovery_intent_changed",
+            "recovery intent or current generation changed before process preparation",
+        ));
+    }
+    let replaced =
+        load_generation(&tx, &chain_id, replaced_generation)?.ok_or(HandoffError::Storage)?;
+    let expected_process = load_generation_process(&tx, &chain_id, replaced_generation)?;
+    let mut subjects = std::collections::BTreeSet::new();
+    {
+        let mut statement = tx.prepare(
+            "SELECT subject, pid, pgid, process_birth_identity
+             FROM terminal_recovery_absence_evidence
+             WHERE recovery_attempt_id = ?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![attempt_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (subject, pid, pgid, birth) = row?;
+            if !subjects.insert(subject.clone()) {
+                return Err(typed_conflict(
+                    RecoveryPlanCode::AbsenceUnknown.as_str(),
+                    "recovery absence evidence is incomplete or contradictory",
+                ));
+            }
+            let status = if subject.ends_with("_process_group") {
+                process_group_status(
+                    i32::try_from(pgid.ok_or(HandoffError::Storage)?)
+                        .map_err(|_| HandoffError::Storage)?,
+                )
+            } else {
+                exact_process_status(
+                    i32::try_from(pid.ok_or(HandoffError::Storage)?)
+                        .map_err(|_| HandoffError::Storage)?,
+                    birth.as_deref().ok_or(HandoffError::Storage)?,
+                )
+            };
+            if status != ExactProcessStatus::Absent {
+                return Err(recovery_process_error(status));
+            }
+        }
+    }
+    let expected_subjects: std::collections::BTreeSet<String> = if expected_process.is_some() {
+        [
+            "supervisor",
+            "supervisor_process_group",
+            "wrapper",
+            "child",
+            "child_process_group",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    } else {
+        ["supervisor", "supervisor_process_group"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    };
+    if subjects != expected_subjects {
+        return Err(typed_conflict(
+            RecoveryPlanCode::AbsenceUnknown.as_str(),
+            "recovery absence evidence is incomplete or contradictory",
+        ));
+    }
+    if let Some(process_id) = replaced.wrapper_process_id.as_deref() {
+        let generic_binding_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM process_bindings WHERE process_id = ?1)",
+            params![process_id],
+            |row| row.get(0),
+        )?;
+        if generic_binding_exists {
+            return Err(typed_conflict(
+                RecoveryPlanCode::AbsenceUnknown.as_str(),
+                "generic process binding changed after recovery authorization",
+            ));
+        }
+    }
+    if let (Some(instance), Some(session)) = (
+        replaced.instance_name.as_deref(),
+        replaced.hcom_session_id.as_deref(),
+    ) {
+        let generic_instance_exists: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM instances WHERE name = ?1 AND session_id = ?2
+             )",
+            params![instance, session],
+            |row| row.get(0),
+        )?;
+        if generic_instance_exists {
+            return Err(typed_conflict(
+                RecoveryPlanCode::AbsenceUnknown.as_str(),
+                "generic instance binding changed after recovery authorization",
+            ));
+        }
+    }
+    let updated = tx.execute(
+        "UPDATE terminal_recovery_attempts
+         SET state = 'authorized', version = version + 1, updated_at = ?1
+         WHERE id = ?2 AND state = 'intent'",
+        params![now_epoch_f64(), attempt_id],
+    )?;
+    if updated != 1 {
+        return Err(typed_conflict(
+            "recovery_intent_changed",
+            "recovery intent changed before process preparation",
+        ));
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5241,6 +7582,180 @@ mod tests {
         workspace: PathBuf,
         source: HandoffActor,
         chain: TerminalChain,
+    }
+
+    struct PublicFixture {
+        _dir: TempDir,
+        db: HcomDb,
+        workspace: PathBuf,
+        chain_id: String,
+        source: HandoffActor,
+        supervisor: SupervisorActor,
+        tty_device: i64,
+        tty_inode: i64,
+    }
+
+    fn test_boot_id() -> String {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    fn absent_birth(pid: i32) -> String {
+        format!("linux-v1:{pid}:1:{}", test_boot_id())
+    }
+
+    fn absent_pid_and_group(seed: i32) -> i32 {
+        for pid in seed..seed + 10_000 {
+            if hcom::chain_supervisor::exact_process_status(pid, &absent_birth(pid))
+                == hcom::chain_supervisor::ExactProcessStatus::Absent
+                && hcom::chain_supervisor::process_group_status(pid)
+                    == hcom::chain_supervisor::ExactProcessStatus::Absent
+            {
+                return pid;
+            }
+        }
+        panic!("could not locate an absent PID/process-group test identity");
+    }
+
+    fn public_spec(
+        workspace: &Path,
+        supervisor_pid: i32,
+        supervisor_pgid: i32,
+        supervisor_birth: String,
+        suffix: &str,
+        tty_device: i64,
+        tty_inode: i64,
+    ) -> ChainSpec {
+        ChainSpec {
+            workspace: workspace.to_path_buf(),
+            tool: "codex".to_string(),
+            model_ref: "gpt-test".to_string(),
+            reasoning_ref: "high".to_string(),
+            permission_policy_ref: "approval=never;sandbox=read-only".to_string(),
+            policy_ref: "codex-0.145.0-foreground-v1".to_string(),
+            supervisor_process_id: format!("supervisor-{suffix}"),
+            supervisor_process_birth_identity: supervisor_birth,
+            supervisor_pid: i64::from(supervisor_pid),
+            supervisor_pgid: i64::from(supervisor_pgid),
+            outer_foreground_pgid: i64::from(supervisor_pgid),
+            outer_tty_device: tty_device,
+            outer_tty_inode: tty_inode,
+            launch_nonce: format!("launch-{suffix}"),
+        }
+    }
+
+    fn public_active_fixture() -> PublicFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        run_git(&workspace, &["init", "-b", "main"]);
+        run_git(&workspace, &["config", "user.name", "hcom test"]);
+        run_git(
+            &workspace,
+            &["config", "user.email", "hcom-test@example.invalid"],
+        );
+        std::fs::write(workspace.join("README.md"), "public fixture\n").unwrap();
+        run_git(&workspace, &["add", "README.md"]);
+        run_git(&workspace, &["commit", "-m", "fixture"]);
+
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let old_supervisor_pid = absent_pid_and_group(1_400_000);
+        let old_supervisor_pgid = absent_pid_and_group(1_420_000);
+        let tty_device = 71;
+        let tty_inode = 73;
+        let spec = public_spec(
+            &workspace,
+            old_supervisor_pid,
+            old_supervisor_pgid,
+            absent_birth(old_supervisor_pid),
+            "old",
+            tty_device,
+            tty_inode,
+        );
+        let supervisor = SupervisorActor {
+            process_id: spec.supervisor_process_id.clone(),
+            process_birth_identity: spec.supervisor_process_birth_identity.clone(),
+        };
+        let reservation = create_public_chain_reservation(&db, &spec).unwrap();
+        let wrapper_pid = absent_pid_and_group(1_440_000);
+        let child_pid = absent_pid_and_group(1_460_000);
+        begin_generation_prepare(
+            &db,
+            &supervisor,
+            &reservation.chain.id,
+            reservation.generation.generation,
+            reservation.chain.version,
+            &reservation.generation.launch_nonce,
+        )
+        .unwrap();
+        let materialized = materialize_initial_generation(
+            &db,
+            &supervisor,
+            &reservation.chain.id,
+            reservation.chain.version,
+            &TargetMaterialization {
+                expected_version: reservation.generation.version,
+                launch_nonce: reservation.generation.launch_nonce.clone(),
+                instance_name: "public-source".to_string(),
+                hcom_session_id: "public-source-session".to_string(),
+                process_id: "public-source-process".to_string(),
+                process_birth_identity: absent_birth(wrapper_pid),
+                wrapper_pid: i64::from(wrapper_pid),
+                wrapper_pgid: i64::from(old_supervisor_pgid),
+                child_pid: i64::from(child_pid),
+                child_pgid: i64::from(child_pid),
+                child_process_birth_identity: absent_birth(child_pid),
+            },
+        )
+        .unwrap();
+        let mut source = HandoffActor {
+            instance_name: "public-source".to_string(),
+            hcom_session_id: "public-source-session".to_string(),
+            native_session_id: None,
+            process_id: "public-source-process".to_string(),
+            process_birth_identity: absent_birth(wrapper_pid),
+            generation: 1,
+        };
+        pin_native_session(
+            &db,
+            &reservation.chain.id,
+            &source,
+            materialized.generation.version,
+            "public-source-native",
+        )
+        .unwrap();
+        source.native_session_id = Some("public-source-native".to_string());
+        PublicFixture {
+            _dir: dir,
+            db,
+            workspace,
+            chain_id: reservation.chain.id,
+            source,
+            supervisor,
+            tty_device,
+            tty_inode,
+        }
+    }
+
+    fn current_terminal_owner(fixture: &PublicFixture, suffix: &str) -> TerminalOwnerEvidence {
+        // SAFETY: these libc calls have no preconditions.
+        let pid = unsafe { libc::getpid() };
+        let pgid = unsafe { libc::getpgrp() };
+        TerminalOwnerEvidence {
+            workspace: fixture.workspace.clone(),
+            supervisor: SupervisorActor {
+                process_id: format!("recovery-supervisor-{suffix}"),
+                process_birth_identity: hcom::chain_supervisor::linux_process_birth_identity(pid)
+                    .unwrap(),
+            },
+            supervisor_pid: i64::from(pid),
+            supervisor_pgid: i64::from(pgid),
+            outer_foreground_pgid: i64::from(pgid),
+            outer_tty_device: fixture.tty_device,
+            outer_tty_inode: fixture.tty_inode,
+        }
     }
 
     fn run_git(workspace: &Path, args: &[&str]) {
@@ -5438,6 +7953,138 @@ mod tests {
         .unwrap()
     }
 
+    fn prepare_public_and_commit(fixture: &PublicFixture) -> HandoffOutcome {
+        let event_id = create_bundle(&fixture.db, &fixture.source, 0);
+        let prepared =
+            prepare_handoff(&fixture.db, &fixture.source, event_id, &fixture.workspace).unwrap();
+        commit_handoff(
+            &fixture.db,
+            &fixture.source,
+            &prepared.handoff.id,
+            prepared.handoff.version,
+            &fixture.workspace,
+        )
+        .unwrap()
+    }
+
+    fn advance_public_to_unmaterialized_target(fixture: &PublicFixture) -> HandoffOutcome {
+        let committed = prepare_public_and_commit(fixture);
+        let token = committed.handoff.quiesce_token.clone().unwrap();
+        let stopped = observe_stop(
+            &fixture.db,
+            &fixture.source,
+            &committed.handoff.id,
+            &StopObservation {
+                expected_version: committed.handoff.version,
+                quiesce_token: token.clone(),
+                committed_version: committed.handoff.version,
+                hook_native_session_id: fixture.source.native_session_id.clone().unwrap(),
+                launch_nonce: committed.handoff.source_launch_nonce.clone(),
+                turn_id: "turn-public-source".to_string(),
+            },
+        )
+        .unwrap();
+        let quiescing = begin_quiesce(
+            &fixture.db,
+            &fixture.supervisor,
+            &stopped.handoff.id,
+            stopped.handoff.version,
+            &token,
+        )
+        .unwrap();
+        let sigterm = record_sigterm_request(
+            &fixture.db,
+            &fixture.supervisor,
+            &quiescing.handoff.id,
+            &SigtermObservation {
+                expected_version: quiescing.handoff.version,
+                requested_wall_at: 2000.0,
+                requested_monotonic_ns: 2_000_000_000,
+                result: SigtermRequestResult::Sent,
+            },
+        )
+        .unwrap();
+        remove_live_actor(&fixture.db, &fixture.source);
+        complete_source_cleanup(
+            &fixture.db,
+            &fixture.supervisor,
+            &sigterm.handoff.id,
+            &CleanupObservation {
+                expected_version: sigterm.handoff.version,
+                exit: Some(ChildExitEvidence {
+                    observed_wall_at: 2000.010,
+                    observed_monotonic_ns: 2_010_000_000,
+                    exit_code: None,
+                    exit_signal: Some(libc::SIGTERM),
+                    delivery_context: DeliveryExitContext::Killed,
+                }),
+                reaped: true,
+                resources: ResourceCleanupEvidence {
+                    inject_succeeded: true,
+                    delivery_succeeded: true,
+                    pty_succeeded: true,
+                    screen_succeeded: true,
+                    write_queue_succeeded: true,
+                },
+                failure_kind: String::new(),
+                failure_reason: String::new(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn materialize_public_target(
+        fixture: &PublicFixture,
+        handoff: &TerminalHandoff,
+        supervisor: &SupervisorActor,
+        wrapper_pgid: i32,
+        suffix: &str,
+    ) -> HandoffActor {
+        let generation = effective_handoff_target_generation(&fixture.db, &handoff.id).unwrap();
+        let durable = get_generation(&fixture.db, &fixture.chain_id, generation)
+            .unwrap()
+            .unwrap();
+        let wrapper_pid = absent_pid_and_group(1_500_000 + generation as i32 * 100);
+        let child_pid = absent_pid_and_group(1_520_000 + generation as i32 * 100);
+        let actor = HandoffActor {
+            instance_name: format!("public-target-{suffix}"),
+            hcom_session_id: format!("public-target-session-{suffix}"),
+            native_session_id: None,
+            process_id: format!("public-target-process-{suffix}"),
+            process_birth_identity: absent_birth(wrapper_pid),
+            generation,
+        };
+        begin_generation_prepare(
+            &fixture.db,
+            supervisor,
+            &fixture.chain_id,
+            generation,
+            handoff.version,
+            &durable.launch_nonce,
+        )
+        .unwrap();
+        materialize_target_generation(
+            &fixture.db,
+            supervisor,
+            &handoff.id,
+            &TargetMaterialization {
+                expected_version: handoff.version,
+                launch_nonce: durable.launch_nonce,
+                instance_name: actor.instance_name.clone(),
+                hcom_session_id: actor.hcom_session_id.clone(),
+                process_id: actor.process_id.clone(),
+                process_birth_identity: actor.process_birth_identity.clone(),
+                wrapper_pid: i64::from(wrapper_pid),
+                wrapper_pgid: i64::from(wrapper_pgid),
+                child_pid: i64::from(child_pid),
+                child_pgid: i64::from(child_pid),
+                child_process_birth_identity: absent_birth(child_pid),
+            },
+        )
+        .unwrap();
+        actor
+    }
+
     fn advance_to_sigterm(fixture: &Fixture) -> HandoffOutcome {
         let committed = prepare_and_commit(fixture);
         let supervisor = supervisor_actor(fixture);
@@ -5496,6 +8143,15 @@ mod tests {
         let generation = load_generation(fixture.db.conn(), &fixture.chain.id, target.generation)
             .unwrap()
             .unwrap();
+        begin_generation_prepare(
+            &fixture.db,
+            &supervisor_actor(fixture),
+            &fixture.chain.id,
+            target.generation,
+            launching.handoff.version,
+            &generation.launch_nonce,
+        )
+        .unwrap();
         materialize_target_generation(
             &fixture.db,
             &supervisor_actor(fixture),
@@ -5507,6 +8163,11 @@ mod tests {
                 hcom_session_id: target.hcom_session_id.clone(),
                 process_id: target.process_id.clone(),
                 process_birth_identity: target.process_birth_identity.clone(),
+                wrapper_pid: 41_002,
+                wrapper_pgid: 41_001,
+                child_pid: 41_003,
+                child_pgid: 41_003,
+                child_process_birth_identity: "child-birth-target".to_string(),
             },
         )
         .unwrap()
@@ -6020,6 +8681,11 @@ mod tests {
                     hcom_session_id: target.hcom_session_id.clone(),
                     process_id: target.process_id.clone(),
                     process_birth_identity: target.process_birth_identity.clone(),
+                    wrapper_pid: 41_002,
+                    wrapper_pgid: 41_001,
+                    child_pid: 41_003,
+                    child_pgid: 41_003,
+                    child_process_birth_identity: "child-birth-target".to_string(),
                 },
             )
             .unwrap()
@@ -6331,7 +8997,10 @@ mod tests {
                 inspection.handoff.version,
                 &fixture.workspace,
             ),
-            Err(HandoffError::Conflict(_))
+            Err(HandoffError::TypedConflict {
+                code: "target_validation_changed",
+                ..
+            })
         ));
         assert_eq!(audit_count(&fixture.db), audit_before);
         assert_eq!(
@@ -6638,7 +9307,10 @@ mod tests {
                 prepared.handoff.version,
                 &fixture.workspace
             ),
-            Err(HandoffError::Conflict(_))
+            Err(HandoffError::TypedConflict {
+                code: "wrong_target_actor",
+                ..
+            })
         ));
         assert_eq!(
             get_handoff(&fixture.db, &prepared.handoff.id)
@@ -6897,7 +9569,10 @@ mod tests {
                 inspection.handoff.version,
                 &fixture.workspace
             ),
-            Err(HandoffError::Conflict(_))
+            Err(HandoffError::TypedConflict {
+                code: "wrong_target_actor",
+                ..
+            })
         ));
     }
 
@@ -7178,7 +9853,21 @@ mod tests {
             hcom_session_id: target.hcom_session_id.clone(),
             process_id: target.process_id.clone(),
             process_birth_identity: target.process_birth_identity.clone(),
+            wrapper_pid: 41_002,
+            wrapper_pgid: 41_001,
+            child_pid: 41_003,
+            child_pgid: 41_003,
+            child_process_birth_identity: "child-birth-target".to_string(),
         };
+        begin_generation_prepare(
+            &fixture.db,
+            &supervisor_actor(&fixture),
+            &fixture.chain.id,
+            target.generation,
+            launching.handoff.version,
+            &generation.launch_nonce,
+        )
+        .unwrap();
         let materialized = materialize_target_generation(
             &fixture.db,
             &supervisor_actor(&fixture),
@@ -7209,6 +9898,19 @@ mod tests {
                 &supervisor_actor(&fixture),
                 &launching.handoff.id,
                 &conflicting,
+            ),
+            Err(HandoffError::Conflict(_))
+        ));
+        let mut topology_conflicting = materialization.clone();
+        topology_conflicting.child_pid = 41_004;
+        topology_conflicting.child_pgid = 41_004;
+        topology_conflicting.child_process_birth_identity = "child-birth-second-target".to_string();
+        assert!(matches!(
+            materialize_target_generation(
+                &fixture.db,
+                &supervisor_actor(&fixture),
+                &launching.handoff.id,
+                &topology_conflicting,
             ),
             Err(HandoffError::Conflict(_))
         ));
@@ -7924,7 +10626,10 @@ mod tests {
                 ready.handoff.version,
                 &fixture.workspace,
             ),
-            Err(HandoffError::Conflict(_))
+            Err(HandoffError::TypedConflict {
+                code: "durable_inspection_required",
+                ..
+            })
         ));
         assert_eq!(audit_count(&fixture.db), audit_before);
 
@@ -7966,7 +10671,10 @@ mod tests {
                 inspection.handoff.version,
                 &fixture.workspace,
             ),
-            Err(HandoffError::Conflict(_))
+            Err(HandoffError::TypedConflict {
+                code: "target_validation_changed",
+                ..
+            })
         ));
         let rejected = reject_handoff(
             &fixture.db,
@@ -7978,6 +10686,873 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rejected.handoff.state, HandoffState::NeedsRecovery);
+    }
+
+    #[test]
+    fn public_reservation_is_single_winner_and_session_start_activates() {
+        let fixture = public_active_fixture();
+        let chain = get_chain(&fixture.db, &fixture.chain_id).unwrap().unwrap();
+        let generation = get_generation(&fixture.db, &fixture.chain_id, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(chain.state, ChainState::Active);
+        assert_eq!(generation.state, GenerationState::Active);
+        assert_eq!(
+            generation.native_session_id.as_deref(),
+            Some("public-source-native")
+        );
+        assert!(
+            get_generation_process(&fixture.db, &fixture.chain_id, 1)
+                .unwrap()
+                .is_some()
+        );
+
+        let other_pid = absent_pid_and_group(1_600_000);
+        let other_pgid = absent_pid_and_group(1_620_000);
+        let conflict = create_public_chain_reservation(
+            &fixture.db,
+            &public_spec(
+                &fixture.workspace,
+                other_pid,
+                other_pgid,
+                absent_birth(other_pid),
+                "loser",
+                fixture.tty_device + 2,
+                fixture.tty_inode + 2,
+            ),
+        )
+        .unwrap_err();
+        assert!(matches!(conflict, HandoffError::Conflict(_)));
+        assert_eq!(
+            fixture
+                .db
+                .conn()
+                .query_row("SELECT COUNT(*) FROM terminal_chains", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_public_start_and_recover_each_have_one_durable_winner() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let db_path = directory.path().join("hcom.db");
+        let db = HcomDb::open_at(&db_path).unwrap();
+        let old_pid = absent_pid_and_group(1_640_000);
+        let old_pgid = absent_pid_and_group(1_660_000);
+        let base = public_spec(
+            &workspace,
+            old_pid,
+            old_pgid,
+            absent_birth(old_pid),
+            "concurrent",
+            81,
+            83,
+        );
+        drop(db);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let starts: Vec<_> = (0..2)
+            .map(|index| {
+                let db_path = db_path.clone();
+                let barrier = Arc::clone(&barrier);
+                let mut spec = base.clone();
+                spec.supervisor_process_id = format!("start-supervisor-{index}");
+                spec.launch_nonce = format!("start-launch-{index}");
+                std::thread::spawn(move || {
+                    let db = HcomDb::open_at(&db_path).unwrap();
+                    barrier.wait();
+                    create_public_chain_reservation(&db, &spec)
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = starts
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Err(HandoffError::Conflict(_))))
+                .count(),
+            1
+        );
+
+        let db = HcomDb::open_at(&db_path).unwrap();
+        let chain: TerminalChain = db
+            .conn()
+            .query_row(
+                "SELECT * FROM terminal_chains LIMIT 1",
+                [],
+                TerminalChain::from_row,
+            )
+            .unwrap();
+        let owner_base =
+            {
+                // SAFETY: these libc calls have no preconditions.
+                let pid = unsafe { libc::getpid() };
+                let pgid = unsafe { libc::getpgrp() };
+                TerminalOwnerEvidence {
+                    workspace: workspace.clone(),
+                    supervisor: SupervisorActor {
+                        process_id: "recover-owner".to_string(),
+                        process_birth_identity:
+                            hcom::chain_supervisor::linux_process_birth_identity(pid).unwrap(),
+                    },
+                    supervisor_pid: i64::from(pid),
+                    supervisor_pgid: i64::from(pgid),
+                    outer_foreground_pgid: i64::from(pgid),
+                    outer_tty_device: 81,
+                    outer_tty_inode: 83,
+                }
+            };
+        let recover_barrier = Arc::new(Barrier::new(2));
+        let recovers: Vec<_> = (0..2)
+            .map(|index| {
+                let db_path = db_path.clone();
+                let barrier = Arc::clone(&recover_barrier);
+                let mut owner = owner_base.clone();
+                owner.supervisor.process_id = format!("recover-owner-{index}");
+                let chain_id = chain.id.clone();
+                let version = chain.version;
+                std::thread::spawn(move || {
+                    let db = HcomDb::open_at(&db_path).unwrap();
+                    barrier.wait();
+                    begin_public_recovery(&db, &chain_id, version, &owner)
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = recovers
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Ok(RecoveryOutcome::Launch(_))))
+                .count(),
+            1
+        );
+        assert_eq!(
+            db.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM terminal_recovery_attempts",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM terminal_generations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_live_reused_and_unknown_supervisor_without_mutation() {
+        enum Case {
+            Live,
+            Reused,
+            Unknown,
+        }
+        for (index, case, expected_code) in [
+            (0, Case::Live, "old_process_still_live"),
+            (1, Case::Reused, "process_identity_reused"),
+            (2, Case::Unknown, "process_absence_unknown"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let workspace = directory.path().join("workspace");
+            std::fs::create_dir(&workspace).unwrap();
+            let db = HcomDb::open_at(&directory.path().join("hcom.db")).unwrap();
+            // SAFETY: these libc calls have no preconditions.
+            let pid = unsafe { libc::getpid() };
+            let pgid = unsafe { libc::getpgrp() };
+            let exact = hcom::chain_supervisor::linux_process_birth_identity(pid).unwrap();
+            let birth = match case {
+                Case::Live => exact,
+                Case::Reused => {
+                    let mut parts = exact.splitn(4, ':');
+                    let prefix = parts.next().unwrap();
+                    let parsed_pid = parts.next().unwrap();
+                    let start = parts.next().unwrap().parse::<u64>().unwrap() + 1;
+                    let boot = parts.next().unwrap();
+                    format!("{prefix}:{parsed_pid}:{start}:{boot}")
+                }
+                Case::Unknown => "not-a-process-birth-identity".to_string(),
+            };
+            let reservation = create_public_chain_reservation(
+                &db,
+                &public_spec(
+                    &workspace,
+                    pid,
+                    pgid,
+                    birth,
+                    &format!("blocked-{index}"),
+                    91 + index,
+                    101 + index,
+                ),
+            )
+            .unwrap();
+            let owner =
+                TerminalOwnerEvidence {
+                    workspace: workspace.clone(),
+                    supervisor: SupervisorActor {
+                        process_id: format!("new-owner-{index}"),
+                        process_birth_identity:
+                            hcom::chain_supervisor::linux_process_birth_identity(pid).unwrap(),
+                    },
+                    supervisor_pid: i64::from(pid),
+                    supervisor_pgid: i64::from(pgid),
+                    outer_foreground_pgid: i64::from(pgid),
+                    outer_tty_device: 91 + index,
+                    outer_tty_inode: 101 + index,
+                };
+            let result = begin_public_recovery(
+                &db,
+                &reservation.chain.id,
+                reservation.chain.version,
+                &owner,
+            );
+            assert!(
+                matches!(
+                    &result,
+                    Err(HandoffError::TypedConflict { code, .. }) if *code == expected_code
+                ),
+                "case={index} expected={expected_code} result={result:?}"
+            );
+            assert_eq!(
+                db.conn()
+                    .query_row(
+                        "SELECT COUNT(*) FROM terminal_recovery_attempts",
+                        [],
+                        |row| { row.get::<_, i64>(0) }
+                    )
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                db.conn()
+                    .query_row("SELECT COUNT(*) FROM terminal_generations", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_planner_covers_each_phase4_state_class() {
+        let fixture = fixture(true);
+        let committed = prepare_and_commit(&fixture);
+        let base_chain = get_chain(&fixture.db, &fixture.chain.id).unwrap().unwrap();
+        let source = get_generation(&fixture.db, &fixture.chain.id, 1)
+            .unwrap()
+            .unwrap();
+        let target = get_generation(&fixture.db, &fixture.chain.id, 2)
+            .unwrap()
+            .unwrap();
+        let base_handoff = committed.handoff;
+
+        let mut chain = base_chain.clone();
+        chain.state = ChainState::Active;
+        assert_eq!(
+            recovery_plan(&chain, &source, None, true),
+            RecoveryPlanCode::SourceDeadBeforeCommit
+        );
+        chain.state = ChainState::Prepared;
+        let mut handoff = base_handoff.clone();
+        handoff.state = HandoffState::Prepared;
+        assert_eq!(
+            recovery_plan(&chain, &source, Some(&handoff), true),
+            RecoveryPlanCode::SourceDeadBeforeCommit
+        );
+
+        for (chain_state, handoff_state) in [
+            (ChainState::Committed, HandoffState::Committed),
+            (ChainState::StopObserved, HandoffState::StopObserved),
+            (ChainState::QuiescingSource, HandoffState::QuiescingSource),
+        ] {
+            chain.state = chain_state;
+            handoff.state = handoff_state;
+            assert_eq!(
+                recovery_plan(&chain, &source, Some(&handoff), true),
+                RecoveryPlanCode::ContinueAfterSourceAbsence
+            );
+        }
+
+        chain.state = ChainState::LaunchingTarget;
+        handoff.state = HandoffState::LaunchingTarget;
+        assert_eq!(
+            recovery_plan(&chain, &target, Some(&handoff), false),
+            RecoveryPlanCode::RetryUnmaterializedTarget
+        );
+        assert_eq!(
+            recovery_plan(&chain, &target, Some(&handoff), true),
+            RecoveryPlanCode::AbsenceUnknown
+        );
+        let mut materialized = target.clone();
+        materialized.wrapper_process_id = Some("target-process".to_string());
+        assert_eq!(
+            recovery_plan(&chain, &materialized, Some(&handoff), false),
+            RecoveryPlanCode::AbsenceUnknown
+        );
+        assert_eq!(
+            recovery_plan(&chain, &materialized, Some(&handoff), true),
+            RecoveryPlanCode::ReplaceDeadTarget
+        );
+
+        chain.state = ChainState::AwaitingAcceptance;
+        handoff.state = HandoffState::AwaitingAcceptance;
+        assert_eq!(
+            recovery_plan(&chain, &materialized, Some(&handoff), true),
+            RecoveryPlanCode::ReplaceDeadAwaitingAcceptance
+        );
+
+        chain.state = ChainState::LaunchingTarget;
+        let mut initial = source.clone();
+        initial.state = GenerationState::Reserved;
+        initial.wrapper_process_id = None;
+        initial.process_birth_identity = None;
+        initial.instance_name = None;
+        initial.hcom_session_id = None;
+        initial.native_session_id = None;
+        assert_eq!(
+            recovery_plan(&chain, &initial, None, false),
+            RecoveryPlanCode::RetryInitialGeneration
+        );
+        initial.native_session_id = Some("old-native".to_string());
+        assert_eq!(
+            recovery_plan(&chain, &initial, None, false),
+            RecoveryPlanCode::AbsenceUnknown
+        );
+        initial.native_session_id = None;
+        assert_eq!(
+            recovery_plan(&chain, &initial, None, true),
+            RecoveryPlanCode::AbsenceUnknown
+        );
+        chain.state = ChainState::NeedsRecovery;
+        initial.state = GenerationState::NeedsRecovery;
+        assert_eq!(
+            recovery_plan(&chain, &initial, None, false),
+            RecoveryPlanCode::RetryInitialGeneration
+        );
+
+        handoff.state = HandoffState::NeedsRecovery;
+        handoff.failure_kind = "unclassified_failure".to_string();
+        assert_eq!(
+            recovery_plan(&chain, &materialized, Some(&handoff), true),
+            RecoveryPlanCode::UnsupportedRecoveryState
+        );
+        handoff.failure_kind = "target_launch_failed".to_string();
+        assert_eq!(
+            recovery_plan(&chain, &materialized, Some(&handoff), true),
+            RecoveryPlanCode::ReplaceDeadTarget
+        );
+    }
+
+    #[test]
+    fn dead_active_source_becomes_manual_and_unmaterialized_target_appends() {
+        let active = public_active_fixture();
+        let active_chain = get_chain(&active.db, &active.chain_id).unwrap().unwrap();
+        let active_owner = current_terminal_owner(&active, "manual");
+        let RecoveryOutcome::Manual { chain, reason } = begin_public_recovery(
+            &active.db,
+            &active_chain.id,
+            active_chain.version,
+            &active_owner,
+        )
+        .unwrap() else {
+            panic!("dead active source must not be automatically continued")
+        };
+        assert_eq!(reason, RecoveryPlanCode::SourceDeadBeforeCommit);
+        assert_eq!(chain.state, ChainState::NeedsRecovery);
+        assert_eq!(
+            active
+                .db
+                .conn()
+                .query_row("SELECT COUNT(*) FROM terminal_generations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            active
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM terminal_recovery_absence_evidence",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            active
+                .db
+                .conn()
+                .query_row(
+                    "SELECT state FROM terminal_chain_claims WHERE chain_id = ?1",
+                    params![active.chain_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "released"
+        );
+        assert_eq!(
+            active
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM terminal_transition_audit
+                     WHERE chain_id = ?1 AND object_id = ?2
+                       AND from_state = 'active' AND to_state = 'released'
+                       AND action = 'release_public_chain_claim'",
+                    params![active.chain_id, format!("{}:claim", active.chain_id)],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert!(
+            active
+                .db
+                .conn()
+                .execute(
+                    "UPDATE terminal_chain_claims
+                     SET state = 'active', version = version + 1, released_at = NULL
+                     WHERE chain_id = ?1",
+                    params![active.chain_id],
+                )
+                .is_err(),
+            "a released public claim must not be reactivated"
+        );
+        let second =
+            begin_public_recovery(&active.db, &active_chain.id, chain.version, &active_owner)
+                .unwrap();
+        let RecoveryOutcome::Manual {
+            reason: second_reason,
+            ..
+        } = second
+        else {
+            panic!("a manual dead-source decision must never become an automatic retry")
+        };
+        assert_eq!(second_reason, RecoveryPlanCode::SourceDeadBeforeCommit);
+        assert_eq!(
+            active
+                .db
+                .conn()
+                .query_row("SELECT COUNT(*) FROM terminal_generations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            active
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM terminal_recovery_attempts WHERE chain_id = ?1",
+                    params![active.chain_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        let replacement_supervisor_pid = absent_pid_and_group(1_480_000);
+        let replacement_supervisor_pgid = absent_pid_and_group(1_500_000);
+        let replacement = create_public_chain_reservation(
+            &active.db,
+            &public_spec(
+                &active.workspace,
+                replacement_supervisor_pid,
+                replacement_supervisor_pgid,
+                absent_birth(replacement_supervisor_pid),
+                "replacement",
+                active.tty_device,
+                active.tty_inode,
+            ),
+        )
+        .unwrap();
+        assert_ne!(replacement.chain.id, active.chain_id);
+        assert_eq!(
+            chain_status_for_terminal_owner(&active.db, None, &active_owner)
+                .unwrap()
+                .id,
+            replacement.chain.id
+        );
+        assert_eq!(
+            chain_status_for_terminal_owner(&active.db, Some(&active.chain_id), &active_owner)
+                .unwrap()
+                .id,
+            active.chain_id
+        );
+
+        let launching = public_active_fixture();
+        let original_target = advance_public_to_unmaterialized_target(&launching);
+        let chain = get_chain(&launching.db, &launching.chain_id)
+            .unwrap()
+            .unwrap();
+        let owner = current_terminal_owner(&launching, "unmaterialized");
+        let RecoveryOutcome::Launch(recovery) =
+            begin_public_recovery(&launching.db, &chain.id, chain.version, &owner).unwrap()
+        else {
+            panic!("unmaterialized target must have one append-only retry")
+        };
+        assert_eq!(recovery.plan, RecoveryPlanCode::RetryUnmaterializedTarget);
+        assert!(recovery.generation.generation > original_target.handoff.target_generation);
+        assert_eq!(
+            launching
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM terminal_recovery_absence_evidence
+                 WHERE recovery_attempt_id = ?1",
+                    params![recovery.attempt_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn explicit_terminal_owner_status_can_read_a_released_chain_handoff() {
+        let fixture = public_active_fixture();
+        let event_id = create_bundle(&fixture.db, &fixture.source, 0);
+        let prepared =
+            prepare_handoff(&fixture.db, &fixture.source, event_id, &fixture.workspace).unwrap();
+        let owner = current_terminal_owner(&fixture, "released-handoff");
+        let chain = get_chain(&fixture.db, &fixture.chain_id).unwrap().unwrap();
+        let RecoveryOutcome::Manual { reason, .. } =
+            begin_public_recovery(&fixture.db, &chain.id, chain.version, &owner).unwrap()
+        else {
+            panic!("a dead prepared source must require explicit reconstruction")
+        };
+        assert_eq!(reason, RecoveryPlanCode::SourceDeadBeforeCommit);
+
+        let replacement_supervisor_pid = absent_pid_and_group(1_520_000);
+        let replacement_supervisor_pgid = absent_pid_and_group(1_540_000);
+        create_public_chain_reservation(
+            &fixture.db,
+            &public_spec(
+                &fixture.workspace,
+                replacement_supervisor_pid,
+                replacement_supervisor_pgid,
+                absent_birth(replacement_supervisor_pid),
+                "status-replacement",
+                fixture.tty_device,
+                fixture.tty_inode,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            handoff_status_for_terminal_owner(&fixture.db, Some(&prepared.handoff.id), &owner)
+                .unwrap()
+                .id,
+            prepared.handoff.id
+        );
+    }
+
+    #[test]
+    fn prepare_intent_without_process_evidence_never_spawns_a_second_target() {
+        let fixture = public_active_fixture();
+        let launching = advance_public_to_unmaterialized_target(&fixture);
+        let target_generation =
+            effective_handoff_target_generation(&fixture.db, &launching.handoff.id).unwrap();
+        let target = get_generation(&fixture.db, &fixture.chain_id, target_generation)
+            .unwrap()
+            .unwrap();
+        begin_generation_prepare(
+            &fixture.db,
+            &fixture.supervisor,
+            &fixture.chain_id,
+            target_generation,
+            launching.handoff.version,
+            &target.launch_nonce,
+        )
+        .unwrap();
+
+        let chain = get_chain(&fixture.db, &fixture.chain_id).unwrap().unwrap();
+        let owner = current_terminal_owner(&fixture, "prepare-gap");
+        let RecoveryOutcome::Manual {
+            chain: recovered,
+            reason,
+        } = begin_public_recovery(&fixture.db, &chain.id, chain.version, &owner).unwrap()
+        else {
+            panic!("an interrupted process preparation must require manual recovery")
+        };
+        assert_eq!(reason, RecoveryPlanCode::AbsenceUnknown);
+        assert_eq!(recovered.state, ChainState::NeedsRecovery);
+        assert_eq!(
+            fixture
+                .db
+                .conn()
+                .query_row("SELECT COUNT(*) FROM terminal_generations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            fixture
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM terminal_generation_prepare_intents
+                     WHERE chain_id = ?1 AND generation = ?2",
+                    params![fixture.chain_id, target_generation],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn committed_recovery_uses_authorized_absence_without_forging_cleanup() {
+        let fixture = public_active_fixture();
+        let committed = prepare_public_and_commit(&fixture);
+        let chain = get_chain(&fixture.db, &fixture.chain_id).unwrap().unwrap();
+        let owner = current_terminal_owner(&fixture, "committed");
+        let RecoveryOutcome::Launch(recovery) =
+            begin_public_recovery(&fixture.db, &chain.id, chain.version, &owner).unwrap()
+        else {
+            panic!("committed dead source should have a launch recovery plan")
+        };
+        assert_eq!(recovery.plan, RecoveryPlanCode::ContinueAfterSourceAbsence);
+        assert!(recovery.generation.generation > committed.handoff.target_generation);
+        assert_eq!(
+            fixture
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM terminal_recovery_absence_evidence
+                     WHERE recovery_attempt_id = ?1",
+                    params![recovery.attempt_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            5
+        );
+        revalidate_recovery_absence(&fixture.db, &recovery.attempt_id, &owner.supervisor).unwrap();
+        assert_eq!(
+            fixture
+                .db
+                .conn()
+                .query_row(
+                    "SELECT state FROM terminal_recovery_attempts WHERE id = ?1",
+                    params![recovery.attempt_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "authorized"
+        );
+        let recovered_handoff = get_handoff(&fixture.db, &committed.handoff.id)
+            .unwrap()
+            .unwrap();
+        assert!(recovered_handoff.waitpid_reaped.is_none());
+        assert!(recovered_handoff.cleanup_completed_at.is_none());
+        assert!(recovered_handoff.sigterm_request_result.is_empty());
+
+        let actor = materialize_public_target(
+            &fixture,
+            &recovered_handoff,
+            &owner.supervisor,
+            i32::try_from(owner.supervisor_pgid).unwrap(),
+            "absence",
+        );
+        assert_eq!(actor.generation, recovery.generation.generation);
+        assert_eq!(
+            fixture
+                .db
+                .conn()
+                .query_row(
+                    "SELECT state FROM terminal_recovery_attempts WHERE id = ?1",
+                    params![recovery.attempt_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "materialized"
+        );
+        assert!(
+            fixture
+                .db
+                .conn()
+                .execute(
+                    "UPDATE terminal_recovery_absence_evidence
+                     SET observed_at = observed_at + 1
+                     WHERE recovery_attempt_id = ?1",
+                    params![recovery.attempt_id],
+                )
+                .is_err()
+        );
+        assert!(
+            fixture
+                .db
+                .conn()
+                .execute(
+                    "DELETE FROM terminal_generation_processes
+                     WHERE chain_id = ?1 AND generation = 1",
+                    params![fixture.chain_id],
+                )
+                .is_err()
+        );
+        assert!(matches!(
+            revalidate_recovery_absence(&fixture.db, &recovery.attempt_id, &owner.supervisor,),
+            Err(HandoffError::TypedConflict {
+                code: "recovery_intent_changed",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn recovered_awaiting_target_gets_new_generation_and_requires_reinspection() {
+        let fixture = public_active_fixture();
+        let launching = advance_public_to_unmaterialized_target(&fixture);
+        let old_pgid = i32::try_from(
+            get_chain(&fixture.db, &fixture.chain_id)
+                .unwrap()
+                .unwrap()
+                .supervisor_pgid
+                .unwrap(),
+        )
+        .unwrap();
+        let mut old_target = materialize_public_target(
+            &fixture,
+            &launching.handoff,
+            &fixture.supervisor,
+            old_pgid,
+            "old",
+        );
+        let old_generation = get_generation(&fixture.db, &fixture.chain_id, old_target.generation)
+            .unwrap()
+            .unwrap();
+        pin_native_session(
+            &fixture.db,
+            &fixture.chain_id,
+            &old_target,
+            old_generation.version,
+            "public-target-native-old",
+        )
+        .unwrap();
+        old_target.native_session_id = Some("public-target-native-old".to_string());
+        let materialized_handoff = get_handoff(&fixture.db, &launching.handoff.id)
+            .unwrap()
+            .unwrap();
+        let ready = target_ready(
+            &fixture.db,
+            &old_target,
+            &materialized_handoff.id,
+            materialized_handoff.version,
+            &old_generation.launch_nonce,
+        )
+        .unwrap();
+        let inspected = inspect_handoff(
+            &fixture.db,
+            &old_target,
+            &ready.handoff.id,
+            ready.handoff.version,
+            &fixture.workspace,
+        )
+        .unwrap();
+
+        let chain = get_chain(&fixture.db, &fixture.chain_id).unwrap().unwrap();
+        let owner = current_terminal_owner(&fixture, "awaiting");
+        let RecoveryOutcome::Launch(recovery) =
+            begin_public_recovery(&fixture.db, &chain.id, chain.version, &owner).unwrap()
+        else {
+            panic!("dead awaiting target should have a launch recovery plan")
+        };
+        assert_eq!(
+            recovery.plan,
+            RecoveryPlanCode::ReplaceDeadAwaitingAcceptance
+        );
+        assert!(recovery.generation.generation > old_target.generation);
+        revalidate_recovery_absence(&fixture.db, &recovery.attempt_id, &owner.supervisor).unwrap();
+        let recovered_handoff = get_handoff(&fixture.db, &ready.handoff.id)
+            .unwrap()
+            .unwrap();
+        let mut new_target = materialize_public_target(
+            &fixture,
+            &recovered_handoff,
+            &owner.supervisor,
+            i32::try_from(owner.supervisor_pgid).unwrap(),
+            "new",
+        );
+        let new_generation = get_generation(&fixture.db, &fixture.chain_id, new_target.generation)
+            .unwrap()
+            .unwrap();
+        pin_native_session(
+            &fixture.db,
+            &fixture.chain_id,
+            &new_target,
+            new_generation.version,
+            "public-target-native-new",
+        )
+        .unwrap();
+        new_target.native_session_id = Some("public-target-native-new".to_string());
+        let after_materialize = get_handoff(&fixture.db, &ready.handoff.id)
+            .unwrap()
+            .unwrap();
+        let new_ready = target_ready(
+            &fixture.db,
+            &new_target,
+            &after_materialize.id,
+            after_materialize.version,
+            &new_generation.launch_nonce,
+        )
+        .unwrap();
+        assert!(matches!(
+            accept_handoff(
+                &fixture.db,
+                &new_target,
+                &new_ready.handoff.id,
+                new_ready.handoff.version,
+                &fixture.workspace,
+            ),
+            Err(HandoffError::TypedConflict {
+                code: "durable_inspection_required",
+                ..
+            })
+        ));
+        let reinspection = inspect_handoff(
+            &fixture.db,
+            &new_target,
+            &new_ready.handoff.id,
+            new_ready.handoff.version,
+            &fixture.workspace,
+        )
+        .unwrap();
+        assert!(!reinspection.replayed);
+        assert_ne!(new_target.generation, old_target.generation);
+        assert_eq!(
+            reinspection.instructions_digest,
+            inspected.instructions_digest
+        );
+        let accepted = accept_handoff(
+            &fixture.db,
+            &new_target,
+            &new_ready.handoff.id,
+            reinspection.handoff.version,
+            &fixture.workspace,
+        )
+        .unwrap();
+        assert_eq!(accepted.handoff.state, HandoffState::Accepted);
     }
 
     #[test]

@@ -1030,6 +1030,15 @@ impl DurableControl for MockControl {
         Ok(())
     }
 
+    fn begin_target_prepare(&mut self, reservation: &TargetReservation) -> Result<(), Self::Error> {
+        if reservation.generation != self.generation + 1
+            || self.phase != ControlPhase::SigtermRecorded
+        {
+            return Err("prepare intent reservation mismatch".to_string());
+        }
+        Ok(())
+    }
+
     fn materialize_target(
         &mut self,
         reservation: &TargetReservation,

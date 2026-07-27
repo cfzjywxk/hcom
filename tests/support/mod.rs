@@ -397,7 +397,27 @@ impl Hcom {
 
     /// Return installed Codex version text, or a clear absence/error reason.
     pub fn codex_version(&self) -> Result<String, String> {
-        self.external_version("codex")
+        let output = self
+            .external_cmd("codex")
+            .args(["--disable", "plugins", "--version"])
+            .output()
+            .map_err(|e| format!("could not execute `codex --version`: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "`codex --version` exited {:?}: stdout={} stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let version = if stdout.is_empty() { stderr } else { stdout };
+        if version.is_empty() {
+            Err("`codex --version` produced no version text".to_string())
+        } else {
+            Ok(version)
+        }
     }
 
     /// Return `<binary> --version` text, or a clear absence/error reason, run in

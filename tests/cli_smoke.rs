@@ -64,7 +64,7 @@ fn help_prints_and_exits_zero() {
 }
 
 #[test]
-fn handoff_and_chain_help_expose_phase3_transition_surface_only() {
+fn handoff_and_chain_help_expose_phase4_public_surface_only() {
     let h = Hcom::new();
     let (code, handoff_help, stderr) = h.run(["handoff", "--help"]);
     assert_eq!(code, 0, "stdout={handoff_help} stderr={stderr}");
@@ -74,27 +74,93 @@ fn handoff_and_chain_help_expose_phase3_transition_surface_only() {
         assert!(handoff_help.contains(command), "stdout={handoff_help}");
     }
     assert!(
-        handoff_help.contains("no chain launcher"),
+        handoff_help.contains("exact managed generation")
+            && handoff_help.contains("owning foreground terminal"),
         "stdout={handoff_help}"
     );
-    for forbidden in ["hcom chain start", "hcom chain recover", "hcom chain codex"] {
-        assert!(!handoff_help.contains(forbidden), "stdout={handoff_help}");
-    }
 
     let (code, chain_help, stderr) = h.run(["chain", "--help"]);
     assert_eq!(code, 0, "stdout={chain_help} stderr={stderr}");
-    assert!(chain_help.contains("status"), "stdout={chain_help}");
+    for command in [
+        "hcom chain codex",
+        "hcom chain status",
+        "hcom chain recover",
+    ] {
+        assert!(chain_help.contains(command), "stdout={chain_help}");
+    }
+    for forbidden in [
+        "hcom chain start",
+        "hcom chain resume",
+        "hcom chain fork",
+        "hcom chain claude",
+        "hcom chain gemini",
+        "hcom chain opencode",
+        "hcom chain kilo",
+        "hcom chain pi",
+        "hcom chain omp",
+        "hcom chain cursor",
+        "hcom chain copilot",
+        "hcom chain kimi",
+        "hcom chain antigravity",
+    ] {
+        assert!(!chain_help.contains(forbidden), "stdout={chain_help}");
+    }
     assert!(
-        !chain_help.contains("hcom chain start"),
+        chain_help.contains("Fresh create only") && chain_help.contains("Stop/task_complete gates"),
         "stdout={chain_help}"
     );
-    assert!(
-        !chain_help.contains("hcom chain recover"),
-        "stdout={chain_help}"
+}
+
+#[test]
+fn public_chain_process_actions_require_an_unmanaged_foreground_tty() {
+    let h = Hcom::new();
+    let (code, stdout, stderr) = h.run([
+        "chain",
+        "codex",
+        "--model",
+        "gpt-5.5",
+        "--reasoning",
+        "high",
+        "--sandbox",
+        "workspace-write",
+        "--approval",
+        "on-request",
+    ]);
+    assert_eq!(code, 2, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.is_empty(), "stdout={stdout}");
+    assert!(stderr.contains("foreground terminal"), "stderr={stderr}");
+
+    let (code, stdout, stderr) =
+        h.run(["chain", "recover", "tc-missing", "--version", "0", "--json"]);
+    assert_eq!(code, 2, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.is_empty(), "stdout={stdout}");
+    let error: serde_json::Value =
+        serde_json::from_str(&stderr).unwrap_or_else(|e| panic!("json error: {e}\n{stderr}"));
+    assert_eq!(
+        error["error"]["code"].as_str(),
+        Some("foreground_terminal_required")
     );
+
+    let mut nested = h.cmd();
+    nested.env("HCOM_PROCESS_ID", "nested-agent").args([
+        "chain",
+        "codex",
+        "--model",
+        "gpt-5.5",
+        "--reasoning",
+        "high",
+        "--sandbox",
+        "workspace-write",
+        "--approval",
+        "on-request",
+    ]);
+    let output = nested.output().expect("run nested chain start");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
     assert!(
-        !chain_help.contains("hcom chain codex"),
-        "stdout={chain_help}"
+        String::from_utf8_lossy(&output.stderr).contains("un-managed human shell"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

@@ -14,6 +14,9 @@ use crate::handoff::{MAX_IDENTITY_BYTES, MAX_OPAQUE_ID_BYTES, TerminalChain};
 
 pub(crate) const SUPPORTED_CODEX_VERSION: &str = "0.145.0";
 pub(crate) const SUPPORTED_CODEX_VERSION_OUTPUT: &str = "codex-cli 0.145.0";
+/// Version probing must not start Codex's asynchronous plugin marketplace
+/// refresh in the caller's foreground process group.
+pub(crate) const CODEX_VERSION_PROBE_ARGS: &[&str] = &["--disable", "plugins", "--version"];
 pub(crate) const MAX_CHAIN_HOOK_PAYLOAD_BYTES: usize = 16 * 1024;
 pub(crate) const CODEX_VERSION_ENV: &str = "HCOM_CHAIN_CODEX_VERSION";
 pub(crate) const HANDOFF_ID_ENV: &str = "HCOM_CHAIN_HANDOFF_ID";
@@ -270,7 +273,20 @@ impl CodexLaunchProfile {
 
     pub(crate) fn argv(&self, handoff_id: &str) -> Result<Vec<String>, CodexContractError> {
         validate_handoff_id(handoff_id)?;
-        let argv = vec![
+        let argv = self.argv_with_prompt(format!("Continue hcom handoff {handoff_id}"));
+        self.validate_exact_argv(handoff_id, &argv)?;
+        Ok(argv)
+    }
+
+    pub(crate) fn initial_argv(&self, chain_id: &str) -> Result<Vec<String>, CodexContractError> {
+        validate_handoff_id(chain_id)?;
+        let argv = self.argv_with_prompt(format!("Start hcom chain {chain_id}"));
+        self.validate_exact_initial_argv(chain_id, &argv)?;
+        Ok(argv)
+    }
+
+    fn argv_with_prompt(&self, prompt: String) -> Vec<String> {
+        vec![
             "--model".to_string(),
             self.model.clone(),
             "--config".to_string(),
@@ -281,10 +297,8 @@ impl CodexLaunchProfile {
             self.approval.cli().to_string(),
             "--cd".to_string(),
             self.workspace.to_string_lossy().into_owned(),
-            format!("Continue hcom handoff {handoff_id}"),
-        ];
-        self.validate_exact_argv(handoff_id, &argv)?;
-        Ok(argv)
+            prompt,
+        ]
     }
 
     pub(crate) fn validate_exact_argv(
@@ -307,6 +321,34 @@ impl CodexLaunchProfile {
                 .to_str()
                 .ok_or(CodexContractError::NonCanonicalWorkspace)?,
             &format!("Continue hcom handoff {handoff_id}"),
+        ];
+        if argv.iter().map(String::as_str).eq(expected) {
+            Ok(())
+        } else {
+            Err(CodexContractError::NonFreshArgv)
+        }
+    }
+
+    pub(crate) fn validate_exact_initial_argv(
+        &self,
+        chain_id: &str,
+        argv: &[String],
+    ) -> Result<(), CodexContractError> {
+        validate_handoff_id(chain_id)?;
+        let expected = [
+            "--model",
+            self.model.as_str(),
+            "--config",
+            &format!("model_reasoning_effort=\"{}\"", self.reasoning),
+            "--sandbox",
+            self.sandbox.cli(),
+            "--ask-for-approval",
+            self.approval.cli(),
+            "--cd",
+            self.workspace
+                .to_str()
+                .ok_or(CodexContractError::NonCanonicalWorkspace)?,
+            &format!("Start hcom chain {chain_id}"),
         ];
         if argv.iter().map(String::as_str).eq(expected) {
             Ok(())
@@ -425,6 +467,35 @@ mod tests {
                 Err(CodexContractError::NonFreshArgv)
             );
         }
+    }
+
+    #[test]
+    fn initial_profile_is_exact_plain_create_with_only_opaque_protocol() {
+        let profile = profile();
+        let chain_id = "tc-opaque";
+        let exact = profile.initial_argv(chain_id).unwrap();
+        assert!(
+            profile
+                .validate_exact_initial_argv(chain_id, &exact)
+                .is_ok()
+        );
+        assert_eq!(
+            exact.last().map(String::as_str),
+            Some("Start hcom chain tc-opaque")
+        );
+        for forbidden in ["resume", "fork", "--last", "raw task", "bundle"] {
+            assert!(
+                !exact.iter().any(|argument| argument.contains(forbidden)),
+                "argv={exact:?}"
+            );
+        }
+
+        let mut changed = exact.clone();
+        changed.push("--profile".to_string());
+        assert_eq!(
+            profile.validate_exact_initial_argv(chain_id, &changed),
+            Err(CodexContractError::NonFreshArgv)
+        );
     }
 
     #[test]

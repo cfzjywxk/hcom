@@ -10,14 +10,16 @@ use crate::handoff::{
     HandoffActor, HandoffError, HandoffInspection, HandoffOutcome, MAX_HANDOFF_BUNDLE_BYTES,
     MAX_INSTRUCTIONS_BYTES, MAX_STATUS_HUMAN_BYTES, MAX_STATUS_JSON_BYTES, ManagedActorMarkers,
     TerminalHandoff, abort_handoff, accept_handoff, commit_handoff, current_chain_for_actor,
-    handoff_status_for_actor, inspect_handoff, prepare_handoff, reject_handoff,
+    effective_handoff_target_generation, handoff_status_for_actor,
+    handoff_status_for_terminal_owner, inspect_handoff, prepare_handoff, reject_handoff,
     resolve_managed_actor,
 };
 use crate::shared::{CommandContext, SenderKind};
 
 const HANDOFF_AFTER_HELP: &str = "\
-Phase 3 accepts mutations only from exact supervisor-owned generation context.
-This CLI does not expose a chain start, recovery, or process-launch path.
+Mutations are accepted only from the exact supervisor-owned Codex generation.
+Human-shell status is read-only and limited to the owning foreground terminal.
+Start and crash recovery are exposed only through `hcom chain`.
 
 Examples:
   hcom handoff prepare --bundle-event 123 --json
@@ -329,9 +331,54 @@ fn print_outcome(action: &str, outcome: &HandoffOutcome, json_mode: bool) -> i32
     }
 }
 
-fn print_status(handoff: &TerminalHandoff, json_mode: bool) -> i32 {
+fn status_recovery_reason(handoff: &TerminalHandoff) -> &'static str {
+    if handoff.state != crate::handoff::HandoffState::NeedsRecovery {
+        return "none";
+    }
+    match handoff.failure_kind.as_str() {
+        "exit_without_stop" => "source_exit_without_stop",
+        "sigterm_timeout" => "sigterm_timeout",
+        "target_rejected" => "target_rejected",
+        "supervisor_shutdown" | "outer_hangup" => "supervisor_shutdown",
+        value if value.starts_with("target_") => "target_launch_failed",
+        _ => "manual_intervention_required",
+    }
+}
+
+fn handoff_status_json(db: &HcomDb, handoff: &TerminalHandoff) -> serde_json::Value {
+    let target_generation =
+        effective_handoff_target_generation(db, &handoff.id).unwrap_or(handoff.target_generation);
+    let next_command = match handoff.state {
+        crate::handoff::HandoffState::AwaitingAcceptance => format!(
+            "hcom handoff inspect {} --version {}",
+            handoff.id, handoff.version
+        ),
+        crate::handoff::HandoffState::NeedsRecovery => {
+            format!("hcom chain status {}", handoff.chain_id)
+        }
+        _ => format!("hcom handoff status {}", handoff.id),
+    };
+    json!({
+        "id": handoff.id,
+        "chain_id": handoff.chain_id,
+        "state": handoff.state.as_str(),
+        "version": handoff.version,
+        "transition": handoff.state.as_str(),
+        "source_generation": handoff.source_generation,
+        "target_generation": target_generation,
+        "workspace": handoff.workspace,
+        "policy": handoff.policy_ref,
+        "recovery": {
+            "required": handoff.state == crate::handoff::HandoffState::NeedsRecovery,
+            "reason_code": status_recovery_reason(handoff),
+        },
+        "next_command": next_command,
+    })
+}
+
+fn print_status(db: &HcomDb, handoff: &TerminalHandoff, json_mode: bool) -> i32 {
     if json_mode {
-        match bounded_json(&handoff_json(handoff, None)) {
+        match bounded_json(&handoff_status_json(db, handoff)) {
             Ok(output) => {
                 println!("{output}");
                 0
@@ -339,7 +386,7 @@ fn print_status(handoff: &TerminalHandoff, json_mode: bool) -> i32 {
             Err(error) => print_error(error, true),
         }
     } else {
-        match handoff_human(handoff) {
+        match handoff_human(db, handoff) {
             Ok(output) => {
                 println!("{output}");
                 0
@@ -349,35 +396,35 @@ fn print_status(handoff: &TerminalHandoff, json_mode: bool) -> i32 {
     }
 }
 
-fn handoff_human(handoff: &TerminalHandoff) -> Result<String, HandoffError> {
+fn handoff_human(db: &HcomDb, handoff: &TerminalHandoff) -> Result<String, HandoffError> {
+    let target_generation =
+        effective_handoff_target_generation(db, &handoff.id).unwrap_or(handoff.target_generation);
+    let next_command = match handoff.state {
+        crate::handoff::HandoffState::AwaitingAcceptance => format!(
+            "hcom handoff inspect {} --version {}",
+            handoff.id, handoff.version
+        ),
+        crate::handoff::HandoffState::NeedsRecovery => {
+            format!("hcom chain status {}", handoff.chain_id)
+        }
+        _ => format!("hcom handoff status {}", handoff.id),
+    };
     let output = format!(
-        "{} state={} version={} source_generation={} target_generation={}\n\
-         chain={} bundle_event={} bundle_bytes={}\n\
-         workspace={}\nrevision={} branch={}\ndirty_summary={}\npolicy_ref={}\n\
-         sigterm_result={} sigterm_to_exit_ms={:?} exit_code={:?} exit_signal={:?}\n\
-         delivery_exit_context={} reaped={:?}\n\
-         failure_kind={} failure_reason={}",
+        "{} state={} version={} transition={} source_generation={} target_generation={}\n\
+         chain={}\nworkspace={}\npolicy={}\n\
+         recovery_required={} recovery_reason={}\nnext={}",
         handoff.id,
         handoff.state,
         handoff.version,
+        handoff.state,
         handoff.source_generation,
-        handoff.target_generation,
+        target_generation,
         handoff.chain_id,
-        handoff.bundle_event_id,
-        handoff.bundle_size_bytes,
         handoff.workspace,
-        handoff.revision,
-        handoff.branch,
-        handoff.dirty_summary,
         handoff.policy_ref,
-        handoff.sigterm_request_result,
-        handoff.sigterm_to_exit_ms,
-        handoff.child_exit_code,
-        handoff.child_exit_signal,
-        handoff.delivery_exit_context,
-        handoff.waitpid_reaped,
-        handoff.failure_kind,
-        handoff.failure_reason,
+        handoff.state == crate::handoff::HandoffState::NeedsRecovery,
+        status_recovery_reason(handoff),
+        next_command,
     );
     if output.len() > MAX_STATUS_HUMAN_BYTES {
         return Err(HandoffError::Storage);
@@ -393,12 +440,12 @@ pub fn cmd_handoff(db: &HcomDb, args: &HandoffArgs, ctx: Option<&CommandContext>
         HandoffCommand::Abort(args) | HandoffCommand::Reject(args) => args.json,
         HandoffCommand::Status(args) => args.json,
     };
-    let actor = match managed_actor_from_ctx(db, ctx) {
-        Ok(actor) => actor,
-        Err(error) => return print_error(error, json_mode),
-    };
     match &args.command {
         HandoffCommand::Prepare(args) => {
+            let actor = match managed_actor_from_ctx(db, ctx) {
+                Ok(actor) => actor,
+                Err(error) => return print_error(error, json_mode),
+            };
             let cwd = match cwd() {
                 Ok(cwd) => cwd,
                 Err(error) => return print_error(error, args.json),
@@ -409,6 +456,10 @@ pub fn cmd_handoff(db: &HcomDb, args: &HandoffArgs, ctx: Option<&CommandContext>
             }
         }
         HandoffCommand::Commit(args) => {
+            let actor = match managed_actor_from_ctx(db, ctx) {
+                Ok(actor) => actor,
+                Err(error) => return print_error(error, json_mode),
+            };
             let cwd = match cwd() {
                 Ok(cwd) => cwd,
                 Err(error) => return print_error(error, args.json),
@@ -419,6 +470,10 @@ pub fn cmd_handoff(db: &HcomDb, args: &HandoffArgs, ctx: Option<&CommandContext>
             }
         }
         HandoffCommand::Abort(args) => {
+            let actor = match managed_actor_from_ctx(db, ctx) {
+                Ok(actor) => actor,
+                Err(error) => return print_error(error, json_mode),
+            };
             let cwd = match cwd() {
                 Ok(cwd) => cwd,
                 Err(error) => return print_error(error, args.json),
@@ -436,12 +491,32 @@ pub fn cmd_handoff(db: &HcomDb, args: &HandoffArgs, ctx: Option<&CommandContext>
             }
         }
         HandoffCommand::Status(args) => {
-            match handoff_status_for_actor(db, &actor, args.id.as_deref()) {
-                Ok(handoff) => print_status(&handoff, args.json),
+            let handoff = match managed_actor_from_ctx(db, ctx) {
+                Ok(actor) => handoff_status_for_actor(db, &actor, args.id.as_deref()),
+                Err(HandoffError::NotManaged)
+                    if ctx.and_then(|value| value.identity.as_ref()).is_none() =>
+                {
+                    match crate::commands::chain::capture_human_terminal() {
+                        Ok(terminal) => handoff_status_for_terminal_owner(
+                            db,
+                            args.id.as_deref(),
+                            &terminal.owner,
+                        ),
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            };
+            match handoff {
+                Ok(handoff) => print_status(db, &handoff, args.json),
                 Err(error) => print_error(error, args.json),
             }
         }
         HandoffCommand::Inspect(args) => {
+            let actor = match managed_actor_from_ctx(db, ctx) {
+                Ok(actor) => actor,
+                Err(error) => return print_error(error, json_mode),
+            };
             let cwd = match cwd() {
                 Ok(cwd) => cwd,
                 Err(error) => return print_error(error, args.json),
@@ -452,6 +527,10 @@ pub fn cmd_handoff(db: &HcomDb, args: &HandoffArgs, ctx: Option<&CommandContext>
             }
         }
         HandoffCommand::Accept(args) => {
+            let actor = match managed_actor_from_ctx(db, ctx) {
+                Ok(actor) => actor,
+                Err(error) => return print_error(error, json_mode),
+            };
             let cwd = match cwd() {
                 Ok(cwd) => cwd,
                 Err(error) => return print_error(error, args.json),
@@ -462,6 +541,10 @@ pub fn cmd_handoff(db: &HcomDb, args: &HandoffArgs, ctx: Option<&CommandContext>
             }
         }
         HandoffCommand::Reject(args) => {
+            let actor = match managed_actor_from_ctx(db, ctx) {
+                Ok(actor) => actor,
+                Err(error) => return print_error(error, json_mode),
+            };
             let cwd = match cwd() {
                 Ok(cwd) => cwd,
                 Err(error) => return print_error(error, args.json),
@@ -616,9 +699,11 @@ mod tests {
 
     #[test]
     fn status_outputs_are_bounded_and_omit_identity_and_authorization_material() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&directory.path().join("hcom.db")).unwrap();
         let handoff = sample_handoff();
-        let json = bounded_json(&handoff_json(&handoff, None)).unwrap();
-        let human = handoff_human(&handoff).unwrap();
+        let json = bounded_json(&handoff_status_json(&db, &handoff)).unwrap();
+        let human = handoff_human(&db, &handoff).unwrap();
         assert!(json.len() <= MAX_STATUS_JSON_BYTES);
         assert!(human.len() <= MAX_STATUS_HUMAN_BYTES);
         for secret in [

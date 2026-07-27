@@ -384,20 +384,16 @@ fn pending_utf8_bytes(data: &[u8]) -> u8 {
     // If last byte is a continuation byte (10xxxxxx), check if sequence is complete
     // by scanning backwards for the leading byte
     if (last & 0xC0) == 0x80 {
-        // Count how many continuation bytes we have at the end
-        let mut cont_count = 1;
-        let mut pos = len - 2;
-        while pos < len && (data[pos] & 0xC0) == 0x80 {
-            cont_count += 1;
-            if pos == 0 {
-                break;
-            }
-            pos = pos.wrapping_sub(1);
+        let mut lead_pos = len;
+        while lead_pos > 0 && data[lead_pos - 1] & 0xC0 == 0x80 {
+            lead_pos -= 1;
         }
+        let cont_count = len - lead_pos;
 
-        // Find the leading byte
-        if pos < len && (data[pos] & 0xC0) != 0x80 {
-            let lead = data[pos];
+        // A continuation-only chunk cannot determine the prior leading byte.
+        // Cross-chunk callers retain that state separately.
+        if lead_pos > 0 {
+            let lead = data[lead_pos - 1];
             let expected = if (lead & 0xF8) == 0xF0 {
                 3 // 4-byte sequence
             } else if (lead & 0xF0) == 0xE0 {
@@ -449,7 +445,7 @@ enum TitleFilterState {
 }
 
 #[cfg(unix)]
-struct TitleOscFilter {
+pub(crate) struct TitleOscFilter {
     state: TitleFilterState,
     discard_count: usize,
     /// Bytes of the title sequence currently being consumed.
@@ -462,7 +458,7 @@ struct TitleOscFilter {
 
 #[cfg(unix)]
 impl TitleOscFilter {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: TitleFilterState::Pass,
             discard_count: 0,
@@ -487,7 +483,7 @@ impl TitleOscFilter {
 
     /// Filter data, stripping title OSC sequences. Returns (filtered_output, had_title).
     #[inline]
-    fn filter(&mut self, data: &[u8]) -> (Vec<u8>, bool) {
+    pub(crate) fn filter(&mut self, data: &[u8]) -> (Vec<u8>, bool) {
         let mut result = Vec::with_capacity(data.len());
         let mut found_title = false;
 
@@ -568,7 +564,7 @@ impl TitleOscFilter {
     }
 
     /// Flush held prefix bytes on EOF/exit.
-    fn flush(&self) -> Vec<u8> {
+    pub(crate) fn flush(&self) -> Vec<u8> {
         match self.state {
             TitleFilterState::SawEsc => vec![0x1b],
             TitleFilterState::SawBracket => vec![0x1b, b']'],
@@ -576,6 +572,64 @@ impl TitleOscFilter {
             _ => Vec::new(),
         }
     }
+}
+
+/// Small reusable output guard for the chain-only PTY adapter. It strips child
+/// title OSCs and records whether inserting the supervisor's own complete OSC
+/// would split UTF-8 or another escape sequence.
+#[cfg(unix)]
+pub(crate) struct ChainTitleOutputFilter {
+    title: TitleOscFilter,
+    pending_utf8: u8,
+    pending_escape: PendingEscape,
+}
+
+#[cfg(unix)]
+impl ChainTitleOutputFilter {
+    pub(crate) fn new() -> Self {
+        Self {
+            title: TitleOscFilter::new(),
+            pending_utf8: 0,
+            pending_escape: PendingEscape::None,
+        }
+    }
+
+    pub(crate) fn filter(&mut self, data: &[u8]) -> Vec<u8> {
+        let (filtered, _) = self.title.filter(data);
+        if !filtered.is_empty() {
+            self.pending_utf8 = advance_pending_utf8(self.pending_utf8, &filtered);
+            self.pending_escape = if filtered.contains(&0x1b) {
+                has_pending_escape(&filtered)
+            } else {
+                resolve_pending_escape(self.pending_escape, &filtered)
+            };
+        }
+        filtered
+    }
+
+    pub(crate) fn title_write_safe(&self) -> bool {
+        title_write_safe(self.pending_utf8, self.pending_escape)
+    }
+
+    pub(crate) fn flush(&self) -> Vec<u8> {
+        self.title.flush()
+    }
+}
+
+#[cfg(unix)]
+fn advance_pending_utf8(mut pending: u8, data: &[u8]) -> u8 {
+    let mut offset = 0;
+    while pending > 0 && offset < data.len() && data[offset] & 0xC0 == 0x80 {
+        pending -= 1;
+        offset += 1;
+    }
+    if pending > 0 && offset == data.len() {
+        return pending;
+    }
+    // A non-continuation byte terminates an invalid prior fragment. Recompute
+    // from the remainder so a later complete boundary can safely carry title
+    // metadata without splitting the next valid UTF-8 sequence.
+    pending_utf8_bytes(&data[offset..])
 }
 
 /// Resize debounce window; the trailing edge is redelivered (see `resize`).
@@ -2117,6 +2171,46 @@ mod tests {
         seq.extend_from_slice(&long);
         filter.filter(&seq);
         assert_eq!(filter.last_title(), Some("Good"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chain_title_filter_strips_child_titles_across_chunks() {
+        let mut filter = super::ChainTitleOutputFilter::new();
+        assert_eq!(filter.filter(b"before\x1b]"), b"before");
+        assert_eq!(filter.filter(b"2;private-native-session"), b"");
+        assert_eq!(filter.filter(b"\x1b\\after"), b"after");
+        assert!(filter.title_write_safe());
+
+        // Non-title OSC sequences remain child output.
+        assert_eq!(
+            filter.filter(b"\x1b]8;;https://example.invalid\x07link\x1b]8;;\x07"),
+            b"\x1b]8;;https://example.invalid\x07link\x1b]8;;\x07"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chain_title_filter_defers_during_split_utf8_and_escape_sequences() {
+        let mut filter = super::ChainTitleOutputFilter::new();
+        assert_eq!(filter.filter(&[0xf0]), vec![0xf0]);
+        assert!(!filter.title_write_safe());
+        assert_eq!(filter.filter(&[0x9f]), vec![0x9f]);
+        assert!(!filter.title_write_safe());
+        assert_eq!(filter.filter(&[0x98, 0x80]), vec![0x98, 0x80]);
+        assert!(filter.title_write_safe());
+
+        assert_eq!(filter.filter(b"\x1b[31"), b"\x1b[31");
+        assert!(!filter.title_write_safe());
+        assert_eq!(filter.filter(b"mred"), b"mred");
+        assert!(filter.title_write_safe());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_utf8_accepts_continuation_only_chunks_without_panicking() {
+        assert_eq!(pending_utf8_bytes(&[0x80]), 0);
+        assert_eq!(pending_utf8_bytes(&[0x80, 0x80]), 0);
     }
 
     // ---- title_write_safe tests ----

@@ -36,7 +36,7 @@ pub use instances::InstanceRow;
 pub use instances::InstanceStatus;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 21;
+const SCHEMA_VERSION: i32 = 22;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
 const REVIEW_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS review_runs (
@@ -738,6 +738,242 @@ const HANDOFF_SCHEMA_SQL: &str = "
         SELECT RAISE(ABORT, 'terminal handoff target validation is incomplete or immutable');
     END;
 
+    CREATE TABLE IF NOT EXISTS terminal_chain_claims (
+        chain_id          TEXT PRIMARY KEY,
+        workspace         TEXT NOT NULL,
+        outer_tty_device  INTEGER NOT NULL CHECK (outer_tty_device > 0),
+        outer_tty_inode   INTEGER NOT NULL CHECK (outer_tty_inode > 0),
+        state             TEXT NOT NULL CHECK (state IN ('active', 'released')),
+        version           INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
+        created_at        REAL NOT NULL,
+        updated_at        REAL NOT NULL,
+        released_at       REAL,
+        CHECK (length(CAST(workspace AS BLOB)) BETWEEN 1 AND 4096),
+        CHECK ((state = 'active' AND released_at IS NULL)
+               OR (state = 'released' AND released_at IS NOT NULL)),
+        FOREIGN KEY (chain_id) REFERENCES terminal_chains(id) ON DELETE RESTRICT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_terminal_chain_claim_workspace
+        ON terminal_chain_claims(workspace) WHERE state = 'active';
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_terminal_chain_claim_tty
+        ON terminal_chain_claims(outer_tty_device, outer_tty_inode)
+        WHERE state = 'active';
+
+    CREATE TABLE IF NOT EXISTS terminal_generation_processes (
+        chain_id                    TEXT NOT NULL,
+        generation                  INTEGER NOT NULL CHECK (generation >= 1),
+        wrapper_pid                 INTEGER NOT NULL CHECK (wrapper_pid > 1),
+        wrapper_pgid                INTEGER NOT NULL CHECK (wrapper_pgid > 0),
+        wrapper_birth_identity      TEXT NOT NULL,
+        child_pid                   INTEGER NOT NULL CHECK (child_pid > 1),
+        child_pgid                  INTEGER NOT NULL CHECK (child_pgid > 1),
+        child_birth_identity        TEXT NOT NULL,
+        materialized_at             REAL NOT NULL,
+        PRIMARY KEY (chain_id, generation),
+        CHECK (wrapper_pid != child_pid),
+        CHECK (child_pid = child_pgid),
+        CHECK (length(CAST(wrapper_birth_identity AS BLOB)) BETWEEN 1 AND 256),
+        CHECK (length(CAST(child_birth_identity AS BLOB)) BETWEEN 1 AND 256),
+        FOREIGN KEY (chain_id, generation)
+            REFERENCES terminal_generations(chain_id, generation) ON DELETE RESTRICT
+    );
+
+    CREATE TABLE IF NOT EXISTS terminal_generation_prepare_intents (
+        chain_id                          TEXT NOT NULL,
+        generation                        INTEGER NOT NULL CHECK (generation >= 1),
+        launch_nonce                      TEXT NOT NULL,
+        supervisor_process_id             TEXT NOT NULL,
+        supervisor_process_birth_identity TEXT NOT NULL,
+        control_object_kind                TEXT NOT NULL
+                                               CHECK (control_object_kind IN ('chain', 'handoff')),
+        control_object_id                  TEXT NOT NULL,
+        control_version                    INTEGER NOT NULL CHECK (control_version >= 0),
+        generation_version                 INTEGER NOT NULL CHECK (generation_version >= 0),
+        started_at                         REAL NOT NULL,
+        PRIMARY KEY (chain_id, generation),
+        CHECK (length(CAST(launch_nonce AS BLOB)) BETWEEN 1 AND 64),
+        CHECK (length(CAST(supervisor_process_id AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (length(CAST(supervisor_process_birth_identity AS BLOB))
+               BETWEEN 1 AND 256),
+        CHECK (length(CAST(control_object_id AS BLOB)) BETWEEN 1 AND 64),
+        FOREIGN KEY (chain_id, generation)
+            REFERENCES terminal_generations(chain_id, generation) ON DELETE RESTRICT
+    );
+
+    CREATE TABLE IF NOT EXISTS terminal_recovery_attempts (
+        id                                TEXT PRIMARY KEY,
+        chain_id                          TEXT NOT NULL,
+        sequence                          INTEGER NOT NULL CHECK (sequence >= 1),
+        requested_chain_version           INTEGER NOT NULL
+                                             CHECK (requested_chain_version >= 0),
+        handoff_id                        TEXT,
+        replaced_generation               INTEGER NOT NULL
+                                             CHECK (replaced_generation >= 1),
+        target_generation                 INTEGER
+                                             CHECK (target_generation >= 1),
+        plan_code                         TEXT NOT NULL,
+        state                             TEXT NOT NULL CHECK (state IN (
+                                              'intent',
+                                              'authorized',
+                                              'materialized',
+                                              'awaiting_acceptance',
+                                              'active',
+                                              'manual',
+                                              'failed'
+                                          )),
+        version                           INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
+        supervisor_process_id             TEXT NOT NULL,
+        supervisor_process_birth_identity TEXT NOT NULL,
+        supervisor_pid                    INTEGER NOT NULL CHECK (supervisor_pid > 1),
+        supervisor_pgid                   INTEGER NOT NULL CHECK (supervisor_pgid > 0),
+        outer_foreground_pgid             INTEGER NOT NULL
+                                             CHECK (outer_foreground_pgid > 0),
+        outer_tty_device                  INTEGER NOT NULL CHECK (outer_tty_device > 0),
+        outer_tty_inode                   INTEGER NOT NULL CHECK (outer_tty_inode > 0),
+        created_at                        REAL NOT NULL,
+        updated_at                        REAL NOT NULL,
+        CHECK (supervisor_pgid = outer_foreground_pgid),
+        CHECK (length(CAST(id AS BLOB)) BETWEEN 1 AND 64),
+        CHECK (length(CAST(plan_code AS BLOB)) BETWEEN 1 AND 64),
+        CHECK (length(CAST(supervisor_process_id AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (length(CAST(supervisor_process_birth_identity AS BLOB))
+               BETWEEN 1 AND 256),
+        CHECK ((state = 'manual' AND target_generation IS NULL)
+               OR (state != 'manual' AND target_generation IS NOT NULL)),
+        UNIQUE (chain_id, sequence),
+        UNIQUE (chain_id, requested_chain_version),
+        UNIQUE (chain_id, target_generation),
+        FOREIGN KEY (chain_id) REFERENCES terminal_chains(id) ON DELETE RESTRICT,
+        FOREIGN KEY (handoff_id) REFERENCES terminal_handoffs(id) ON DELETE RESTRICT,
+        FOREIGN KEY (chain_id, replaced_generation)
+            REFERENCES terminal_generations(chain_id, generation) ON DELETE RESTRICT,
+        FOREIGN KEY (chain_id, target_generation)
+            REFERENCES terminal_generations(chain_id, generation) ON DELETE RESTRICT
+    );
+    CREATE INDEX IF NOT EXISTS idx_terminal_recovery_attempts_chain
+        ON terminal_recovery_attempts(chain_id, sequence);
+
+    CREATE TABLE IF NOT EXISTS terminal_recovery_absence_evidence (
+        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+        recovery_attempt_id    TEXT NOT NULL,
+        subject                TEXT NOT NULL CHECK (subject IN (
+                                   'supervisor', 'supervisor_process_group',
+                                   'wrapper', 'child', 'child_process_group'
+                               )),
+        generation             INTEGER,
+        pid                    INTEGER,
+        pgid                   INTEGER,
+        process_birth_identity TEXT,
+        observation            TEXT NOT NULL CHECK (observation = 'absent'),
+        method                 TEXT NOT NULL CHECK (method IN (
+                                   'proc_birth_missing', 'process_group_missing'
+                               )),
+        observed_at            REAL NOT NULL,
+        CHECK ((subject IN ('supervisor_process_group', 'child_process_group')
+                AND pid IS NULL AND pgid > 1
+                AND process_birth_identity IS NULL)
+               OR
+               (subject NOT IN ('supervisor_process_group', 'child_process_group')
+                AND pid > 1 AND pgid IS NULL
+                AND length(CAST(process_birth_identity AS BLOB))
+                    BETWEEN 1 AND 256)),
+        UNIQUE (recovery_attempt_id, subject, generation),
+        FOREIGN KEY (recovery_attempt_id)
+            REFERENCES terminal_recovery_attempts(id) ON DELETE RESTRICT
+    );
+    CREATE INDEX IF NOT EXISTS idx_terminal_recovery_absence_attempt
+        ON terminal_recovery_absence_evidence(recovery_attempt_id, id);
+
+    CREATE TABLE IF NOT EXISTS terminal_target_validations (
+        handoff_id          TEXT NOT NULL,
+        target_generation   INTEGER NOT NULL CHECK (target_generation >= 1),
+        validation_token    TEXT NOT NULL,
+        instructions_digest TEXT NOT NULL,
+        validated_at        REAL NOT NULL,
+        PRIMARY KEY (handoff_id, target_generation),
+        CHECK (length(CAST(validation_token AS BLOB)) BETWEEN 1 AND 64),
+        CHECK (length(CAST(instructions_digest AS BLOB)) = 64),
+        FOREIGN KEY (handoff_id) REFERENCES terminal_handoffs(id) ON DELETE RESTRICT
+    );
+
+    CREATE TRIGGER IF NOT EXISTS terminal_chain_claims_immutable_identity
+    BEFORE UPDATE OF chain_id, workspace, outer_tty_device, outer_tty_inode
+    ON terminal_chain_claims
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal chain public claim identity is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_chain_claims_release_once
+    BEFORE UPDATE OF state, version, released_at
+    ON terminal_chain_claims
+    WHEN NOT (
+        OLD.state = 'active' AND NEW.state = 'released'
+        AND NEW.version = OLD.version + 1
+        AND OLD.released_at IS NULL AND NEW.released_at IS NOT NULL
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal chain public claim release is one-shot');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_generation_processes_no_update
+    BEFORE UPDATE ON terminal_generation_processes
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal generation process evidence is append-only');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_generation_processes_no_delete
+    BEFORE DELETE ON terminal_generation_processes
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal generation process evidence is append-only');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_generation_prepare_intents_no_update
+    BEFORE UPDATE ON terminal_generation_prepare_intents
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal generation prepare intent is append-only');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_generation_prepare_intents_no_delete
+    BEFORE DELETE ON terminal_generation_prepare_intents
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal generation prepare intent is append-only');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_recovery_attempts_immutable_identity
+    BEFORE UPDATE OF id, chain_id, sequence, requested_chain_version, handoff_id,
+                     replaced_generation, target_generation, plan_code,
+                     supervisor_process_id, supervisor_process_birth_identity,
+                     supervisor_pid, supervisor_pgid, outer_foreground_pgid,
+                     outer_tty_device, outer_tty_inode, created_at
+    ON terminal_recovery_attempts
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal recovery attempt identity is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_recovery_absence_no_update
+    BEFORE UPDATE ON terminal_recovery_absence_evidence
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal recovery absence evidence is append-only');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_recovery_absence_no_delete
+    BEFORE DELETE ON terminal_recovery_absence_evidence
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal recovery absence evidence is append-only');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_target_validations_no_update
+    BEFORE UPDATE ON terminal_target_validations
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal target validation is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_target_validations_no_delete
+    BEFORE DELETE ON terminal_target_validations
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal target validation is immutable');
+    END;
+
     CREATE TABLE IF NOT EXISTS terminal_transition_audit (
         id                     INTEGER PRIMARY KEY AUTOINCREMENT,
         chain_id               TEXT NOT NULL,
@@ -835,6 +1071,9 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (20, ""),
     // v21 is additive and repaired by `ensure_handoff_v21_columns`.
     (21, ""),
+    // v22 adds public ownership, process, recovery, absence, and per-target
+    // validation evidence without rewriting any Phase 3 lifecycle row.
+    (22, HANDOFF_SCHEMA_SQL),
 ];
 
 const HANDOFF_V21_COLUMNS: &[(&str, &str, &str)] = &[
@@ -1117,6 +1356,98 @@ const HANDOFF_TABLE_COLUMNS: &[(&str, &[&str])] = &[
             "created_at",
         ],
     ),
+    (
+        "terminal_chain_claims",
+        &[
+            "chain_id",
+            "workspace",
+            "outer_tty_device",
+            "outer_tty_inode",
+            "state",
+            "version",
+            "created_at",
+            "updated_at",
+            "released_at",
+        ],
+    ),
+    (
+        "terminal_generation_processes",
+        &[
+            "chain_id",
+            "generation",
+            "wrapper_pid",
+            "wrapper_pgid",
+            "wrapper_birth_identity",
+            "child_pid",
+            "child_pgid",
+            "child_birth_identity",
+            "materialized_at",
+        ],
+    ),
+    (
+        "terminal_generation_prepare_intents",
+        &[
+            "chain_id",
+            "generation",
+            "launch_nonce",
+            "supervisor_process_id",
+            "supervisor_process_birth_identity",
+            "control_object_kind",
+            "control_object_id",
+            "control_version",
+            "generation_version",
+            "started_at",
+        ],
+    ),
+    (
+        "terminal_recovery_attempts",
+        &[
+            "id",
+            "chain_id",
+            "sequence",
+            "requested_chain_version",
+            "handoff_id",
+            "replaced_generation",
+            "target_generation",
+            "plan_code",
+            "state",
+            "version",
+            "supervisor_process_id",
+            "supervisor_process_birth_identity",
+            "supervisor_pid",
+            "supervisor_pgid",
+            "outer_foreground_pgid",
+            "outer_tty_device",
+            "outer_tty_inode",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "terminal_recovery_absence_evidence",
+        &[
+            "id",
+            "recovery_attempt_id",
+            "subject",
+            "generation",
+            "pid",
+            "pgid",
+            "process_birth_identity",
+            "observation",
+            "method",
+            "observed_at",
+        ],
+    ),
+    (
+        "terminal_target_validations",
+        &[
+            "handoff_id",
+            "target_generation",
+            "validation_token",
+            "instructions_digest",
+            "validated_at",
+        ],
+    ),
 ];
 
 const HANDOFF_SCHEMA_OBJECTS: &[(&str, &str)] = &[
@@ -1125,6 +1456,10 @@ const HANDOFF_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("index", "idx_terminal_handoffs_one_non_final"),
     ("index", "idx_terminal_handoffs_chain"),
     ("index", "idx_terminal_transition_audit_chain"),
+    ("index", "idx_terminal_chain_claim_workspace"),
+    ("index", "idx_terminal_chain_claim_tty"),
+    ("index", "idx_terminal_recovery_attempts_chain"),
+    ("index", "idx_terminal_recovery_absence_attempt"),
     ("trigger", "terminal_chains_immutable_identity_policy"),
     ("trigger", "terminal_chains_outer_evidence_insert"),
     ("trigger", "terminal_chains_outer_evidence_update"),
@@ -1142,6 +1477,17 @@ const HANDOFF_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("trigger", "terminal_handoffs_target_validation_once"),
     ("trigger", "terminal_transition_audit_no_update"),
     ("trigger", "terminal_transition_audit_no_delete"),
+    ("trigger", "terminal_chain_claims_immutable_identity"),
+    ("trigger", "terminal_chain_claims_release_once"),
+    ("trigger", "terminal_generation_processes_no_update"),
+    ("trigger", "terminal_generation_processes_no_delete"),
+    ("trigger", "terminal_generation_prepare_intents_no_update"),
+    ("trigger", "terminal_generation_prepare_intents_no_delete"),
+    ("trigger", "terminal_recovery_attempts_immutable_identity"),
+    ("trigger", "terminal_recovery_absence_no_update"),
+    ("trigger", "terminal_recovery_absence_no_delete"),
+    ("trigger", "terminal_target_validations_no_update"),
+    ("trigger", "terminal_target_validations_no_delete"),
 ];
 
 const REVIEW_TABLE_COLUMNS: &[(&str, &[&str])] = &[
@@ -1867,6 +2213,12 @@ impl HcomDb {
             "terminal_generations",
             "terminal_handoffs",
             "terminal_transition_audit",
+            "terminal_chain_claims",
+            "terminal_generation_processes",
+            "terminal_generation_prepare_intents",
+            "terminal_recovery_attempts",
+            "terminal_recovery_absence_evidence",
+            "terminal_target_validations",
         ];
         let missing_migrated: Vec<&str> = migrated_tables
             .iter()
@@ -3151,6 +3503,54 @@ pub(super) mod tests {
                 .is_err(),
             "migrated schema must reject partial cleanup evidence"
         );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_v21_to_v22_migration_preserves_handoff_state_and_adds_recovery_schema() {
+        let (db, db_path) = setup_full_test_db();
+        insert_preserved_phase1_handoff(db.conn());
+        db.conn()
+            .execute_batch(
+                "DROP TABLE terminal_target_validations;
+                 DROP TABLE terminal_recovery_absence_evidence;
+                 DROP TABLE terminal_recovery_attempts;
+                 DROP TABLE terminal_generation_prepare_intents;
+                 DROP TABLE terminal_generation_processes;
+                 DROP TABLE terminal_chain_claims;
+                 PRAGMA user_version = 21;",
+            )
+            .unwrap();
+        drop(db);
+
+        let migrated = HcomDb::open_at(&db_path).unwrap();
+        assert_eq!(
+            migrated
+                .conn()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert!(handoff_schema_is_complete(migrated.conn()).unwrap());
+        assert_eq!(
+            migrated
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM terminal_handoffs
+                     WHERE id = 'ho-migrate' AND bundle_size_bytes = 17",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        let (fresh, fresh_path) = setup_full_test_db();
+        assert_eq!(
+            terminal_schema_objects(migrated.conn()),
+            terminal_schema_objects(fresh.conn())
+        );
+        cleanup_test_db(fresh_path);
         cleanup_test_db(db_path);
     }
 

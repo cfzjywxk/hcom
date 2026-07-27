@@ -315,6 +315,27 @@ pub enum GenerationEvent {
     Continue,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainTitleState {
+    Active,
+    Quiescing,
+    Launching,
+    AwaitingAcceptance,
+    NeedsRecovery,
+}
+
+impl ChainTitleState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Quiescing => "quiescing",
+            Self::Launching => "launching",
+            Self::AwaitingAcceptance => "awaiting-acceptance",
+            Self::NeedsRecovery => "needs-recovery",
+        }
+    }
+}
+
 /// Adapter-owned result of reaping and resource cleanup. A residual handle is
 /// mandatory whenever liveness or cleanup ownership is unresolved.
 pub struct FinishAttempt<H> {
@@ -343,6 +364,18 @@ pub trait GenerationAdapter {
     fn send_signal(&mut self, active: &Self::Active, signal: ChainSignal) -> SignalSendResult;
     fn resize(&mut self, active: &mut Self::Active) -> Result<(), Self::Error>;
     fn reassert_outer_terminal(&mut self) -> Result<(), Self::Error>;
+    /// Best-effort outer-terminal metadata. Implementations must not turn a
+    /// title failure into a state transition or process action.
+    fn set_chain_title(
+        &mut self,
+        _generation: u64,
+        _state: ChainTitleState,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn flush_chain_title(&mut self, _active: &mut Self::Active) -> Result<(), Self::Error> {
+        Ok(())
+    }
     fn finish_after_exit(
         &mut self,
         active: Self::Active,
@@ -380,6 +413,13 @@ pub trait GenerationAdapter {
 pub trait DurableControl {
     type Error: fmt::Display;
 
+    fn title_state(
+        &mut self,
+        _active: &GenerationIdentity,
+    ) -> Result<ChainTitleState, Self::Error> {
+        Ok(ChainTitleState::Active)
+    }
+
     fn read_directive(
         &mut self,
         active: &GenerationIdentity,
@@ -405,6 +445,10 @@ pub trait DurableControl {
         active: &GenerationIdentity,
         evidence: &CleanupEvidence,
     ) -> Result<(), Self::Error>;
+    /// Persist the irreversible boundary immediately before process
+    /// preparation. An intent without later materialization is unknown
+    /// ownership, never evidence that no wrapper or child was created.
+    fn begin_target_prepare(&mut self, reservation: &TargetReservation) -> Result<(), Self::Error>;
     fn materialize_target(
         &mut self,
         reservation: &TargetReservation,
@@ -583,14 +627,30 @@ where
         active: A::Active,
         quiesce_timeout: Duration,
     ) -> Result<Self, SupervisorInvariantError> {
-        Self::with_clock(
+        Self::new_preserving_ownership(outer, control, adapter, active, quiesce_timeout)
+            .map_err(|(error, _control, _adapter, _active)| error)
+    }
+
+    /// Production constructor variant that never discards the only active
+    /// generation handle on an invariant error.
+    pub fn new_preserving_ownership(
+        outer: OuterTerminalIdentity,
+        control: C,
+        adapter: A,
+        active: A::Active,
+        quiesce_timeout: Duration,
+    ) -> Result<Self, (SupervisorInvariantError, C, A, A::Active)> {
+        if let Err(error) = Self::validate_initial(outer, &adapter, &active, quiesce_timeout) {
+            return Err((error, control, adapter, active));
+        }
+        Ok(Self::assemble(
             outer,
             control,
             adapter,
             active,
             quiesce_timeout,
             SystemClock,
-        )
+        ))
     }
 }
 
@@ -608,9 +668,26 @@ where
         quiesce_timeout: Duration,
         clock: K,
     ) -> Result<Self, SupervisorInvariantError> {
+        Self::validate_initial(outer, &adapter, &active, quiesce_timeout)?;
+        Ok(Self::assemble(
+            outer,
+            control,
+            adapter,
+            active,
+            quiesce_timeout,
+            clock,
+        ))
+    }
+
+    fn validate_initial(
+        outer: OuterTerminalIdentity,
+        adapter: &A,
+        active: &A::Active,
+        quiesce_timeout: Duration,
+    ) -> Result<(), SupervisorInvariantError> {
         outer.validate()?;
-        adapter.identity(&active).validate(outer)?;
-        if adapter.identity(&active).native_session_id.is_none() {
+        adapter.identity(active).validate(outer)?;
+        if adapter.identity(active).native_session_id.is_none() {
             return Err(SupervisorInvariantError(
                 "initial generation native session is not pinned".to_string(),
             ));
@@ -620,6 +697,22 @@ where
                 "quiesce timeout must be positive".to_string(),
             ));
         }
+        Ok(())
+    }
+
+    fn assemble(
+        outer: OuterTerminalIdentity,
+        mut control: C,
+        mut adapter: A,
+        active: A::Active,
+        quiesce_timeout: Duration,
+        clock: K,
+    ) -> Self {
+        let identity = adapter.identity(&active);
+        let initial_title = control
+            .title_state(identity)
+            .unwrap_or(ChainTitleState::Active);
+        let _ = adapter.set_chain_title(identity.generation, initial_title);
         let mut supervisor = Self {
             outer,
             control,
@@ -633,7 +726,7 @@ where
             next_sequence: 0,
         };
         supervisor.record(TraceKind::SupervisorStarted, None);
-        Ok(supervisor)
+        supervisor
     }
 
     pub fn trace(&self) -> &[TraceRecord] {
@@ -664,6 +757,18 @@ where
                 return self.recovery(&error.to_string());
             }
             self.record(TraceKind::DurableReread, Some(&identity));
+
+            match self.control.title_state(&identity) {
+                Ok(state) => {
+                    let _ = self.adapter.set_chain_title(identity.generation, state);
+                    if let Some(active) = self.active.as_mut() {
+                        let _ = self.adapter.flush_chain_title(active);
+                    }
+                }
+                Err(error) => {
+                    return self.recovery(&format!("durable title-state reread failed: {error}"));
+                }
+            }
 
             let directive = match self
                 .control
@@ -931,7 +1036,20 @@ where
         {
             return self.recovery("target reservation is not the exact serial successor");
         }
+        if let Err(error) = self.control.begin_target_prepare(&reservation) {
+            let reason = format!("target process prepare intent could not be persisted: {error}");
+            return self.target_failure(
+                &reservation,
+                None,
+                None,
+                "target_prepare_intent_failed",
+                &reason,
+            );
+        }
         self.record(TraceKind::TargetPrepare, None);
+        let _ = self
+            .adapter
+            .set_chain_title(reservation.generation, ChainTitleState::Launching);
         let prepared = match self.adapter.prepare_target(&reservation, self.outer) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -1090,6 +1208,13 @@ where
                     );
                 }
                 self.record(TraceKind::TargetReady, Some(&ready_identity));
+                let _ = self.adapter.set_chain_title(
+                    ready_identity.generation,
+                    ChainTitleState::AwaitingAcceptance,
+                );
+                if let Some(active) = self.active.as_mut() {
+                    let _ = self.adapter.flush_chain_title(active);
+                }
                 return SupervisorRunOutcome::AwaitingAcceptance {
                     generation: ready_identity.generation,
                     handoff_id: reservation.handoff_id.clone(),
@@ -1331,6 +1456,13 @@ where
             .active
             .as_ref()
             .map(|active| self.adapter.identity(active).clone());
+        let generation = identity.as_ref().map_or(0, |value| value.generation);
+        let _ = self
+            .adapter
+            .set_chain_title(generation, ChainTitleState::NeedsRecovery);
+        if let Some(active) = self.active.as_mut() {
+            let _ = self.adapter.flush_chain_title(active);
+        }
         self.record(TraceKind::Recovery, identity.as_ref());
         SupervisorRunOutcome::NeedsRecovery(bounded)
     }
@@ -1381,6 +1513,54 @@ pub fn linux_process_birth_identity(pid: i32) -> io::Result<String> {
         ));
     }
     Ok(format!("linux-v1:{pid}:{start_ticks}:{boot_id}"))
+}
+
+/// PID-reuse-resistant liveness classification used by the public recovery
+/// planner. Only `Absent` is authorization to continue; every other result is
+/// fail-closed and performs no signal or process action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExactProcessStatus {
+    LiveExact,
+    Absent,
+    Reused,
+    Unknown,
+}
+
+pub fn exact_process_status(pid: i32, identity: &str) -> ExactProcessStatus {
+    let Ok((expected_pid, expected_start, expected_boot)) = parse_linux_birth(identity) else {
+        return ExactProcessStatus::Unknown;
+    };
+    if pid <= 1 || expected_pid != pid {
+        return ExactProcessStatus::Unknown;
+    }
+    let Ok(current_boot) = fs::read_to_string("/proc/sys/kernel/random/boot_id") else {
+        return ExactProcessStatus::Unknown;
+    };
+    if current_boot.trim() != expected_boot {
+        return ExactProcessStatus::Absent;
+    }
+    match linux_proc_parent_and_start(pid) {
+        Ok((_, live_start)) if live_start == expected_start => ExactProcessStatus::LiveExact,
+        Ok(_) => ExactProcessStatus::Reused,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => ExactProcessStatus::Absent,
+        Err(_) => ExactProcessStatus::Unknown,
+    }
+}
+
+pub fn process_group_status(pgid: i32) -> ExactProcessStatus {
+    if pgid <= 1 {
+        return ExactProcessStatus::Unknown;
+    }
+    // SAFETY: signal zero is a read-only existence/permission probe.
+    let result = unsafe { libc::kill(-pgid, 0) };
+    if result == 0 {
+        return ExactProcessStatus::LiveExact;
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => ExactProcessStatus::Absent,
+        Some(libc::EPERM) => ExactProcessStatus::LiveExact,
+        _ => ExactProcessStatus::Unknown,
+    }
 }
 
 /// Verify that the exact wrapper birth identity is still live and that the
@@ -1482,6 +1662,10 @@ mod tests {
         let pid = unsafe { libc::getpid() };
         let identity = linux_process_birth_identity(pid).unwrap();
         verify_current_process_scope(&identity).unwrap();
+        assert_eq!(
+            exact_process_status(pid, &identity),
+            ExactProcessStatus::LiveExact
+        );
         assert!(verify_current_process_scope("linux-v1:1:1:not-this-boot").is_err());
     }
 
@@ -1634,6 +1818,13 @@ mod tests {
             &mut self,
             _active: &GenerationIdentity,
             _evidence: &CleanupEvidence,
+        ) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+
+        fn begin_target_prepare(
+            &mut self,
+            _reservation: &TargetReservation,
         ) -> Result<(), Self::Error> {
             unreachable!()
         }
@@ -1809,6 +2000,54 @@ mod tests {
         fn abort_prepared(&mut self, _prepared: Self::Prepared) -> FinishAttempt<Self::Prepared> {
             unreachable!()
         }
+    }
+
+    #[test]
+    fn preserving_constructor_returns_the_only_active_handle_on_error() {
+        let outer = OuterTerminalIdentity {
+            supervisor_pid: 100,
+            supervisor_pgid: 100,
+            foreground_pgid: 100,
+            tty_device: 1,
+            tty_inode: 2,
+        };
+        let adapter = TimeoutAdapter {
+            identity: GenerationIdentity {
+                generation: 1,
+                launch_nonce: "nonce-owned".to_string(),
+                wrapper_pid: 101,
+                wrapper_pgid: 100,
+                child_pid: 102,
+                child_pgid: 102,
+                child_process_birth_identity: "child-birth-owned".to_string(),
+                process_id: "process-owned".to_string(),
+                process_birth_identity: "birth-owned".to_string(),
+                instance_name: "instance-owned".to_string(),
+                hcom_session_id: "hcom-owned".to_string(),
+                native_session_id: Some("native-owned".to_string()),
+            },
+            clock: Arc::new(AtomicI64::new(0)),
+            term_count: 0,
+            duplicate_wakes: 0,
+        };
+        let control = TimeoutControl {
+            phase: 0,
+            cleanup_seen: false,
+        };
+        let result = ForegroundChainSupervisor::new_preserving_ownership(
+            outer,
+            control,
+            adapter,
+            (),
+            Duration::ZERO,
+        );
+        let Err((error, control, adapter, active)) = result else {
+            panic!("zero timeout must fail while returning all owned parts")
+        };
+        assert!(error.0.contains("timeout"));
+        assert_eq!(control.phase, 0);
+        assert_eq!(adapter.identity.process_id, "process-owned");
+        assert_eq!(active, ());
     }
 
     #[test]
