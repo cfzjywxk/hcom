@@ -1,9 +1,9 @@
-//! Internal Phase 2 adapter between the foreground supervisor core and the
-//! durable handoff state machine.
+//! Internal adapter between the foreground supervisor core and the durable
+//! handoff state machine.
 //!
-//! No router or CLI path constructs this adapter yet. Phase 3 will supply the
-//! real Codex generation lifecycle; keeping this module internal prevents the
-//! fake adapter seam from becoming a hidden production launcher.
+//! No router or CLI path constructs this adapter yet. The Phase 3 Codex
+//! generation lifecycle remains private, preventing the adapter seam from
+//! becoming a hidden production launcher.
 
 use hcom::chain_supervisor::{
     CleanupEvidence, DeliveryExitContext as CoreDeliveryExitContext, DurableControl,
@@ -12,6 +12,7 @@ use hcom::chain_supervisor::{
     TargetReservation,
 };
 
+use crate::codex_chain::terminal_record_persisted;
 use crate::db::HcomDb;
 use crate::handoff::{
     self, ChainShutdownObservation, ChainState, ChildExitEvidence, CleanupObservation,
@@ -81,8 +82,7 @@ impl HcomChainControl {
                 != Some(active.process_birth_identity.as_str())
             || generation.instance_name.as_deref() != Some(active.instance_name.as_str())
             || generation.hcom_session_id.as_deref() != Some(active.hcom_session_id.as_str())
-            || generation.native_session_id.as_deref()
-                != Some(active.synthetic_native_session_id.as_str())
+            || generation.native_session_id.as_deref() != active.native_session_id.as_deref()
         {
             return Err(HandoffError::Conflict(
                 "HANDOFF_CONFLICT active process does not match the exact typed generation"
@@ -157,6 +157,43 @@ impl DurableControl for HcomChainControl {
                         "HANDOFF_CONFLICT Stop belongs to a different generation".to_string(),
                     ));
                 }
+                let native_session_id =
+                    generation.native_session_id.as_deref().ok_or_else(|| {
+                        HandoffError::Conflict(
+                            "HANDOFF_CONFLICT generation native session is not pinned".to_string(),
+                        )
+                    })?;
+                let stop_turn_id = handoff.stop_turn_id.as_deref().ok_or_else(|| {
+                    HandoffError::Conflict(
+                        "HANDOFF_CONFLICT Stop has no exact turn identity".to_string(),
+                    )
+                })?;
+                let instance = self
+                    .db
+                    .get_instance_full(&active.instance_name)
+                    .map_err(|_| HandoffError::Storage)?
+                    .ok_or(HandoffError::NotManaged)?;
+                if instance.session_id.as_deref() != Some(active.hcom_session_id.as_str())
+                    || instance.tool != "codex"
+                    || instance.transcript_path.is_empty()
+                {
+                    return Ok(DurableDirective::NeedsRecovery(
+                        "exact Codex transcript binding is unavailable".to_string(),
+                    ));
+                }
+                match terminal_record_persisted(
+                    &instance.transcript_path,
+                    native_session_id,
+                    stop_turn_id,
+                ) {
+                    Ok(false) => return Ok(DurableDirective::Wait),
+                    Err(_) => {
+                        return Ok(DurableDirective::NeedsRecovery(
+                            "exact Codex terminal rollout evidence is invalid".to_string(),
+                        ));
+                    }
+                    Ok(true) => {}
+                }
                 Ok(DurableDirective::Quiesce(QuiesceAuthorization {
                     handoff_id: handoff.id,
                     expected_version: handoff.version,
@@ -167,11 +204,7 @@ impl DurableControl for HcomChainControl {
                     })?,
                     generation: active.generation,
                     launch_nonce: generation.launch_nonce,
-                    pinned_native_session_id: generation.native_session_id.ok_or_else(|| {
-                        HandoffError::Conflict(
-                            "HANDOFF_CONFLICT generation native session is not pinned".to_string(),
-                        )
-                    })?,
+                    pinned_native_session_id: native_session_id.to_string(),
                     process_birth_identity: generation.process_birth_identity.ok_or_else(|| {
                         HandoffError::Conflict(
                             "HANDOFF_CONFLICT generation process birth is missing".to_string(),
@@ -337,7 +370,7 @@ impl DurableControl for HcomChainControl {
         let actor = HandoffActor {
             instance_name: identity.instance_name.clone(),
             hcom_session_id: identity.hcom_session_id.clone(),
-            native_session_id: Some(identity.synthetic_native_session_id.clone()),
+            native_session_id: identity.native_session_id.clone(),
             process_id: identity.process_id.clone(),
             process_birth_identity: identity.process_birth_identity.clone(),
             generation: identity.generation as i64,
@@ -353,6 +386,45 @@ impl DurableControl for HcomChainControl {
             return Err(HandoffError::Storage);
         }
         Ok(())
+    }
+
+    fn target_native_session(
+        &mut self,
+        reservation: &TargetReservation,
+        identity: &GenerationIdentity,
+    ) -> Result<Option<String>, Self::Error> {
+        let handoff = handoff::get_handoff(&self.db, &reservation.handoff_id)?
+            .ok_or(HandoffError::NotManaged)?;
+        let generation = handoff::get_generation(
+            &self.db,
+            &handoff.chain_id,
+            i64::try_from(reservation.generation).map_err(|_| {
+                HandoffError::Invalid("generation exceeds the durable integer bound".to_string())
+            })?,
+        )?
+        .ok_or(HandoffError::NotManaged)?;
+        let chain =
+            handoff::get_chain(&self.db, &handoff.chain_id)?.ok_or(HandoffError::NotManaged)?;
+        if handoff.chain_id != self.chain_id
+            || handoff.state != HandoffState::LaunchingTarget
+            || handoff.target_generation != reservation.generation as i64
+            || chain.state != ChainState::LaunchingTarget
+            || chain.current_generation != reservation.generation as i64
+            || generation.state != GenerationState::Launching
+            || generation.launch_nonce != reservation.launch_nonce
+            || generation.wrapper_process_id.as_deref() != Some(identity.process_id.as_str())
+            || generation.process_birth_identity.as_deref()
+                != Some(identity.process_birth_identity.as_str())
+            || generation.instance_name.as_deref() != Some(identity.instance_name.as_str())
+            || generation.hcom_session_id.as_deref() != Some(identity.hcom_session_id.as_str())
+            || identity.native_session_id.is_some()
+        {
+            return Err(HandoffError::Conflict(
+                "HANDOFF_CONFLICT target SessionStart state does not match the activated reservation"
+                    .to_string(),
+            ));
+        }
+        Ok(generation.native_session_id)
     }
 
     fn record_target_failure(
@@ -414,7 +486,7 @@ impl DurableControl for HcomChainControl {
         let actor = HandoffActor {
             instance_name: active.instance_name.clone(),
             hcom_session_id: active.hcom_session_id.clone(),
-            native_session_id: Some(active.synthetic_native_session_id.clone()),
+            native_session_id: active.native_session_id.clone(),
             process_id: active.process_id.clone(),
             process_birth_identity: active.process_birth_identity.clone(),
             generation: active.generation as i64,
@@ -540,6 +612,12 @@ mod tests {
         run_git(&workspace, &["commit", "-m", "fixture"]);
 
         let db = HcomDb::open_at(&directory.path().join("hcom.db")).unwrap();
+        let transcript_path = directory.path().join("rollout-fixture-native-source.jsonl");
+        std::fs::write(
+            &transcript_path,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-source\"}}\n",
+        )
+        .unwrap();
         let source = HandoffActor {
             instance_name: "source".to_string(),
             hcom_session_id: "hcom-source".to_string(),
@@ -551,10 +629,14 @@ mod tests {
         db.conn()
             .execute(
                 "INSERT INTO instances (
-                     name, session_id, status, tool, created_at,
+                     name, session_id, status, tool, created_at, transcript_path,
                      parent_name, origin_device_id
-                 ) VALUES (?1, ?2, 'listening', 'codex', 1.0, '', '')",
-                params![source.instance_name, source.hcom_session_id],
+                 ) VALUES (?1, ?2, 'listening', 'codex', 1.0, ?3, '', '')",
+                params![
+                    source.instance_name,
+                    source.hcom_session_id,
+                    transcript_path.to_str().unwrap()
+                ],
             )
             .unwrap();
         db.set_process_binding(
@@ -625,6 +707,7 @@ mod tests {
                 committed_version: committed.handoff.version,
                 hook_native_session_id: "native-source".to_string(),
                 launch_nonce: "nonce-source".to_string(),
+                turn_id: "turn-source".to_string(),
             },
         )
         .unwrap();
@@ -641,9 +724,22 @@ mod tests {
             process_birth_identity: source.process_birth_identity.clone(),
             instance_name: source.instance_name.clone(),
             hcom_session_id: source.hcom_session_id.clone(),
-            synthetic_native_session_id: source.native_session_id.clone().unwrap(),
+            native_session_id: source.native_session_id.clone(),
         };
         let mut control = HcomChainControl::new(db, chain.id.clone(), supervisor, outer).unwrap();
+        assert_eq!(
+            control.read_directive(&source_identity, None).unwrap(),
+            DurableDirective::Wait
+        );
+        use std::io::Write as _;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript_path)
+                .unwrap(),
+            "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"turn-source\"}}}}"
+        )
+        .unwrap();
         let authorization = match control.read_directive(&source_identity, None).unwrap() {
             DurableDirective::Quiesce(authorization) => authorization,
             other => panic!("expected exact Stop directive, got {other:?}"),
@@ -716,7 +812,7 @@ mod tests {
             PostCleanup::Advance(reservation) => reservation,
             PostCleanup::NeedsRecovery => panic!("complete cleanup must advance"),
         };
-        let target = GenerationIdentity {
+        let mut target = GenerationIdentity {
             generation: 2,
             launch_nonce: reservation.launch_nonce.clone(),
             wrapper_pid: 41004,
@@ -728,9 +824,29 @@ mod tests {
             process_birth_identity: "birth-target".to_string(),
             instance_name: "target".to_string(),
             hcom_session_id: "hcom-target".to_string(),
-            synthetic_native_session_id: "native-target".to_string(),
+            native_session_id: None,
         };
         control.materialize_target(&reservation, &target).unwrap();
+        let target_actor = HandoffActor {
+            instance_name: target.instance_name.clone(),
+            hcom_session_id: target.hcom_session_id.clone(),
+            native_session_id: None,
+            process_id: target.process_id.clone(),
+            process_birth_identity: target.process_birth_identity.clone(),
+            generation: target.generation as i64,
+        };
+        let target_generation = handoff::get_generation(&control.db, &chain.id, 2)
+            .unwrap()
+            .unwrap();
+        handoff::pin_native_session(
+            &control.db,
+            &chain.id,
+            &target_actor,
+            target_generation.version,
+            "native-target",
+        )
+        .unwrap();
+        target.native_session_id = Some("native-target".to_string());
         control.target_ready(&reservation, &target).unwrap();
         let handoff = handoff::get_handoff(&control.db, &reservation.handoff_id)
             .unwrap()

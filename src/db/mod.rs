@@ -36,7 +36,7 @@ pub use instances::InstanceRow;
 pub use instances::InstanceStatus;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 20;
+const SCHEMA_VERSION: i32 = 21;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
 const REVIEW_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS review_runs (
@@ -305,6 +305,7 @@ const HANDOFF_SCHEMA_SQL: &str = "
         quiesce_process_birth_identity       TEXT,
         quiesce_committed_version            INTEGER,
         stop_observed_at                     REAL,
+        stop_turn_id                         TEXT,
         sigterm_requested_wall_at             REAL,
         sigterm_requested_monotonic_ns        INTEGER,
         sigterm_request_result                TEXT NOT NULL DEFAULT ''
@@ -333,6 +334,9 @@ const HANDOFF_SCHEMA_SQL: &str = "
         write_queue_cleanup_succeeded         INTEGER
                                                CHECK (write_queue_cleanup_succeeded IN (0, 1)),
         cleanup_completed_at                  REAL,
+        target_validation_token              TEXT,
+        target_instructions_digest           TEXT,
+        target_validated_at                   REAL,
         failure_kind                         TEXT NOT NULL DEFAULT '',
         failure_reason                       TEXT NOT NULL DEFAULT '',
         created_at                           REAL NOT NULL,
@@ -357,12 +361,27 @@ const HANDOFF_SCHEMA_SQL: &str = "
                length(CAST(quiesce_token AS BLOB)) BETWEEN 1 AND 64),
         CHECK (quiesce_native_session_id IS NULL OR
                length(CAST(quiesce_native_session_id AS BLOB)) BETWEEN 1 AND 256),
+        CHECK (stop_turn_id IS NULL OR
+               length(CAST(stop_turn_id AS BLOB)) BETWEEN 1 AND 256),
         CHECK (quiesce_process_id IS NULL OR
                length(CAST(quiesce_process_id AS BLOB)) BETWEEN 1 AND 128),
         CHECK (quiesce_process_birth_identity IS NULL OR
                length(CAST(quiesce_process_birth_identity AS BLOB)) BETWEEN 1 AND 256),
         CHECK (length(CAST(failure_kind AS BLOB)) <= 64),
         CHECK (length(CAST(failure_reason AS BLOB)) <= 1024),
+        CHECK (target_validation_token IS NULL OR
+               length(CAST(target_validation_token AS BLOB)) BETWEEN 1 AND 64),
+        CHECK (target_instructions_digest IS NULL OR
+               length(CAST(target_instructions_digest AS BLOB)) = 64),
+        CHECK (
+            (target_validation_token IS NULL
+             AND target_instructions_digest IS NULL
+             AND target_validated_at IS NULL)
+            OR
+            (target_validation_token IS NOT NULL
+             AND target_instructions_digest IS NOT NULL
+             AND target_validated_at IS NOT NULL)
+        ),
         CHECK (sigterm_requested_monotonic_ns IS NULL
                OR sigterm_requested_monotonic_ns >= 0),
         CHECK (child_exit_observed_monotonic_ns IS NULL
@@ -660,6 +679,65 @@ const HANDOFF_SCHEMA_SQL: &str = "
         SELECT RAISE(ABORT, 'terminal handoff process evidence is inconsistent');
     END;
 
+    CREATE TRIGGER IF NOT EXISTS terminal_handoffs_exit_requires_cleanup_insert
+    BEFORE INSERT ON terminal_handoffs
+    WHEN NEW.child_exit_observed_wall_at IS NOT NULL
+      AND NEW.cleanup_completed_at IS NULL
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal handoff exit evidence requires atomic cleanup evidence');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_handoffs_exit_requires_cleanup_update
+    BEFORE UPDATE OF child_exit_observed_wall_at, child_exit_observed_monotonic_ns,
+                     child_exit_code, child_exit_signal, sigterm_to_exit_ms,
+                     delivery_exit_context, waitpid_reaped,
+                     inject_cleanup_succeeded, delivery_cleanup_succeeded,
+                     pty_cleanup_succeeded, screen_cleanup_succeeded,
+                     write_queue_cleanup_succeeded, cleanup_completed_at
+    ON terminal_handoffs
+    WHEN NEW.child_exit_observed_wall_at IS NOT NULL
+      AND NEW.cleanup_completed_at IS NULL
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal handoff exit evidence requires atomic cleanup evidence');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_handoffs_stop_identity_insert
+    BEFORE INSERT ON terminal_handoffs
+    WHEN NEW.stop_observed_at IS NOT NULL OR NEW.stop_turn_id IS NOT NULL
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal handoff Stop identity must be recorded atomically');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_handoffs_stop_identity_once
+    BEFORE UPDATE OF stop_observed_at, stop_turn_id
+    ON terminal_handoffs
+    WHEN (NEW.stop_observed_at IS NULL) != (NEW.stop_turn_id IS NULL)
+      OR (OLD.stop_observed_at IS NOT NULL
+          AND NEW.stop_observed_at IS NOT OLD.stop_observed_at)
+      OR (OLD.stop_turn_id IS NOT NULL
+          AND NEW.stop_turn_id IS NOT OLD.stop_turn_id)
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal handoff Stop identity is incomplete or mutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_handoffs_target_validation_once
+    BEFORE UPDATE OF target_validation_token, target_instructions_digest,
+                     target_validated_at
+    ON terminal_handoffs
+    WHEN (NEW.target_validation_token IS NULL) !=
+             (NEW.target_instructions_digest IS NULL)
+      OR (NEW.target_validation_token IS NULL) !=
+             (NEW.target_validated_at IS NULL)
+      OR OLD.target_validation_token IS NOT NULL
+         AND (
+             NEW.target_validation_token IS NOT OLD.target_validation_token
+             OR NEW.target_instructions_digest IS NOT OLD.target_instructions_digest
+             OR NEW.target_validated_at IS NOT OLD.target_validated_at
+         )
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal handoff target validation is incomplete or immutable');
+    END;
+
     CREATE TABLE IF NOT EXISTS terminal_transition_audit (
         id                     INTEGER PRIMARY KEY AUTOINCREMENT,
         chain_id               TEXT NOT NULL,
@@ -755,6 +833,37 @@ const MIGRATIONS: &[(i32, &str)] = &[
     // migrations can repair individual missing columns without recreating or
     // archiving any typed control-plane table.
     (20, ""),
+    // v21 is additive and repaired by `ensure_handoff_v21_columns`.
+    (21, ""),
+];
+
+const HANDOFF_V21_COLUMNS: &[(&str, &str, &str)] = &[
+    (
+        "terminal_handoffs",
+        "stop_turn_id",
+        "ALTER TABLE terminal_handoffs ADD COLUMN stop_turn_id TEXT
+         CHECK (stop_turn_id IS NULL OR
+                length(CAST(stop_turn_id AS BLOB)) BETWEEN 1 AND 256)",
+    ),
+    (
+        "terminal_handoffs",
+        "target_validation_token",
+        "ALTER TABLE terminal_handoffs ADD COLUMN target_validation_token TEXT
+         CHECK (target_validation_token IS NULL OR
+                length(CAST(target_validation_token AS BLOB)) BETWEEN 1 AND 64)",
+    ),
+    (
+        "terminal_handoffs",
+        "target_instructions_digest",
+        "ALTER TABLE terminal_handoffs ADD COLUMN target_instructions_digest TEXT
+         CHECK (target_instructions_digest IS NULL OR
+                length(CAST(target_instructions_digest AS BLOB)) = 64)",
+    ),
+    (
+        "terminal_handoffs",
+        "target_validated_at",
+        "ALTER TABLE terminal_handoffs ADD COLUMN target_validated_at REAL",
+    ),
 ];
 
 const HANDOFF_V20_COLUMNS: &[(&str, &str, &str)] = &[
@@ -958,6 +1067,7 @@ const HANDOFF_TABLE_COLUMNS: &[(&str, &[&str])] = &[
             "quiesce_process_birth_identity",
             "quiesce_committed_version",
             "stop_observed_at",
+            "stop_turn_id",
             "sigterm_requested_wall_at",
             "sigterm_requested_monotonic_ns",
             "sigterm_request_result",
@@ -974,6 +1084,9 @@ const HANDOFF_TABLE_COLUMNS: &[(&str, &[&str])] = &[
             "screen_cleanup_succeeded",
             "write_queue_cleanup_succeeded",
             "cleanup_completed_at",
+            "target_validation_token",
+            "target_instructions_digest",
+            "target_validated_at",
             "failure_kind",
             "failure_reason",
             "created_at",
@@ -1022,6 +1135,11 @@ const HANDOFF_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("trigger", "terminal_handoffs_process_evidence_once"),
     ("trigger", "terminal_handoffs_process_evidence_insert"),
     ("trigger", "terminal_handoffs_process_evidence_update"),
+    ("trigger", "terminal_handoffs_exit_requires_cleanup_insert"),
+    ("trigger", "terminal_handoffs_exit_requires_cleanup_update"),
+    ("trigger", "terminal_handoffs_stop_identity_insert"),
+    ("trigger", "terminal_handoffs_stop_identity_once"),
+    ("trigger", "terminal_handoffs_target_validation_once"),
     ("trigger", "terminal_transition_audit_no_update"),
     ("trigger", "terminal_transition_audit_no_delete"),
 ];
@@ -1123,7 +1241,7 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
     Ok(present)
 }
 
-/// Add only missing v20 evidence columns, then refresh the two triggers whose
+/// Add only missing v20 evidence columns, then refresh the triggers whose
 /// definitions reference them. This is safe for both a real v19 migration and
 /// a v20 database that was stamped after only part of the ALTER sequence.
 fn ensure_handoff_v20_columns(conn: &Connection) -> Result<()> {
@@ -1158,6 +1276,27 @@ fn ensure_handoff_v20_columns(conn: &Connection) -> Result<()> {
          DROP TRIGGER IF EXISTS terminal_handoffs_process_evidence_once;
          DROP TRIGGER IF EXISTS terminal_handoffs_process_evidence_insert;
          DROP TRIGGER IF EXISTS terminal_handoffs_process_evidence_update;",
+    )?;
+    conn.execute_batch(HANDOFF_SCHEMA_SQL)?;
+    Ok(())
+}
+
+/// Add the Phase 3 Stop/validation columns and refresh the fail-closed
+/// evidence triggers. This remains safe if a prior open was interrupted
+/// between individual ALTER statements.
+fn ensure_handoff_v21_columns(conn: &Connection) -> Result<()> {
+    ensure_handoff_v20_columns(conn)?;
+    for (table, column, sql) in HANDOFF_V21_COLUMNS {
+        if !table_has_column(conn, table, column)? {
+            conn.execute_batch(sql)?;
+        }
+    }
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS terminal_handoffs_exit_requires_cleanup_insert;
+         DROP TRIGGER IF EXISTS terminal_handoffs_exit_requires_cleanup_update;
+         DROP TRIGGER IF EXISTS terminal_handoffs_stop_identity_insert;
+         DROP TRIGGER IF EXISTS terminal_handoffs_stop_identity_once;
+         DROP TRIGGER IF EXISTS terminal_handoffs_target_validation_once;",
     )?;
     conn.execute_batch(HANDOFF_SCHEMA_SQL)?;
     Ok(())
@@ -1451,7 +1590,7 @@ impl HcomDb {
             |row| row.get(0),
         )?;
         if has_handoff_tables {
-            ensure_handoff_v20_columns(&tx)?;
+            ensure_handoff_v21_columns(&tx)?;
         }
         tx.execute_batch(HANDOFF_SCHEMA_SQL)?;
         if !review_schema_is_complete(&tx)? || !handoff_schema_is_complete(&tx)? {
@@ -1783,7 +1922,7 @@ impl HcomDb {
                 |row| row.get(0),
             )?;
             if has_handoff_tables {
-                ensure_handoff_v20_columns(&tx)?;
+                ensure_handoff_v21_columns(&tx)?;
             }
             tx.execute_batch(HANDOFF_SCHEMA_SQL)?;
             if !review_schema_is_complete(&tx)? || !handoff_schema_is_complete(&tx)? {
@@ -1836,6 +1975,8 @@ impl HcomDb {
             };
             if next_version == 20 {
                 ensure_handoff_v20_columns(&tx)?;
+            } else if next_version == 21 {
+                ensure_handoff_v21_columns(&tx)?;
             } else {
                 tx.execute_batch(sql)?;
             }
@@ -2894,7 +3035,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn test_real_v19_shape_migrates_to_v20_without_losing_handoff_state() {
+    fn test_real_v19_shape_migrates_to_current_without_losing_handoff_state() {
         let (db, db_path) = setup_full_test_db();
         insert_preserved_phase1_handoff(db.conn());
         rebuild_handoff_tables_with_v19_columns(db.conn(), 19);
@@ -2906,7 +3047,7 @@ pub(super) mod tests {
             .conn()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 20);
+        assert_eq!(version, SCHEMA_VERSION);
         let preserved: (String, i64, String, i64, Option<i64>, String) = migrated
             .conn()
             .query_row(
@@ -3032,11 +3173,22 @@ pub(super) mod tests {
             )
             .unwrap();
         assert_eq!(preserved, 1);
+        let phase3_fields: (Option<String>, Option<String>, Option<String>, Option<f64>) = repaired
+            .conn()
+            .query_row(
+                "SELECT stop_turn_id, target_validation_token,
+                        target_instructions_digest, target_validated_at
+                 FROM terminal_handoffs WHERE id = 'ho-migrate'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(phase3_fields, (None, None, None, None));
         cleanup_test_db(db_path);
     }
 
     #[test]
-    fn test_concurrent_v19_to_v20_migration_is_atomic_and_idempotent() {
+    fn test_concurrent_v19_to_current_migration_is_atomic_and_idempotent() {
         use std::sync::{Arc, Barrier};
 
         let (db, db_path) = setup_full_test_db();
@@ -3060,7 +3212,7 @@ pub(super) mod tests {
             })
             .collect();
         for result in handles.into_iter().map(|handle| handle.join().unwrap()) {
-            assert_eq!(result.unwrap(), 20);
+            assert_eq!(result.unwrap(), SCHEMA_VERSION);
         }
         let db = HcomDb::open_at(&db_path).unwrap();
         assert!(handoff_schema_is_complete(db.conn()).unwrap());
@@ -3383,6 +3535,94 @@ pub(super) mod tests {
                 )
                 .is_err()
         );
+        let split_stop = db
+            .conn
+            .execute(
+                "UPDATE terminal_handoffs
+                 SET stop_observed_at = 9.0
+                 WHERE id = 'ho-valid'",
+                [],
+            )
+            .unwrap_err();
+        assert!(split_stop.to_string().contains("Stop identity"));
+        db.conn
+            .execute(
+                "UPDATE terminal_handoffs
+                 SET stop_observed_at = 9.0, stop_turn_id = 'turn-valid'
+                 WHERE id = 'ho-valid'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            db.conn
+                .execute(
+                    "UPDATE terminal_handoffs
+                     SET stop_observed_at = 9.1
+                     WHERE id = 'ho-valid'",
+                    [],
+                )
+                .is_err(),
+            "recorded Stop identity must be immutable"
+        );
+        db.conn
+            .execute(
+                "UPDATE terminal_handoffs
+                 SET sigterm_request_result = 'sent',
+                     sigterm_requested_wall_at = 10.0,
+                     sigterm_requested_monotonic_ns = 1000000000
+                 WHERE id = 'ho-valid'",
+                [],
+            )
+            .unwrap();
+        let split_exit = db
+            .conn
+            .execute(
+                "UPDATE terminal_handoffs
+                 SET child_exit_observed_wall_at = 10.1,
+                     child_exit_observed_monotonic_ns = 1100000000,
+                     child_exit_signal = 15,
+                     sigterm_to_exit_ms = 100,
+                     delivery_exit_context = 'exit:killed'
+                 WHERE id = 'ho-valid'",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            split_exit
+                .to_string()
+                .contains("exit evidence requires atomic cleanup evidence")
+        );
+        let exit_fields: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM terminal_handoffs
+                 WHERE id = 'ho-valid'
+                   AND child_exit_observed_wall_at IS NULL
+                   AND cleanup_completed_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exit_fields, 1);
+        db.conn
+            .execute(
+                "UPDATE terminal_handoffs
+                 SET child_exit_observed_wall_at = 10.1,
+                     child_exit_observed_monotonic_ns = 1100000000,
+                     child_exit_signal = 15,
+                     sigterm_to_exit_ms = 100,
+                     delivery_exit_context = 'exit:killed',
+                     waitpid_reaped = 1,
+                     inject_cleanup_succeeded = 1,
+                     delivery_cleanup_succeeded = 1,
+                     pty_cleanup_succeeded = 1,
+                     screen_cleanup_succeeded = 1,
+                     write_queue_cleanup_succeeded = 1,
+                     cleanup_completed_at = 10.2
+                 WHERE id = 'ho-valid'",
+                [],
+            )
+            .unwrap();
         assert!(
             db.conn
                 .execute(

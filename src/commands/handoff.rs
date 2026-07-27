@@ -7,24 +7,25 @@ use serde_json::json;
 
 use crate::db::HcomDb;
 use crate::handoff::{
-    HandoffActor, HandoffError, HandoffOutcome, MAX_STATUS_HUMAN_BYTES, MAX_STATUS_JSON_BYTES,
-    ManagedActorMarkers, TerminalHandoff, abort_handoff, accept_handoff, commit_handoff,
-    current_chain_for_actor, handoff_status_for_actor, prepare_handoff, reject_handoff,
+    HandoffActor, HandoffError, HandoffInspection, HandoffOutcome, MAX_HANDOFF_BUNDLE_BYTES,
+    MAX_INSTRUCTIONS_BYTES, MAX_STATUS_HUMAN_BYTES, MAX_STATUS_JSON_BYTES, ManagedActorMarkers,
+    TerminalHandoff, abort_handoff, accept_handoff, commit_handoff, current_chain_for_actor,
+    handoff_status_for_actor, inspect_handoff, prepare_handoff, reject_handoff,
     resolve_managed_actor,
 };
 use crate::shared::{CommandContext, SenderKind};
 
 const HANDOFF_AFTER_HELP: &str = "\
-Phase 2 accepts mutations only from exact supervisor-owned generation context.
-The public CLI still never launches a chain or wires real Codex hooks; that
-adapter remains unavailable until Phase 3.
+Phase 3 accepts mutations only from exact supervisor-owned generation context.
+This CLI does not expose a chain start, recovery, or process-launch path.
 
 Examples:
   hcom handoff prepare --bundle-event 123 --json
   hcom handoff commit ho-0123456789abcdef --version 0
   hcom handoff abort ho-0123456789abcdef --version 0 -- 'no longer needed'
   hcom handoff status ho-0123456789abcdef --json
-  hcom handoff accept ho-0123456789abcdef --version 5
+  hcom handoff inspect ho-0123456789abcdef --version 5 --json
+  hcom handoff accept ho-0123456789abcdef --version 6
   hcom handoff reject ho-0123456789abcdef --version 5 -- 'workspace mismatch'";
 
 #[derive(Parser, Debug)]
@@ -48,7 +49,9 @@ pub enum HandoffCommand {
     Abort(HandoffReasonArgs),
     /// Show the current or selected handoff
     Status(HandoffStatusArgs),
-    /// Accept a ready target generation
+    /// Read and validate a ready target's bundle and project instructions
+    Inspect(HandoffVersionArgs),
+    /// Explicitly accept a previously inspected target generation
     Accept(HandoffVersionArgs),
     /// Reject a ready target generation
     Reject(HandoffReasonArgs),
@@ -237,6 +240,41 @@ pub(crate) fn bounded_json(value: &serde_json::Value) -> Result<String, HandoffE
     Ok(output)
 }
 
+fn inspection_json(inspection: &HandoffInspection) -> serde_json::Value {
+    json!({
+        "handoff": handoff_json(&inspection.handoff, Some(inspection.replayed)),
+        "validation": {
+            "instructions_digest": inspection.instructions_digest,
+        },
+        "bundle": inspection.bundle,
+        "instructions": inspection.instructions.iter().map(|instruction| json!({
+            "scope": instruction.scope,
+            "path": instruction.path,
+            "digest": instruction.digest,
+            "content": instruction.content,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn print_inspection(inspection: &HandoffInspection, json_mode: bool) -> i32 {
+    let value = inspection_json(inspection);
+    let output = if json_mode {
+        serde_json::to_string(&value)
+    } else {
+        serde_json::to_string_pretty(&value)
+    };
+    let output = match output {
+        Ok(output)
+            if output.len() <= MAX_HANDOFF_BUNDLE_BYTES + MAX_INSTRUCTIONS_BYTES + 128 * 1024 =>
+        {
+            output
+        }
+        _ => return print_error(HandoffError::Storage, json_mode),
+    };
+    println!("{output}");
+    0
+}
+
 pub(crate) fn print_error(error: HandoffError, json_mode: bool) -> i32 {
     let exit = error.exit_code();
     if json_mode {
@@ -350,7 +388,8 @@ fn handoff_human(handoff: &TerminalHandoff) -> Result<String, HandoffError> {
 pub fn cmd_handoff(db: &HcomDb, args: &HandoffArgs, ctx: Option<&CommandContext>) -> i32 {
     let json_mode = match &args.command {
         HandoffCommand::Prepare(args) => args.json,
-        HandoffCommand::Commit(args) | HandoffCommand::Accept(args) => args.json,
+        HandoffCommand::Commit(args) | HandoffCommand::Inspect(args) => args.json,
+        HandoffCommand::Accept(args) => args.json,
         HandoffCommand::Abort(args) | HandoffCommand::Reject(args) => args.json,
         HandoffCommand::Status(args) => args.json,
     };
@@ -402,6 +441,16 @@ pub fn cmd_handoff(db: &HcomDb, args: &HandoffArgs, ctx: Option<&CommandContext>
                 Err(error) => print_error(error, args.json),
             }
         }
+        HandoffCommand::Inspect(args) => {
+            let cwd = match cwd() {
+                Ok(cwd) => cwd,
+                Err(error) => return print_error(error, args.json),
+            };
+            match inspect_handoff(db, &actor, &args.id, args.version, &cwd) {
+                Ok(inspection) => print_inspection(&inspection, args.json),
+                Err(error) => print_error(error, args.json),
+            }
+        }
         HandoffCommand::Accept(args) => {
             let cwd = match cwd() {
                 Ok(cwd) => cwd,
@@ -447,6 +496,21 @@ mod tests {
         let commit =
             HandoffArgs::try_parse_from(["handoff", "commit", "ho-123", "--version", "0"]).unwrap();
         assert!(matches!(commit.command, HandoffCommand::Commit(_)));
+
+        let inspect = HandoffArgs::try_parse_from([
+            "handoff",
+            "inspect",
+            "ho-123",
+            "--version",
+            "5",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(inspect.command, HandoffCommand::Inspect(_)));
+
+        let accept =
+            HandoffArgs::try_parse_from(["handoff", "accept", "ho-123", "--version", "6"]).unwrap();
+        assert!(matches!(accept.command, HandoffCommand::Accept(_)));
 
         let reject = HandoffArgs::try_parse_from([
             "handoff",
@@ -519,6 +583,7 @@ mod tests {
             quiesce_process_birth_identity: Some("secret-birth".to_string()),
             quiesce_committed_version: Some(1),
             stop_observed_at: None,
+            stop_turn_id: None,
             sigterm_requested_wall_at: None,
             sigterm_requested_monotonic_ns: None,
             sigterm_request_result: String::new(),
@@ -535,6 +600,11 @@ mod tests {
             screen_cleanup_succeeded: None,
             write_queue_cleanup_succeeded: None,
             cleanup_completed_at: None,
+            target_validation_token: Some("secret-validation-token".to_string()),
+            target_instructions_digest: Some(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            ),
+            target_validated_at: Some(1.0),
             failure_kind: String::new(),
             failure_reason: String::new(),
             created_at: 1.0,
@@ -559,6 +629,7 @@ mod tests {
             "secret-process",
             "secret-birth",
             "secret-quiesce-token",
+            "secret-validation-token",
         ] {
             assert!(!json.contains(secret), "JSON leaked {secret}");
             assert!(!human.contains(secret), "human output leaked {secret}");

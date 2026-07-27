@@ -64,19 +64,22 @@ fn help_prints_and_exits_zero() {
 }
 
 #[test]
-fn handoff_and_chain_help_expose_phase1_surface_only() {
+fn handoff_and_chain_help_expose_phase3_transition_surface_only() {
     let h = Hcom::new();
     let (code, handoff_help, stderr) = h.run(["handoff", "--help"]);
     assert_eq!(code, 0, "stdout={handoff_help} stderr={stderr}");
-    for command in ["prepare", "commit", "abort", "status", "accept", "reject"] {
+    for command in [
+        "prepare", "commit", "abort", "status", "inspect", "accept", "reject",
+    ] {
         assert!(handoff_help.contains(command), "stdout={handoff_help}");
     }
     assert!(
-        handoff_help.contains("never launch")
-            || handoff_help.contains("never launch, stop")
-            || handoff_help.contains("never launch, stop,"),
+        handoff_help.contains("no chain launcher"),
         "stdout={handoff_help}"
     );
+    for forbidden in ["hcom chain start", "hcom chain recover", "hcom chain codex"] {
+        assert!(!handoff_help.contains(forbidden), "stdout={handoff_help}");
+    }
 
     let (code, chain_help, stderr) = h.run(["chain", "--help"]);
     assert_eq!(code, 0, "stdout={chain_help} stderr={stderr}");

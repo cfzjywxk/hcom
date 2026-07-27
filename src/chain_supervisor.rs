@@ -97,7 +97,7 @@ pub struct GenerationIdentity {
     pub process_birth_identity: String,
     pub instance_name: String,
     pub hcom_session_id: String,
-    pub synthetic_native_session_id: String,
+    pub native_session_id: Option<String>,
 }
 
 impl GenerationIdentity {
@@ -130,12 +130,11 @@ impl GenerationIdentity {
             ),
             ("instance identity", self.instance_name.as_str()),
             ("hcom session identity", self.hcom_session_id.as_str()),
-            (
-                "synthetic native session identity",
-                self.synthetic_native_session_id.as_str(),
-            ),
         ] {
             validate_opaque(name, value)?;
+        }
+        if let Some(native_session_id) = self.native_session_id.as_deref() {
+            validate_opaque("native session identity", native_session_id)?;
         }
         Ok(())
     }
@@ -366,6 +365,13 @@ pub trait GenerationAdapter {
         &mut self,
         prepared: Self::Prepared,
     ) -> Result<Self::Active, (Self::Prepared, Self::Error)>;
+    /// Bind the exact immutable native ID read back from durable SessionStart
+    /// state. Implementations must reject a different second binding.
+    fn bind_native_session(
+        &mut self,
+        active: &mut Self::Active,
+        native_session_id: &str,
+    ) -> Result<(), Self::Error>;
     fn abort_prepared(&mut self, prepared: Self::Prepared) -> FinishAttempt<Self::Prepared>;
 }
 
@@ -404,9 +410,14 @@ pub trait DurableControl {
         reservation: &TargetReservation,
         identity: &GenerationIdentity,
     ) -> Result<(), Self::Error>;
-    /// Phase 2 fake adapters may pin a synthetic native session here. A real
-    /// Codex SessionStart implementation is deliberately outside this module.
-    /// This operation may reach AwaitingAcceptance only; it must not accept.
+    /// Read the immutable native ID only after the exact SessionStart CAS.
+    fn target_native_session(
+        &mut self,
+        reservation: &TargetReservation,
+        identity: &GenerationIdentity,
+    ) -> Result<Option<String>, Self::Error>;
+    /// This operation may reach AwaitingAcceptance only; it must not pin the
+    /// native session or accept the handoff.
     fn target_ready(
         &mut self,
         reservation: &TargetReservation,
@@ -599,6 +610,11 @@ where
     ) -> Result<Self, SupervisorInvariantError> {
         outer.validate()?;
         adapter.identity(&active).validate(outer)?;
+        if adapter.identity(&active).native_session_id.is_none() {
+            return Err(SupervisorInvariantError(
+                "initial generation native session is not pinned".to_string(),
+            ));
+        }
         if quiesce_timeout.is_zero() {
             return Err(SupervisorInvariantError(
                 "quiesce timeout must be positive".to_string(),
@@ -759,7 +775,8 @@ where
     ) -> Option<SupervisorRunOutcome> {
         if authorization.generation != identity.generation
             || authorization.launch_nonce != identity.launch_nonce
-            || authorization.pinned_native_session_id != identity.synthetic_native_session_id
+            || identity.native_session_id.as_deref()
+                != Some(authorization.pinned_native_session_id.as_str())
             || authorization.process_birth_identity != identity.process_birth_identity
             || authorization.expected_version < 0
             || validate_opaque("handoff ID", &authorization.handoff_id).is_err()
@@ -1008,22 +1025,190 @@ where
         }
         self.record(TraceKind::TargetActivated, Some(&target));
         self.active = Some(active);
-        if let Err(error) = self.control.target_ready(&reservation, &target) {
-            let reason = format!(
-                "target started but ready evidence failed; acceptance was not inferred: {error}"
-            );
-            return self.target_failure(
-                &reservation,
-                Some(&target),
-                None,
-                "target_ready_failed",
-                &reason,
-            );
+        self.await_target_session_start(&reservation)
+    }
+
+    fn await_target_session_start(
+        &mut self,
+        reservation: &TargetReservation,
+    ) -> SupervisorRunOutcome {
+        loop {
+            let identity = self
+                .active
+                .as_ref()
+                .map(|active| self.adapter.identity(active).clone())
+                .expect("activated target is owned");
+            let native = match self.control.target_native_session(reservation, &identity) {
+                Ok(native) => native,
+                Err(error) => {
+                    return self.target_failure(
+                        reservation,
+                        Some(&identity),
+                        None,
+                        "target_session_start_read_failed",
+                        &format!("target SessionStart durable reread failed: {error}"),
+                    );
+                }
+            };
+            if let Some(native_session_id) = native {
+                let bind = {
+                    let active = self.active.as_mut().expect("activated target is owned");
+                    self.adapter.bind_native_session(active, &native_session_id)
+                };
+                if let Err(error) = bind {
+                    return self.target_failure(
+                        reservation,
+                        Some(&identity),
+                        None,
+                        "target_native_bind_failed",
+                        &format!("target native identity could not be bound: {error}"),
+                    );
+                }
+                let ready_identity = self
+                    .active
+                    .as_ref()
+                    .map(|active| self.adapter.identity(active).clone())
+                    .expect("activated target is owned");
+                if ready_identity.native_session_id.as_deref() != Some(native_session_id.as_str()) {
+                    return self.target_failure(
+                        reservation,
+                        Some(&ready_identity),
+                        None,
+                        "target_native_bind_mismatch",
+                        "adapter did not preserve the exact SessionStart native identity",
+                    );
+                }
+                if let Err(error) = self.control.target_ready(reservation, &ready_identity) {
+                    return self.target_failure(
+                        reservation,
+                        Some(&ready_identity),
+                        None,
+                        "target_ready_failed",
+                        &format!(
+                            "target started but ready evidence failed; acceptance was not inferred: {error}"
+                        ),
+                    );
+                }
+                self.record(TraceKind::TargetReady, Some(&ready_identity));
+                return SupervisorRunOutcome::AwaitingAcceptance {
+                    generation: ready_identity.generation,
+                    handoff_id: reservation.handoff_id.clone(),
+                };
+            }
+
+            let event = {
+                let active = self.active.as_mut().expect("activated target is owned");
+                self.adapter.wait_event(active, CONTROL_POLL_INTERVAL)
+            };
+            match event {
+                Ok(GenerationEvent::ControlWake | GenerationEvent::Timeout) => {}
+                Ok(GenerationEvent::Resize) => {
+                    let result = {
+                        let active = self.active.as_mut().expect("activated target is owned");
+                        self.adapter.resize(active)
+                    };
+                    if let Err(error) = result {
+                        return self.fail_live_target(
+                            reservation,
+                            "target_resize_failed",
+                            &format!("target resize failed before SessionStart: {error}"),
+                        );
+                    }
+                }
+                Ok(GenerationEvent::Continue) => {
+                    if let Err(error) = self.adapter.reassert_outer_terminal() {
+                        return self.fail_live_target(
+                            reservation,
+                            "target_continue_failed",
+                            &format!("target terminal reassertion failed: {error}"),
+                        );
+                    }
+                    let resize = {
+                        let active = self.active.as_mut().expect("activated target is owned");
+                        self.adapter.resize(active)
+                    };
+                    if let Err(error) = resize {
+                        return self.fail_live_target(
+                            reservation,
+                            "target_continue_resize_failed",
+                            &format!("target resize after SIGCONT failed: {error}"),
+                        );
+                    }
+                }
+                Ok(GenerationEvent::Interrupt) => {
+                    let result = {
+                        let active = self.active.as_ref().expect("activated target is owned");
+                        self.adapter.send_signal(active, ChainSignal::Interrupt)
+                    };
+                    if result != SignalSendResult::Sent {
+                        return self.fail_live_target(
+                            reservation,
+                            "target_interrupt_failed",
+                            "SIGINT could not be forwarded to the launching target",
+                        );
+                    }
+                }
+                Ok(GenerationEvent::Hangup) => {
+                    return self.fail_live_target(
+                        reservation,
+                        "target_outer_hangup",
+                        "outer terminal hung up before target SessionStart",
+                    );
+                }
+                Ok(GenerationEvent::ChildExited(exit)) => {
+                    let active = self.active.take().expect("activated target is owned");
+                    let finish = self.adapter.finish_after_exit(active, &exit);
+                    self.active = finish.residual;
+                    return self.target_failure(
+                        reservation,
+                        Some(&identity),
+                        Some(&finish.evidence),
+                        "target_exited_before_session_start",
+                        "target exited before exact SessionStart binding",
+                    );
+                }
+                Err(error) => {
+                    return self.fail_live_target(
+                        reservation,
+                        "target_event_loop_failed",
+                        &format!("target launch event loop failed: {error}"),
+                    );
+                }
+            }
         }
-        self.record(TraceKind::TargetReady, Some(&target));
-        SupervisorRunOutcome::AwaitingAcceptance {
-            generation: target.generation,
-            handoff_id: reservation.handoff_id,
+    }
+
+    fn fail_live_target(
+        &mut self,
+        reservation: &TargetReservation,
+        failure_kind: &str,
+        failure_reason: &str,
+    ) -> SupervisorRunOutcome {
+        let identity = self
+            .active
+            .as_ref()
+            .map(|active| self.adapter.identity(active).clone());
+        let cleanup = self.active.take().map(|active| {
+            self.adapter
+                .shutdown_without_successor(active, ShutdownReason::Explicit)
+        });
+        if let Some(finish) = cleanup {
+            self.active = finish.residual;
+            self.target_failure(
+                reservation,
+                identity.as_ref(),
+                Some(&finish.evidence),
+                failure_kind,
+                failure_reason,
+            )
+        } else {
+            self.target_failure(
+                reservation,
+                identity.as_ref(),
+                None,
+                failure_kind,
+                failure_reason,
+            )
         }
     }
 
@@ -1398,7 +1583,7 @@ mod tests {
                     quiesce_token: "quiesce-timeout".to_string(),
                     generation: active.generation,
                     launch_nonce: active.launch_nonce.clone(),
-                    pinned_native_session_id: active.synthetic_native_session_id.clone(),
+                    pinned_native_session_id: active.native_session_id.clone().unwrap(),
                     process_birth_identity: active.process_birth_identity.clone(),
                 }))
             } else {
@@ -1466,6 +1651,14 @@ mod tests {
             _reservation: &TargetReservation,
             _identity: &GenerationIdentity,
         ) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+
+        fn target_native_session(
+            &mut self,
+            _reservation: &TargetReservation,
+            _identity: &GenerationIdentity,
+        ) -> Result<Option<String>, Self::Error> {
             unreachable!()
         }
 
@@ -1605,6 +1798,14 @@ mod tests {
             ))
         }
 
+        fn bind_native_session(
+            &mut self,
+            _active: &mut Self::Active,
+            _native_session_id: &str,
+        ) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+
         fn abort_prepared(&mut self, _prepared: Self::Prepared) -> FinishAttempt<Self::Prepared> {
             unreachable!()
         }
@@ -1633,7 +1834,7 @@ mod tests {
             process_birth_identity: "birth-1".to_string(),
             instance_name: "instance-1".to_string(),
             hcom_session_id: "hcom-1".to_string(),
-            synthetic_native_session_id: "native-1".to_string(),
+            native_session_id: Some("native-1".to_string()),
         };
         let control = TimeoutControl {
             phase: 0,

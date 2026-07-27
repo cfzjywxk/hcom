@@ -1,11 +1,12 @@
 //! Durable, typed control plane for same-terminal Codex handoffs.
 //!
 //! This module deliberately has no PTY, hook, launcher, signal, or process
-//! control integration. Later phases may call these service APIs, but Phase 1
-//! only persists and validates deterministic state transitions.
+//! control integration. The private Phase 3 Codex adapter and exact hooks call
+//! these services, while every state transition remains deterministic and
+//! durable.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 
@@ -29,6 +30,9 @@ pub const MAX_DIRTY_SUMMARY_BYTES: usize = 512;
 pub const MAX_FAILURE_KIND_BYTES: usize = 64;
 pub const MAX_FAILURE_REASON_BYTES: usize = 1024;
 pub const MAX_HANDOFF_BUNDLE_BYTES: usize = 1024 * 1024;
+pub const MAX_INSTRUCTION_FILE_BYTES: usize = 256 * 1024;
+pub const MAX_INSTRUCTIONS_BYTES: usize = 1024 * 1024;
+pub const MAX_INSTRUCTION_FILES: usize = 64;
 pub const MAX_STATUS_JSON_BYTES: usize = 16 * 1024;
 pub const MAX_STATUS_HUMAN_BYTES: usize = 16 * 1024;
 pub const MAX_QUIESCE_ELAPSED_MS: i64 = 86_400_000;
@@ -316,6 +320,7 @@ pub struct TerminalHandoff {
     pub quiesce_process_birth_identity: Option<String>,
     pub quiesce_committed_version: Option<i64>,
     pub stop_observed_at: Option<f64>,
+    pub stop_turn_id: Option<String>,
     pub sigterm_requested_wall_at: Option<f64>,
     pub sigterm_requested_monotonic_ns: Option<i64>,
     pub sigterm_request_result: String,
@@ -332,6 +337,9 @@ pub struct TerminalHandoff {
     pub screen_cleanup_succeeded: Option<bool>,
     pub write_queue_cleanup_succeeded: Option<bool>,
     pub cleanup_completed_at: Option<f64>,
+    pub target_validation_token: Option<String>,
+    pub target_instructions_digest: Option<String>,
+    pub target_validated_at: Option<f64>,
     pub failure_kind: String,
     pub failure_reason: String,
     pub created_at: f64,
@@ -372,6 +380,7 @@ impl TerminalHandoff {
             quiesce_process_birth_identity: row.get("quiesce_process_birth_identity")?,
             quiesce_committed_version: row.get("quiesce_committed_version")?,
             stop_observed_at: row.get("stop_observed_at")?,
+            stop_turn_id: row.get("stop_turn_id")?,
             sigterm_requested_wall_at: row.get("sigterm_requested_wall_at")?,
             sigterm_requested_monotonic_ns: row.get("sigterm_requested_monotonic_ns")?,
             sigterm_request_result: row.get("sigterm_request_result")?,
@@ -388,6 +397,9 @@ impl TerminalHandoff {
             screen_cleanup_succeeded: row.get("screen_cleanup_succeeded")?,
             write_queue_cleanup_succeeded: row.get("write_queue_cleanup_succeeded")?,
             cleanup_completed_at: row.get("cleanup_completed_at")?,
+            target_validation_token: row.get("target_validation_token")?,
+            target_instructions_digest: row.get("target_instructions_digest")?,
+            target_validated_at: row.get("target_validated_at")?,
             failure_kind: row.get("failure_kind")?,
             failure_reason: row.get("failure_reason")?,
             created_at: row.get("created_at")?,
@@ -462,6 +474,23 @@ pub struct HandoffOutcome {
 }
 
 #[derive(Debug, Clone)]
+pub struct ProjectInstruction {
+    pub scope: String,
+    pub path: String,
+    pub content: String,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct HandoffInspection {
+    pub handoff: TerminalHandoff,
+    pub bundle: serde_json::Value,
+    pub instructions: Vec<ProjectInstruction>,
+    pub instructions_digest: String,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct GenerationOutcome {
     pub generation: TerminalGeneration,
     pub replayed: bool,
@@ -502,6 +531,7 @@ pub struct StopObservation {
     pub committed_version: i64,
     pub hook_native_session_id: String,
     pub launch_nonce: String,
+    pub turn_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -861,6 +891,22 @@ fn load_handoff(conn: &Connection, id: &str) -> Result<Option<TerminalHandoff>, 
     .map_err(Into::into)
 }
 
+fn load_handoff_for_target_generation(
+    conn: &Connection,
+    chain_id: &str,
+    generation: i64,
+) -> Result<Option<TerminalHandoff>, HandoffError> {
+    conn.query_row(
+        "SELECT * FROM terminal_handoffs
+         WHERE chain_id = ?1 AND target_generation = ?2
+           AND state NOT IN ('accepted', 'aborted')",
+        params![chain_id, generation],
+        TerminalHandoff::from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 pub fn get_chain(db: &HcomDb, id: &str) -> Result<Option<TerminalChain>, HandoffError> {
     let id = validate_opaque_id(id, "chain ID")?;
     load_chain(db.conn(), &id)
@@ -1077,6 +1123,68 @@ pub fn resolve_managed_actor(
     Ok(actor)
 }
 
+/// Resolve the exact materialized generation before its native Codex session
+/// has been pinned. This is intentionally narrower than the ordinary CLI
+/// resolver and is only suitable for a verified SessionStart hook.
+pub fn resolve_managed_actor_for_session_start(
+    db: &HcomDb,
+    instance_name: &str,
+    hcom_session_id: &str,
+    process_id: &str,
+    markers: &ManagedActorMarkers,
+) -> Result<HandoffActor, HandoffError> {
+    let chain_id =
+        validate_opaque_id(&markers.chain_id, "chain ID").map_err(|_| HandoffError::NotManaged)?;
+    if markers.generation < 1 {
+        return Err(HandoffError::NotManaged);
+    }
+    let launch_nonce = validate_opaque_id(&markers.launch_nonce, "launch nonce")
+        .map_err(|_| HandoffError::NotManaged)?;
+    let process_birth_identity = validate_text(
+        &markers.process_birth_identity,
+        "process birth identity",
+        MAX_IDENTITY_BYTES,
+        false,
+    )
+    .map_err(|_| HandoffError::NotManaged)?;
+    validate_text(
+        instance_name,
+        "instance identity",
+        MAX_INSTANCE_NAME_BYTES,
+        false,
+    )
+    .map_err(|_| HandoffError::NotManaged)?;
+    validate_text(
+        hcom_session_id,
+        "hcom session identity",
+        MAX_IDENTITY_BYTES,
+        false,
+    )
+    .map_err(|_| HandoffError::NotManaged)?;
+    validate_text(process_id, "process identity", MAX_PROCESS_ID_BYTES, false)
+        .map_err(|_| HandoffError::NotManaged)?;
+
+    let chain = load_chain(db.conn(), &chain_id)?.ok_or(HandoffError::NotManaged)?;
+    let generation = load_generation(db.conn(), &chain_id, markers.generation)?
+        .ok_or(HandoffError::NotManaged)?;
+    let actor = HandoffActor {
+        instance_name: instance_name.to_string(),
+        hcom_session_id: hcom_session_id.to_string(),
+        native_session_id: None,
+        process_id: process_id.to_string(),
+        process_birth_identity,
+        generation: markers.generation,
+    };
+    if chain.current_generation != markers.generation
+        || generation.launch_nonce != launch_nonce
+        || !generation_matches_actor(&generation, &actor, false)
+        || !live_binding_matches(db.conn(), &actor)?
+    {
+        return Err(HandoffError::NotManaged);
+    }
+    Ok(actor)
+}
+
 fn canonical_workspace(path: &Path) -> Result<String, HandoffError> {
     let canonical = std::fs::canonicalize(path)
         .map_err(|_| HandoffError::Invalid("workspace cannot be canonicalized".to_string()))?;
@@ -1231,6 +1339,7 @@ struct BundleSnapshot {
     event_id: i64,
     digest: String,
     size_bytes: i64,
+    value: serde_json::Value,
 }
 
 fn load_bundle_snapshot(
@@ -1288,6 +1397,7 @@ fn load_bundle_snapshot(
         event_id,
         digest: hash_parts(&[&canonical]),
         size_bytes: canonical.len() as i64,
+        value,
     })
 }
 
@@ -1308,6 +1418,197 @@ fn verify_pinned_bundle(
         ));
     }
     Ok(current)
+}
+
+fn load_current_instructions(
+    workspace: &str,
+    bundle: &serde_json::Value,
+) -> Result<(Vec<ProjectInstruction>, String), HandoffError> {
+    let workspace = PathBuf::from(workspace);
+    let canonical_workspace = std::fs::canonicalize(&workspace).map_err(|_| {
+        HandoffError::Conflict(
+            "HANDOFF_CONFLICT target workspace is no longer available".to_string(),
+        )
+    })?;
+    if canonical_workspace != workspace {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT target workspace is no longer canonical".to_string(),
+        ));
+    }
+
+    let mut candidates: Vec<(String, PathBuf, PathBuf)> = Vec::new();
+    if let Some(codex_home) = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| crate::runtime_env::user_home().map(|home| home.join(".codex")))
+        && let Some(path) = preferred_instruction_file(&codex_home)
+    {
+        candidates.push(("global".to_string(), codex_home, path));
+    }
+
+    let mut project_directories = vec![workspace.clone()];
+    if let Some(files) = bundle.pointer("/refs/files") {
+        let files = files.as_array().ok_or_else(|| {
+            HandoffError::Conflict(
+                "HANDOFF_CONFLICT bundle refs.files is not a bounded path list".to_string(),
+            )
+        })?;
+        if files.len() > MAX_INSTRUCTION_FILES {
+            return Err(HandoffError::Conflict(
+                "HANDOFF_CONFLICT bundle references too many instruction scopes".to_string(),
+            ));
+        }
+        for value in files {
+            let raw = value.as_str().ok_or_else(|| {
+                HandoffError::Conflict(
+                    "HANDOFF_CONFLICT bundle refs.files contains a non-path value".to_string(),
+                )
+            })?;
+            let relative = bounded_relative_path(raw)?;
+            let referenced = workspace.join(relative);
+            let directory = if referenced.is_dir() {
+                referenced
+            } else {
+                referenced
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| workspace.clone())
+            };
+            let relative_directory = directory.strip_prefix(&workspace).map_err(|_| {
+                HandoffError::Conflict(
+                    "HANDOFF_CONFLICT bundle file escapes the pinned workspace".to_string(),
+                )
+            })?;
+            let mut current = workspace.clone();
+            for component in relative_directory.components() {
+                current.push(component);
+                project_directories.push(current.clone());
+            }
+        }
+    }
+    project_directories.sort();
+    project_directories.dedup();
+    for directory in project_directories {
+        if let Some(path) = preferred_instruction_file(&directory) {
+            candidates.push(("workspace".to_string(), workspace.clone(), path));
+        }
+    }
+
+    let mut instructions = Vec::with_capacity(candidates.len());
+    let mut total = 0usize;
+    for (scope, root, path) in candidates {
+        if instructions.len() >= MAX_INSTRUCTION_FILES {
+            return Err(HandoffError::Conflict(
+                "HANDOFF_CONFLICT current project instructions exceed the file bound".to_string(),
+            ));
+        }
+        let canonical_root = std::fs::canonicalize(&root).map_err(|_| {
+            HandoffError::Conflict(
+                "HANDOFF_CONFLICT instruction root is no longer available".to_string(),
+            )
+        })?;
+        let canonical_path = std::fs::canonicalize(&path).map_err(|_| {
+            HandoffError::Conflict(
+                "HANDOFF_CONFLICT project instruction file changed during validation".to_string(),
+            )
+        })?;
+        if !canonical_path.starts_with(&canonical_root) {
+            return Err(HandoffError::Conflict(
+                "HANDOFF_CONFLICT project instruction file escapes its scope".to_string(),
+            ));
+        }
+        let metadata = std::fs::metadata(&canonical_path).map_err(|_| {
+            HandoffError::Conflict(
+                "HANDOFF_CONFLICT project instruction metadata is unavailable".to_string(),
+            )
+        })?;
+        if !metadata.is_file() || metadata.len() as usize > MAX_INSTRUCTION_FILE_BYTES {
+            return Err(HandoffError::Conflict(
+                "HANDOFF_CONFLICT project instruction file is not bounded".to_string(),
+            ));
+        }
+        let content = std::fs::read_to_string(&canonical_path).map_err(|_| {
+            HandoffError::Conflict(
+                "HANDOFF_CONFLICT project instruction file is not valid UTF-8".to_string(),
+            )
+        })?;
+        total = total.checked_add(content.len()).ok_or_else(|| {
+            HandoffError::Conflict(
+                "HANDOFF_CONFLICT current project instructions exceed the byte bound".to_string(),
+            )
+        })?;
+        if total > MAX_INSTRUCTIONS_BYTES {
+            return Err(HandoffError::Conflict(
+                "HANDOFF_CONFLICT current project instructions exceed the byte bound".to_string(),
+            ));
+        }
+        let display_path = canonical_path
+            .strip_prefix(&canonical_root)
+            .ok()
+            .and_then(Path::to_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                HandoffError::Conflict(
+                    "HANDOFF_CONFLICT project instruction path is not representable".to_string(),
+                )
+            })?
+            .to_string();
+        let digest = hash_parts(&[
+            scope.as_bytes(),
+            display_path.as_bytes(),
+            content.as_bytes(),
+        ]);
+        instructions.push(ProjectInstruction {
+            scope,
+            path: display_path,
+            content,
+            digest,
+        });
+    }
+    instructions.sort_by(|left, right| (&left.scope, &left.path).cmp(&(&right.scope, &right.path)));
+    let instructions_digest = {
+        let mut digest_parts: Vec<&[u8]> = Vec::with_capacity(instructions.len() * 4);
+        for instruction in &instructions {
+            digest_parts.push(instruction.scope.as_bytes());
+            digest_parts.push(instruction.path.as_bytes());
+            digest_parts.push(instruction.digest.as_bytes());
+            digest_parts.push(instruction.content.as_bytes());
+        }
+        hash_parts(&digest_parts)
+    };
+    Ok((instructions, instructions_digest))
+}
+
+fn preferred_instruction_file(directory: &Path) -> Option<PathBuf> {
+    for name in ["AGENTS.override.md", "AGENTS.md"] {
+        let candidate = directory.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn bounded_relative_path(raw: &str) -> Result<PathBuf, HandoffError> {
+    let raw = validate_text(raw, "bundle file reference", MAX_WORKSPACE_BYTES, false)?;
+    let path = Path::new(&raw);
+    let mut relative = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => relative.push(value),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(HandoffError::Conflict(
+                    "HANDOFF_CONFLICT bundle file reference is outside the workspace".to_string(),
+                ));
+            }
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT bundle file reference is empty".to_string(),
+        ));
+    }
+    Ok(relative)
 }
 
 fn generate_id(prefix: &str) -> String {
@@ -1530,6 +1831,25 @@ pub fn create_chain(
     actor: &HandoffActor,
     spec: &ChainSpec,
 ) -> Result<TerminalChain, HandoffError> {
+    create_chain_with_id(db, actor, spec, &generate_id("tc"))
+}
+
+/// Allocate the opaque identity consumed by the private Phase 3 factory before
+/// its initial Codex is released from the bootstrap gate.
+#[cfg(test)]
+pub(crate) fn allocate_chain_id() -> String {
+    generate_id("tc")
+}
+
+/// Private create variant used only while the foreground factory already owns
+/// a gated initial wrapper. There is deliberately no CLI/router path for a
+/// caller-supplied chain identity.
+pub(crate) fn create_chain_with_id(
+    db: &HcomDb,
+    actor: &HandoffActor,
+    spec: &ChainSpec,
+    requested_chain_id: &str,
+) -> Result<TerminalChain, HandoffError> {
     validate_actor(actor)?;
     if actor.generation != 1 {
         return Err(HandoffError::Invalid(
@@ -1601,7 +1921,7 @@ pub fn create_chain(
     let outer_foreground_pgid = spec.outer_foreground_pgid.to_string();
     let outer_tty_device = spec.outer_tty_device.to_string();
     let outer_tty_inode = spec.outer_tty_inode.to_string();
-    let chain_id = generate_id("tc");
+    let chain_id = validate_opaque_id(requested_chain_id, "chain ID")?;
     let request_hash = hash_request(
         "create_chain",
         &chain_id,
@@ -1713,6 +2033,11 @@ pub fn pin_native_session(
 ) -> Result<GenerationOutcome, HandoffError> {
     let chain_id = validate_opaque_id(chain_id, "chain ID")?;
     validate_actor(actor)?;
+    if actor.native_session_id.is_some() {
+        return Err(HandoffError::Invalid(
+            "SessionStart actor must not supply a native session identity".to_string(),
+        ));
+    }
     validate_expected_version(expected_version)?;
     let native_session_id = validate_text(
         native_session_id,
@@ -1728,7 +2053,7 @@ pub fn pin_native_session(
         &[native_session_id.as_bytes()],
     );
     let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
-    let mut chain = load_chain(&tx, &chain_id)?.ok_or(HandoffError::NotManaged)?;
+    let chain = load_chain(&tx, &chain_id)?.ok_or(HandoffError::NotManaged)?;
     let mut generation =
         load_generation(&tx, &chain_id, actor.generation)?.ok_or(HandoffError::NotManaged)?;
     authorize_generation(&tx, &chain, &generation, actor, false, true, true)?;
@@ -1762,35 +2087,39 @@ pub fn pin_native_session(
             generation.version,
         ));
     }
-    let now = now_epoch_f64();
     if generation.native_session_id.is_some() {
-        update_generation_state(
-            &tx,
-            &mut generation,
-            GenerationState::NeedsRecovery,
-            actor,
-            "supervisor",
-            "pin_native_session_conflict",
-            &request_hash,
-            now,
-        )?;
-        let current_generation = chain.current_generation;
-        update_chain_state(
-            &tx,
-            &mut chain,
-            ChainState::NeedsRecovery,
-            current_generation,
-            actor,
-            "supervisor",
-            "pin_native_session_conflict",
-            &request_hash,
-            now,
-        )?;
-        tx.commit()?;
         return Err(HandoffError::Conflict(
-            "HANDOFF_CONFLICT native session is already pinned; chain needs recovery".to_string(),
+            "HANDOFF_CONFLICT native session is already pinned".to_string(),
         ));
     }
+    let valid_initial = actor.generation == 1
+        && generation.state == GenerationState::Active
+        && chain.state == ChainState::Active;
+    let valid_target = generation.state == GenerationState::Launching
+        && chain.state == ChainState::LaunchingTarget
+        && load_handoff_for_target_generation(&tx, &chain_id, actor.generation)?
+            .is_some_and(|handoff| handoff.state == HandoffState::LaunchingTarget);
+    if !valid_initial && !valid_target {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT SessionStart does not match an active initial or launching target generation"
+                .to_string(),
+        ));
+    }
+    let historical_collision: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM terminal_generations
+             WHERE chain_id = ?1 AND generation != ?2
+               AND native_session_id = ?3
+         )",
+        params![chain_id, actor.generation, native_session_id],
+        |row| row.get(0),
+    )?;
+    if historical_collision {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT native session is not fresh within the chain".to_string(),
+        ));
+    }
+    let now = now_epoch_f64();
     let updated = tx.execute(
         "UPDATE terminal_generations
          SET native_session_id = ?1, version = ?2, updated_at = ?3
@@ -1823,7 +2152,7 @@ pub fn pin_native_session(
         Some(generation.state.as_str()),
         generation.state.as_str(),
         actor,
-        "supervisor",
+        if valid_target { "target" } else { "source" },
         "pin_native_session",
         &request_hash,
         now,
@@ -2723,6 +3052,12 @@ pub fn observe_stop(
         false,
     )?;
     let launch_nonce = validate_opaque_id(&observation.launch_nonce, "launch nonce")?;
+    let turn_id = validate_text(
+        &observation.turn_id,
+        "Stop turn identity",
+        MAX_IDENTITY_BYTES,
+        false,
+    )?;
     let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
     let (mut handoff, mut chain, mut source) =
         load_source_context(&tx, &handoff_id, actor, true, true)?;
@@ -2737,6 +3072,7 @@ pub fn observe_stop(
             committed_version.as_bytes(),
             hook_session.as_bytes(),
             launch_nonce.as_bytes(),
+            turn_id.as_bytes(),
         ],
     );
     if transition_is_replay(
@@ -2785,11 +3121,12 @@ pub fn observe_stop(
     let updated = tx.execute(
         "UPDATE terminal_handoffs
          SET state = 'stop_observed', version = ?1,
-             stop_observed_at = ?2, updated_at = ?2
-         WHERE id = ?3 AND state = 'committed' AND version = ?4",
+             stop_observed_at = ?2, stop_turn_id = ?3, updated_at = ?2
+         WHERE id = ?4 AND state = 'committed' AND version = ?5",
         params![
             observation.expected_version + 1,
             now,
+            turn_id,
             handoff_id,
             observation.expected_version
         ],
@@ -3293,6 +3630,15 @@ pub fn observe_source_exit_without_stop(
     })
 }
 
+struct RetiredInstanceSnapshot {
+    session_id: Option<String>,
+    tool: String,
+    directory: Option<String>,
+    transcript_path: Option<String>,
+    pid: Option<i64>,
+    created_at: Option<f64>,
+}
+
 pub fn complete_source_cleanup(
     db: &HcomDb,
     supervisor: &SupervisorActor,
@@ -3441,6 +3787,7 @@ pub fn complete_source_cleanup(
             handoff.version,
         ));
     }
+    let now = now_epoch_f64();
     if success {
         let binding: Option<(Option<String>, Option<String>)> = tx
             .query_row(
@@ -3458,20 +3805,80 @@ pub fn complete_source_cleanup(
                 "HANDOFF_CONFLICT source process binding changed before cleanup".to_string(),
             ));
         }
-        let instance: Option<(Option<String>, String)> = tx
+        let instance: Option<RetiredInstanceSnapshot> = tx
             .query_row(
-                "SELECT session_id, tool FROM instances WHERE name = ?1",
+                "SELECT session_id, tool, directory, transcript_path, pid, created_at
+                 FROM instances WHERE name = ?1",
                 [&handoff.source_instance_name],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    Ok(RetiredInstanceSnapshot {
+                        session_id: row.get(0)?,
+                        tool: row.get(1)?,
+                        directory: row.get(2)?,
+                        transcript_path: row.get(3)?,
+                        pid: row.get(4)?,
+                        created_at: row.get(5)?,
+                    })
+                },
             )
             .optional()?;
-        if instance.as_ref().is_some_and(|(session, tool)| {
-            session.as_deref() != Some(handoff.source_hcom_session_id.as_str()) || tool != "codex"
+        if instance.as_ref().is_some_and(|instance| {
+            instance.session_id.as_deref() != Some(handoff.source_hcom_session_id.as_str())
+                || instance.tool != "codex"
         }) {
             return Err(HandoffError::Conflict(
                 "HANDOFF_CONFLICT source instance changed before cleanup".to_string(),
             ));
         }
+        let directory = instance
+            .as_ref()
+            .and_then(|value| value.directory.as_deref())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(handoff.workspace.as_str());
+        let transcript_path = instance
+            .as_ref()
+            .and_then(|value| value.transcript_path.as_deref())
+            .unwrap_or("");
+        validate_text(
+            directory,
+            "retired instance directory",
+            MAX_WORKSPACE_BYTES,
+            false,
+        )?;
+        validate_text(
+            transcript_path,
+            "retired instance transcript path",
+            MAX_WORKSPACE_BYTES,
+            true,
+        )?;
+        let lifecycle = serde_json::json!({
+            "action": "stopped",
+            "by": "chain-supervisor",
+            "reason": "handoff",
+            "snapshot": {
+                "tool": "codex",
+                "session_id": handoff.source_hcom_session_id,
+                "directory": directory,
+                "transcript_path": transcript_path,
+                "pid": instance.as_ref().and_then(|value| value.pid),
+                "created_at": instance.as_ref().and_then(|value| value.created_at),
+            },
+        });
+        let lifecycle = serde_json::to_string(&lifecycle).map_err(|_| HandoffError::Storage)?;
+        if lifecycle.len() > MAX_STATUS_JSON_BYTES {
+            return Err(HandoffError::Conflict(
+                "HANDOFF_CONFLICT retired lifecycle snapshot exceeds the byte bound".to_string(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO events (timestamp, type, instance, data)
+             VALUES (?1, 'life', ?2, ?3)",
+            params![
+                crate::shared::time::now_iso(),
+                handoff.source_instance_name,
+                lifecycle
+            ],
+        )?;
         tx.execute(
             "DELETE FROM process_bindings
              WHERE process_id = ?1 AND session_id = ?2 AND instance_name = ?3",
@@ -3487,7 +3894,6 @@ pub fn complete_source_cleanup(
             params![handoff.source_instance_name, handoff.source_hcom_session_id],
         )?;
     }
-    let now = now_epoch_f64();
     let next_handoff = if success {
         HandoffState::LaunchingTarget
     } else {
@@ -4227,7 +4633,7 @@ pub fn target_ready(
         || target.process_birth_identity.as_deref() != Some(actor.process_birth_identity.as_str())
         || target.instance_name.as_deref() != Some(actor.instance_name.as_str())
         || target.hcom_session_id.as_deref() != Some(actor.hcom_session_id.as_str())
-        || target.native_session_id.is_some()
+        || target.native_session_id.as_deref() != Some(native_session)
     {
         return Err(conflict(
             &handoff_id,
@@ -4241,18 +4647,16 @@ pub fn target_ready(
     let target_from_version = target.version;
     let target_updated = tx.execute(
         "UPDATE terminal_generations
-         SET native_session_id = ?1, state = 'awaiting_acceptance',
-             version = ?2, updated_at = ?3
-         WHERE chain_id = ?4 AND generation = ?5
-           AND state = 'launching' AND version = ?6
-           AND wrapper_process_id = ?7
-           AND process_birth_identity = ?8
-           AND instance_name = ?9
-           AND hcom_session_id = ?10
-           AND native_session_id IS NULL
+         SET state = 'awaiting_acceptance', version = ?1, updated_at = ?2
+         WHERE chain_id = ?3 AND generation = ?4
+           AND state = 'launching' AND version = ?5
+           AND wrapper_process_id = ?6
+           AND process_birth_identity = ?7
+           AND instance_name = ?8
+           AND hcom_session_id = ?9
+           AND native_session_id = ?10
            AND launch_nonce = ?11",
         params![
-            native_session,
             target_from_version + 1,
             now,
             target.chain_id,
@@ -4262,6 +4666,7 @@ pub fn target_ready(
             actor.process_birth_identity,
             actor.instance_name,
             actor.hcom_session_id,
+            native_session,
             launch_nonce,
         ],
     )?;
@@ -4284,7 +4689,6 @@ pub fn target_ready(
         &request_hash,
         now,
     )?;
-    target.native_session_id = Some(native_session.to_string());
     target.state = GenerationState::AwaitingAcceptance;
     target.version += 1;
     target.updated_at = now;
@@ -4354,6 +4758,171 @@ pub fn accept_handoff(
     )
 }
 
+pub fn inspect_handoff(
+    db: &HcomDb,
+    actor: &HandoffActor,
+    handoff_id: &str,
+    expected_version: i64,
+    cwd: &Path,
+) -> Result<HandoffInspection, HandoffError> {
+    inspect_handoff_with_snapshot_provider(
+        db,
+        actor,
+        handoff_id,
+        expected_version,
+        cwd,
+        snapshot_workspace,
+    )
+}
+
+fn inspect_handoff_with_snapshot_provider<F>(
+    db: &HcomDb,
+    actor: &HandoffActor,
+    handoff_id: &str,
+    expected_version: i64,
+    cwd: &Path,
+    snapshot_provider: F,
+) -> Result<HandoffInspection, HandoffError>
+where
+    F: FnOnce(&Path) -> Result<WorkspaceSnapshot, HandoffError>,
+{
+    let handoff_id = validate_opaque_id(handoff_id, "handoff ID")?;
+    validate_actor(actor)?;
+    validate_expected_version(expected_version)?;
+    let workspace = snapshot_provider(cwd)?;
+    let preliminary = load_handoff(db.conn(), &handoff_id)?.ok_or(HandoffError::NotManaged)?;
+    if !workspace_matches_handoff(&workspace, &preliminary) {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT target workspace does not match the prepared snapshot".to_string(),
+        ));
+    }
+    let preliminary_bundle = verify_pinned_bundle(db.conn(), &preliminary)?;
+    let (instructions, instructions_digest) =
+        load_current_instructions(&preliminary.workspace, &preliminary_bundle.value)?;
+
+    let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
+    let (mut handoff, chain, target) = load_target_context(&tx, &handoff_id, actor, true)?;
+    if !workspace_matches_handoff(&workspace, &handoff) {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT target workspace changed during validation".to_string(),
+        ));
+    }
+    let bundle = verify_pinned_bundle(&tx, &handoff)?;
+    if bundle.digest != preliminary_bundle.digest
+        || bundle.size_bytes != preliminary_bundle.size_bytes
+    {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT pinned bundle changed during target validation".to_string(),
+        ));
+    }
+    let request_hash = hash_request(
+        "inspect_target",
+        &handoff_id,
+        expected_version,
+        actor,
+        &[
+            workspace.workspace.as_bytes(),
+            workspace.revision.as_bytes(),
+            workspace.branch.as_bytes(),
+            workspace.dirty_summary.as_bytes(),
+            bundle.digest.as_bytes(),
+            instructions_digest.as_bytes(),
+            handoff.policy_ref.as_bytes(),
+        ],
+    );
+    if transition_is_replay(
+        &tx,
+        ("handoff", &handoff_id),
+        expected_version,
+        handoff.version,
+        handoff.state.as_str(),
+        "inspect_target",
+        &request_hash,
+    )? {
+        if handoff.target_validation_token.is_none()
+            || handoff.target_instructions_digest.as_deref() != Some(instructions_digest.as_str())
+        {
+            return Err(HandoffError::Conflict(
+                "HANDOFF_CONFLICT project instructions changed after validation".to_string(),
+            ));
+        }
+        tx.commit()?;
+        return Ok(HandoffInspection {
+            handoff,
+            bundle: bundle.value,
+            instructions,
+            instructions_digest,
+            replayed: true,
+        });
+    }
+    if handoff.state != HandoffState::AwaitingAcceptance
+        || handoff.version != expected_version
+        || chain.state != ChainState::AwaitingAcceptance
+        || target.state != GenerationState::AwaitingAcceptance
+        || handoff.target_validation_token.is_some()
+        || handoff.target_instructions_digest.is_some()
+        || handoff.target_validated_at.is_some()
+    {
+        return Err(conflict(
+            &handoff_id,
+            expected_version,
+            handoff.state.as_str(),
+            handoff.version,
+        ));
+    }
+    let validation_token = generate_id("validation");
+    let now = now_epoch_f64();
+    let updated = tx.execute(
+        "UPDATE terminal_handoffs
+         SET version = ?1, target_validation_token = ?2,
+             target_instructions_digest = ?3, target_validated_at = ?4,
+             updated_at = ?4
+         WHERE id = ?5 AND state = 'awaiting_acceptance' AND version = ?6
+           AND target_validation_token IS NULL
+           AND target_instructions_digest IS NULL
+           AND target_validated_at IS NULL",
+        params![
+            expected_version + 1,
+            validation_token,
+            instructions_digest,
+            now,
+            handoff_id,
+            expected_version,
+        ],
+    )?;
+    if updated != 1 {
+        return Err(conflict(
+            &handoff_id,
+            expected_version,
+            handoff.state.as_str(),
+            handoff.version,
+        ));
+    }
+    insert_audit(
+        &tx,
+        &handoff.chain_id,
+        "handoff",
+        &handoff_id,
+        expected_version,
+        Some(HandoffState::AwaitingAcceptance.as_str()),
+        HandoffState::AwaitingAcceptance.as_str(),
+        actor,
+        "target",
+        "inspect_target",
+        &request_hash,
+        now,
+    )?;
+    tx.commit()?;
+    handoff = load_handoff(db.conn(), &handoff_id)?.ok_or(HandoffError::Storage)?;
+    Ok(HandoffInspection {
+        handoff,
+        bundle: bundle.value,
+        instructions,
+        instructions_digest,
+        replayed: false,
+    })
+}
+
 fn accept_handoff_with_snapshot_provider<F>(
     db: &HcomDb,
     actor: &HandoffActor,
@@ -4369,14 +4938,13 @@ where
     validate_actor(actor)?;
     validate_expected_version(expected_version)?;
     let workspace = snapshot_provider(cwd)?;
+    let preliminary = load_handoff(db.conn(), &handoff_id)?.ok_or(HandoffError::NotManaged)?;
+    let preliminary_bundle = verify_pinned_bundle(db.conn(), &preliminary)?;
+    let (_, instructions_digest) =
+        load_current_instructions(&preliminary.workspace, &preliminary_bundle.value)?;
     let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
     let (mut handoff, mut chain, mut target) = load_target_context(&tx, &handoff_id, actor, true)?;
-    if workspace.workspace != chain.workspace
-        || workspace.workspace != handoff.workspace
-        || workspace.revision != handoff.revision
-        || workspace.branch != handoff.branch
-        || workspace.dirty_summary != handoff.dirty_summary
-    {
+    if !workspace_matches_handoff(&workspace, &handoff) || workspace.workspace != chain.workspace {
         return Err(HandoffError::Conflict(
             "HANDOFF_CONFLICT target workspace does not match the prepared snapshot".to_string(),
         ));
@@ -4398,6 +4966,12 @@ where
             bundle.digest.as_bytes(),
             bundle_size.as_bytes(),
             handoff.policy_ref.as_bytes(),
+            handoff
+                .target_validation_token
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes(),
+            instructions_digest.as_bytes(),
         ],
     );
     if transition_is_replay(
@@ -4419,6 +4993,9 @@ where
         || handoff.version != expected_version
         || chain.state != ChainState::AwaitingAcceptance
         || target.state != GenerationState::AwaitingAcceptance
+        || handoff.target_validation_token.is_none()
+        || handoff.target_instructions_digest.as_deref() != Some(instructions_digest.as_str())
+        || handoff.target_validated_at.is_none()
     {
         return Err(conflict(
             &handoff_id,
@@ -4484,6 +5061,13 @@ where
         handoff,
         replayed: false,
     })
+}
+
+fn workspace_matches_handoff(workspace: &WorkspaceSnapshot, handoff: &TerminalHandoff) -> bool {
+    workspace.workspace == handoff.workspace
+        && workspace.revision == handoff.revision
+        && workspace.branch == handoff.branch
+        && workspace.dirty_summary == handoff.dirty_summary
 }
 
 pub fn reject_handoff(
@@ -4868,6 +5452,7 @@ mod tests {
                 committed_version: committed.handoff.version,
                 hook_native_session_id: fixture.source.native_session_id.clone().unwrap(),
                 launch_nonce: committed.handoff.source_launch_nonce.clone(),
+                turn_id: "turn-source".to_string(),
             },
         )
         .unwrap();
@@ -4897,7 +5482,10 @@ mod tests {
 
     fn advance_to_launching(fixture: &Fixture) -> HandoffOutcome {
         let launching = advance_to_unmaterialized_launching(fixture);
-        materialize_target_fixture(fixture, &launching, &target_actor())
+        let target = target_actor();
+        let materialized = materialize_target_fixture(fixture, &launching, &target);
+        pin_target_fixture(fixture, &target);
+        materialized
     }
 
     fn materialize_target_fixture(
@@ -4933,6 +5521,22 @@ mod tests {
             process_birth_identity: "birth-target".to_string(),
             generation: 2,
         }
+    }
+
+    fn pin_target_fixture(fixture: &Fixture, target: &HandoffActor) {
+        let generation = get_generation(&fixture.db, &fixture.chain.id, target.generation)
+            .unwrap()
+            .unwrap();
+        let mut session_start_actor = target.clone();
+        session_start_actor.native_session_id = None;
+        pin_native_session(
+            &fixture.db,
+            &fixture.chain.id,
+            &session_start_actor,
+            generation.version,
+            target.native_session_id.as_deref().unwrap(),
+        )
+        .unwrap();
     }
 
     fn assert_audit_continuity(db: &HcomDb, object_kind: &str, object_id: &str) {
@@ -4986,6 +5590,21 @@ mod tests {
         )
         .unwrap();
         (ready, target)
+    }
+
+    fn inspect_target_fixture(
+        fixture: &Fixture,
+        ready: &HandoffOutcome,
+        target: &HandoffActor,
+    ) -> HandoffInspection {
+        inspect_handoff(
+            &fixture.db,
+            target,
+            &ready.handoff.id,
+            ready.handoff.version,
+            &fixture.workspace,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -5178,6 +5797,7 @@ mod tests {
                 committed_version: 1,
                 hook_native_session_id: "native-source".to_string(),
                 launch_nonce: "launch-source".to_string(),
+                turn_id: "turn-source".to_string(),
             },
         )
         .unwrap();
@@ -5209,6 +5829,7 @@ mod tests {
 
         let target = target_actor();
         let launching = materialize_target_fixture(&fixture, &launching, &target);
+        pin_target_fixture(&fixture, &target);
         let target_generation = load_generation(fixture.db.conn(), &fixture.chain.id, 2)
             .unwrap()
             .unwrap();
@@ -5228,11 +5849,12 @@ mod tests {
                 .state,
             ChainState::AwaitingAcceptance
         );
+        let inspection = inspect_target_fixture(&fixture, &ready, &target);
         let accepted = accept_handoff(
             &fixture.db,
             &target,
             &ready.handoff.id,
-            ready.handoff.version,
+            inspection.handoff.version,
             &fixture.workspace,
         )
         .unwrap();
@@ -5299,6 +5921,7 @@ mod tests {
             committed_version: committed.handoff.version,
             hook_native_session_id: fixture.source.native_session_id.clone().unwrap(),
             launch_nonce: committed.handoff.source_launch_nonce.clone(),
+            turn_id: "turn-source".to_string(),
         };
         let stopped =
             observe_stop(&fixture.db, &fixture.source, &committed.handoff.id, &stop).unwrap();
@@ -5403,6 +6026,7 @@ mod tests {
             .replayed
         );
         assert_eq!(audit_count(&fixture.db), before);
+        pin_target_fixture(&fixture, &target);
         let ready = target_ready(
             &fixture.db,
             &target,
@@ -5425,11 +6049,12 @@ mod tests {
         );
         assert_eq!(audit_count(&fixture.db), before);
 
+        let inspection = inspect_target_fixture(&fixture, &ready, &target);
         let accepted = accept_handoff(
             &fixture.db,
             &target,
             &ready.handoff.id,
-            ready.handoff.version,
+            inspection.handoff.version,
             &fixture.workspace,
         )
         .unwrap();
@@ -5440,7 +6065,7 @@ mod tests {
                 &fixture.db,
                 &target,
                 &ready.handoff.id,
-                ready.handoff.version,
+                inspection.handoff.version,
                 &fixture.workspace,
             )
             .unwrap()
@@ -5450,8 +6075,8 @@ mod tests {
     }
 
     #[test]
-    fn native_session_pin_is_one_way_and_conflict_enters_recovery() {
-        let mut fixture = fixture(false);
+    fn native_session_pin_is_one_way_and_conflict_is_zero_write() {
+        let fixture = fixture(false);
         let pinned = pin_native_session(
             &fixture.db,
             &fixture.chain.id,
@@ -5474,7 +6099,6 @@ mod tests {
         .unwrap();
         assert!(replay.replayed);
 
-        fixture.source.native_session_id = Some("different-native".to_string());
         let conflict = pin_native_session(
             &fixture.db,
             &fixture.chain.id,
@@ -5490,13 +6114,13 @@ mod tests {
             generation.native_session_id.as_deref(),
             Some("native-source")
         );
-        assert_eq!(generation.state, GenerationState::NeedsRecovery);
+        assert_eq!(generation.state, GenerationState::Active);
         assert_eq!(
             get_chain(&fixture.db, &fixture.chain.id)
                 .unwrap()
                 .unwrap()
                 .state,
-            ChainState::NeedsRecovery
+            ChainState::Active
         );
     }
 
@@ -5681,6 +6305,7 @@ mod tests {
 
         let fixture = fixture(true);
         let (ready, target) = advance_to_awaiting_acceptance(&fixture);
+        let inspection = inspect_target_fixture(&fixture, &ready, &target);
         let audit_before = audit_count(&fixture.db);
         fixture
             .db
@@ -5703,7 +6328,7 @@ mod tests {
                 &fixture.db,
                 &target,
                 &ready.handoff.id,
-                ready.handoff.version,
+                inspection.handoff.version,
                 &fixture.workspace,
             ),
             Err(HandoffError::Conflict(_))
@@ -5734,6 +6359,7 @@ mod tests {
                 committed_version: 0,
                 hook_native_session_id: "native-source".to_string(),
                 launch_nonce: "launch-source".to_string(),
+                turn_id: "turn-source".to_string(),
             },
         );
         assert!(matches!(before_commit, Err(HandoffError::Conflict(_))));
@@ -5753,6 +6379,7 @@ mod tests {
                 committed_version: 1,
                 hook_native_session_id: "native-source".to_string(),
                 launch_nonce: "launch-source".to_string(),
+                turn_id: "turn-source".to_string(),
             },
             StopObservation {
                 expected_version: 1,
@@ -5760,6 +6387,7 @@ mod tests {
                 committed_version: 1,
                 hook_native_session_id: "wrong-native".to_string(),
                 launch_nonce: "launch-source".to_string(),
+                turn_id: "turn-source".to_string(),
             },
             StopObservation {
                 expected_version: 1,
@@ -5767,6 +6395,7 @@ mod tests {
                 committed_version: 0,
                 hook_native_session_id: "native-source".to_string(),
                 launch_nonce: "launch-source".to_string(),
+                turn_id: "turn-source".to_string(),
             },
         ] {
             assert!(matches!(
@@ -5795,6 +6424,7 @@ mod tests {
             committed_version: committed.handoff.version,
             hook_native_session_id: fixture.source.native_session_id.clone().unwrap(),
             launch_nonce: committed.handoff.source_launch_nonce.clone(),
+            turn_id: "turn-source".to_string(),
         };
         assert!(matches!(
             observe_stop(&fixture.db, &wrong_identity, &committed.handoff.id, &exact),
@@ -5904,6 +6534,7 @@ mod tests {
                 committed_version: committed.handoff.version,
                 hook_native_session_id: cleanup_fixture.source.native_session_id.clone().unwrap(),
                 launch_nonce: committed.handoff.source_launch_nonce.clone(),
+                turn_id: "turn-source".to_string(),
             },
         )
         .unwrap();
@@ -6257,12 +6888,13 @@ mod tests {
         spoof.hcom_session_id = "hcom-spoof".to_string();
         spoof.native_session_id = Some("native-spoof".to_string());
         add_live_actor(&fixture.db, &spoof);
+        let inspection = inspect_target_fixture(&fixture, &ready, &target);
         assert!(matches!(
             accept_handoff(
                 &fixture.db,
                 &spoof,
                 &ready.handoff.id,
-                ready.handoff.version,
+                inspection.handoff.version,
                 &fixture.workspace
             ),
             Err(HandoffError::Conflict(_))
@@ -6602,6 +7234,7 @@ mod tests {
             )]
         );
 
+        pin_target_fixture(&fixture, &target);
         let ready = target_ready(
             &fixture.db,
             &target,
@@ -6864,6 +7497,7 @@ mod tests {
                 committed_version: committed.handoff.version,
                 hook_native_session_id: fixture.source.native_session_id.clone().unwrap(),
                 launch_nonce: committed.handoff.source_launch_nonce.clone(),
+                turn_id: "turn-source".to_string(),
             },
         )
         .unwrap();
@@ -6944,6 +7578,96 @@ mod tests {
             )
             .unwrap();
         assert_eq!(audit_before, audit_after);
+    }
+
+    #[test]
+    fn successful_retirement_logs_one_bounded_stop_and_replay_preserves_name_reuse() {
+        let fixture = fixture(true);
+        let sigterm = advance_to_sigterm(&fixture);
+        let observation = successful_cleanup(sigterm.handoff.version);
+        let retired = complete_source_cleanup(
+            &fixture.db,
+            &supervisor_actor(&fixture),
+            &sigterm.handoff.id,
+            &observation,
+        )
+        .unwrap();
+        assert_eq!(retired.handoff.state, HandoffState::LaunchingTarget);
+        assert_eq!(
+            fixture
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM instances WHERE name = ?1",
+                    [&fixture.source.instance_name],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        let lifecycle: String = fixture
+            .db
+            .conn()
+            .query_row(
+                "SELECT data FROM events
+                 WHERE type = 'life' AND instance = ?1
+                   AND json_extract(data, '$.action') = 'stopped'",
+                [&fixture.source.instance_name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(lifecycle.len() <= MAX_STATUS_JSON_BYTES);
+        let lifecycle: serde_json::Value = serde_json::from_str(&lifecycle).unwrap();
+        assert_eq!(lifecycle["by"], "chain-supervisor");
+        assert_eq!(lifecycle["reason"], "handoff");
+        assert_eq!(lifecycle["snapshot"]["tool"], "codex");
+        assert_eq!(
+            lifecycle["snapshot"]["session_id"],
+            fixture.source.hcom_session_id
+        );
+
+        let mut reused = fixture.source.clone();
+        reused.hcom_session_id = "hcom-reused".to_string();
+        reused.native_session_id = Some("native-reused".to_string());
+        reused.process_id = "process-reused".to_string();
+        reused.process_birth_identity = "birth-reused".to_string();
+        add_live_actor(&fixture.db, &reused);
+        assert!(
+            complete_source_cleanup(
+                &fixture.db,
+                &supervisor_actor(&fixture),
+                &sigterm.handoff.id,
+                &observation,
+            )
+            .unwrap()
+            .replayed
+        );
+        assert_eq!(
+            fixture
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM events
+                     WHERE type = 'life' AND instance = ?1
+                       AND json_extract(data, '$.action') = 'stopped'",
+                    [&fixture.source.instance_name],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            fixture
+                .db
+                .conn()
+                .query_row(
+                    "SELECT session_id FROM instances WHERE name = ?1",
+                    [&fixture.source.instance_name],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            reused.hcom_session_id
+        );
     }
 
     #[test]
@@ -7061,6 +7785,7 @@ mod tests {
             committed_version: committed.handoff.version,
             hook_native_session_id: fixture.source.native_session_id.clone().unwrap(),
             launch_nonce: committed.handoff.source_launch_nonce.clone(),
+            turn_id: "turn-source".to_string(),
         };
         let db_path = fixture.db.path().to_path_buf();
         let barrier = Arc::new(Barrier::new(2));
@@ -7109,7 +7834,8 @@ mod tests {
     fn concurrent_accept_has_one_transition_and_one_replay() {
         let fixture = fixture(true);
         let (ready, target) = advance_to_awaiting_acceptance(&fixture);
-        let expected_version = ready.handoff.version;
+        let inspection = inspect_target_fixture(&fixture, &ready, &target);
+        let expected_version = inspection.handoff.version;
         let db_path = fixture.db.path().to_path_buf();
         let barrier = Arc::new(Barrier::new(2));
         let handles: Vec<_> = (0..2)
@@ -7157,11 +7883,12 @@ mod tests {
     fn target_accept_and_reject_are_mutually_exclusive() {
         let fixture = fixture(true);
         let (ready, target) = advance_to_awaiting_acceptance(&fixture);
+        let inspection = inspect_target_fixture(&fixture, &ready, &target);
         let accepted = accept_handoff(
             &fixture.db,
             &target,
             &ready.handoff.id,
-            ready.handoff.version,
+            inspection.handoff.version,
             &fixture.workspace,
         )
         .unwrap();
@@ -7177,5 +7904,112 @@ mod tests {
             ),
             Err(HandoffError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn target_must_inspect_bundle_and_current_instructions_before_accepting() {
+        let fixture = fixture(true);
+        std::fs::write(
+            fixture.workspace.join("AGENTS.md"),
+            "phase3 instruction sentinel one\n",
+        )
+        .unwrap();
+        let (ready, target) = advance_to_awaiting_acceptance(&fixture);
+        let audit_before = audit_count(&fixture.db);
+        assert!(matches!(
+            accept_handoff(
+                &fixture.db,
+                &target,
+                &ready.handoff.id,
+                ready.handoff.version,
+                &fixture.workspace,
+            ),
+            Err(HandoffError::Conflict(_))
+        ));
+        assert_eq!(audit_count(&fixture.db), audit_before);
+
+        let inspection = inspect_target_fixture(&fixture, &ready, &target);
+        assert_eq!(inspection.handoff.state, HandoffState::AwaitingAcceptance);
+        assert_eq!(inspection.handoff.version, ready.handoff.version + 1);
+        assert_eq!(
+            inspection
+                .bundle
+                .get("created_by")
+                .and_then(serde_json::Value::as_str),
+            Some(fixture.source.instance_name.as_str())
+        );
+        assert!(inspection.instructions.iter().any(|instruction| {
+            instruction.scope == "workspace"
+                && instruction.path == "AGENTS.md"
+                && instruction.content == "phase3 instruction sentinel one\n"
+        }));
+        let replay = inspect_handoff(
+            &fixture.db,
+            &target,
+            &ready.handoff.id,
+            ready.handoff.version,
+            &fixture.workspace,
+        )
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.instructions_digest, inspection.instructions_digest);
+        std::fs::write(
+            fixture.workspace.join("AGENTS.md"),
+            "phase3 instruction sentinel two\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            accept_handoff(
+                &fixture.db,
+                &target,
+                &ready.handoff.id,
+                inspection.handoff.version,
+                &fixture.workspace,
+            ),
+            Err(HandoffError::Conflict(_))
+        ));
+        let rejected = reject_handoff(
+            &fixture.db,
+            &target,
+            &ready.handoff.id,
+            inspection.handoff.version,
+            "project instructions changed after validation",
+            &fixture.workspace,
+        )
+        .unwrap();
+        assert_eq!(rejected.handoff.state, HandoffState::NeedsRecovery);
+    }
+
+    #[test]
+    fn instruction_snapshot_follows_bounded_bundle_subtree_scopes() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("src/nested")).unwrap();
+        std::fs::write(workspace.join("AGENTS.md"), "root\n").unwrap();
+        std::fs::write(workspace.join("src/AGENTS.md"), "src ordinary\n").unwrap();
+        std::fs::write(workspace.join("src/AGENTS.override.md"), "src override\n").unwrap();
+        std::fs::write(workspace.join("src/nested/file.rs"), "fn main() {}\n").unwrap();
+        let canonical = std::fs::canonicalize(&workspace).unwrap();
+        let bundle = serde_json::json!({
+            "refs": {"files": ["src/nested/file.rs"]}
+        });
+        let (instructions, digest) =
+            load_current_instructions(canonical.to_str().unwrap(), &bundle).unwrap();
+        let workspace_instructions: Vec<_> = instructions
+            .iter()
+            .filter(|instruction| instruction.scope == "workspace")
+            .collect();
+        assert!(workspace_instructions.iter().any(|instruction| {
+            instruction.path == "AGENTS.md" && instruction.content == "root\n"
+        }));
+        assert!(workspace_instructions.iter().any(|instruction| {
+            instruction.path == "src/AGENTS.override.md" && instruction.content == "src override\n"
+        }));
+        assert!(
+            !workspace_instructions
+                .iter()
+                .any(|instruction| instruction.content == "src ordinary\n")
+        );
+        assert_eq!(digest.len(), 64);
     }
 }

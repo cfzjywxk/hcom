@@ -5,9 +5,12 @@
 //! as a side-channel for messaging and coordination with other agents.
 
 mod bootstrap;
-#[allow(dead_code)] // Phase 2 seam; no production launcher exists until Phase 3.
+#[allow(dead_code)] // Private chain control; no public launcher exists until Phase 4.
 mod chain_control;
 mod cli_context;
+mod codex_chain;
+#[allow(dead_code)] // Phase 3 private adapter; no production launcher until Phase 4.
+mod codex_chain_adapter;
 pub mod commands;
 mod config;
 pub mod core;

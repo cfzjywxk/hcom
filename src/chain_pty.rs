@@ -68,6 +68,25 @@ pub fn send_process_group_signal(
     expected_birth_identity: &str,
     signal: ChainSignal,
 ) -> SignalSendResult {
+    send_process_group_signal_impl(
+        child_pid,
+        child_pgid,
+        expected_birth_identity,
+        signal,
+        || {},
+    )
+}
+
+fn send_process_group_signal_impl<F>(
+    child_pid: i32,
+    child_pgid: i32,
+    expected_birth_identity: &str,
+    signal: ChainSignal,
+    before_group_kill: F,
+) -> SignalSendResult
+where
+    F: FnOnce(),
+{
     if child_pid <= 1
         || child_pgid != child_pid
         || expected_birth_identity.is_empty()
@@ -116,6 +135,10 @@ pub fn send_process_group_signal(
         ChainSignal::Terminate => libc::SIGTERM,
         ChainSignal::Hangup => libc::SIGHUP,
     };
+    // Tests stop here to force the exact liveness-check -> child-exit race.
+    // Production supplies a no-op. The adapter still owns the unreaped child,
+    // so its numeric process group cannot be reused across this boundary.
+    before_group_kill();
     // SAFETY: a negative, birth-validated group-leader PID selects the exact
     // inner process group. The adapter keeps any racing exit unreaped until the
     // supervisor's explicit finish step, so this PGID cannot be recycled here.
@@ -238,6 +261,7 @@ pub fn copy_winsize(outer_fd: RawFd, inner_master_fd: RawFd) -> io::Result<libc:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn invalid_process_group_fails_without_signaling() {
@@ -298,5 +322,78 @@ mod tests {
     fn wait_helpers_reject_unresolved_pid() {
         assert!(observe_direct_child(0).is_err());
         assert!(reap_direct_child(0).is_err());
+    }
+
+    #[test]
+    fn exit_racing_verified_signal_remains_unreaped_until_adapter_finish() {
+        let mut ready = [-1; 2];
+        // SAFETY: ready has two writable descriptor slots.
+        assert_eq!(
+            unsafe { libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // SAFETY: the fixture child uses only async-signal-safe operations.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            unsafe {
+                libc::close(ready[0]);
+                if libc::setsid() == -1 {
+                    libc::_exit(90);
+                }
+                let marker = 1u8;
+                libc::write(ready[1], (&marker as *const u8).cast(), 1);
+                libc::pause();
+                libc::_exit(0);
+            }
+        }
+        unsafe {
+            libc::close(ready[1]);
+            let mut marker = 0u8;
+            assert_eq!(libc::read(ready[0], (&mut marker as *mut u8).cast(), 1), 1);
+            libc::close(ready[0]);
+        }
+        let birth = linux_process_birth_identity(child).unwrap();
+        let result =
+            send_process_group_signal_impl(child, child, &birth, ChainSignal::Interrupt, || {
+                // Force exit after pidfd/birth/liveness validation but before
+                // kill(-pgid). A pidfd wait observes terminal state without
+                // consuming the parent's waitpid obligation.
+                assert_eq!(unsafe { libc::kill(child, libc::SIGTERM) }, 0);
+                let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child, 0) };
+                assert!(pidfd >= 0);
+                let mut descriptor = libc::pollfd {
+                    fd: pidfd as RawFd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert_eq!(
+                    unsafe {
+                        libc::poll(
+                            &mut descriptor,
+                            1,
+                            Duration::from_secs(5).as_millis() as i32,
+                        )
+                    },
+                    1
+                );
+                unsafe {
+                    libc::close(pidfd as RawFd);
+                }
+            });
+        assert!(matches!(
+            result,
+            SignalSendResult::Sent | SignalSendResult::NotFound
+        ));
+
+        // This exact waitpid must still consume the child. ECHILD would prove
+        // that the signal helper (or another adapter path) reaped too early.
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) },
+            child
+        );
+        assert!(libc::WIFSIGNALED(status));
+        assert_eq!(libc::WTERMSIG(status), libc::SIGTERM);
     }
 }

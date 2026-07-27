@@ -55,6 +55,13 @@ pub mod test_helpers {
         saved_pi_config_dir: Option<String>,
         saved_omp_profile: Option<String>,
         saved_pi_profile: Option<String>,
+        saved_hcom_process_id: Option<String>,
+        saved_chain_id: Option<String>,
+        saved_chain_generation: Option<String>,
+        saved_chain_launch_nonce: Option<String>,
+        saved_chain_process_birth_identity: Option<String>,
+        saved_chain_codex_version: Option<String>,
+        saved_chain_handoff_id: Option<String>,
         // Declared last so it drops AFTER Drop::drop restores env vars,
         // releasing the lock only once this test's env state is gone.
         _lock: MutexGuard<'static, ()>,
@@ -88,6 +95,16 @@ pub mod test_helpers {
                 saved_pi_config_dir: std::env::var("PI_CONFIG_DIR").ok(),
                 saved_omp_profile: std::env::var("OMP_PROFILE").ok(),
                 saved_pi_profile: std::env::var("PI_PROFILE").ok(),
+                saved_hcom_process_id: std::env::var("HCOM_PROCESS_ID").ok(),
+                saved_chain_id: std::env::var("HCOM_CHAIN_ID").ok(),
+                saved_chain_generation: std::env::var("HCOM_CHAIN_GENERATION").ok(),
+                saved_chain_launch_nonce: std::env::var("HCOM_CHAIN_LAUNCH_NONCE").ok(),
+                saved_chain_process_birth_identity: std::env::var(
+                    "HCOM_CHAIN_PROCESS_BIRTH_IDENTITY",
+                )
+                .ok(),
+                saved_chain_codex_version: std::env::var("HCOM_CHAIN_CODEX_VERSION").ok(),
+                saved_chain_handoff_id: std::env::var("HCOM_CHAIN_HANDOFF_ID").ok(),
                 _lock: lock,
             }
         }
@@ -163,6 +180,23 @@ pub mod test_helpers {
                 match &self.saved_pi_profile {
                     Some(v) => std::env::set_var("PI_PROFILE", v),
                     None => std::env::remove_var("PI_PROFILE"),
+                }
+                for (key, value) in [
+                    ("HCOM_PROCESS_ID", &self.saved_hcom_process_id),
+                    ("HCOM_CHAIN_ID", &self.saved_chain_id),
+                    ("HCOM_CHAIN_GENERATION", &self.saved_chain_generation),
+                    ("HCOM_CHAIN_LAUNCH_NONCE", &self.saved_chain_launch_nonce),
+                    (
+                        "HCOM_CHAIN_PROCESS_BIRTH_IDENTITY",
+                        &self.saved_chain_process_birth_identity,
+                    ),
+                    ("HCOM_CHAIN_CODEX_VERSION", &self.saved_chain_codex_version),
+                    ("HCOM_CHAIN_HANDOFF_ID", &self.saved_chain_handoff_id),
+                ] {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
                 }
             }
             crate::config::Config::reset();

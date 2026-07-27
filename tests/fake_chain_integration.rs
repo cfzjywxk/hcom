@@ -118,10 +118,14 @@ fn main() {
         unsafe { libc::waitpid(worker, &mut wait_status, 0) },
         worker
     );
-    assert_eq!(status, u8::MAX, "fake-chain worker did not report success");
+    let outer_text = String::from_utf8_lossy(&outer_output);
+    assert_eq!(
+        status,
+        u8::MAX,
+        "fake-chain worker did not report success; terminal output:\n{outer_text}"
+    );
     assert!(libc::WIFEXITED(wait_status));
     assert_eq!(libc::WEXITSTATUS(wait_status), 0);
-    let outer_text = String::from_utf8_lossy(&outer_output);
     let evidence = outer_text
         .lines()
         .find(|line| line.contains("FAKE_CHAIN_JSON "))
@@ -131,8 +135,10 @@ fn main() {
     eprintln!(
         "FAKE_CHAIN_SUITE_JSON {}",
         serde_json::json!({
-            "cases_passed": 12,
+            "cases_passed": 14,
             "prepared_abort_residual_retained": true,
+            "target_exit_before_session_start_no_successor": true,
+            "target_native_read_failure_retained_active": true,
             "shutdown_intent_failure_preserved_child": true,
             "abrupt_supervisor_death_closed_wrapper_and_child": true,
             "generation_switch_resize_and_continue": true,
@@ -185,6 +191,10 @@ fn run_all_cases(status_fd: RawFd) {
     abrupt_supervisor_death_closes_generation_case();
     write_byte(status_fd, 12).unwrap();
     resize_and_continue_after_generation_switch_case();
+    write_byte(status_fd, 13).unwrap();
+    target_exit_before_session_start_case();
+    write_byte(status_fd, 14).unwrap();
+    target_native_read_failure_retains_active_case();
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -309,7 +319,9 @@ impl FakePtyAdapter {
             launch_nonce: "nonce-g1".to_string(),
         };
         let prepared = self.spawn_prepared(&reservation).unwrap();
-        self.activate(prepared).unwrap()
+        let mut active = self.activate(prepared).unwrap();
+        self.bind_native_session(&mut active, "native-g1").unwrap();
+        active
     }
 
     fn behavior(&self, generation: u64) -> ChildBehavior {
@@ -415,7 +427,7 @@ impl FakePtyAdapter {
             process_birth_identity: linux_process_birth_identity(wrapper)?,
             instance_name: format!("fake-g{}", reservation.generation),
             hcom_session_id: format!("hcom-g{}", reservation.generation),
-            synthetic_native_session_id: format!("native-g{}", reservation.generation),
+            native_session_id: None,
         };
         self.stats.live_generations += 1;
         self.stats.max_live_generations = self
@@ -732,6 +744,36 @@ impl GenerationAdapter for FakePtyAdapter {
         }
     }
 
+    fn bind_native_session(
+        &mut self,
+        active: &mut Self::Active,
+        native_session_id: &str,
+    ) -> Result<(), Self::Error> {
+        match active.identity.native_session_id.as_deref() {
+            None => {
+                active.identity.native_session_id = Some(native_session_id.to_string());
+                let recorded = self
+                    .stats
+                    .identities
+                    .iter_mut()
+                    .find(|identity| identity.generation == active.identity.generation)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "activated generation is absent from fixture evidence",
+                        )
+                    })?;
+                recorded.native_session_id = Some(native_session_id.to_string());
+                Ok(())
+            }
+            Some(existing) if existing == native_session_id => Ok(()),
+            Some(_) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "native session already differs",
+            )),
+        }
+    }
+
     fn abort_prepared(&mut self, prepared: Self::Prepared) -> FinishAttempt<Self::Prepared> {
         if self.faults.abort_prepared_residual {
             return FinishAttempt {
@@ -808,6 +850,8 @@ struct MockControl {
     handoff_enabled: bool,
     corrupt_authorization: bool,
     materialize_commit_then_error: bool,
+    target_native_waits: usize,
+    target_native_error: bool,
     shutdown_intent_error: bool,
     ready_count: usize,
     acceptance_count: usize,
@@ -827,6 +871,8 @@ impl MockControl {
             handoff_enabled: true,
             corrupt_authorization: false,
             materialize_commit_then_error: false,
+            target_native_waits: 0,
+            target_native_error: false,
             shutdown_intent_error: false,
             ready_count: 0,
             acceptance_count: 0,
@@ -858,7 +904,7 @@ impl MockControl {
             quiesce_token: format!("quiesce-g{}", active.generation),
             generation: active.generation,
             launch_nonce: active.launch_nonce.clone(),
-            pinned_native_session_id: active.synthetic_native_session_id.clone(),
+            pinned_native_session_id: active.native_session_id.clone().unwrap(),
             process_birth_identity: if self.corrupt_authorization {
                 "linux-v1:1:1:stale".to_string()
             } else {
@@ -1011,7 +1057,7 @@ impl DurableControl for MockControl {
     ) -> Result<(), Self::Error> {
         if self.phase != ControlPhase::Materialized
             || reservation.generation != identity.generation
-            || identity.synthetic_native_session_id == identity.hcom_session_id
+            || identity.native_session_id.as_deref() == Some(identity.hcom_session_id.as_str())
         {
             return Err("target ready exact identity mismatch".to_string());
         }
@@ -1019,6 +1065,27 @@ impl DurableControl for MockControl {
         self.phase = ControlPhase::AwaitingAcceptance;
         self.ready_count += 1;
         Ok(())
+    }
+
+    fn target_native_session(
+        &mut self,
+        reservation: &TargetReservation,
+        identity: &GenerationIdentity,
+    ) -> Result<Option<String>, Self::Error> {
+        if self.phase != ControlPhase::Materialized
+            || identity.generation != reservation.generation
+            || identity.native_session_id.is_some()
+        {
+            return Err("target native-session reread failed".to_string());
+        }
+        if self.target_native_error {
+            return Err("injected target native-session read failure".to_string());
+        }
+        if self.target_native_waits > 0 {
+            self.target_native_waits -= 1;
+            return Ok(None);
+        }
+        Ok(Some(format!("native-g{}", reservation.generation)))
     }
 
     fn record_target_failure(
@@ -1136,8 +1203,10 @@ fn happy_three_generation_case() {
             .windows(2)
             .all(|pair| pair[0].wrapper_pid != pair[1].wrapper_pid
                 && pair[0].child_pid != pair[1].child_pid
+                && pair[0].process_id != pair[1].process_id
+                && pair[0].instance_name != pair[1].instance_name
                 && pair[0].hcom_session_id != pair[1].hcom_session_id
-                && pair[0].synthetic_native_session_id != pair[1].synthetic_native_session_id)
+                && pair[0].native_session_id != pair[1].native_session_id)
     );
     assert!(
         trace
@@ -1189,7 +1258,8 @@ fn happy_three_generation_case() {
                 "child_pgid": identity.child_pgid,
                 "child_sid": child_sid,
                 "hcom_native_distinct":
-                    identity.hcom_session_id != identity.synthetic_native_session_id,
+                    Some(identity.hcom_session_id.as_str())
+                        != identity.native_session_id.as_deref(),
             })
         })
         .collect();
@@ -1398,6 +1468,79 @@ fn materialize_crash_boundary_case() {
     let teardown = adapter.abort_prepared(prepared.unwrap());
     assert!(teardown.evidence.successful());
     assert!(teardown.residual.is_none());
+    assert_eq!(adapter.stats.live_generations, 0);
+}
+
+fn target_exit_before_session_start_case() {
+    let outer = OuterTerminalIdentity::capture(libc::STDIN_FILENO).unwrap();
+    let observed = Arc::new(AtomicUsize::new(0));
+    let mut control = MockControl::serial(2, Arc::clone(&observed));
+    control.target_native_waits = 1;
+    let mut adapter = FakePtyAdapter::new(
+        outer,
+        vec![ChildBehavior::ExitOnSignal, ChildBehavior::ExitImmediately],
+        AdapterFaults::default(),
+        observed,
+    );
+    let active = adapter.spawn_initial();
+    let mut supervisor =
+        ForegroundChainSupervisor::new(outer, control, adapter, active, Duration::from_secs(1))
+            .unwrap();
+    assert!(matches!(
+        supervisor.run(),
+        SupervisorRunOutcome::NeedsRecovery(_)
+    ));
+    let (control, adapter, active, prepared, trace) = supervisor.into_parts();
+    assert!(active.is_none());
+    assert!(prepared.is_none());
+    assert_eq!(control.phase, ControlPhase::Recovery);
+    assert_eq!(control.ready_count, 0);
+    assert_eq!(adapter.stats.target_prepares, 1);
+    assert_eq!(adapter.stats.target_activations, 1);
+    assert_eq!(adapter.stats.max_live_generations, 1);
+    assert_eq!(adapter.stats.live_generations, 0);
+    assert_eq!(adapter.stats.fixture_sigkills, 0);
+    assert!(
+        !trace
+            .iter()
+            .any(|record| record.kind == TraceKind::TargetReady)
+    );
+}
+
+fn target_native_read_failure_retains_active_case() {
+    let outer = OuterTerminalIdentity::capture(libc::STDIN_FILENO).unwrap();
+    let observed = Arc::new(AtomicUsize::new(0));
+    let mut control = MockControl::serial(2, Arc::clone(&observed));
+    control.target_native_error = true;
+    let mut adapter = FakePtyAdapter::new(
+        outer,
+        vec![ChildBehavior::ExitOnSignal; 2],
+        AdapterFaults::default(),
+        observed,
+    );
+    let active = adapter.spawn_initial();
+    let mut supervisor =
+        ForegroundChainSupervisor::new(outer, control, adapter, active, Duration::from_secs(1))
+            .unwrap();
+    assert!(matches!(
+        supervisor.run(),
+        SupervisorRunOutcome::NeedsRecovery(_)
+    ));
+    let (control, mut adapter, active, prepared, trace) = supervisor.into_parts();
+    assert!(prepared.is_none());
+    assert_eq!(control.phase, ControlPhase::Recovery);
+    assert_eq!(control.ready_count, 0);
+    assert_eq!(adapter.stats.target_prepares, 1);
+    assert_eq!(adapter.stats.target_activations, 1);
+    assert_eq!(adapter.stats.max_live_generations, 1);
+    assert_eq!(adapter.stats.live_generations, 1);
+    assert_eq!(adapter.stats.fixture_sigkills, 0);
+    assert!(
+        !trace
+            .iter()
+            .any(|record| record.kind == TraceKind::TargetReady)
+    );
+    adapter.fixture_force_teardown(active.expect("failed target must remain owned"));
     assert_eq!(adapter.stats.live_generations, 0);
 }
 

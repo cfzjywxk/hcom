@@ -324,8 +324,12 @@ const HANDOFF_HELP: &[HelpEntry] = &[
         "Show sanitized typed handoff metadata",
     ),
     (
+        "handoff inspect ID --version VERSION [--json]",
+        "Read and validate the bounded bundle and project instructions",
+    ),
+    (
         "handoff accept ID --version VERSION [--json]",
-        "Accept as the exact ready target",
+        "Explicitly accept after exact target validation",
     ),
     (
         "handoff reject ID --version VERSION [--json] -- REASON",
@@ -334,7 +338,7 @@ const HANDOFF_HELP: &[HelpEntry] = &[
     ("", ""),
     (
         "",
-        "Phase 1 changes durable state only; it never launches, stops, signals, or injects input.",
+        "Phase 3 exposes typed transitions only; it has no chain launcher or recovery command.",
     ),
 ];
 
@@ -346,7 +350,7 @@ const CHAIN_HELP: &[HelpEntry] = &[
     ("", ""),
     (
         "",
-        "Phase 1 has no chain start, Codex launch, recovery, or hidden initialization command.",
+        "Phase 3 has no chain start, Codex launch, recovery, or hidden initialization command.",
     ),
 ];
 

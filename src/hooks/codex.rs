@@ -1,9 +1,9 @@
 //! Codex native hook handlers and settings management.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 #[cfg(not(test))]
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use std::process::Stdio;
@@ -16,10 +16,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
+use serde::Deserialize;
 use serde_json::Value;
 use toml_edit::{DocumentMut, Item, value};
 
+use crate::codex_chain::{
+    CODEX_VERSION_ENV, CodexLaunchProfile, HANDOFF_ID_ENV, MAX_CHAIN_HOOK_PAYLOAD_BYTES,
+    SUPPORTED_CODEX_VERSION, exact_transcript_path,
+};
 use crate::db::{HcomDb, InstanceRow};
+use crate::handoff::{
+    self, HandoffActor, HandoffError, HandoffState, ManagedActorMarkers, StopObservation,
+};
 use crate::hooks::{HookPayload, HookResult, common, family};
 use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
@@ -32,6 +40,13 @@ use crate::shared::{ST_ACTIVE, ST_LISTENING};
 use super::common::SAFE_HCOM_COMMANDS;
 
 const HCOM_TRIGGER: &str = "<hcom>";
+const CHAIN_MARKER_VARS: &[&str] = &[
+    "HCOM_CHAIN_ID",
+    "HCOM_CHAIN_GENERATION",
+    "HCOM_CHAIN_LAUNCH_NONCE",
+    "HCOM_CHAIN_PROCESS_BIRTH_IDENTITY",
+    CODEX_VERSION_ENV,
+];
 const CODEX_HOOK_COMMANDS: &[(&str, &str, Option<&str>)] = &[
     (
         "SessionStart",
@@ -60,6 +75,45 @@ const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(not(test))]
 const CODEX_APP_SERVER_STDERR_LIMIT: usize = 8192;
 type CodexHookHandler = fn(&HcomDb, &HcomContext, &HookPayload) -> HookResult;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExactSessionStartPayload {
+    cwd: String,
+    hook_event_name: String,
+    model: String,
+    permission_mode: String,
+    session_id: String,
+    source: String,
+    transcript_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExactStopPayload {
+    cwd: String,
+    hook_event_name: String,
+    last_assistant_message: Option<String>,
+    model: String,
+    permission_mode: String,
+    session_id: String,
+    stop_hook_active: bool,
+    transcript_path: Option<String>,
+    turn_id: String,
+}
+
+#[derive(Debug)]
+enum ExactChainPayload {
+    SessionStart(ExactSessionStartPayload),
+    Stop(ExactStopPayload),
+}
+
+struct ExactChainHookContext {
+    actor: HandoffActor,
+    markers: ManagedActorMarkers,
+    chain: handoff::TerminalChain,
+    generation: handoff::TerminalGeneration,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CodexHookTrustEntry {
@@ -236,7 +290,13 @@ fn update_codex_position(
     if !cwd.is_empty() {
         updates.insert("directory".into(), Value::String(cwd));
     }
-    if let Some(session_id) = payload.session_id.as_ref().filter(|s| !s.is_empty()) {
+    // A managed chain keeps the hcom session identity in `instances.session_id`
+    // and pins the native Codex thread separately in typed generation state.
+    // Ordinary UserPromptSubmit/PreToolUse/PostToolUse hooks still run for status
+    // and delivery, but must not overwrite that stable hcom identity.
+    if !has_chain_markers()
+        && let Some(session_id) = payload.session_id.as_ref().filter(|s| !s.is_empty())
+    {
         updates.insert("session_id".into(), Value::String(session_id.clone()));
     }
     let transcript_path = payload.transcript_path.clone().or_else(|| {
@@ -392,6 +452,372 @@ fn get_codex_handler(hook_name: &str) -> Option<CodexHookHandler> {
     }
 }
 
+fn has_chain_markers() -> bool {
+    CHAIN_MARKER_VARS
+        .iter()
+        .any(|key| std::env::var_os(key).is_some())
+}
+
+fn bounded_chain_text(value: &str, max: usize) -> bool {
+    !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
+}
+
+fn read_exact_chain_payload(hook_name: &str) -> Result<ExactChainPayload, &'static str> {
+    let mut bytes = Vec::with_capacity(MAX_CHAIN_HOOK_PAYLOAD_BYTES.min(4096));
+    std::io::stdin()
+        .lock()
+        .take((MAX_CHAIN_HOOK_PAYLOAD_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "read")?;
+    if bytes.len() > MAX_CHAIN_HOOK_PAYLOAD_BYTES {
+        return Err("oversized");
+    }
+    parse_exact_chain_payload(hook_name, &bytes)
+}
+
+fn parse_exact_chain_payload(
+    hook_name: &str,
+    bytes: &[u8],
+) -> Result<ExactChainPayload, &'static str> {
+    if bytes.len() > MAX_CHAIN_HOOK_PAYLOAD_BYTES {
+        return Err("oversized");
+    }
+    match hook_name {
+        "codex-sessionstart" => {
+            let payload: ExactSessionStartPayload =
+                serde_json::from_slice(bytes).map_err(|_| "schema")?;
+            if payload.hook_event_name != "SessionStart"
+                || payload.source != "startup"
+                || !bounded_chain_text(&payload.cwd, handoff::MAX_WORKSPACE_BYTES)
+                || !bounded_chain_text(&payload.model, handoff::MAX_MODEL_REF_BYTES)
+                || !bounded_chain_text(&payload.session_id, handoff::MAX_IDENTITY_BYTES)
+                || !matches!(
+                    payload.permission_mode.as_str(),
+                    "default" | "acceptEdits" | "plan" | "dontAsk" | "bypassPermissions"
+                )
+                || payload
+                    .transcript_path
+                    .as_deref()
+                    .is_none_or(|value| !bounded_chain_text(value, handoff::MAX_WORKSPACE_BYTES))
+            {
+                return Err("fields");
+            }
+            Ok(ExactChainPayload::SessionStart(payload))
+        }
+        "codex-stop" => {
+            let payload: ExactStopPayload = serde_json::from_slice(bytes).map_err(|_| "schema")?;
+            if payload.hook_event_name != "Stop"
+                || payload.stop_hook_active
+                || !bounded_chain_text(&payload.cwd, handoff::MAX_WORKSPACE_BYTES)
+                || !bounded_chain_text(&payload.model, handoff::MAX_MODEL_REF_BYTES)
+                || !bounded_chain_text(&payload.session_id, handoff::MAX_IDENTITY_BYTES)
+                || !bounded_chain_text(&payload.turn_id, handoff::MAX_IDENTITY_BYTES)
+                || !matches!(
+                    payload.permission_mode.as_str(),
+                    "default" | "acceptEdits" | "plan" | "dontAsk" | "bypassPermissions"
+                )
+                || payload
+                    .transcript_path
+                    .as_deref()
+                    .is_none_or(|value| !bounded_chain_text(value, handoff::MAX_WORKSPACE_BYTES))
+                || payload
+                    .last_assistant_message
+                    .as_deref()
+                    .is_some_and(|value| value.len() > MAX_CHAIN_HOOK_PAYLOAD_BYTES)
+            {
+                return Err("fields");
+            }
+            Ok(ExactChainPayload::Stop(payload))
+        }
+        _ => Err("event"),
+    }
+}
+
+fn exact_chain_hook_context(
+    db: &HcomDb,
+    session_start: bool,
+) -> Result<ExactChainHookContext, HandoffError> {
+    if std::env::var(CODEX_VERSION_ENV).ok().as_deref() != Some(SUPPORTED_CODEX_VERSION) {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT unsupported Codex hook version".to_string(),
+        ));
+    }
+    let process_id = std::env::var("HCOM_PROCESS_ID")
+        .ok()
+        .filter(|value| bounded_chain_text(value, handoff::MAX_PROCESS_ID_BYTES))
+        .ok_or(HandoffError::NotManaged)?;
+    let chain_id = std::env::var("HCOM_CHAIN_ID")
+        .ok()
+        .filter(|value| bounded_chain_text(value, handoff::MAX_OPAQUE_ID_BYTES))
+        .ok_or(HandoffError::NotManaged)?;
+    let generation = std::env::var("HCOM_CHAIN_GENERATION")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or(HandoffError::NotManaged)?;
+    let launch_nonce = std::env::var("HCOM_CHAIN_LAUNCH_NONCE")
+        .ok()
+        .filter(|value| bounded_chain_text(value, handoff::MAX_OPAQUE_ID_BYTES))
+        .ok_or(HandoffError::NotManaged)?;
+    let process_birth_identity = std::env::var("HCOM_CHAIN_PROCESS_BIRTH_IDENTITY")
+        .ok()
+        .filter(|value| bounded_chain_text(value, handoff::MAX_IDENTITY_BYTES))
+        .ok_or(HandoffError::NotManaged)?;
+    hcom::chain_supervisor::verify_current_process_scope(&process_birth_identity)
+        .map_err(|_| HandoffError::NotManaged)?;
+    let (hcom_session_id, instance_name) = db
+        .get_process_binding_full(&process_id)
+        .map_err(|_| HandoffError::Storage)?
+        .and_then(|(session, instance)| session.map(|session| (session, instance)))
+        .ok_or(HandoffError::NotManaged)?;
+    let instance = db
+        .get_instance_full(&instance_name)
+        .map_err(|_| HandoffError::Storage)?
+        .ok_or(HandoffError::NotManaged)?;
+    if instance.tool != "codex"
+        || instance.session_id.as_deref() != Some(hcom_session_id.as_str())
+        || instance.parent_name.is_some()
+        || instance.origin_device_id.is_some()
+    {
+        return Err(HandoffError::NotManaged);
+    }
+    let markers = ManagedActorMarkers {
+        chain_id: chain_id.clone(),
+        generation,
+        launch_nonce,
+        process_birth_identity,
+    };
+    let actor = if session_start {
+        handoff::resolve_managed_actor_for_session_start(
+            db,
+            &instance_name,
+            &hcom_session_id,
+            &process_id,
+            &markers,
+        )?
+    } else {
+        handoff::resolve_managed_actor(db, &instance_name, &hcom_session_id, &process_id, &markers)?
+    };
+    let chain = handoff::get_chain(db, &chain_id)?.ok_or(HandoffError::NotManaged)?;
+    let generation =
+        handoff::get_generation(db, &chain_id, generation)?.ok_or(HandoffError::NotManaged)?;
+    Ok(ExactChainHookContext {
+        actor,
+        markers,
+        chain,
+        generation,
+    })
+}
+
+fn exact_chain_workspace(cwd: &str, chain: &handoff::TerminalChain) -> Result<(), HandoffError> {
+    let canonical = std::fs::canonicalize(cwd).map_err(|_| HandoffError::NotManaged)?;
+    if canonical.to_str() == Some(chain.workspace.as_str()) {
+        Ok(())
+    } else {
+        Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT Codex hook workspace differs from the pinned chain".to_string(),
+        ))
+    }
+}
+
+fn update_chain_hook_position(db: &HcomDb, actor: &HandoffActor, cwd: &str, transcript_path: &str) {
+    let mut updates = serde_json::Map::new();
+    updates.insert("directory".into(), Value::String(cwd.to_string()));
+    updates.insert(
+        "transcript_path".into(),
+        Value::String(transcript_path.to_string()),
+    );
+    // Deliberately do not rebind `instances.session_id`: it is the stable hcom
+    // session identity, while the native Codex ID is immutable typed state.
+    instances::update_instance_position(db, &actor.instance_name, &updates);
+}
+
+fn validate_exact_hook_profile(
+    chain: &handoff::TerminalChain,
+    cwd: &str,
+    model: &str,
+    permission_mode: &str,
+) -> Result<CodexLaunchProfile, HandoffError> {
+    exact_chain_workspace(cwd, chain)?;
+    let profile = CodexLaunchProfile::from_chain(chain).map_err(|_| {
+        HandoffError::Conflict("HANDOFF_CONFLICT invalid pinned Codex chain policy".to_string())
+    })?;
+    if model != profile.model || permission_mode != profile.approval.hook_permission_mode() {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT Codex hook model or permission differs from the pinned chain"
+                .to_string(),
+        ));
+    }
+    Ok(profile)
+}
+
+fn advisory_chain_wake(chain: &handoff::TerminalChain) {
+    let Some(pid) = chain
+        .supervisor_pid
+        .and_then(|value| i32::try_from(value).ok())
+    else {
+        return;
+    };
+    if hcom::chain_supervisor::linux_process_birth_identity(pid)
+        .is_ok_and(|identity| identity == chain.supervisor_process_birth_identity)
+    {
+        // SAFETY: the durable PID and birth identity were revalidated. SIGUSR1
+        // only wakes the supervisor self-pipe; it is never sent to a tool.
+        unsafe {
+            libc::kill(pid, libc::SIGUSR1);
+        }
+    }
+}
+
+fn handle_exact_chain_session_start(
+    db: &HcomDb,
+    payload: ExactSessionStartPayload,
+) -> Result<(), HandoffError> {
+    let context = exact_chain_hook_context(db, true)?;
+    validate_exact_hook_profile(
+        &context.chain,
+        &payload.cwd,
+        &payload.model,
+        &payload.permission_mode,
+    )?;
+    if context.actor.generation > 1 {
+        let handoff_id = std::env::var(HANDOFF_ID_ENV).map_err(|_| HandoffError::NotManaged)?;
+        let open = handoff::get_open_handoff_for_chain(db, &context.chain.id)?
+            .ok_or(HandoffError::NotManaged)?;
+        if open.id != handoff_id
+            || open.target_generation != context.actor.generation
+            || open.state != HandoffState::LaunchingTarget
+        {
+            return Err(HandoffError::NotManaged);
+        }
+    }
+    let transcript_path = exact_transcript_path(
+        payload
+            .transcript_path
+            .as_deref()
+            .ok_or(HandoffError::NotManaged)?,
+        &payload.session_id,
+    )
+    .map_err(|_| HandoffError::NotManaged)?
+    .to_str()
+    .filter(|value| bounded_chain_text(value, handoff::MAX_WORKSPACE_BYTES))
+    .map(ToString::to_string)
+    .ok_or(HandoffError::NotManaged)?;
+    let outcome = handoff::pin_native_session(
+        db,
+        &context.chain.id,
+        &context.actor,
+        context.generation.version,
+        &payload.session_id,
+    )?;
+    update_chain_hook_position(db, &context.actor, &payload.cwd, &transcript_path);
+    if !outcome.replayed {
+        lifecycle::set_status(
+            db,
+            &context.actor.instance_name,
+            ST_LISTENING,
+            "start",
+            Default::default(),
+        );
+    }
+    advisory_chain_wake(&context.chain);
+    Ok(())
+}
+
+fn handle_exact_chain_stop(db: &HcomDb, payload: ExactStopPayload) -> Result<(), HandoffError> {
+    let context = exact_chain_hook_context(db, false)?;
+    validate_exact_hook_profile(
+        &context.chain,
+        &payload.cwd,
+        &payload.model,
+        &payload.permission_mode,
+    )?;
+    if context.actor.native_session_id.as_deref() != Some(payload.session_id.as_str()) {
+        return Err(HandoffError::NotManaged);
+    }
+    let transcript_path = exact_transcript_path(
+        payload
+            .transcript_path
+            .as_deref()
+            .ok_or(HandoffError::NotManaged)?,
+        &payload.session_id,
+    )
+    .map_err(|_| HandoffError::NotManaged)?
+    .to_str()
+    .filter(|value| bounded_chain_text(value, handoff::MAX_WORKSPACE_BYTES))
+    .map(ToString::to_string)
+    .ok_or(HandoffError::NotManaged)?;
+    let open = handoff::get_open_handoff_for_chain(db, &context.chain.id)?
+        .ok_or(HandoffError::NotManaged)?;
+    if open.source_generation != context.actor.generation
+        || !matches!(
+            open.state,
+            HandoffState::Committed | HandoffState::StopObserved
+        )
+        || open.quiesce_generation != Some(context.actor.generation)
+    {
+        return Err(HandoffError::NotManaged);
+    }
+    let committed_version = open
+        .quiesce_committed_version
+        .ok_or(HandoffError::NotManaged)?;
+    let expected_version = if open.state == HandoffState::Committed {
+        open.version
+    } else {
+        committed_version
+    };
+    let outcome = handoff::observe_stop(
+        db,
+        &context.actor,
+        &open.id,
+        &StopObservation {
+            expected_version,
+            quiesce_token: open.quiesce_token.clone().ok_or(HandoffError::NotManaged)?,
+            committed_version,
+            hook_native_session_id: payload.session_id,
+            launch_nonce: context.markers.launch_nonce,
+            turn_id: payload.turn_id,
+        },
+    )?;
+    update_chain_hook_position(db, &context.actor, &payload.cwd, &transcript_path);
+    if !outcome.replayed {
+        lifecycle::set_status(
+            db,
+            &context.actor.instance_name,
+            ST_LISTENING,
+            "",
+            Default::default(),
+        );
+    }
+    advisory_chain_wake(&context.chain);
+    Ok(())
+}
+
+fn dispatch_exact_chain_hook(db: &HcomDb, payload: ExactChainPayload) -> i32 {
+    let result = match payload {
+        ExactChainPayload::SessionStart(payload) => handle_exact_chain_session_start(db, payload),
+        ExactChainPayload::Stop(payload) => handle_exact_chain_stop(db, payload),
+    };
+    match result {
+        Ok(()) => {
+            let _ = serde_json::to_writer(std::io::stdout().lock(), &serde_json::json!({}));
+            0
+        }
+        Err(HandoffError::NotManaged) => 0,
+        Err(error) => {
+            log::log_warn(
+                "hooks",
+                "codex.chain_rejected",
+                &format!("code={}", error.code()),
+            );
+            let _ = std::io::stderr()
+                .lock()
+                .write_all(b"hcom managed Codex hook rejected");
+            2
+        }
+    }
+}
+
 fn dispatch_result_to_stdout(db: &HcomDb, hook_name: &str, result: HookResult) -> i32 {
     match result {
         HookResult::Allow {
@@ -447,16 +873,40 @@ fn dispatch_result_to_stdout(db: &HcomDb, hook_name: &str, result: HookResult) -
 /// Main entry point for native Codex hooks.
 pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
     let start = std::time::Instant::now();
-    let raw: Value = match serde_json::from_reader(std::io::stdin().lock()) {
-        Ok(v) => v,
-        Err(e) => {
-            log::log_error(
-                "hooks",
-                "codex.parse_error",
-                &format!("hook={hook_name} err={e}"),
-            );
-            return 0;
+    let exact_chain =
+        has_chain_markers() && matches!(hook_name, "codex-sessionstart" | "codex-stop");
+    let exact_payload = if exact_chain {
+        match read_exact_chain_payload(hook_name) {
+            Ok(payload) => Some(payload),
+            Err(code) => {
+                log::log_warn(
+                    "hooks",
+                    "codex.chain_payload_rejected",
+                    &format!("hook={hook_name} code={code}"),
+                );
+                let _ = std::io::stderr()
+                    .lock()
+                    .write_all(b"hcom managed Codex hook payload rejected");
+                return 2;
+            }
         }
+    } else {
+        None
+    };
+    let raw: Option<Value> = if exact_payload.is_none() {
+        match serde_json::from_reader(std::io::stdin().lock()) {
+            Ok(value) => Some(value),
+            Err(e) => {
+                log::log_error(
+                    "hooks",
+                    "codex.parse_error",
+                    &format!("hook={hook_name} err={e}"),
+                );
+                return 0;
+            }
+        }
+    } else {
+        None
     };
 
     let db = match HcomDb::open() {
@@ -476,7 +926,14 @@ pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
         return 0;
     }
 
-    let payload = HookPayload::from_codex_native(codex_event_name(hook_name), raw);
+    if let Some(payload) = exact_payload {
+        return dispatch_exact_chain_hook(&db, payload);
+    }
+
+    let payload = HookPayload::from_codex_native(
+        codex_event_name(hook_name),
+        raw.expect("ordinary Codex hook payload was parsed"),
+    );
     let result = common::dispatch_with_panic_guard("codex", hook_name, hook_noop(), || {
         get_codex_handler(hook_name)
             .map(|handler| handler(&db, &ctx, &payload))
@@ -1968,8 +2425,737 @@ pub fn remove_codex_hooks() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handoff::{
+        ChainSpec, CleanupObservation, DeliveryExitContext, ResourceCleanupEvidence,
+        SigtermObservation, SigtermRequestResult, SupervisorActor, TargetMaterialization,
+        begin_quiesce, commit_handoff, complete_source_cleanup, create_chain, get_generation,
+        materialize_target_generation, prepare_handoff, record_sigterm_request,
+    };
     use crate::hooks::test_helpers::{EnvGuard, isolated_test_env};
     use serial_test::serial;
+
+    struct ExactHookFixture {
+        _dir: tempfile::TempDir,
+        _guard: EnvGuard,
+        db: HcomDb,
+        workspace: PathBuf,
+        codex_home: PathBuf,
+        source: HandoffActor,
+        chain: handoff::TerminalChain,
+        process_birth: String,
+    }
+
+    fn run_git(workspace: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(workspace)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn exact_hook_fixture() -> ExactHookFixture {
+        let (dir, hcom_dir, _home, guard) = isolated_test_env();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        run_git(&workspace, &["init", "-b", "main"]);
+        run_git(&workspace, &["config", "user.name", "hcom test"]);
+        run_git(
+            &workspace,
+            &["config", "user.email", "hcom-test@example.invalid"],
+        );
+        std::fs::write(workspace.join("README.md"), "fixture\n").unwrap();
+        run_git(&workspace, &["add", "README.md"]);
+        run_git(&workspace, &["commit", "-m", "fixture"]);
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+        let codex_home = dir.path().join("codex-home");
+        std::fs::create_dir_all(codex_home.join("sessions/2026/07/27")).unwrap();
+        unsafe {
+            std::env::set_var("CODEX_HOME", &codex_home);
+            std::env::set_var("HCOM_DIR", &hcom_dir);
+        }
+
+        let db = HcomDb::open_at(&hcom_dir.join("hcom.db")).unwrap();
+        let process_birth =
+            hcom::chain_supervisor::linux_process_birth_identity(std::process::id() as i32)
+                .unwrap();
+        let source = HandoffActor {
+            instance_name: "source".to_string(),
+            hcom_session_id: "hcom-source".to_string(),
+            native_session_id: None,
+            process_id: "process-source".to_string(),
+            process_birth_identity: process_birth.clone(),
+            generation: 1,
+        };
+        db.conn()
+            .execute(
+                "INSERT INTO instances (
+                     name, session_id, status, tool, created_at,
+                     parent_name, origin_device_id
+                 ) VALUES (?1, ?2, 'launching', 'codex', 1.0, '', '')",
+                rusqlite::params![source.instance_name, source.hcom_session_id],
+            )
+            .unwrap();
+        db.set_process_binding(
+            &source.process_id,
+            &source.hcom_session_id,
+            &source.instance_name,
+        )
+        .unwrap();
+        let chain = create_chain(
+            &db,
+            &source,
+            &ChainSpec {
+                workspace: workspace.clone(),
+                tool: "codex".to_string(),
+                model_ref: "gpt-test".to_string(),
+                reasoning_ref: "high".to_string(),
+                permission_policy_ref: "approval=never;sandbox=danger-full-access".to_string(),
+                policy_ref: "phase3-policy".to_string(),
+                supervisor_process_id: "supervisor".to_string(),
+                supervisor_process_birth_identity: "linux-v1:999999:1:missing".to_string(),
+                supervisor_pid: 999_999,
+                supervisor_pgid: 999_999,
+                outer_foreground_pgid: 999_999,
+                outer_tty_device: 7,
+                outer_tty_inode: 11,
+                launch_nonce: "nonce-source".to_string(),
+            },
+        )
+        .unwrap();
+        ExactHookFixture {
+            _dir: dir,
+            _guard: guard,
+            db,
+            workspace,
+            codex_home,
+            source,
+            chain,
+            process_birth,
+        }
+    }
+
+    fn set_exact_hook_env(
+        fixture: &ExactHookFixture,
+        process_id: &str,
+        generation: i64,
+        launch_nonce: &str,
+        handoff_id: Option<&str>,
+    ) {
+        unsafe {
+            std::env::set_var("HCOM_PROCESS_ID", process_id);
+            std::env::set_var("HCOM_CHAIN_ID", &fixture.chain.id);
+            std::env::set_var("HCOM_CHAIN_GENERATION", generation.to_string());
+            std::env::set_var("HCOM_CHAIN_LAUNCH_NONCE", launch_nonce);
+            std::env::set_var("HCOM_CHAIN_PROCESS_BIRTH_IDENTITY", &fixture.process_birth);
+            std::env::set_var(CODEX_VERSION_ENV, SUPPORTED_CODEX_VERSION);
+            match handoff_id {
+                Some(id) => std::env::set_var(HANDOFF_ID_ENV, id),
+                None => std::env::remove_var(HANDOFF_ID_ENV),
+            }
+        }
+    }
+
+    fn exact_transcript(fixture: &ExactHookFixture, native: &str) -> String {
+        let path = fixture
+            .codex_home
+            .join("sessions/2026/07/27")
+            .join(format!("rollout-phase3-{native}.jsonl"));
+        std::fs::write(&path, "{}\n").unwrap();
+        std::fs::canonicalize(path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn exact_session_payload(
+        fixture: &ExactHookFixture,
+        native: &str,
+        transcript_path: String,
+    ) -> ExactSessionStartPayload {
+        ExactSessionStartPayload {
+            cwd: fixture.workspace.to_string_lossy().into_owned(),
+            hook_event_name: "SessionStart".to_string(),
+            model: "gpt-test".to_string(),
+            permission_mode: "bypassPermissions".to_string(),
+            session_id: native.to_string(),
+            source: "startup".to_string(),
+            transcript_path: Some(transcript_path),
+        }
+    }
+
+    fn exact_stop_payload(
+        fixture: &ExactHookFixture,
+        native: &str,
+        turn_id: &str,
+        transcript_path: String,
+    ) -> ExactStopPayload {
+        ExactStopPayload {
+            cwd: fixture.workspace.to_string_lossy().into_owned(),
+            hook_event_name: "Stop".to_string(),
+            last_assistant_message: Some("bounded".to_string()),
+            model: "gpt-test".to_string(),
+            permission_mode: "bypassPermissions".to_string(),
+            session_id: native.to_string(),
+            stop_hook_active: false,
+            transcript_path: Some(transcript_path),
+            turn_id: turn_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn exact_chain_payload_parser_is_versioned_bounded_and_schema_exact() {
+        let session = serde_json::json!({
+            "cwd": "/tmp/workspace",
+            "hook_event_name": "SessionStart",
+            "model": "gpt-test",
+            "permission_mode": "bypassPermissions",
+            "session_id": "native-a",
+            "source": "startup",
+            "transcript_path": "/tmp/rollout-native-a.jsonl",
+        });
+        assert!(
+            parse_exact_chain_payload("codex-sessionstart", &serde_json::to_vec(&session).unwrap())
+                .is_ok()
+        );
+        let mut extra = session.clone();
+        extra["unexpected"] = serde_json::json!("secret-sentinel");
+        assert_eq!(
+            parse_exact_chain_payload("codex-sessionstart", &serde_json::to_vec(&extra).unwrap())
+                .unwrap_err(),
+            "schema"
+        );
+        let mut wrong_source = session;
+        wrong_source["source"] = serde_json::json!("resume");
+        assert_eq!(
+            parse_exact_chain_payload(
+                "codex-sessionstart",
+                &serde_json::to_vec(&wrong_source).unwrap()
+            )
+            .unwrap_err(),
+            "fields"
+        );
+        assert_eq!(
+            parse_exact_chain_payload("codex-stop", &vec![b' '; MAX_CHAIN_HOOK_PAYLOAD_BYTES + 1])
+                .unwrap_err(),
+            "oversized"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn exact_chain_hooks_pin_fresh_sessions_and_replay_stop_without_partial_writes() {
+        let fixture = exact_hook_fixture();
+        set_exact_hook_env(
+            &fixture,
+            &fixture.source.process_id,
+            1,
+            "nonce-source",
+            None,
+        );
+        let source_transcript = exact_transcript(&fixture, "native-source");
+        handle_exact_chain_session_start(
+            &fixture.db,
+            exact_session_payload(&fixture, "native-source", source_transcript.clone()),
+        )
+        .unwrap();
+        let source_generation = get_generation(&fixture.db, &fixture.chain.id, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            source_generation.native_session_id.as_deref(),
+            Some("native-source")
+        );
+        let ordinary_payload = HookPayload::from_codex_native(
+            "UserPromptSubmit",
+            serde_json::json!({
+                "cwd": fixture.workspace,
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "continue",
+                "session_id": "native-source",
+                "transcript_path": source_transcript,
+            }),
+        );
+        handle_userpromptsubmit(&fixture.db, &HcomContext::from_os(), &ordinary_payload);
+        let live_source = fixture
+            .db
+            .get_instance_full(&fixture.source.instance_name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            live_source.session_id.as_deref(),
+            Some(fixture.source.hcom_session_id.as_str()),
+            "ordinary managed-chain hooks must not replace the stable hcom session"
+        );
+        assert_eq!(
+            fixture
+                .db
+                .get_process_binding_full(&fixture.source.process_id)
+                .unwrap(),
+            Some((
+                Some(fixture.source.hcom_session_id.clone()),
+                fixture.source.instance_name.clone(),
+            ))
+        );
+        let pin_audits: i64 = fixture
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM terminal_transition_audit
+                 WHERE action = 'pin_native_session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        handle_exact_chain_session_start(
+            &fixture.db,
+            exact_session_payload(&fixture, "native-source", source_transcript.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            fixture
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM terminal_transition_audit
+                     WHERE action = 'pin_native_session'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            pin_audits
+        );
+        let conflicting_transcript = exact_transcript(&fixture, "native-conflict");
+        assert!(matches!(
+            handle_exact_chain_session_start(
+                &fixture.db,
+                exact_session_payload(&fixture, "native-conflict", conflicting_transcript),
+            ),
+            Err(HandoffError::Conflict(_))
+        ));
+
+        let mut source = fixture.source.clone();
+        source.native_session_id = Some("native-source".to_string());
+        let bundle = serde_json::json!({
+            "bundle_id": "bundle:hook-phase3",
+            "created_by": source.instance_name,
+            "description": "bounded",
+            "refs": {"events": [], "files": ["README.md"], "transcript": []},
+        });
+        fixture
+            .db
+            .log_event("bundle", &source.instance_name, &bundle)
+            .unwrap();
+        let bundle_event: i64 = fixture
+            .db
+            .conn()
+            .query_row("SELECT MAX(id) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let prepared =
+            prepare_handoff(&fixture.db, &source, bundle_event, &fixture.workspace).unwrap();
+        let committed = commit_handoff(
+            &fixture.db,
+            &source,
+            &prepared.handoff.id,
+            prepared.handoff.version,
+            &fixture.workspace,
+        )
+        .unwrap();
+        let stop_audits_before: i64 = fixture
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM terminal_transition_audit
+                 WHERE action = 'observe_stop'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        set_exact_hook_env(
+            &fixture,
+            &fixture.source.process_id,
+            1,
+            "wrong-source-nonce",
+            None,
+        );
+        assert!(matches!(
+            handle_exact_chain_stop(
+                &fixture.db,
+                exact_stop_payload(
+                    &fixture,
+                    "native-source",
+                    "turn-spoof",
+                    exact_transcript(&fixture, "native-source"),
+                ),
+            ),
+            Err(HandoffError::NotManaged)
+        ));
+        assert_eq!(
+            fixture
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM terminal_transition_audit
+                     WHERE action = 'observe_stop'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            stop_audits_before
+        );
+        set_exact_hook_env(
+            &fixture,
+            &fixture.source.process_id,
+            1,
+            "nonce-source",
+            None,
+        );
+        let stop = exact_stop_payload(&fixture, "native-source", "turn-source", source_transcript);
+        handle_exact_chain_stop(&fixture.db, stop).unwrap();
+        let stopped = handoff::get_handoff(&fixture.db, &committed.handoff.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.state, HandoffState::StopObserved);
+        assert_eq!(stopped.stop_turn_id.as_deref(), Some("turn-source"));
+        let stop_audits: i64 = fixture
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM terminal_transition_audit
+                 WHERE action = 'observe_stop'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        handle_exact_chain_stop(
+            &fixture.db,
+            exact_stop_payload(
+                &fixture,
+                "native-source",
+                "turn-source",
+                exact_transcript(&fixture, "native-source"),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            fixture
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM terminal_transition_audit
+                     WHERE action = 'observe_stop'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            stop_audits
+        );
+        let transcript_before = fixture
+            .db
+            .get_transcript_path(&source.instance_name)
+            .unwrap();
+        assert!(matches!(
+            handle_exact_chain_stop(
+                &fixture.db,
+                exact_stop_payload(
+                    &fixture,
+                    "native-source",
+                    "turn-conflict",
+                    exact_transcript(&fixture, "native-source"),
+                ),
+            ),
+            Err(HandoffError::Conflict(_))
+        ));
+        assert_eq!(
+            fixture
+                .db
+                .get_transcript_path(&source.instance_name)
+                .unwrap(),
+            transcript_before
+        );
+
+        let supervisor = SupervisorActor {
+            process_id: fixture.chain.supervisor_process_id.clone(),
+            process_birth_identity: fixture.chain.supervisor_process_birth_identity.clone(),
+        };
+        let quiescing = begin_quiesce(
+            &fixture.db,
+            &supervisor,
+            &stopped.id,
+            stopped.version,
+            stopped.quiesce_token.as_deref().unwrap(),
+        )
+        .unwrap();
+        let sigterm = record_sigterm_request(
+            &fixture.db,
+            &supervisor,
+            &stopped.id,
+            &SigtermObservation {
+                expected_version: quiescing.handoff.version,
+                requested_wall_at: 1000.0,
+                requested_monotonic_ns: 1_000_000_000,
+                result: SigtermRequestResult::Sent,
+            },
+        )
+        .unwrap();
+        let launching = complete_source_cleanup(
+            &fixture.db,
+            &supervisor,
+            &stopped.id,
+            &CleanupObservation {
+                expected_version: sigterm.handoff.version,
+                exit: Some(handoff::ChildExitEvidence {
+                    observed_wall_at: 1000.01,
+                    observed_monotonic_ns: 1_010_000_000,
+                    exit_code: None,
+                    exit_signal: Some(libc::SIGTERM),
+                    delivery_context: DeliveryExitContext::Killed,
+                }),
+                reaped: true,
+                resources: ResourceCleanupEvidence {
+                    inject_succeeded: true,
+                    delivery_succeeded: true,
+                    pty_succeeded: true,
+                    screen_succeeded: true,
+                    write_queue_succeeded: true,
+                },
+                failure_kind: String::new(),
+                failure_reason: String::new(),
+            },
+        )
+        .unwrap();
+        set_exact_hook_env(
+            &fixture,
+            &fixture.source.process_id,
+            1,
+            "nonce-source",
+            None,
+        );
+        assert!(matches!(
+            handle_exact_chain_stop(
+                &fixture.db,
+                exact_stop_payload(
+                    &fixture,
+                    "native-source",
+                    "turn-source",
+                    exact_transcript(&fixture, "native-source"),
+                ),
+            ),
+            Err(HandoffError::NotManaged)
+        ));
+        let target_generation = get_generation(&fixture.db, &fixture.chain.id, 2)
+            .unwrap()
+            .unwrap();
+        materialize_target_generation(
+            &fixture.db,
+            &supervisor,
+            &launching.handoff.id,
+            &TargetMaterialization {
+                expected_version: launching.handoff.version,
+                launch_nonce: target_generation.launch_nonce.clone(),
+                instance_name: "target".to_string(),
+                hcom_session_id: "hcom-target".to_string(),
+                process_id: "process-target".to_string(),
+                process_birth_identity: fixture.process_birth.clone(),
+            },
+        )
+        .unwrap();
+        set_exact_hook_env(
+            &fixture,
+            "process-target",
+            2,
+            &target_generation.launch_nonce,
+            Some("wrong-handoff"),
+        );
+        assert!(matches!(
+            handle_exact_chain_session_start(
+                &fixture.db,
+                exact_session_payload(
+                    &fixture,
+                    "native-target",
+                    exact_transcript(&fixture, "native-target"),
+                ),
+            ),
+            Err(HandoffError::NotManaged)
+        ));
+        assert!(
+            get_generation(&fixture.db, &fixture.chain.id, 2)
+                .unwrap()
+                .unwrap()
+                .native_session_id
+                .is_none()
+        );
+        set_exact_hook_env(
+            &fixture,
+            "process-target",
+            2,
+            &target_generation.launch_nonce,
+            Some(&launching.handoff.id),
+        );
+        assert!(matches!(
+            handle_exact_chain_session_start(
+                &fixture.db,
+                exact_session_payload(
+                    &fixture,
+                    "native-source",
+                    exact_transcript(&fixture, "native-source"),
+                ),
+            ),
+            Err(HandoffError::Conflict(_))
+        ));
+        handle_exact_chain_session_start(
+            &fixture.db,
+            exact_session_payload(
+                &fixture,
+                "native-target",
+                exact_transcript(&fixture, "native-target"),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            get_generation(&fixture.db, &fixture.chain.id, 2)
+                .unwrap()
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("native-target")
+        );
+        let stop_audits = fixture
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM terminal_transition_audit
+                 WHERE action = 'observe_stop'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert!(matches!(
+            handle_exact_chain_stop(
+                &fixture.db,
+                exact_stop_payload(
+                    &fixture,
+                    "native-target",
+                    "turn-target-too-early",
+                    exact_transcript(&fixture, "native-target"),
+                ),
+            ),
+            Err(HandoffError::NotManaged)
+        ));
+        assert_eq!(
+            fixture
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM terminal_transition_audit
+                     WHERE action = 'observe_stop'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            stop_audits
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn exact_chain_hook_rejects_unknown_version_and_copied_process_binding_without_writes() {
+        let fixture = exact_hook_fixture();
+        set_exact_hook_env(
+            &fixture,
+            &fixture.source.process_id,
+            1,
+            "nonce-source",
+            None,
+        );
+        unsafe { std::env::set_var(CODEX_VERSION_ENV, "0.146.0") };
+        let audit_before: i64 = fixture
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM terminal_transition_audit",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(matches!(
+            handle_exact_chain_session_start(
+                &fixture.db,
+                exact_session_payload(
+                    &fixture,
+                    "native-source",
+                    exact_transcript(&fixture, "native-source"),
+                ),
+            ),
+            Err(HandoffError::Conflict(_))
+        ));
+        unsafe { std::env::remove_var(CODEX_VERSION_ENV) };
+        assert!(matches!(
+            handle_exact_chain_session_start(
+                &fixture.db,
+                exact_session_payload(
+                    &fixture,
+                    "native-source",
+                    exact_transcript(&fixture, "native-source"),
+                ),
+            ),
+            Err(HandoffError::Conflict(_))
+        ));
+        unsafe {
+            std::env::set_var(CODEX_VERSION_ENV, SUPPORTED_CODEX_VERSION);
+        }
+        fixture
+            .db
+            .conn()
+            .execute(
+                "INSERT INTO instances (
+                     name, session_id, status, tool, created_at,
+                     parent_name, origin_device_id
+                 ) VALUES ('spoof', 'hcom-spoof', 'launching', 'codex', 1.0, '', '')",
+                [],
+            )
+            .unwrap();
+        fixture
+            .db
+            .set_process_binding("process-spoof", "hcom-spoof", "spoof")
+            .unwrap();
+        set_exact_hook_env(&fixture, "process-spoof", 1, "nonce-source", None);
+        assert!(matches!(
+            handle_exact_chain_session_start(
+                &fixture.db,
+                exact_session_payload(
+                    &fixture,
+                    "native-spoof",
+                    exact_transcript(&fixture, "native-spoof"),
+                ),
+            ),
+            Err(HandoffError::NotManaged)
+        ));
+        assert_eq!(
+            fixture
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM terminal_transition_audit",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            audit_before
+        );
+        assert!(
+            get_generation(&fixture.db, &fixture.chain.id, 1)
+                .unwrap()
+                .unwrap()
+                .native_session_id
+                .is_none()
+        );
+    }
 
     #[test]
     #[serial]
