@@ -59,6 +59,40 @@ fn help_prints_and_exits_zero() {
         stdout.contains("Commands:") || stdout.contains("Launch:"),
         "stdout={stdout}"
     );
+    assert!(stdout.contains("handoff"), "stdout={stdout}");
+    assert!(stdout.contains("chain"), "stdout={stdout}");
+}
+
+#[test]
+fn handoff_and_chain_help_expose_phase1_surface_only() {
+    let h = Hcom::new();
+    let (code, handoff_help, stderr) = h.run(["handoff", "--help"]);
+    assert_eq!(code, 0, "stdout={handoff_help} stderr={stderr}");
+    for command in ["prepare", "commit", "abort", "status", "accept", "reject"] {
+        assert!(handoff_help.contains(command), "stdout={handoff_help}");
+    }
+    assert!(
+        handoff_help.contains("never launch")
+            || handoff_help.contains("never launch, stop")
+            || handoff_help.contains("never launch, stop,"),
+        "stdout={handoff_help}"
+    );
+
+    let (code, chain_help, stderr) = h.run(["chain", "--help"]);
+    assert_eq!(code, 0, "stdout={chain_help} stderr={stderr}");
+    assert!(chain_help.contains("status"), "stdout={chain_help}");
+    assert!(
+        !chain_help.contains("hcom chain start"),
+        "stdout={chain_help}"
+    );
+    assert!(
+        !chain_help.contains("hcom chain recover"),
+        "stdout={chain_help}"
+    );
+    assert!(
+        !chain_help.contains("hcom chain codex"),
+        "stdout={chain_help}"
+    );
 }
 
 #[test]
@@ -88,6 +122,171 @@ fn events_empty_in_fresh_dir() {
     let (code, stdout, _stderr) = h.run(["events", "--last", "5"]);
     assert_eq!(code, 0);
     assert!(stdout.trim().is_empty(), "expected no events, got {stdout}");
+}
+
+#[test]
+fn ordinary_codex_session_handoff_mutations_fail_closed() {
+    let h = Hcom::new();
+    let (hooks_code, hooks_stdout, hooks_stderr) = h.run(["hooks", "add", "codex"]);
+    assert_eq!(hooks_code, 0, "stdout={hooks_stdout} stderr={hooks_stderr}");
+
+    let process_id = "ordinary-codex-process";
+    let native_session = "ordinary-native-session";
+    let mut start = h.cmd();
+    start
+        .env("HCOM_PROCESS_ID", process_id)
+        .env("CODEX_SANDBOX", "1")
+        .env("CODEX_THREAD_ID", native_session)
+        .arg("start");
+    let output = start.output().expect("start ordinary Codex identity");
+    let start_stdout = String::from_utf8_lossy(&output.stdout);
+    let start_stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout={start_stdout} stderr={start_stderr}"
+    );
+    let name = parse_hcom_marker(&start_stdout).expect("ordinary Codex marker");
+
+    let mut prepare = h.cmd();
+    prepare
+        .env("HCOM_PROCESS_ID", process_id)
+        .env("CODEX_SANDBOX", "1")
+        .env("CODEX_THREAD_ID", native_session)
+        .args(["handoff", "prepare", "--bundle-event", "1", "--json"]);
+    let output = prepare.output().expect("run fail-closed prepare");
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    let error: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("typed JSON error");
+    assert_eq!(error["error"]["code"].as_str(), Some("not_managed"));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not managed by a handoff chain"))
+    );
+    assert!(output.stderr.len() <= 16 * 1024);
+
+    for args in [
+        vec![
+            "handoff",
+            "commit",
+            "ho-missing",
+            "--version",
+            "0",
+            "--json",
+        ],
+        vec![
+            "handoff",
+            "abort",
+            "ho-missing",
+            "--version",
+            "0",
+            "--json",
+            "--",
+            "reason",
+        ],
+        vec![
+            "handoff",
+            "accept",
+            "ho-missing",
+            "--version",
+            "0",
+            "--json",
+        ],
+        vec![
+            "handoff",
+            "reject",
+            "ho-missing",
+            "--version",
+            "0",
+            "--json",
+            "--",
+            "reason",
+        ],
+    ] {
+        let mut mutation = h.cmd();
+        mutation
+            .env("HCOM_PROCESS_ID", process_id)
+            .env("CODEX_SANDBOX", "1")
+            .env("CODEX_THREAD_ID", native_session)
+            .args(&args);
+        let output = mutation.output().expect("run fail-closed mutation");
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "args={args:?} stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let error: serde_json::Value =
+            serde_json::from_slice(&output.stderr).expect("typed mutation error");
+        assert_eq!(error["error"]["code"].as_str(), Some("not_managed"));
+    }
+
+    let mut go = h.cmd();
+    go.env("HCOM_PROCESS_ID", process_id)
+        .env("CODEX_SANDBOX", "1")
+        .env("CODEX_THREAD_ID", native_session)
+        .args([
+            "--go",
+            "handoff",
+            "prepare",
+            "--bundle-event",
+            "1",
+            "--json",
+        ]);
+    let output = go.output().expect("run --go fail-closed mutation");
+    assert_eq!(output.status.code(), Some(3));
+    let error: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("--go typed error");
+    assert_eq!(error["error"]["code"].as_str(), Some("not_managed"));
+
+    let mut status = h.cmd();
+    status
+        .env("HCOM_PROCESS_ID", process_id)
+        .env("CODEX_SANDBOX", "1")
+        .env("CODEX_THREAD_ID", native_session)
+        .args(["chain", "status"]);
+    let output = status.output().expect("run fail-closed chain status");
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not managed by a handoff chain"),
+        "stderr={stderr}"
+    );
+
+    let mut spoof = h.cmd();
+    spoof
+        .env("HCOM_PROCESS_ID", "unbound-attacker-process")
+        .args([
+            "handoff",
+            "prepare",
+            "--bundle-event",
+            "1",
+            "--json",
+            "--name",
+            &name,
+        ]);
+    let output = spoof.output().expect("run --name spoof attempt");
+    assert_eq!(output.status.code(), Some(3));
+    let error: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("spoof typed JSON error");
+    assert_eq!(error["error"]["code"].as_str(), Some("not_managed"));
+
+    let conn = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    for table in [
+        "terminal_chains",
+        "terminal_generations",
+        "terminal_handoffs",
+        "terminal_transition_audit",
+    ] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "{table} must remain empty");
+    }
 }
 
 #[test]

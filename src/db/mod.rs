@@ -18,7 +18,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::shared::time::now_epoch_f64;
 
@@ -36,7 +36,7 @@ pub use instances::InstanceRow;
 pub use instances::InstanceStatus;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 18;
+const SCHEMA_VERSION: i32 = 19;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
 const REVIEW_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS review_runs (
@@ -93,6 +93,339 @@ const REVIEW_SCHEMA_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_review_transitions_workflow
         ON review_transitions(workflow_id, to_version);
 ";
+const HANDOFF_SCHEMA_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS terminal_chains (
+        id                                TEXT PRIMARY KEY,
+        workspace                         TEXT NOT NULL,
+        tool                              TEXT NOT NULL CHECK (tool = 'codex'),
+        model_ref                         TEXT NOT NULL,
+        reasoning_ref                     TEXT NOT NULL,
+        permission_policy_ref             TEXT NOT NULL,
+        policy_ref                        TEXT NOT NULL,
+        supervisor_process_id             TEXT NOT NULL,
+        supervisor_process_birth_identity TEXT NOT NULL,
+        current_generation                INTEGER NOT NULL CHECK (current_generation >= 1),
+        state                             TEXT NOT NULL CHECK (state IN (
+                                              'active',
+                                              'prepared',
+                                              'committed',
+                                              'stop_observed',
+                                              'quiescing_source',
+                                              'launching_target',
+                                              'awaiting_acceptance',
+                                              'needs_recovery'
+                                          )),
+        version                           INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
+        created_at                        REAL NOT NULL,
+        updated_at                        REAL NOT NULL,
+        CHECK (length(CAST(id AS BLOB)) BETWEEN 1 AND 64),
+        CHECK (length(CAST(workspace AS BLOB)) BETWEEN 1 AND 4096),
+        CHECK (length(CAST(model_ref AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (length(CAST(reasoning_ref AS BLOB)) BETWEEN 1 AND 64),
+        CHECK (length(CAST(permission_policy_ref AS BLOB)) BETWEEN 1 AND 512),
+        CHECK (length(CAST(policy_ref AS BLOB)) BETWEEN 1 AND 512),
+        CHECK (length(CAST(supervisor_process_id AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (length(CAST(supervisor_process_birth_identity AS BLOB)) BETWEEN 1 AND 256),
+        FOREIGN KEY (id, current_generation)
+            REFERENCES terminal_generations(chain_id, generation)
+            DEFERRABLE INITIALLY DEFERRED
+    );
+
+    CREATE TABLE IF NOT EXISTS terminal_generations (
+        chain_id              TEXT NOT NULL,
+        generation            INTEGER NOT NULL CHECK (generation >= 1),
+        launch_nonce          TEXT NOT NULL,
+        wrapper_process_id    TEXT,
+        process_birth_identity TEXT,
+        instance_name         TEXT,
+        hcom_session_id       TEXT,
+        native_session_id     TEXT,
+        state                 TEXT NOT NULL CHECK (state IN (
+                                  'active',
+                                  'handoff_prepared',
+                                  'handoff_committed',
+                                  'stop_observed',
+                                  'quiescing',
+                                  'retired',
+                                  'reserved',
+                                  'launching',
+                                  'awaiting_acceptance',
+                                  'needs_recovery'
+                              )),
+        version               INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
+        created_at            REAL NOT NULL,
+        updated_at            REAL NOT NULL,
+        PRIMARY KEY (chain_id, generation),
+        CHECK (length(CAST(launch_nonce AS BLOB)) BETWEEN 1 AND 64),
+        CHECK (wrapper_process_id IS NULL OR
+               length(CAST(wrapper_process_id AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (process_birth_identity IS NULL OR
+               length(CAST(process_birth_identity AS BLOB)) BETWEEN 1 AND 256),
+        CHECK (instance_name IS NULL OR
+               length(CAST(instance_name AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (hcom_session_id IS NULL OR
+               length(CAST(hcom_session_id AS BLOB)) BETWEEN 1 AND 256),
+        CHECK (native_session_id IS NULL OR
+               length(CAST(native_session_id AS BLOB)) BETWEEN 1 AND 256),
+        CHECK (
+            (wrapper_process_id IS NULL AND process_birth_identity IS NULL
+             AND instance_name IS NULL AND hcom_session_id IS NULL
+             AND native_session_id IS NULL)
+            OR
+            (wrapper_process_id IS NOT NULL AND process_birth_identity IS NOT NULL
+             AND instance_name IS NOT NULL AND hcom_session_id IS NOT NULL)
+        ),
+        FOREIGN KEY (chain_id) REFERENCES terminal_chains(id) ON DELETE RESTRICT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_terminal_generation_launch_nonce
+        ON terminal_generations(launch_nonce);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_terminal_generation_process
+        ON terminal_generations(wrapper_process_id)
+        WHERE wrapper_process_id IS NOT NULL;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_chains_immutable_identity_policy
+    BEFORE UPDATE OF workspace, tool, model_ref, reasoning_ref,
+                     permission_policy_ref, policy_ref, supervisor_process_id,
+                     supervisor_process_birth_identity
+    ON terminal_chains
+    WHEN NEW.workspace IS NOT OLD.workspace
+      OR NEW.tool IS NOT OLD.tool
+      OR NEW.model_ref IS NOT OLD.model_ref
+      OR NEW.reasoning_ref IS NOT OLD.reasoning_ref
+      OR NEW.permission_policy_ref IS NOT OLD.permission_policy_ref
+      OR NEW.policy_ref IS NOT OLD.policy_ref
+      OR NEW.supervisor_process_id IS NOT OLD.supervisor_process_id
+      OR NEW.supervisor_process_birth_identity
+             IS NOT OLD.supervisor_process_birth_identity
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal chain identity and policy are immutable');
+    END;
+
+    CREATE TABLE IF NOT EXISTS terminal_handoffs (
+        id                                  TEXT PRIMARY KEY,
+        chain_id                            TEXT NOT NULL,
+        source_generation                   INTEGER NOT NULL CHECK (source_generation >= 1),
+        target_generation                   INTEGER NOT NULL CHECK (target_generation >= 1),
+        source_launch_nonce                 TEXT NOT NULL,
+        source_instance_name                TEXT NOT NULL,
+        source_hcom_session_id              TEXT NOT NULL,
+        source_native_session_id            TEXT NOT NULL,
+        source_wrapper_process_id            TEXT NOT NULL,
+        source_process_birth_identity        TEXT NOT NULL,
+        bundle_event_id                     INTEGER NOT NULL,
+        bundle_digest                       TEXT NOT NULL,
+        bundle_size_bytes                   INTEGER NOT NULL
+                                             CHECK (bundle_size_bytes BETWEEN 0 AND 1048576),
+        workspace                            TEXT NOT NULL,
+        revision                             TEXT NOT NULL,
+        branch                               TEXT NOT NULL,
+        dirty_summary                        TEXT NOT NULL,
+        policy_ref                           TEXT NOT NULL,
+        state                                TEXT NOT NULL CHECK (state IN (
+                                                 'prepared',
+                                                 'committed',
+                                                 'stop_observed',
+                                                 'quiescing_source',
+                                                 'launching_target',
+                                                 'awaiting_acceptance',
+                                                 'accepted',
+                                                 'aborted',
+                                                 'needs_recovery'
+                                             )),
+        version                              INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
+        quiesce_token                        TEXT,
+        quiesce_generation                   INTEGER,
+        quiesce_native_session_id            TEXT,
+        quiesce_process_id                   TEXT,
+        quiesce_process_birth_identity       TEXT,
+        quiesce_committed_version            INTEGER,
+        stop_observed_at                     REAL,
+        failure_kind                         TEXT NOT NULL DEFAULT '',
+        failure_reason                       TEXT NOT NULL DEFAULT '',
+        created_at                           REAL NOT NULL,
+        updated_at                           REAL NOT NULL,
+        committed_at                         REAL,
+        accepted_at                          REAL,
+        CHECK (target_generation = source_generation + 1),
+        CHECK (length(CAST(id AS BLOB)) BETWEEN 1 AND 64),
+        CHECK (length(CAST(source_launch_nonce AS BLOB)) BETWEEN 1 AND 64),
+        CHECK (length(CAST(source_instance_name AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (length(CAST(source_hcom_session_id AS BLOB)) BETWEEN 1 AND 256),
+        CHECK (length(CAST(source_native_session_id AS BLOB)) BETWEEN 1 AND 256),
+        CHECK (length(CAST(source_wrapper_process_id AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (length(CAST(source_process_birth_identity AS BLOB)) BETWEEN 1 AND 256),
+        CHECK (length(CAST(bundle_digest AS BLOB)) = 64),
+        CHECK (length(CAST(workspace AS BLOB)) BETWEEN 1 AND 4096),
+        CHECK (length(CAST(revision AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (length(CAST(branch AS BLOB)) BETWEEN 1 AND 1024),
+        CHECK (length(CAST(dirty_summary AS BLOB)) BETWEEN 1 AND 512),
+        CHECK (length(CAST(policy_ref AS BLOB)) BETWEEN 1 AND 512),
+        CHECK (quiesce_token IS NULL OR
+               length(CAST(quiesce_token AS BLOB)) BETWEEN 1 AND 64),
+        CHECK (quiesce_native_session_id IS NULL OR
+               length(CAST(quiesce_native_session_id AS BLOB)) BETWEEN 1 AND 256),
+        CHECK (quiesce_process_id IS NULL OR
+               length(CAST(quiesce_process_id AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (quiesce_process_birth_identity IS NULL OR
+               length(CAST(quiesce_process_birth_identity AS BLOB)) BETWEEN 1 AND 256),
+        CHECK (length(CAST(failure_kind AS BLOB)) <= 64),
+        CHECK (length(CAST(failure_reason AS BLOB)) <= 1024),
+        CHECK (
+            (quiesce_token IS NULL
+             AND quiesce_generation IS NULL
+             AND quiesce_native_session_id IS NULL
+             AND quiesce_process_id IS NULL
+             AND quiesce_process_birth_identity IS NULL
+             AND quiesce_committed_version IS NULL)
+            OR
+            (quiesce_token IS NOT NULL
+             AND quiesce_generation = source_generation
+             AND quiesce_native_session_id = source_native_session_id
+             AND quiesce_process_id = source_wrapper_process_id
+             AND quiesce_process_birth_identity = source_process_birth_identity
+             AND quiesce_committed_version >= 1)
+        ),
+        FOREIGN KEY (chain_id) REFERENCES terminal_chains(id) ON DELETE RESTRICT,
+        FOREIGN KEY (chain_id, source_generation)
+            REFERENCES terminal_generations(chain_id, generation) ON DELETE RESTRICT,
+        FOREIGN KEY (chain_id, target_generation)
+            REFERENCES terminal_generations(chain_id, generation) ON DELETE RESTRICT,
+        FOREIGN KEY (bundle_event_id) REFERENCES events(id) ON DELETE RESTRICT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_terminal_handoffs_one_non_final
+        ON terminal_handoffs(chain_id)
+        WHERE state NOT IN ('accepted', 'aborted');
+    CREATE INDEX IF NOT EXISTS idx_terminal_handoffs_chain
+        ON terminal_handoffs(chain_id, source_generation, target_generation);
+
+    CREATE TRIGGER IF NOT EXISTS terminal_handoffs_immutable_snapshot
+    BEFORE UPDATE OF chain_id, source_generation, target_generation,
+                     source_launch_nonce, source_instance_name,
+                     source_hcom_session_id, source_native_session_id,
+                     source_wrapper_process_id, source_process_birth_identity,
+                     bundle_event_id, bundle_digest, bundle_size_bytes,
+                     workspace, revision, branch, dirty_summary, policy_ref
+    ON terminal_handoffs
+    WHEN NEW.chain_id IS NOT OLD.chain_id
+      OR NEW.source_generation IS NOT OLD.source_generation
+      OR NEW.target_generation IS NOT OLD.target_generation
+      OR NEW.source_launch_nonce IS NOT OLD.source_launch_nonce
+      OR NEW.source_instance_name IS NOT OLD.source_instance_name
+      OR NEW.source_hcom_session_id IS NOT OLD.source_hcom_session_id
+      OR NEW.source_native_session_id IS NOT OLD.source_native_session_id
+      OR NEW.source_wrapper_process_id IS NOT OLD.source_wrapper_process_id
+      OR NEW.source_process_birth_identity IS NOT OLD.source_process_birth_identity
+      OR NEW.bundle_event_id IS NOT OLD.bundle_event_id
+      OR NEW.bundle_digest IS NOT OLD.bundle_digest
+      OR NEW.bundle_size_bytes IS NOT OLD.bundle_size_bytes
+      OR NEW.workspace IS NOT OLD.workspace
+      OR NEW.revision IS NOT OLD.revision
+      OR NEW.branch IS NOT OLD.branch
+      OR NEW.dirty_summary IS NOT OLD.dirty_summary
+      OR NEW.policy_ref IS NOT OLD.policy_ref
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal handoff snapshot is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_handoffs_quiesce_once
+    BEFORE UPDATE OF quiesce_token, quiesce_generation,
+                     quiesce_native_session_id, quiesce_process_id,
+                     quiesce_process_birth_identity, quiesce_committed_version
+    ON terminal_handoffs
+    WHEN OLD.quiesce_token IS NOT NULL
+      AND (
+          NEW.quiesce_token IS NOT OLD.quiesce_token
+          OR NEW.quiesce_generation IS NOT OLD.quiesce_generation
+          OR NEW.quiesce_native_session_id IS NOT OLD.quiesce_native_session_id
+          OR NEW.quiesce_process_id IS NOT OLD.quiesce_process_id
+          OR NEW.quiesce_process_birth_identity
+                 IS NOT OLD.quiesce_process_birth_identity
+          OR NEW.quiesce_committed_version IS NOT OLD.quiesce_committed_version
+      )
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal handoff quiesce authorization is immutable once committed');
+    END;
+
+    CREATE TABLE IF NOT EXISTS terminal_transition_audit (
+        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+        chain_id               TEXT NOT NULL,
+        object_kind            TEXT NOT NULL CHECK (object_kind IN (
+                                     'chain', 'generation', 'handoff'
+                                 )),
+        object_id              TEXT NOT NULL,
+        from_version           INTEGER NOT NULL CHECK (from_version >= -1),
+        to_version             INTEGER NOT NULL CHECK (to_version = from_version + 1),
+        from_state             TEXT,
+        to_state               TEXT NOT NULL,
+        actor_instance_name    TEXT NOT NULL,
+        actor_hcom_session_id  TEXT NOT NULL,
+        actor_process_id       TEXT NOT NULL,
+        actor_process_birth_identity TEXT NOT NULL,
+        actor_generation       INTEGER NOT NULL CHECK (actor_generation >= 1),
+        actor_role             TEXT NOT NULL CHECK (actor_role IN (
+                                     'source', 'target', 'supervisor'
+                                 )),
+        action                 TEXT NOT NULL,
+        request_hash           TEXT NOT NULL,
+        created_at             REAL NOT NULL,
+        UNIQUE (object_kind, object_id, from_version),
+        CHECK (length(CAST(object_id AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (length(CAST(from_state AS BLOB)) <= 64),
+        CHECK (length(CAST(to_state AS BLOB)) BETWEEN 1 AND 64),
+        CHECK (length(CAST(actor_instance_name AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (length(CAST(actor_hcom_session_id AS BLOB)) BETWEEN 1 AND 256),
+        CHECK (length(CAST(actor_process_id AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (length(CAST(actor_process_birth_identity AS BLOB)) BETWEEN 1 AND 256),
+        CHECK (length(CAST(action AS BLOB)) BETWEEN 1 AND 64),
+        CHECK (length(CAST(request_hash AS BLOB)) = 64),
+        FOREIGN KEY (chain_id) REFERENCES terminal_chains(id) ON DELETE RESTRICT
+    );
+    CREATE INDEX IF NOT EXISTS idx_terminal_transition_audit_chain
+        ON terminal_transition_audit(chain_id, id);
+
+    CREATE TRIGGER IF NOT EXISTS terminal_generations_monotonic_insert
+    BEFORE INSERT ON terminal_generations
+    WHEN NEW.generation != COALESCE(
+        (SELECT MAX(generation) + 1
+         FROM terminal_generations
+         WHERE chain_id = NEW.chain_id),
+        1
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal generation must be next monotonic integer');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_generations_immutable_identity
+    BEFORE UPDATE OF launch_nonce, wrapper_process_id, process_birth_identity,
+                     instance_name, hcom_session_id, native_session_id
+    ON terminal_generations
+    WHEN NEW.launch_nonce != OLD.launch_nonce
+      OR (OLD.wrapper_process_id IS NOT NULL
+          AND NEW.wrapper_process_id IS NOT OLD.wrapper_process_id)
+      OR (OLD.process_birth_identity IS NOT NULL
+          AND NEW.process_birth_identity IS NOT OLD.process_birth_identity)
+      OR (OLD.instance_name IS NOT NULL
+          AND NEW.instance_name IS NOT OLD.instance_name)
+      OR (OLD.hcom_session_id IS NOT NULL
+          AND NEW.hcom_session_id IS NOT OLD.hcom_session_id)
+      OR (OLD.native_session_id IS NOT NULL
+          AND NEW.native_session_id IS NOT OLD.native_session_id)
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal generation identity is immutable once pinned');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_transition_audit_no_update
+    BEFORE UPDATE ON terminal_transition_audit
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal transition audit is append-only');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_transition_audit_no_delete
+    BEFORE DELETE ON terminal_transition_audit
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal transition audit is append-only');
+    END;
+";
 const MIGRATIONS: &[(i32, &str)] = &[
     (
         17,
@@ -103,7 +436,210 @@ const MIGRATIONS: &[(i32, &str)] = &[
      WHERE launch_context != '' AND json_valid(launch_context) AND json_extract(launch_context, '$.terminal_preset') IS NOT NULL;",
     ),
     (18, REVIEW_SCHEMA_SQL),
+    (19, HANDOFF_SCHEMA_SQL),
 ];
+
+const HANDOFF_TABLE_COLUMNS: &[(&str, &[&str])] = &[
+    (
+        "terminal_chains",
+        &[
+            "id",
+            "workspace",
+            "tool",
+            "model_ref",
+            "reasoning_ref",
+            "permission_policy_ref",
+            "policy_ref",
+            "supervisor_process_id",
+            "supervisor_process_birth_identity",
+            "current_generation",
+            "state",
+            "version",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "terminal_generations",
+        &[
+            "chain_id",
+            "generation",
+            "launch_nonce",
+            "wrapper_process_id",
+            "process_birth_identity",
+            "instance_name",
+            "hcom_session_id",
+            "native_session_id",
+            "state",
+            "version",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "terminal_handoffs",
+        &[
+            "id",
+            "chain_id",
+            "source_generation",
+            "target_generation",
+            "source_launch_nonce",
+            "source_instance_name",
+            "source_hcom_session_id",
+            "source_native_session_id",
+            "source_wrapper_process_id",
+            "source_process_birth_identity",
+            "bundle_event_id",
+            "bundle_digest",
+            "bundle_size_bytes",
+            "workspace",
+            "revision",
+            "branch",
+            "dirty_summary",
+            "policy_ref",
+            "state",
+            "version",
+            "quiesce_token",
+            "quiesce_generation",
+            "quiesce_native_session_id",
+            "quiesce_process_id",
+            "quiesce_process_birth_identity",
+            "quiesce_committed_version",
+            "stop_observed_at",
+            "failure_kind",
+            "failure_reason",
+            "created_at",
+            "updated_at",
+            "committed_at",
+            "accepted_at",
+        ],
+    ),
+    (
+        "terminal_transition_audit",
+        &[
+            "id",
+            "chain_id",
+            "object_kind",
+            "object_id",
+            "from_version",
+            "to_version",
+            "from_state",
+            "to_state",
+            "actor_instance_name",
+            "actor_hcom_session_id",
+            "actor_process_id",
+            "actor_process_birth_identity",
+            "actor_generation",
+            "actor_role",
+            "action",
+            "request_hash",
+            "created_at",
+        ],
+    ),
+];
+
+const HANDOFF_SCHEMA_OBJECTS: &[(&str, &str)] = &[
+    ("index", "idx_terminal_generation_launch_nonce"),
+    ("index", "idx_terminal_generation_process"),
+    ("index", "idx_terminal_handoffs_one_non_final"),
+    ("index", "idx_terminal_handoffs_chain"),
+    ("index", "idx_terminal_transition_audit_chain"),
+    ("trigger", "terminal_chains_immutable_identity_policy"),
+    ("trigger", "terminal_generations_monotonic_insert"),
+    ("trigger", "terminal_generations_immutable_identity"),
+    ("trigger", "terminal_handoffs_immutable_snapshot"),
+    ("trigger", "terminal_handoffs_quiesce_once"),
+    ("trigger", "terminal_transition_audit_no_update"),
+    ("trigger", "terminal_transition_audit_no_delete"),
+];
+
+const REVIEW_TABLE_COLUMNS: &[(&str, &[&str])] = &[
+    (
+        "review_runs",
+        &[
+            "id",
+            "task",
+            "workspace",
+            "thread",
+            "developer_name",
+            "developer_session_id",
+            "reviewer_name",
+            "reviewer_session_id",
+            "state",
+            "round",
+            "max_rounds",
+            "version",
+            "last_message_event_id",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "review_transitions",
+        &[
+            "id",
+            "workflow_id",
+            "from_version",
+            "to_version",
+            "round",
+            "actor_name",
+            "actor_session_id",
+            "actor_role",
+            "action",
+            "from_state",
+            "to_state",
+            "summary",
+            "payload_hash",
+            "message_event_id",
+            "created_at",
+        ],
+    ),
+];
+
+const REVIEW_SCHEMA_OBJECTS: &[(&str, &str)] = &[
+    ("index", "idx_review_runs_active_pair"),
+    ("index", "idx_review_transitions_workflow"),
+];
+
+fn schema_objects_are_complete(
+    conn: &Connection,
+    tables: &[(&str, &[&str])],
+    objects: &[(&str, &str)],
+) -> Result<bool> {
+    for (table, expected_columns) in tables {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let actual: std::collections::HashSet<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !expected_columns
+            .iter()
+            .all(|column| actual.contains(*column))
+        {
+            return Ok(false);
+        }
+    }
+    for (kind, name) in objects {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2
+             )",
+            rusqlite::params![kind, name],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn review_schema_is_complete(conn: &Connection) -> Result<bool> {
+    schema_objects_are_complete(conn, REVIEW_TABLE_COLUMNS, REVIEW_SCHEMA_OBJECTS)
+}
+
+fn handoff_schema_is_complete(conn: &Connection) -> Result<bool> {
+    schema_objects_are_complete(conn, HANDOFF_TABLE_COLUMNS, HANDOFF_SCHEMA_OBJECTS)
+}
 
 /// Schema compatibility check result
 enum SchemaCompat {
@@ -223,15 +759,19 @@ impl HcomDb {
     /// Creates all tables, indexes, events_v view, FTS5 virtual table + trigger,
     /// and sets PRAGMA user_version.
     pub fn init_db(&self) -> Result<()> {
-        // Skip if already at current version (avoids DROP VIEW race with concurrent readers)
-        let current: i32 = self
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if current == SCHEMA_VERSION {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        // Re-read after taking the writer lock so concurrent fresh opens cannot
+        // interleave schema creation or stamp a partial database.
+        let current: i32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if current == SCHEMA_VERSION
+            && review_schema_is_complete(&tx)?
+            && handoff_schema_is_complete(&tx)?
+        {
+            tx.commit()?;
             return Ok(());
         }
 
-        self.conn.execute_batch(
+        tx.execute_batch(
             "
             -- Events table
             CREATE TABLE IF NOT EXISTS events (
@@ -379,11 +919,15 @@ impl HcomDb {
             ",
         )?;
 
-        self.conn.execute_batch(REVIEW_SCHEMA_SQL)?;
+        tx.execute_batch(REVIEW_SCHEMA_SQL)?;
+        tx.execute_batch(HANDOFF_SCHEMA_SQL)?;
+        if !review_schema_is_complete(&tx)? || !handoff_schema_is_complete(&tx)? {
+            anyhow::bail!("migrated control-plane schema is incomplete");
+        }
 
         // Set schema version
-        self.conn
-            .execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))?;
+        tx.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))?;
+        tx.commit()?;
 
         Ok(())
     }
@@ -408,7 +952,11 @@ impl HcomDb {
                         version
                     };
                     match self.try_apply_migrations(migrate_from) {
-                        Ok(true) => return Ok(()),
+                        Ok(true) => {
+                            if matches!(self.check_schema_compat()?, SchemaCompat::Ok) {
+                                return Ok(());
+                            }
+                        }
                         Ok(false) => {}
                         Err(e) => {
                             crate::log::log_warn(
@@ -417,6 +965,15 @@ impl HcomDb {
                                 &format!("v{} -> v{} failed: {}", migrate_from, SCHEMA_VERSION, e),
                             );
                         }
+                    }
+                    // v18 is the data-preserving handoff migration boundary.
+                    // Never archive a v18+ database to recover a missing or
+                    // malformed handoff schema: returning an error preserves
+                    // all existing events, instances, bindings, and reviews.
+                    if version >= 18 {
+                        anyhow::bail!(
+                            "Failed to repair migrated control-plane schema in place; database was left unchanged"
+                        );
                     }
                 }
                 eprintln!("hcom: {}, archiving...", reason);
@@ -577,7 +1134,10 @@ impl HcomDb {
             ));
         }
 
-        // Verify required tables exist
+        // Verify the long-standing core tables first. Corruption here follows
+        // the pre-existing archive/recreate recovery path; the Phase 1
+        // data-preserving migration path below is only for review/handoff
+        // schema introduced by explicit migrations.
         let have_all = required.iter().all(|t| tables.contains(*t));
         if !have_all {
             let missing: Vec<&&str> = required.iter().filter(|t| !tables.contains(**t)).collect();
@@ -611,6 +1171,37 @@ impl HcomDb {
         if let Some(col) = missing_col {
             return Ok(SchemaCompat::NeedsArchive(
                 format!("DB schema missing instances.{}", col),
+                None,
+            ));
+        }
+        let migrated_tables = [
+            "review_runs",
+            "review_transitions",
+            "terminal_chains",
+            "terminal_generations",
+            "terminal_handoffs",
+            "terminal_transition_audit",
+        ];
+        let missing_migrated: Vec<&str> = migrated_tables
+            .iter()
+            .copied()
+            .filter(|table| !tables.contains(*table))
+            .collect();
+        if !missing_migrated.is_empty() {
+            return Ok(SchemaCompat::NeedsArchive(
+                format!("DB missing migrated tables {:?}", missing_migrated),
+                Some(version),
+            ));
+        }
+        if !handoff_schema_is_complete(&self.conn)? {
+            return Ok(SchemaCompat::NeedsArchive(
+                "DB terminal handoff schema is incomplete".to_string(),
+                Some(version),
+            ));
+        }
+        if !review_schema_is_complete(&self.conn)? {
+            return Ok(SchemaCompat::NeedsArchive(
+                "DB review schema is incomplete".to_string(),
                 Some(version),
             ));
         }
@@ -620,13 +1211,28 @@ impl HcomDb {
 
     /// Try in-place migration for consecutive schema versions.
     ///
-    /// Returns `Ok(false)` if any step is missing from `MIGRATIONS`,
-    /// causing `ensure_schema()` to fall back to archive+recreate.
+    /// Returns `Ok(false)` if a step is missing or the result is incomplete.
+    /// `ensure_schema()` preserves v18+ databases and fails closed in that
+    /// case; only older legacy versions retain the archive/recreate fallback.
     fn try_apply_migrations(&self, old_version: i32) -> Result<bool> {
         if old_version <= 0 || old_version >= SCHEMA_VERSION {
             return Ok(false);
         }
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let current: i32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if current == SCHEMA_VERSION {
+            // Handles a DB stamped at the current version with missing Phase 1
+            // tables/indexes/triggers. CREATE IF NOT EXISTS repairs missing
+            // objects without touching existing data; malformed existing
+            // tables are detected before commit and fail closed.
+            tx.execute_batch(REVIEW_SCHEMA_SQL)?;
+            tx.execute_batch(HANDOFF_SCHEMA_SQL)?;
+            if !review_schema_is_complete(&tx)? || !handoff_schema_is_complete(&tx)? {
+                return Ok(false);
+            }
+            tx.commit()?;
+            return Ok(true);
+        }
         // v17 was briefly stamped onto v16-shaped databases before its two
         // terminal columns had actually been added (issue #16). Once code
         // advances beyond v17 this repair still has to run before later
@@ -644,6 +1250,13 @@ impl HcomDb {
                     .expect("v17 migration must exist");
                 tx.execute_batch(migration)?;
             }
+        }
+        // A v18 database may have been stamped while one or more review
+        // objects were still missing. Re-run the idempotent v18 DDL under the
+        // same writer transaction before applying v19; malformed existing
+        // tables remain detectable by the completeness check and roll back.
+        if old_version >= 18 {
+            tx.execute_batch(REVIEW_SCHEMA_SQL)?;
         }
         for next_version in (old_version + 1)..=SCHEMA_VERSION {
             if next_version == 17 {
@@ -664,6 +1277,9 @@ impl HcomDb {
             };
             tx.execute_batch(sql)?;
             tx.execute_batch(&format!("PRAGMA user_version = {}", next_version))?;
+        }
+        if !review_schema_is_complete(&tx)? || !handoff_schema_is_complete(&tx)? {
+            return Ok(false);
         }
         tx.commit()?;
         Ok(true)
@@ -962,6 +1578,10 @@ pub(super) mod tests {
         assert!(tables.contains(&"session_bindings".to_string()));
         assert!(tables.contains(&"review_runs".to_string()));
         assert!(tables.contains(&"review_transitions".to_string()));
+        assert!(tables.contains(&"terminal_chains".to_string()));
+        assert!(tables.contains(&"terminal_generations".to_string()));
+        assert!(tables.contains(&"terminal_handoffs".to_string()));
+        assert!(tables.contains(&"terminal_transition_audit".to_string()));
 
         cleanup_test_db(db_path);
     }
@@ -1456,6 +2076,508 @@ pub(super) mod tests {
             )
             .unwrap();
         assert_eq!(name, "luna");
+
+        cleanup_test_db(db_path);
+    }
+
+    fn terminal_schema_objects(conn: &Connection) -> Vec<(String, String, String)> {
+        conn.prepare(
+            "SELECT type, name, COALESCE(sql, '')
+             FROM sqlite_master
+             WHERE name LIKE 'terminal_%' OR name LIKE 'idx_terminal_%'
+             ORDER BY type, name",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn test_v18_to_v19_migration_preserves_all_existing_state_and_matches_fresh_schema() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES ('2026-07-27T00:00:00Z', 'message', 'source', '{}')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, created_at)
+                 VALUES ('source', 'session-source', 'codex', 1.0)",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO process_bindings (
+                     process_id, session_id, instance_name, updated_at
+                 ) VALUES ('process-source', 'session-source', 'source', 1.0)",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO session_bindings (session_id, instance_name, created_at)
+                 VALUES ('session-source', 'source', 1.0)",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO review_runs (
+                     id, task, workspace, thread, developer_name,
+                     developer_session_id, reviewer_name, reviewer_session_id,
+                     state, round, max_rounds, version, created_at, updated_at
+                 ) VALUES (
+                     'rv-preserved', 'task', '/workspace', 'review-rv-preserved',
+                     'source', 'session-source', 'reviewer', 'session-reviewer',
+                     'awaiting_review', 1, 3, 0, 1.0, 1.0
+                 )",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO review_transitions (
+                     workflow_id, from_version, to_version, round,
+                     actor_name, actor_session_id, actor_role, action,
+                     from_state, to_state, summary, payload_hash, created_at
+                 ) VALUES (
+                     'rv-preserved', -1, 0, 1, 'source', 'session-source',
+                     'developer', 'start', NULL, 'awaiting_review',
+                     'task', 'hash', 1.0
+                 )",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "DROP INDEX idx_review_runs_active_pair;
+             DROP TRIGGER terminal_transition_audit_no_delete;
+             DROP TRIGGER terminal_transition_audit_no_update;
+             DROP TRIGGER terminal_generations_immutable_identity;
+             DROP TRIGGER terminal_generations_monotonic_insert;
+             DROP TABLE terminal_transition_audit;
+             DROP TABLE terminal_handoffs;
+             DROP TABLE terminal_generations;
+             DROP TABLE terminal_chains;
+             PRAGMA user_version = 18;",
+            )
+            .unwrap();
+        drop(db);
+
+        let migrated = HcomDb::open_at(&db_path).unwrap();
+        assert!(review_schema_is_complete(migrated.conn()).unwrap());
+        let preserved: (i64, i64, i64, i64, i64, i64) = migrated
+            .conn
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM events WHERE instance = 'source'),
+                     (SELECT COUNT(*) FROM instances WHERE name = 'source'),
+                     (SELECT COUNT(*) FROM process_bindings
+                       WHERE process_id = 'process-source'),
+                     (SELECT COUNT(*) FROM session_bindings
+                       WHERE session_id = 'session-source'),
+                     (SELECT COUNT(*) FROM review_runs
+                       WHERE id = 'rv-preserved'),
+                     (SELECT COUNT(*) FROM review_transitions
+                       WHERE workflow_id = 'rv-preserved')",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(preserved, (1, 1, 1, 1, 1, 1));
+
+        let (fresh, fresh_path) = setup_full_test_db();
+        assert_eq!(
+            terminal_schema_objects(migrated.conn()),
+            terminal_schema_objects(fresh.conn())
+        );
+        cleanup_test_db(fresh_path);
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_stamped_v19_missing_handoff_objects_repairs_without_archive() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES ('2026-07-27T00:00:00Z', 'message', 'preserved', '{}')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "DROP TRIGGER terminal_transition_audit_no_delete;
+             DROP TRIGGER terminal_transition_audit_no_update;
+             DROP TRIGGER terminal_generations_immutable_identity;
+             DROP TRIGGER terminal_generations_monotonic_insert;
+             DROP TABLE terminal_transition_audit;
+             DROP TABLE terminal_handoffs;
+             DROP TABLE terminal_generations;
+             DROP TABLE terminal_chains;
+             PRAGMA user_version = 19;",
+            )
+            .unwrap();
+        drop(db);
+
+        let repaired = HcomDb::open_at(&db_path).unwrap();
+        assert!(handoff_schema_is_complete(repaired.conn()).unwrap());
+        let preserved: i64 = repaired
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE instance = 'preserved'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, 1);
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_stamped_v19_missing_review_object_repairs_and_preserves_review_data() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO review_runs (
+                     id, task, workspace, thread, developer_name,
+                     developer_session_id, reviewer_name, reviewer_session_id,
+                     state, round, max_rounds, version, created_at, updated_at
+                 ) VALUES (
+                     'rv-preserved', 'task', '/workspace', 'review-rv-preserved',
+                     'source', 'session-source', 'reviewer', 'session-reviewer',
+                     'awaiting_review', 1, 3, 0, 1.0, 1.0
+                 )",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "DROP INDEX idx_review_runs_active_pair;
+                 PRAGMA user_version = 19;",
+            )
+            .unwrap();
+        drop(db);
+
+        let repaired = HcomDb::open_at(&db_path).unwrap();
+        assert!(review_schema_is_complete(repaired.conn()).unwrap());
+        let preserved: i64 = repaired
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM review_runs WHERE id = 'rv-preserved'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, 1);
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_malformed_stamped_v19_fails_closed_without_archive_or_data_loss() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES ('2026-07-27T00:00:00Z', 'message', 'preserved', '{}')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "DROP TRIGGER terminal_transition_audit_no_delete;
+             DROP TRIGGER terminal_transition_audit_no_update;
+             DROP TRIGGER terminal_generations_immutable_identity;
+             DROP TRIGGER terminal_generations_monotonic_insert;
+             DROP TABLE terminal_transition_audit;
+             DROP TABLE terminal_handoffs;
+             DROP TABLE terminal_generations;
+             PRAGMA foreign_keys = OFF;
+             DROP TABLE terminal_chains;
+             CREATE TABLE terminal_chains (id TEXT PRIMARY KEY);
+             PRAGMA foreign_keys = ON;
+             PRAGMA user_version = 19;",
+            )
+            .unwrap();
+        drop(db);
+
+        let result = HcomDb::open_at(&db_path);
+        assert!(result.is_err());
+        let conn = Connection::open(&db_path).unwrap();
+        let preserved: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE instance = 'preserved'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, 1);
+        let reset_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'life' AND instance = '_device'
+                   AND json_extract(data, '$.action') = 'reset'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reset_events, 0);
+        drop(conn);
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_concurrent_v18_migration_is_atomic_and_idempotent() {
+        use std::sync::{Arc, Barrier};
+
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute_batch(
+                "DROP TRIGGER terminal_transition_audit_no_delete;
+             DROP TRIGGER terminal_transition_audit_no_update;
+             DROP TRIGGER terminal_generations_immutable_identity;
+             DROP TRIGGER terminal_generations_monotonic_insert;
+             DROP TABLE terminal_transition_audit;
+             DROP TABLE terminal_handoffs;
+             DROP TABLE terminal_generations;
+             DROP TABLE terminal_chains;
+             PRAGMA user_version = 18;",
+            )
+            .unwrap();
+        drop(db);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let db_path = db_path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    HcomDb::open_at(&db_path).map(|db| {
+                        db.conn
+                            .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                            .unwrap()
+                    })
+                })
+            })
+            .collect();
+        for result in handles.into_iter().map(|handle| handle.join().unwrap()) {
+            assert_eq!(result.unwrap(), SCHEMA_VERSION);
+        }
+        let db = HcomDb::open_at(&db_path).unwrap();
+        assert!(handoff_schema_is_complete(db.conn()).unwrap());
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_handoff_schema_constraints_and_append_only_audit() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 INSERT INTO events (timestamp, type, instance, data)
+                 VALUES (
+                     '2026-07-27T00:00:00Z', 'bundle', 'source',
+                     '{\"bundle_id\":\"bundle:test\",\"created_by\":\"source\"}'
+                 );
+                 INSERT INTO terminal_chains (
+                     id, workspace, tool, model_ref, reasoning_ref,
+                     permission_policy_ref, policy_ref, supervisor_process_id,
+                     supervisor_process_birth_identity, current_generation,
+                     state, version, created_at, updated_at
+                 ) VALUES (
+                     'tc-valid', '/tmp', 'codex', 'm', 'r', 'p', 'policy',
+                     'supervisor', 'supervisor-birth', 1, 'prepared', 0, 1.0, 1.0
+                 );
+                 INSERT INTO terminal_generations (
+                     chain_id, generation, launch_nonce, wrapper_process_id,
+                     process_birth_identity, instance_name, hcom_session_id,
+                     native_session_id, state, version, created_at, updated_at
+                 ) VALUES (
+                     'tc-valid', 1, 'nonce-1', 'process-1', 'birth-1',
+                     'source', 'hcom-source', 'native-source',
+                     'handoff_prepared', 0, 1.0, 1.0
+                 );
+                 INSERT INTO terminal_generations (
+                     chain_id, generation, launch_nonce, state, version,
+                     created_at, updated_at
+                 ) VALUES (
+                     'tc-valid', 2, 'nonce-2', 'reserved', 0, 1.0, 1.0
+                 );
+                 INSERT INTO terminal_handoffs (
+                     id, chain_id, source_generation, target_generation,
+                     source_launch_nonce, source_instance_name,
+                     source_hcom_session_id, source_native_session_id,
+                     source_wrapper_process_id, source_process_birth_identity,
+                     bundle_event_id, bundle_digest, bundle_size_bytes,
+                     workspace, revision, branch, dirty_summary, policy_ref,
+                     state, version, created_at, updated_at
+                 ) VALUES (
+                     'ho-valid', 'tc-valid', 1, 2, 'nonce-1', 'source',
+                     'hcom-source', 'native-source', 'process-1', 'birth-1',
+                     1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     0, '/tmp', 'revision', 'main',
+                     'staged=0,unstaged=0,untracked=0,conflicted=0',
+                     'policy', 'prepared', 0, 1.0, 1.0
+                 );
+                 INSERT INTO terminal_transition_audit (
+                     chain_id, object_kind, object_id, from_version, to_version,
+                     from_state, to_state, actor_instance_name,
+                     actor_hcom_session_id, actor_process_id,
+                     actor_process_birth_identity, actor_generation,
+                     actor_role, action, request_hash, created_at
+                 ) VALUES (
+                     'tc-valid', 'handoff', 'ho-valid', -1, 0, NULL,
+                     'prepared', 'source', 'hcom-source', 'process-1',
+                     'birth-1', 1, 'source', 'prepare',
+                     'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                     1.0
+                 );
+                 COMMIT;",
+            )
+            .unwrap();
+
+        let rejects = [
+            "INSERT INTO terminal_generations (
+                 chain_id, generation, launch_nonce, state, version,
+                 created_at, updated_at
+             ) VALUES ('tc-valid', 4, 'nonce-4', 'reserved', 0, 1.0, 1.0)",
+            "UPDATE terminal_chains SET state = 'unknown' WHERE id = 'tc-valid'",
+            "UPDATE terminal_chains SET version = -1 WHERE id = 'tc-valid'",
+            "UPDATE terminal_generations SET state = 'unknown'
+             WHERE chain_id = 'tc-valid' AND generation = 2",
+            "UPDATE terminal_generations SET version = -1
+             WHERE chain_id = 'tc-valid' AND generation = 2",
+            "UPDATE terminal_chains SET policy_ref = 'changed'
+             WHERE id = 'tc-valid'",
+            "UPDATE terminal_generations SET native_session_id = 'changed'
+             WHERE chain_id = 'tc-valid' AND generation = 1",
+            "UPDATE terminal_handoffs SET workspace = '/changed'
+             WHERE id = 'ho-valid'",
+            "UPDATE terminal_handoffs SET state = 'unknown'
+             WHERE id = 'ho-valid'",
+            "UPDATE terminal_handoffs SET version = -1
+             WHERE id = 'ho-valid'",
+            "INSERT INTO terminal_handoffs (
+                 id, chain_id, source_generation, target_generation,
+                 source_launch_nonce, source_instance_name,
+                 source_hcom_session_id, source_native_session_id,
+                 source_wrapper_process_id, source_process_birth_identity,
+                 bundle_event_id, bundle_digest, bundle_size_bytes,
+                 workspace, revision, branch, dirty_summary, policy_ref,
+                 state, version, created_at, updated_at
+             ) VALUES (
+                 'ho-second', 'tc-valid', 1, 2, 'nonce-1', 'source',
+                 'hcom-source', 'native-source', 'process-1', 'birth-1',
+                 1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                 0, '/tmp', 'revision', 'main',
+                 'staged=0,unstaged=0,untracked=0,conflicted=0',
+                 'policy', 'prepared', 0, 1.0, 1.0
+             )",
+        ];
+        for sql in rejects {
+            assert!(db.conn.execute(sql, []).is_err(), "must reject: {sql}");
+        }
+
+        db.conn
+            .execute(
+                "UPDATE terminal_handoffs SET
+                     quiesce_token = 'qa-token',
+                     quiesce_generation = 1,
+                     quiesce_native_session_id = 'native-source',
+                     quiesce_process_id = 'process-1',
+                     quiesce_process_birth_identity = 'birth-1',
+                     quiesce_committed_version = 1
+                 WHERE id = 'ho-valid'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            db.conn
+                .execute(
+                    "UPDATE terminal_handoffs
+                     SET quiesce_token = 'qa-different'
+                     WHERE id = 'ho-valid'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            db.conn
+                .execute(
+                    "UPDATE terminal_transition_audit
+                     SET action = 'changed' WHERE object_id = 'ho-valid'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            db.conn
+                .execute(
+                    "DELETE FROM terminal_transition_audit
+                     WHERE object_id = 'ho-valid'",
+                    [],
+                )
+                .is_err()
+        );
+
+        // Once the first handoff is final, the uniqueness guard no longer
+        // masks the exact N -> N+1 constraint.
+        db.conn
+            .execute(
+                "UPDATE terminal_handoffs SET state = 'accepted'
+                 WHERE id = 'ho-valid'",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO terminal_generations (
+                     chain_id, generation, launch_nonce, state, version,
+                     created_at, updated_at
+                 ) VALUES ('tc-valid', 3, 'nonce-3', 'reserved', 0, 1.0, 1.0)",
+                [],
+            )
+            .unwrap();
+        assert!(
+            db.conn
+                .execute(
+                    "INSERT INTO terminal_handoffs (
+                         id, chain_id, source_generation, target_generation,
+                         source_launch_nonce, source_instance_name,
+                         source_hcom_session_id, source_native_session_id,
+                         source_wrapper_process_id, source_process_birth_identity,
+                         bundle_event_id, bundle_digest, bundle_size_bytes,
+                         workspace, revision, branch, dirty_summary, policy_ref,
+                         state, version, created_at, updated_at
+                     ) VALUES (
+                         'ho-skips-generation', 'tc-valid', 1, 3, 'nonce-1',
+                         'source', 'hcom-source', 'native-source', 'process-1',
+                         'birth-1', 1,
+                         'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                         0, '/tmp', 'revision', 'main',
+                         'staged=0,unstaged=0,untracked=0,conflicted=0',
+                         'policy', 'prepared', 0, 1.0, 1.0
+                     )",
+                    [],
+                )
+                .is_err()
+        );
 
         cleanup_test_db(db_path);
     }

@@ -306,6 +306,50 @@ const REVIEW_HELP: &[HelpEntry] = &[
     ("", "Supports local top-level Claude/Codex agents in v1."),
 ];
 
+const HANDOFF_HELP: &[HelpEntry] = &[
+    (
+        "handoff prepare --bundle-event EVENT_ID [--json]",
+        "Prepare from one exact numeric bundle event",
+    ),
+    (
+        "handoff commit ID --version VERSION [--json]",
+        "Commit with expected-version CAS",
+    ),
+    (
+        "handoff abort ID --version VERSION [--json] -- REASON",
+        "Abort a prepared handoff",
+    ),
+    (
+        "handoff status [ID] [--json]",
+        "Show sanitized typed handoff metadata",
+    ),
+    (
+        "handoff accept ID --version VERSION [--json]",
+        "Accept as the exact ready target",
+    ),
+    (
+        "handoff reject ID --version VERSION [--json] -- REASON",
+        "Reject as the exact ready target",
+    ),
+    ("", ""),
+    (
+        "",
+        "Phase 1 changes durable state only; it never launches, stops, signals, or injects input.",
+    ),
+];
+
+const CHAIN_HELP: &[HelpEntry] = &[
+    (
+        "chain status [CHAIN_ID] [--json]",
+        "Show sanitized typed chain metadata",
+    ),
+    ("", ""),
+    (
+        "",
+        "Phase 1 has no chain start, Codex launch, recovery, or hidden initialization command.",
+    ),
+];
+
 const BUNDLE_HELP: &[HelpEntry] = &[
     ("bundle", "List recent bundles (alias: bundle list)"),
     ("bundle list", "List recent bundles"),
@@ -872,6 +916,8 @@ fn format_entries(entries: &[HelpEntry]) -> Vec<String> {
 pub const COMMAND_NAMES: &[&str] = &[
     "send",
     "review",
+    "handoff",
+    "chain",
     "list",
     "events",
     "stop",
@@ -951,6 +997,8 @@ Launch:\n\
 Commands:\n\
   send         Send message to your buddies\n\
   review       Review/fix/re-review until LGTM or a round limit\n\
+  handoff      Typed same-terminal handoff state transitions\n\
+  chain        Inspect same-terminal handoff chain state\n\
   listen       Block until message or event arrives\n\
   list         Show agents, status, unread counts\n\
   events       Query event stream, manage subscriptions\n\
@@ -1071,6 +1119,8 @@ pub fn get_command_help(name: &str) -> String {
         "list" => Some(LIST_HELP),
         "send" => Some(SEND_HELP),
         "review" => Some(REVIEW_HELP),
+        "handoff" => Some(HANDOFF_HELP),
+        "chain" => Some(CHAIN_HELP),
         "bundle" => Some(BUNDLE_HELP),
         "stop" => Some(STOP_HELP),
         "start" => Some(START_HELP),
@@ -1183,6 +1233,8 @@ mod tests {
         let commands = [
             "send",
             "review",
+            "handoff",
+            "chain",
             "list",
             "events",
             "stop",

@@ -23,6 +23,8 @@ fn is_hook(name: &str) -> bool {
 const COMMANDS: &[&str] = &[
     "send",
     "review",
+    "handoff",
+    "chain",
     "list",
     "events",
     "stop",
@@ -586,6 +588,8 @@ pub fn dispatch() -> anyhow::Result<()> {
                 cmd.as_str(),
                 "send"
                     | "review"
+                    | "handoff"
+                    | "chain"
                     | "list"
                     | "stop"
                     | "listen"
@@ -824,6 +828,15 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
             &cmd_argv,
             |args| crate::commands::review::cmd_review(&db, &args, Some(&ctx))
         ),
+        "handoff" => clap_dispatch!(
+            crate::commands::handoff::HandoffArgs,
+            cmd,
+            &cmd_argv,
+            |args| crate::commands::handoff::cmd_handoff(&db, &args, Some(&ctx))
+        ),
+        "chain" => clap_dispatch!(crate::commands::chain::ChainArgs, cmd, &cmd_argv, |args| {
+            crate::commands::chain::cmd_chain(&db, &args, Some(&ctx))
+        }),
         "list" => clap_dispatch!(crate::commands::list::ListArgs, cmd, &cmd_argv, |args| {
             crate::commands::list::cmd_list(&db, &args, Some(&ctx))
         }),
