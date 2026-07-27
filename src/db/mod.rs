@@ -36,7 +36,7 @@ pub use instances::InstanceRow;
 pub use instances::InstanceStatus;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 19;
+const SCHEMA_VERSION: i32 = 20;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
 const REVIEW_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS review_runs (
@@ -104,6 +104,11 @@ const HANDOFF_SCHEMA_SQL: &str = "
         policy_ref                        TEXT NOT NULL,
         supervisor_process_id             TEXT NOT NULL,
         supervisor_process_birth_identity TEXT NOT NULL,
+        supervisor_pid                    INTEGER,
+        supervisor_pgid                   INTEGER,
+        outer_foreground_pgid             INTEGER,
+        outer_tty_device                  INTEGER,
+        outer_tty_inode                   INTEGER,
         current_generation                INTEGER NOT NULL CHECK (current_generation >= 1),
         state                             TEXT NOT NULL CHECK (state IN (
                                               'active',
@@ -126,6 +131,19 @@ const HANDOFF_SCHEMA_SQL: &str = "
         CHECK (length(CAST(policy_ref AS BLOB)) BETWEEN 1 AND 512),
         CHECK (length(CAST(supervisor_process_id AS BLOB)) BETWEEN 1 AND 128),
         CHECK (length(CAST(supervisor_process_birth_identity AS BLOB)) BETWEEN 1 AND 256),
+        CHECK (
+            (supervisor_pid IS NULL
+             AND supervisor_pgid IS NULL
+             AND outer_foreground_pgid IS NULL
+             AND outer_tty_device IS NULL
+             AND outer_tty_inode IS NULL)
+            OR
+            (supervisor_pid > 0
+             AND supervisor_pgid > 0
+             AND outer_foreground_pgid > 0
+             AND outer_tty_device > 0
+             AND outer_tty_inode > 0)
+        ),
         FOREIGN KEY (id, current_generation)
             REFERENCES terminal_generations(chain_id, generation)
             DEFERRABLE INITIALLY DEFERRED
@@ -186,7 +204,9 @@ const HANDOFF_SCHEMA_SQL: &str = "
     CREATE TRIGGER IF NOT EXISTS terminal_chains_immutable_identity_policy
     BEFORE UPDATE OF workspace, tool, model_ref, reasoning_ref,
                      permission_policy_ref, policy_ref, supervisor_process_id,
-                     supervisor_process_birth_identity
+                     supervisor_process_birth_identity, supervisor_pid,
+                     supervisor_pgid, outer_foreground_pgid, outer_tty_device,
+                     outer_tty_inode
     ON terminal_chains
     WHEN NEW.workspace IS NOT OLD.workspace
       OR NEW.tool IS NOT OLD.tool
@@ -197,8 +217,53 @@ const HANDOFF_SCHEMA_SQL: &str = "
       OR NEW.supervisor_process_id IS NOT OLD.supervisor_process_id
       OR NEW.supervisor_process_birth_identity
              IS NOT OLD.supervisor_process_birth_identity
+      OR NEW.supervisor_pid IS NOT OLD.supervisor_pid
+      OR NEW.supervisor_pgid IS NOT OLD.supervisor_pgid
+      OR NEW.outer_foreground_pgid IS NOT OLD.outer_foreground_pgid
+      OR NEW.outer_tty_device IS NOT OLD.outer_tty_device
+      OR NEW.outer_tty_inode IS NOT OLD.outer_tty_inode
     BEGIN
         SELECT RAISE(ABORT, 'terminal chain identity and policy are immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_chains_outer_evidence_insert
+    BEFORE INSERT ON terminal_chains
+    WHEN NOT (
+        (NEW.supervisor_pid IS NULL
+         AND NEW.supervisor_pgid IS NULL
+         AND NEW.outer_foreground_pgid IS NULL
+         AND NEW.outer_tty_device IS NULL
+         AND NEW.outer_tty_inode IS NULL)
+        OR
+        (NEW.supervisor_pid > 0
+         AND NEW.supervisor_pgid > 0
+         AND NEW.outer_foreground_pgid > 0
+         AND NEW.outer_tty_device > 0
+         AND NEW.outer_tty_inode > 0)
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal chain outer evidence must be complete');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_chains_outer_evidence_update
+    BEFORE UPDATE OF supervisor_pid, supervisor_pgid, outer_foreground_pgid,
+                     outer_tty_device, outer_tty_inode
+    ON terminal_chains
+    WHEN NOT (
+        (NEW.supervisor_pid IS NULL
+         AND NEW.supervisor_pgid IS NULL
+         AND NEW.outer_foreground_pgid IS NULL
+         AND NEW.outer_tty_device IS NULL
+         AND NEW.outer_tty_inode IS NULL)
+        OR
+        (NEW.supervisor_pid > 0
+         AND NEW.supervisor_pgid > 0
+         AND NEW.outer_foreground_pgid > 0
+         AND NEW.outer_tty_device > 0
+         AND NEW.outer_tty_inode > 0)
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal chain outer evidence must be complete');
     END;
 
     CREATE TABLE IF NOT EXISTS terminal_handoffs (
@@ -240,6 +305,34 @@ const HANDOFF_SCHEMA_SQL: &str = "
         quiesce_process_birth_identity       TEXT,
         quiesce_committed_version            INTEGER,
         stop_observed_at                     REAL,
+        sigterm_requested_wall_at             REAL,
+        sigterm_requested_monotonic_ns        INTEGER,
+        sigterm_request_result                TEXT NOT NULL DEFAULT ''
+                                               CHECK (sigterm_request_result IN (
+                                                   '', 'sent', 'not_found',
+                                                   'permission_denied', 'error'
+                                               )),
+        child_exit_observed_wall_at           REAL,
+        child_exit_observed_monotonic_ns      INTEGER,
+        child_exit_code                       INTEGER,
+        child_exit_signal                     INTEGER,
+        sigterm_to_exit_ms                    INTEGER,
+        delivery_exit_context                 TEXT NOT NULL DEFAULT ''
+                                               CHECK (delivery_exit_context IN (
+                                                   '', 'exit:closed', 'exit:killed'
+                                               )),
+        waitpid_reaped                        INTEGER CHECK (waitpid_reaped IN (0, 1)),
+        inject_cleanup_succeeded              INTEGER
+                                               CHECK (inject_cleanup_succeeded IN (0, 1)),
+        delivery_cleanup_succeeded            INTEGER
+                                               CHECK (delivery_cleanup_succeeded IN (0, 1)),
+        pty_cleanup_succeeded                 INTEGER
+                                               CHECK (pty_cleanup_succeeded IN (0, 1)),
+        screen_cleanup_succeeded              INTEGER
+                                               CHECK (screen_cleanup_succeeded IN (0, 1)),
+        write_queue_cleanup_succeeded         INTEGER
+                                               CHECK (write_queue_cleanup_succeeded IN (0, 1)),
+        cleanup_completed_at                  REAL,
         failure_kind                         TEXT NOT NULL DEFAULT '',
         failure_reason                       TEXT NOT NULL DEFAULT '',
         created_at                           REAL NOT NULL,
@@ -270,6 +363,59 @@ const HANDOFF_SCHEMA_SQL: &str = "
                length(CAST(quiesce_process_birth_identity AS BLOB)) BETWEEN 1 AND 256),
         CHECK (length(CAST(failure_kind AS BLOB)) <= 64),
         CHECK (length(CAST(failure_reason AS BLOB)) <= 1024),
+        CHECK (sigterm_requested_monotonic_ns IS NULL
+               OR sigterm_requested_monotonic_ns >= 0),
+        CHECK (child_exit_observed_monotonic_ns IS NULL
+               OR child_exit_observed_monotonic_ns >= 0),
+        CHECK (sigterm_to_exit_ms IS NULL
+               OR sigterm_to_exit_ms BETWEEN 0 AND 86400000),
+        CHECK (
+            (sigterm_request_result = ''
+             AND sigterm_requested_wall_at IS NULL
+             AND sigterm_requested_monotonic_ns IS NULL)
+            OR
+            (sigterm_request_result != ''
+             AND sigterm_requested_wall_at IS NOT NULL
+             AND sigterm_requested_monotonic_ns IS NOT NULL)
+        ),
+        CHECK (
+            (child_exit_observed_wall_at IS NULL
+             AND child_exit_observed_monotonic_ns IS NULL
+             AND child_exit_code IS NULL
+             AND child_exit_signal IS NULL
+             AND sigterm_to_exit_ms IS NULL
+             AND delivery_exit_context = '')
+            OR
+            (child_exit_observed_wall_at IS NOT NULL
+             AND child_exit_observed_monotonic_ns IS NOT NULL
+             AND ((child_exit_code IS NOT NULL AND child_exit_signal IS NULL)
+                  OR (child_exit_code IS NULL AND child_exit_signal IS NOT NULL))
+             AND (
+                 (sigterm_request_result = 'sent'
+                  AND sigterm_to_exit_ms IS NOT NULL)
+                 OR
+                 (sigterm_request_result = ''
+                  AND sigterm_to_exit_ms IS NULL)
+             )
+             AND delivery_exit_context != '')
+        ),
+        CHECK (
+            (waitpid_reaped IS NULL
+             AND inject_cleanup_succeeded IS NULL
+             AND delivery_cleanup_succeeded IS NULL
+             AND pty_cleanup_succeeded IS NULL
+             AND screen_cleanup_succeeded IS NULL
+             AND write_queue_cleanup_succeeded IS NULL
+             AND cleanup_completed_at IS NULL)
+            OR
+            (waitpid_reaped IS NOT NULL
+             AND inject_cleanup_succeeded IS NOT NULL
+             AND delivery_cleanup_succeeded IS NOT NULL
+             AND pty_cleanup_succeeded IS NOT NULL
+             AND screen_cleanup_succeeded IS NOT NULL
+             AND write_queue_cleanup_succeeded IS NOT NULL
+             AND cleanup_completed_at IS NOT NULL)
+        ),
         CHECK (
             (quiesce_token IS NULL
              AND quiesce_generation IS NULL
@@ -344,6 +490,174 @@ const HANDOFF_SCHEMA_SQL: &str = "
       )
     BEGIN
         SELECT RAISE(ABORT, 'terminal handoff quiesce authorization is immutable once committed');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_handoffs_process_evidence_once
+    BEFORE UPDATE OF sigterm_requested_wall_at, sigterm_requested_monotonic_ns,
+                     sigterm_request_result, child_exit_observed_wall_at,
+                     child_exit_observed_monotonic_ns, child_exit_code,
+                     child_exit_signal, sigterm_to_exit_ms,
+                     delivery_exit_context, waitpid_reaped,
+                     inject_cleanup_succeeded, delivery_cleanup_succeeded,
+                     pty_cleanup_succeeded, screen_cleanup_succeeded,
+                     write_queue_cleanup_succeeded, cleanup_completed_at
+    ON terminal_handoffs
+    WHEN OLD.sigterm_request_result != ''
+      AND (
+          NEW.sigterm_requested_wall_at IS NOT OLD.sigterm_requested_wall_at
+          OR NEW.sigterm_requested_monotonic_ns
+                 IS NOT OLD.sigterm_requested_monotonic_ns
+          OR NEW.sigterm_request_result IS NOT OLD.sigterm_request_result
+      )
+      OR OLD.cleanup_completed_at IS NOT NULL
+      AND (
+          NEW.child_exit_observed_wall_at
+                 IS NOT OLD.child_exit_observed_wall_at
+          OR NEW.child_exit_observed_monotonic_ns
+                 IS NOT OLD.child_exit_observed_monotonic_ns
+          OR NEW.child_exit_code IS NOT OLD.child_exit_code
+          OR NEW.child_exit_signal IS NOT OLD.child_exit_signal
+          OR NEW.sigterm_to_exit_ms IS NOT OLD.sigterm_to_exit_ms
+          OR NEW.delivery_exit_context IS NOT OLD.delivery_exit_context
+          OR NEW.waitpid_reaped IS NOT OLD.waitpid_reaped
+          OR NEW.inject_cleanup_succeeded IS NOT OLD.inject_cleanup_succeeded
+          OR NEW.delivery_cleanup_succeeded IS NOT OLD.delivery_cleanup_succeeded
+          OR NEW.pty_cleanup_succeeded IS NOT OLD.pty_cleanup_succeeded
+          OR NEW.screen_cleanup_succeeded IS NOT OLD.screen_cleanup_succeeded
+          OR NEW.write_queue_cleanup_succeeded
+                 IS NOT OLD.write_queue_cleanup_succeeded
+          OR NEW.cleanup_completed_at IS NOT OLD.cleanup_completed_at
+      )
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal handoff process evidence is immutable once recorded');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_handoffs_process_evidence_insert
+    BEFORE INSERT ON terminal_handoffs
+    WHEN NOT (
+        (
+            (NEW.sigterm_request_result = ''
+             AND NEW.sigterm_requested_wall_at IS NULL
+             AND NEW.sigterm_requested_monotonic_ns IS NULL)
+            OR
+            (NEW.sigterm_request_result != ''
+             AND NEW.sigterm_requested_wall_at IS NOT NULL
+             AND NEW.sigterm_requested_monotonic_ns IS NOT NULL)
+        )
+        AND
+        (
+            (NEW.child_exit_observed_wall_at IS NULL
+             AND NEW.child_exit_observed_monotonic_ns IS NULL
+             AND NEW.child_exit_code IS NULL
+             AND NEW.child_exit_signal IS NULL
+             AND NEW.sigterm_to_exit_ms IS NULL
+             AND NEW.delivery_exit_context = '')
+            OR
+            (NEW.child_exit_observed_wall_at IS NOT NULL
+             AND NEW.child_exit_observed_monotonic_ns IS NOT NULL
+             AND ((NEW.child_exit_code IS NOT NULL
+                   AND NEW.child_exit_signal IS NULL)
+                  OR
+                  (NEW.child_exit_code IS NULL
+                   AND NEW.child_exit_signal IS NOT NULL))
+             AND (
+                 (NEW.sigterm_request_result = 'sent'
+                  AND NEW.sigterm_to_exit_ms IS NOT NULL)
+                 OR
+                 (NEW.sigterm_request_result = ''
+                  AND NEW.sigterm_to_exit_ms IS NULL)
+             )
+             AND NEW.delivery_exit_context != '')
+        )
+        AND
+        (
+            (NEW.waitpid_reaped IS NULL
+             AND NEW.inject_cleanup_succeeded IS NULL
+             AND NEW.delivery_cleanup_succeeded IS NULL
+             AND NEW.pty_cleanup_succeeded IS NULL
+             AND NEW.screen_cleanup_succeeded IS NULL
+             AND NEW.write_queue_cleanup_succeeded IS NULL
+             AND NEW.cleanup_completed_at IS NULL)
+            OR
+            (NEW.waitpid_reaped IS NOT NULL
+             AND NEW.inject_cleanup_succeeded IS NOT NULL
+             AND NEW.delivery_cleanup_succeeded IS NOT NULL
+             AND NEW.pty_cleanup_succeeded IS NOT NULL
+             AND NEW.screen_cleanup_succeeded IS NOT NULL
+             AND NEW.write_queue_cleanup_succeeded IS NOT NULL
+             AND NEW.cleanup_completed_at IS NOT NULL)
+        )
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal handoff process evidence is inconsistent');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS terminal_handoffs_process_evidence_update
+    BEFORE UPDATE OF sigterm_requested_wall_at, sigterm_requested_monotonic_ns,
+                     sigterm_request_result, child_exit_observed_wall_at,
+                     child_exit_observed_monotonic_ns, child_exit_code,
+                     child_exit_signal, sigterm_to_exit_ms,
+                     delivery_exit_context, waitpid_reaped,
+                     inject_cleanup_succeeded, delivery_cleanup_succeeded,
+                     pty_cleanup_succeeded, screen_cleanup_succeeded,
+                     write_queue_cleanup_succeeded, cleanup_completed_at
+    ON terminal_handoffs
+    WHEN NOT (
+        (
+            (NEW.sigterm_request_result = ''
+             AND NEW.sigterm_requested_wall_at IS NULL
+             AND NEW.sigterm_requested_monotonic_ns IS NULL)
+            OR
+            (NEW.sigterm_request_result != ''
+             AND NEW.sigterm_requested_wall_at IS NOT NULL
+             AND NEW.sigterm_requested_monotonic_ns IS NOT NULL)
+        )
+        AND
+        (
+            (NEW.child_exit_observed_wall_at IS NULL
+             AND NEW.child_exit_observed_monotonic_ns IS NULL
+             AND NEW.child_exit_code IS NULL
+             AND NEW.child_exit_signal IS NULL
+             AND NEW.sigterm_to_exit_ms IS NULL
+             AND NEW.delivery_exit_context = '')
+            OR
+            (NEW.child_exit_observed_wall_at IS NOT NULL
+             AND NEW.child_exit_observed_monotonic_ns IS NOT NULL
+             AND ((NEW.child_exit_code IS NOT NULL
+                   AND NEW.child_exit_signal IS NULL)
+                  OR
+                  (NEW.child_exit_code IS NULL
+                   AND NEW.child_exit_signal IS NOT NULL))
+             AND (
+                 (NEW.sigterm_request_result = 'sent'
+                  AND NEW.sigterm_to_exit_ms IS NOT NULL)
+                 OR
+                 (NEW.sigterm_request_result = ''
+                  AND NEW.sigterm_to_exit_ms IS NULL)
+             )
+             AND NEW.delivery_exit_context != '')
+        )
+        AND
+        (
+            (NEW.waitpid_reaped IS NULL
+             AND NEW.inject_cleanup_succeeded IS NULL
+             AND NEW.delivery_cleanup_succeeded IS NULL
+             AND NEW.pty_cleanup_succeeded IS NULL
+             AND NEW.screen_cleanup_succeeded IS NULL
+             AND NEW.write_queue_cleanup_succeeded IS NULL
+             AND NEW.cleanup_completed_at IS NULL)
+            OR
+            (NEW.waitpid_reaped IS NOT NULL
+             AND NEW.inject_cleanup_succeeded IS NOT NULL
+             AND NEW.delivery_cleanup_succeeded IS NOT NULL
+             AND NEW.pty_cleanup_succeeded IS NOT NULL
+             AND NEW.screen_cleanup_succeeded IS NOT NULL
+             AND NEW.write_queue_cleanup_succeeded IS NOT NULL
+             AND NEW.cleanup_completed_at IS NOT NULL)
+        )
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal handoff process evidence is inconsistent');
     END;
 
     CREATE TABLE IF NOT EXISTS terminal_transition_audit (
@@ -437,6 +751,139 @@ const MIGRATIONS: &[(i32, &str)] = &[
     ),
     (18, REVIEW_SCHEMA_SQL),
     (19, HANDOFF_SCHEMA_SQL),
+    // v20 is applied by `ensure_handoff_v20_columns` so stamped partial
+    // migrations can repair individual missing columns without recreating or
+    // archiving any typed control-plane table.
+    (20, ""),
+];
+
+const HANDOFF_V20_COLUMNS: &[(&str, &str, &str)] = &[
+    (
+        "terminal_chains",
+        "supervisor_pid",
+        "ALTER TABLE terminal_chains ADD COLUMN supervisor_pid INTEGER
+         CHECK (supervisor_pid IS NULL OR supervisor_pid > 0)",
+    ),
+    (
+        "terminal_chains",
+        "supervisor_pgid",
+        "ALTER TABLE terminal_chains ADD COLUMN supervisor_pgid INTEGER
+         CHECK (supervisor_pgid IS NULL OR supervisor_pgid > 0)",
+    ),
+    (
+        "terminal_chains",
+        "outer_foreground_pgid",
+        "ALTER TABLE terminal_chains ADD COLUMN outer_foreground_pgid INTEGER
+         CHECK (outer_foreground_pgid IS NULL OR outer_foreground_pgid > 0)",
+    ),
+    (
+        "terminal_chains",
+        "outer_tty_device",
+        "ALTER TABLE terminal_chains ADD COLUMN outer_tty_device INTEGER
+         CHECK (outer_tty_device IS NULL OR outer_tty_device > 0)",
+    ),
+    (
+        "terminal_chains",
+        "outer_tty_inode",
+        "ALTER TABLE terminal_chains ADD COLUMN outer_tty_inode INTEGER
+         CHECK (outer_tty_inode IS NULL OR outer_tty_inode > 0)",
+    ),
+    (
+        "terminal_handoffs",
+        "sigterm_requested_wall_at",
+        "ALTER TABLE terminal_handoffs ADD COLUMN sigterm_requested_wall_at REAL",
+    ),
+    (
+        "terminal_handoffs",
+        "sigterm_requested_monotonic_ns",
+        "ALTER TABLE terminal_handoffs ADD COLUMN sigterm_requested_monotonic_ns INTEGER
+         CHECK (sigterm_requested_monotonic_ns IS NULL
+                OR sigterm_requested_monotonic_ns >= 0)",
+    ),
+    (
+        "terminal_handoffs",
+        "sigterm_request_result",
+        "ALTER TABLE terminal_handoffs ADD COLUMN sigterm_request_result TEXT NOT NULL DEFAULT ''
+         CHECK (sigterm_request_result IN (
+             '', 'sent', 'not_found', 'permission_denied', 'error'
+         ))",
+    ),
+    (
+        "terminal_handoffs",
+        "child_exit_observed_wall_at",
+        "ALTER TABLE terminal_handoffs ADD COLUMN child_exit_observed_wall_at REAL",
+    ),
+    (
+        "terminal_handoffs",
+        "child_exit_observed_monotonic_ns",
+        "ALTER TABLE terminal_handoffs ADD COLUMN child_exit_observed_monotonic_ns INTEGER
+         CHECK (child_exit_observed_monotonic_ns IS NULL
+                OR child_exit_observed_monotonic_ns >= 0)",
+    ),
+    (
+        "terminal_handoffs",
+        "child_exit_code",
+        "ALTER TABLE terminal_handoffs ADD COLUMN child_exit_code INTEGER",
+    ),
+    (
+        "terminal_handoffs",
+        "child_exit_signal",
+        "ALTER TABLE terminal_handoffs ADD COLUMN child_exit_signal INTEGER",
+    ),
+    (
+        "terminal_handoffs",
+        "sigterm_to_exit_ms",
+        "ALTER TABLE terminal_handoffs ADD COLUMN sigterm_to_exit_ms INTEGER
+         CHECK (sigterm_to_exit_ms IS NULL
+                OR sigterm_to_exit_ms BETWEEN 0 AND 86400000)",
+    ),
+    (
+        "terminal_handoffs",
+        "delivery_exit_context",
+        "ALTER TABLE terminal_handoffs ADD COLUMN delivery_exit_context TEXT NOT NULL DEFAULT ''
+         CHECK (delivery_exit_context IN ('', 'exit:closed', 'exit:killed'))",
+    ),
+    (
+        "terminal_handoffs",
+        "waitpid_reaped",
+        "ALTER TABLE terminal_handoffs ADD COLUMN waitpid_reaped INTEGER
+         CHECK (waitpid_reaped IN (0, 1))",
+    ),
+    (
+        "terminal_handoffs",
+        "inject_cleanup_succeeded",
+        "ALTER TABLE terminal_handoffs ADD COLUMN inject_cleanup_succeeded INTEGER
+         CHECK (inject_cleanup_succeeded IN (0, 1))",
+    ),
+    (
+        "terminal_handoffs",
+        "delivery_cleanup_succeeded",
+        "ALTER TABLE terminal_handoffs ADD COLUMN delivery_cleanup_succeeded INTEGER
+         CHECK (delivery_cleanup_succeeded IN (0, 1))",
+    ),
+    (
+        "terminal_handoffs",
+        "pty_cleanup_succeeded",
+        "ALTER TABLE terminal_handoffs ADD COLUMN pty_cleanup_succeeded INTEGER
+         CHECK (pty_cleanup_succeeded IN (0, 1))",
+    ),
+    (
+        "terminal_handoffs",
+        "screen_cleanup_succeeded",
+        "ALTER TABLE terminal_handoffs ADD COLUMN screen_cleanup_succeeded INTEGER
+         CHECK (screen_cleanup_succeeded IN (0, 1))",
+    ),
+    (
+        "terminal_handoffs",
+        "write_queue_cleanup_succeeded",
+        "ALTER TABLE terminal_handoffs ADD COLUMN write_queue_cleanup_succeeded INTEGER
+         CHECK (write_queue_cleanup_succeeded IN (0, 1))",
+    ),
+    (
+        "terminal_handoffs",
+        "cleanup_completed_at",
+        "ALTER TABLE terminal_handoffs ADD COLUMN cleanup_completed_at REAL",
+    ),
 ];
 
 const HANDOFF_TABLE_COLUMNS: &[(&str, &[&str])] = &[
@@ -452,6 +899,11 @@ const HANDOFF_TABLE_COLUMNS: &[(&str, &[&str])] = &[
             "policy_ref",
             "supervisor_process_id",
             "supervisor_process_birth_identity",
+            "supervisor_pid",
+            "supervisor_pgid",
+            "outer_foreground_pgid",
+            "outer_tty_device",
+            "outer_tty_inode",
             "current_generation",
             "state",
             "version",
@@ -506,6 +958,22 @@ const HANDOFF_TABLE_COLUMNS: &[(&str, &[&str])] = &[
             "quiesce_process_birth_identity",
             "quiesce_committed_version",
             "stop_observed_at",
+            "sigterm_requested_wall_at",
+            "sigterm_requested_monotonic_ns",
+            "sigterm_request_result",
+            "child_exit_observed_wall_at",
+            "child_exit_observed_monotonic_ns",
+            "child_exit_code",
+            "child_exit_signal",
+            "sigterm_to_exit_ms",
+            "delivery_exit_context",
+            "waitpid_reaped",
+            "inject_cleanup_succeeded",
+            "delivery_cleanup_succeeded",
+            "pty_cleanup_succeeded",
+            "screen_cleanup_succeeded",
+            "write_queue_cleanup_succeeded",
+            "cleanup_completed_at",
             "failure_kind",
             "failure_reason",
             "created_at",
@@ -545,10 +1013,15 @@ const HANDOFF_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("index", "idx_terminal_handoffs_chain"),
     ("index", "idx_terminal_transition_audit_chain"),
     ("trigger", "terminal_chains_immutable_identity_policy"),
+    ("trigger", "terminal_chains_outer_evidence_insert"),
+    ("trigger", "terminal_chains_outer_evidence_update"),
     ("trigger", "terminal_generations_monotonic_insert"),
     ("trigger", "terminal_generations_immutable_identity"),
     ("trigger", "terminal_handoffs_immutable_snapshot"),
     ("trigger", "terminal_handoffs_quiesce_once"),
+    ("trigger", "terminal_handoffs_process_evidence_once"),
+    ("trigger", "terminal_handoffs_process_evidence_insert"),
+    ("trigger", "terminal_handoffs_process_evidence_update"),
     ("trigger", "terminal_transition_audit_no_update"),
     ("trigger", "terminal_transition_audit_no_delete"),
 ];
@@ -639,6 +1112,55 @@ fn review_schema_is_complete(conn: &Connection) -> Result<bool> {
 
 fn handoff_schema_is_complete(conn: &Connection) -> Result<bool> {
     schema_objects_are_complete(conn, HANDOFF_TABLE_COLUMNS, HANDOFF_SCHEMA_OBJECTS)
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let present = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|row| row.ok())
+        .any(|name| name == column);
+    Ok(present)
+}
+
+/// Add only missing v20 evidence columns, then refresh the two triggers whose
+/// definitions reference them. This is safe for both a real v19 migration and
+/// a v20 database that was stamped after only part of the ALTER sequence.
+fn ensure_handoff_v20_columns(conn: &Connection) -> Result<()> {
+    let have_chain: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'terminal_chains'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let have_handoff: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'terminal_handoffs'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !have_chain || !have_handoff {
+        conn.execute_batch(HANDOFF_SCHEMA_SQL)?;
+    }
+    for (table, column, sql) in HANDOFF_V20_COLUMNS {
+        if !table_has_column(conn, table, column)? {
+            conn.execute_batch(sql)?;
+        }
+    }
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS terminal_chains_immutable_identity_policy;
+         DROP TRIGGER IF EXISTS terminal_chains_outer_evidence_insert;
+         DROP TRIGGER IF EXISTS terminal_chains_outer_evidence_update;
+         DROP TRIGGER IF EXISTS terminal_handoffs_process_evidence_once;
+         DROP TRIGGER IF EXISTS terminal_handoffs_process_evidence_insert;
+         DROP TRIGGER IF EXISTS terminal_handoffs_process_evidence_update;",
+    )?;
+    conn.execute_batch(HANDOFF_SCHEMA_SQL)?;
+    Ok(())
 }
 
 /// Schema compatibility check result
@@ -920,6 +1442,17 @@ impl HcomDb {
         )?;
 
         tx.execute_batch(REVIEW_SCHEMA_SQL)?;
+        let has_handoff_tables: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'terminal_handoffs'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_handoff_tables {
+            ensure_handoff_v20_columns(&tx)?;
+        }
         tx.execute_batch(HANDOFF_SCHEMA_SQL)?;
         if !review_schema_is_complete(&tx)? || !handoff_schema_is_complete(&tx)? {
             anyhow::bail!("migrated control-plane schema is incomplete");
@@ -939,7 +1472,21 @@ impl HcomDb {
     pub fn ensure_schema(&mut self) -> Result<()> {
         match self.check_schema_compat()? {
             SchemaCompat::Ok => {
-                self.init_db()?;
+                // The compatibility check above is deliberately read-only. A
+                // complete current database is the overwhelmingly common
+                // case, so return without taking a writer lock. Fresh,
+                // partially initialized, or repairable databases still enter
+                // init_db(), which re-checks version/completeness after
+                // acquiring BEGIN IMMEDIATE.
+                let current: i32 = self
+                    .conn
+                    .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+                if current != SCHEMA_VERSION
+                    || !review_schema_is_complete(&self.conn)?
+                    || !handoff_schema_is_complete(&self.conn)?
+                {
+                    self.init_db()?;
+                }
                 Ok(())
             }
             SchemaCompat::NeedsArchive(reason, old_version) => {
@@ -1221,11 +1768,23 @@ impl HcomDb {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let current: i32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if current == SCHEMA_VERSION {
-            // Handles a DB stamped at the current version with missing Phase 1
-            // tables/indexes/triggers. CREATE IF NOT EXISTS repairs missing
-            // objects without touching existing data; malformed existing
-            // tables are detected before commit and fail closed.
+            // Handles a DB stamped at the current version with missing typed
+            // tables/indexes/triggers or only part of the v20 ALTER sequence.
+            // Repairs are additive and happen under this writer transaction;
+            // malformed existing tables are detected before commit and fail
+            // closed.
             tx.execute_batch(REVIEW_SCHEMA_SQL)?;
+            let has_handoff_tables: bool = tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'terminal_handoffs'
+                 )",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_handoff_tables {
+                ensure_handoff_v20_columns(&tx)?;
+            }
             tx.execute_batch(HANDOFF_SCHEMA_SQL)?;
             if !review_schema_is_complete(&tx)? || !handoff_schema_is_complete(&tx)? {
                 return Ok(false);
@@ -1275,7 +1834,11 @@ impl HcomDb {
             let Some((_, sql)) = MIGRATIONS.iter().find(|(v, _)| *v == next_version) else {
                 return Ok(false);
             };
-            tx.execute_batch(sql)?;
+            if next_version == 20 {
+                ensure_handoff_v20_columns(&tx)?;
+            } else {
+                tx.execute_batch(sql)?;
+            }
             tx.execute_batch(&format!("PRAGMA user_version = {}", next_version))?;
         }
         if !review_schema_is_complete(&tx)? || !handoff_schema_is_complete(&tx)? {
@@ -1557,6 +2120,98 @@ pub(super) mod tests {
         (db, db_path)
     }
 
+    fn rebuild_handoff_tables_with_v19_columns(conn: &Connection, stamped_version: i32) {
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             CREATE TABLE terminal_chains_v19 AS
+             SELECT id, workspace, tool, model_ref, reasoning_ref,
+                    permission_policy_ref, policy_ref, supervisor_process_id,
+                    supervisor_process_birth_identity, current_generation,
+                    state, version, created_at, updated_at
+             FROM terminal_chains;
+             CREATE TABLE terminal_handoffs_v19 AS
+             SELECT id, chain_id, source_generation, target_generation,
+                    source_launch_nonce, source_instance_name,
+                    source_hcom_session_id, source_native_session_id,
+                    source_wrapper_process_id, source_process_birth_identity,
+                    bundle_event_id, bundle_digest, bundle_size_bytes,
+                    workspace, revision, branch, dirty_summary, policy_ref,
+                    state, version, quiesce_token, quiesce_generation,
+                    quiesce_native_session_id, quiesce_process_id,
+                    quiesce_process_birth_identity, quiesce_committed_version,
+                    stop_observed_at, failure_kind, failure_reason,
+                    created_at, updated_at, committed_at, accepted_at
+             FROM terminal_handoffs;
+             DROP TABLE terminal_handoffs;
+             DROP TABLE terminal_chains;
+             ALTER TABLE terminal_chains_v19 RENAME TO terminal_chains;
+             ALTER TABLE terminal_handoffs_v19 RENAME TO terminal_handoffs;",
+        )
+        .unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA user_version = {stamped_version};
+             PRAGMA foreign_keys = ON;"
+        ))
+        .unwrap();
+    }
+
+    fn insert_preserved_phase1_handoff(conn: &Connection) {
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO events (timestamp, type, instance, data)
+             VALUES (
+                 '2026-07-27T00:00:00Z', 'bundle', 'source',
+                 '{\"bundle_id\":\"bundle:migrate\",\"created_by\":\"source\"}'
+             );
+             INSERT INTO terminal_chains (
+                 id, workspace, tool, model_ref, reasoning_ref,
+                 permission_policy_ref, policy_ref, supervisor_process_id,
+                 supervisor_process_birth_identity, current_generation,
+                 state, version, created_at, updated_at
+             ) VALUES (
+                 'tc-migrate', '/tmp', 'codex', 'model', 'reasoning',
+                 'permission', 'policy', 'supervisor', 'supervisor-birth',
+                 1, 'prepared', 0, 1.0, 1.0
+             );
+             INSERT INTO terminal_generations (
+                 chain_id, generation, launch_nonce, wrapper_process_id,
+                 process_birth_identity, instance_name, hcom_session_id,
+                 native_session_id, state, version, created_at, updated_at
+             ) VALUES (
+                 'tc-migrate', 1, 'nonce-1', 'process-1', 'birth-1',
+                 'source', 'hcom-source', 'native-source',
+                 'handoff_prepared', 0, 1.0, 1.0
+             );
+             INSERT INTO terminal_generations (
+                 chain_id, generation, launch_nonce, state, version,
+                 created_at, updated_at
+             ) VALUES (
+                 'tc-migrate', 2, 'nonce-2', 'reserved', 0, 1.0, 1.0
+             );
+             INSERT INTO terminal_handoffs (
+                 id, chain_id, source_generation, target_generation,
+                 source_launch_nonce, source_instance_name,
+                 source_hcom_session_id, source_native_session_id,
+                 source_wrapper_process_id, source_process_birth_identity,
+                 bundle_event_id, bundle_digest, bundle_size_bytes,
+                 workspace, revision, branch, dirty_summary, policy_ref,
+                 state, version, created_at, updated_at
+             ) VALUES (
+                 'ho-migrate', 'tc-migrate', 1, 2, 'nonce-1', 'source',
+                 'hcom-source', 'native-source', 'process-1', 'birth-1',
+                 (SELECT id FROM events
+                  WHERE instance = 'source' AND type = 'bundle'
+                  ORDER BY id DESC LIMIT 1),
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                 17, '/tmp', 'revision', 'main',
+                 'staged=0,unstaged=0,untracked=0,conflicted=0',
+                 'policy', 'prepared', 0, 1.0, 1.0
+             );
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+    }
+
     #[test]
     fn test_init_db_creates_all_tables() {
         let (db, db_path) = setup_full_test_db();
@@ -1612,6 +2267,34 @@ pub(super) mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
 
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_current_complete_open_does_not_wait_for_writer_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (db, db_path) = setup_full_test_db();
+        drop(db);
+
+        let writer = Connection::open(&db_path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; BEGIN IMMEDIATE;")
+            .unwrap();
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let open_path = db_path.clone();
+        let handle = std::thread::spawn(move || {
+            tx.send(HcomDb::open_at(&open_path).map(|_| ())).unwrap();
+        });
+        let result = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("current complete open waited for the held writer transaction");
+        result.unwrap();
+
+        writer.execute_batch("ROLLBACK").unwrap();
+        handle.join().unwrap();
         cleanup_test_db(db_path);
     }
 
@@ -2207,6 +2890,189 @@ pub(super) mod tests {
             terminal_schema_objects(fresh.conn())
         );
         cleanup_test_db(fresh_path);
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_real_v19_shape_migrates_to_v20_without_losing_handoff_state() {
+        let (db, db_path) = setup_full_test_db();
+        insert_preserved_phase1_handoff(db.conn());
+        rebuild_handoff_tables_with_v19_columns(db.conn(), 19);
+        drop(db);
+
+        let migrated = HcomDb::open_at(&db_path).unwrap();
+        assert!(handoff_schema_is_complete(migrated.conn()).unwrap());
+        let version: i32 = migrated
+            .conn()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 20);
+        let preserved: (String, i64, String, i64, Option<i64>, String) = migrated
+            .conn()
+            .query_row(
+                "SELECT chain_id, target_generation, bundle_digest,
+                        bundle_size_bytes, child_exit_signal,
+                        sigterm_request_result
+                 FROM terminal_handoffs WHERE id = 'ho-migrate'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                "tc-migrate".to_string(),
+                2,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                17,
+                None,
+                String::new(),
+            )
+        );
+        type OsEvidence = (
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        );
+        let os_evidence: OsEvidence = migrated
+            .conn()
+            .query_row(
+                "SELECT supervisor_pid, supervisor_pgid,
+                            outer_foreground_pgid, outer_tty_device,
+                            outer_tty_inode
+                     FROM terminal_chains WHERE id = 'tc-migrate'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(os_evidence, (None, None, None, None, None));
+        assert!(
+            migrated
+                .conn()
+                .execute(
+                    "INSERT INTO terminal_chains (
+                         id, workspace, tool, model_ref, reasoning_ref,
+                         permission_policy_ref, policy_ref,
+                         supervisor_process_id,
+                         supervisor_process_birth_identity,
+                         supervisor_pid, current_generation, state, version,
+                         created_at, updated_at
+                     ) VALUES (
+                         'tc-partial-outer', '/tmp', 'codex', 'model',
+                         'reasoning', 'permission', 'policy', 'supervisor-2',
+                         'supervisor-birth-2', 42, 1, 'active', 0, 1.0, 1.0
+                     )",
+                    [],
+                )
+                .is_err(),
+            "migrated schema must reject partial outer-terminal evidence"
+        );
+        assert!(
+            migrated
+                .conn()
+                .execute(
+                    "UPDATE terminal_handoffs
+                     SET sigterm_request_result = 'sent'
+                     WHERE id = 'ho-migrate'",
+                    [],
+                )
+                .is_err(),
+            "migrated schema must reject a SIGTERM result without timestamps"
+        );
+        assert!(
+            migrated
+                .conn()
+                .execute(
+                    "UPDATE terminal_handoffs
+                     SET waitpid_reaped = 1
+                     WHERE id = 'ho-migrate'",
+                    [],
+                )
+                .is_err(),
+            "migrated schema must reject partial cleanup evidence"
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_stamped_partial_v20_adds_only_missing_evidence_columns() {
+        let (db, db_path) = setup_full_test_db();
+        insert_preserved_phase1_handoff(db.conn());
+        rebuild_handoff_tables_with_v19_columns(db.conn(), 20);
+        drop(db);
+
+        let repaired = HcomDb::open_at(&db_path).unwrap();
+        assert!(handoff_schema_is_complete(repaired.conn()).unwrap());
+        let preserved: i64 = repaired
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM terminal_handoffs
+                 WHERE id = 'ho-migrate' AND bundle_size_bytes = 17",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, 1);
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_concurrent_v19_to_v20_migration_is_atomic_and_idempotent() {
+        use std::sync::{Arc, Barrier};
+
+        let (db, db_path) = setup_full_test_db();
+        insert_preserved_phase1_handoff(db.conn());
+        rebuild_handoff_tables_with_v19_columns(db.conn(), 19);
+        drop(db);
+
+        let barrier = Arc::new(Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let db_path = db_path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    HcomDb::open_at(&db_path).map(|db| {
+                        db.conn()
+                            .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                            .unwrap()
+                    })
+                })
+            })
+            .collect();
+        for result in handles.into_iter().map(|handle| handle.join().unwrap()) {
+            assert_eq!(result.unwrap(), 20);
+        }
+        let db = HcomDb::open_at(&db_path).unwrap();
+        assert!(handoff_schema_is_complete(db.conn()).unwrap());
+        let preserved: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM terminal_handoffs WHERE id = 'ho-migrate'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, 1);
         cleanup_test_db(db_path);
     }
 

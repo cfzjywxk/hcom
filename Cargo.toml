@@ -13,6 +13,11 @@ rust-version = "1.88"
 name = "hcom"
 path = "src/main.rs"
 
+[[test]]
+name = "fake_chain_integration"
+path = "tests/fake_chain_integration.rs"
+harness = false
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 vt100 = "0.16"

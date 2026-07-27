@@ -9,8 +9,8 @@ use crate::handoff::{HandoffError, MAX_STATUS_HUMAN_BYTES, TerminalChain, chain_
 use crate::shared::CommandContext;
 
 const CHAIN_AFTER_HELP: &str = "\
-Phase 1 provides status only. There is no chain start, Codex launch, recovery,
-or hidden production initialization command.";
+Phase 2 provides status only on the public CLI. There is no chain start, real
+Codex launch, recovery, or hidden production initialization command.";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -138,6 +138,11 @@ mod tests {
             policy_ref: "policy".to_string(),
             supervisor_process_id: "secret-supervisor-process".to_string(),
             supervisor_process_birth_identity: "secret-supervisor-birth".to_string(),
+            supervisor_pid: Some(41001),
+            supervisor_pgid: Some(41001),
+            outer_foreground_pgid: Some(41001),
+            outer_tty_device: Some(7),
+            outer_tty_inode: Some(11),
             current_generation: 1,
             state: crate::handoff::ChainState::Active,
             version: 0,

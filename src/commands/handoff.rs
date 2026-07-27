@@ -8,14 +8,16 @@ use serde_json::json;
 use crate::db::HcomDb;
 use crate::handoff::{
     HandoffActor, HandoffError, HandoffOutcome, MAX_STATUS_HUMAN_BYTES, MAX_STATUS_JSON_BYTES,
-    TerminalHandoff, abort_handoff, accept_handoff, commit_handoff, current_chain_for_actor,
-    handoff_status_for_actor, prepare_handoff, reject_handoff,
+    ManagedActorMarkers, TerminalHandoff, abort_handoff, accept_handoff, commit_handoff,
+    current_chain_for_actor, handoff_status_for_actor, prepare_handoff, reject_handoff,
+    resolve_managed_actor,
 };
 use crate::shared::{CommandContext, SenderKind};
 
 const HANDOFF_AFTER_HELP: &str = "\
-Phase 1 exposes only durable typed state. These commands never launch, stop,
-signal, or inject input into an agent.
+Phase 2 accepts mutations only from exact supervisor-owned generation context.
+The public CLI still never launches a chain or wires real Codex hooks; that
+adapter remains unavailable until Phase 3.
 
 Examples:
   hcom handoff prepare --bundle-event 123 --json
@@ -88,7 +90,10 @@ pub struct HandoffStatusArgs {
     pub json: bool,
 }
 
-pub(crate) fn actor_from_ctx(ctx: Option<&CommandContext>) -> Result<HandoffActor, HandoffError> {
+pub(crate) fn actor_from_ctx(
+    db: &HcomDb,
+    ctx: Option<&CommandContext>,
+) -> Result<HandoffActor, HandoffError> {
     let identity = ctx
         .and_then(|context| context.identity.as_ref())
         .ok_or(HandoffError::NotManaged)?;
@@ -122,28 +127,44 @@ pub(crate) fn actor_from_ctx(ctx: Option<&CommandContext>) -> Result<HandoffActo
         .ok()
         .filter(|value| !value.is_empty())
         .ok_or(HandoffError::NotManaged)?;
-
-    // Phase 1 intentionally has no supervisor/launcher wiring that can supply
-    // the independently observed wrapper birth identity or generation. Use a
-    // fresh, invocation-local sentinel that cannot have been persisted by an
-    // earlier chain creation. Ordinary sessions therefore fail closed; Phase 2
-    // will replace this with supervisor-owned identity material without
-    // changing the CLI/state service contract.
-    Ok(HandoffActor {
-        instance_name: identity.name.clone(),
-        hcom_session_id: session_id.to_string(),
-        native_session_id: Some(session_id.to_string()),
-        process_id,
-        process_birth_identity: format!("phase1-unavailable-{}", uuid::Uuid::new_v4().simple()),
-        generation: 1,
-    })
+    let chain_id = std::env::var("HCOM_CHAIN_ID")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or(HandoffError::NotManaged)?;
+    let generation = std::env::var("HCOM_CHAIN_GENERATION")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or(HandoffError::NotManaged)?;
+    let launch_nonce = std::env::var("HCOM_CHAIN_LAUNCH_NONCE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or(HandoffError::NotManaged)?;
+    let process_birth_identity = std::env::var("HCOM_CHAIN_PROCESS_BIRTH_IDENTITY")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or(HandoffError::NotManaged)?;
+    hcom::chain_supervisor::verify_current_process_scope(&process_birth_identity)
+        .map_err(|_| HandoffError::NotManaged)?;
+    resolve_managed_actor(
+        db,
+        &identity.name,
+        session_id,
+        &process_id,
+        &ManagedActorMarkers {
+            chain_id,
+            generation,
+            launch_nonce,
+            process_birth_identity,
+        },
+    )
 }
 
 pub(crate) fn managed_actor_from_ctx(
     db: &HcomDb,
     ctx: Option<&CommandContext>,
 ) -> Result<HandoffActor, HandoffError> {
-    let actor = actor_from_ctx(ctx)?;
+    let actor = actor_from_ctx(db, ctx)?;
     match current_chain_for_actor(db, &actor)? {
         Some(_) => Ok(actor),
         None => Err(HandoffError::NotManaged),
@@ -176,6 +197,26 @@ fn handoff_json(handoff: &TerminalHandoff, replayed: Option<bool>) -> serde_json
         "failure": {
             "kind": handoff.failure_kind,
             "reason": handoff.failure_reason,
+        },
+        "quiesce_evidence": {
+            "sigterm_requested_wall_at": handoff.sigterm_requested_wall_at,
+            "sigterm_requested_monotonic_ns": handoff.sigterm_requested_monotonic_ns,
+            "sigterm_request_result": handoff.sigterm_request_result,
+            "child_exit_observed_wall_at": handoff.child_exit_observed_wall_at,
+            "child_exit_observed_monotonic_ns": handoff.child_exit_observed_monotonic_ns,
+            "exit_code": handoff.child_exit_code,
+            "exit_signal": handoff.child_exit_signal,
+            "sigterm_to_exit_ms": handoff.sigterm_to_exit_ms,
+            "delivery_exit_context": handoff.delivery_exit_context,
+            "waitpid_reaped": handoff.waitpid_reaped,
+            "cleanup": {
+                "inject": handoff.inject_cleanup_succeeded,
+                "delivery": handoff.delivery_cleanup_succeeded,
+                "pty": handoff.pty_cleanup_succeeded,
+                "screen": handoff.screen_cleanup_succeeded,
+                "write_queue": handoff.write_queue_cleanup_succeeded,
+                "completed_at": handoff.cleanup_completed_at,
+            },
         },
         "created_at": handoff.created_at,
         "updated_at": handoff.updated_at,
@@ -275,6 +316,8 @@ fn handoff_human(handoff: &TerminalHandoff) -> Result<String, HandoffError> {
         "{} state={} version={} source_generation={} target_generation={}\n\
          chain={} bundle_event={} bundle_bytes={}\n\
          workspace={}\nrevision={} branch={}\ndirty_summary={}\npolicy_ref={}\n\
+         sigterm_result={} sigterm_to_exit_ms={:?} exit_code={:?} exit_signal={:?}\n\
+         delivery_exit_context={} reaped={:?}\n\
          failure_kind={} failure_reason={}",
         handoff.id,
         handoff.state,
@@ -289,6 +332,12 @@ fn handoff_human(handoff: &TerminalHandoff) -> Result<String, HandoffError> {
         handoff.branch,
         handoff.dirty_summary,
         handoff.policy_ref,
+        handoff.sigterm_request_result,
+        handoff.sigterm_to_exit_ms,
+        handoff.child_exit_code,
+        handoff.child_exit_signal,
+        handoff.delivery_exit_context,
+        handoff.waitpid_reaped,
         handoff.failure_kind,
         handoff.failure_reason,
     );
@@ -470,6 +519,22 @@ mod tests {
             quiesce_process_birth_identity: Some("secret-birth".to_string()),
             quiesce_committed_version: Some(1),
             stop_observed_at: None,
+            sigterm_requested_wall_at: None,
+            sigterm_requested_monotonic_ns: None,
+            sigterm_request_result: String::new(),
+            child_exit_observed_wall_at: None,
+            child_exit_observed_monotonic_ns: None,
+            child_exit_code: None,
+            child_exit_signal: None,
+            sigterm_to_exit_ms: None,
+            delivery_exit_context: String::new(),
+            waitpid_reaped: None,
+            inject_cleanup_succeeded: None,
+            delivery_cleanup_succeeded: None,
+            pty_cleanup_succeeded: None,
+            screen_cleanup_succeeded: None,
+            write_queue_cleanup_succeeded: None,
+            cleanup_completed_at: None,
             failure_kind: String::new(),
             failure_reason: String::new(),
             created_at: 1.0,

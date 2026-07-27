@@ -31,6 +31,7 @@ pub const MAX_FAILURE_REASON_BYTES: usize = 1024;
 pub const MAX_HANDOFF_BUNDLE_BYTES: usize = 1024 * 1024;
 pub const MAX_STATUS_JSON_BYTES: usize = 16 * 1024;
 pub const MAX_STATUS_HUMAN_BYTES: usize = 16 * 1024;
+pub const MAX_QUIESCE_ELAPSED_MS: i64 = 86_400_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainState {
@@ -209,6 +210,11 @@ pub struct TerminalChain {
     pub policy_ref: String,
     pub supervisor_process_id: String,
     pub supervisor_process_birth_identity: String,
+    pub supervisor_pid: Option<i64>,
+    pub supervisor_pgid: Option<i64>,
+    pub outer_foreground_pgid: Option<i64>,
+    pub outer_tty_device: Option<i64>,
+    pub outer_tty_inode: Option<i64>,
     pub current_generation: i64,
     pub state: ChainState,
     pub version: i64,
@@ -230,6 +236,11 @@ impl TerminalChain {
             policy_ref: row.get("policy_ref")?,
             supervisor_process_id: row.get("supervisor_process_id")?,
             supervisor_process_birth_identity: row.get("supervisor_process_birth_identity")?,
+            supervisor_pid: row.get("supervisor_pid")?,
+            supervisor_pgid: row.get("supervisor_pgid")?,
+            outer_foreground_pgid: row.get("outer_foreground_pgid")?,
+            outer_tty_device: row.get("outer_tty_device")?,
+            outer_tty_inode: row.get("outer_tty_inode")?,
             current_generation: row.get("current_generation")?,
             state,
             version: row.get("version")?,
@@ -305,6 +316,22 @@ pub struct TerminalHandoff {
     pub quiesce_process_birth_identity: Option<String>,
     pub quiesce_committed_version: Option<i64>,
     pub stop_observed_at: Option<f64>,
+    pub sigterm_requested_wall_at: Option<f64>,
+    pub sigterm_requested_monotonic_ns: Option<i64>,
+    pub sigterm_request_result: String,
+    pub child_exit_observed_wall_at: Option<f64>,
+    pub child_exit_observed_monotonic_ns: Option<i64>,
+    pub child_exit_code: Option<i64>,
+    pub child_exit_signal: Option<i64>,
+    pub sigterm_to_exit_ms: Option<i64>,
+    pub delivery_exit_context: String,
+    pub waitpid_reaped: Option<bool>,
+    pub inject_cleanup_succeeded: Option<bool>,
+    pub delivery_cleanup_succeeded: Option<bool>,
+    pub pty_cleanup_succeeded: Option<bool>,
+    pub screen_cleanup_succeeded: Option<bool>,
+    pub write_queue_cleanup_succeeded: Option<bool>,
+    pub cleanup_completed_at: Option<f64>,
     pub failure_kind: String,
     pub failure_reason: String,
     pub created_at: f64,
@@ -345,6 +372,22 @@ impl TerminalHandoff {
             quiesce_process_birth_identity: row.get("quiesce_process_birth_identity")?,
             quiesce_committed_version: row.get("quiesce_committed_version")?,
             stop_observed_at: row.get("stop_observed_at")?,
+            sigterm_requested_wall_at: row.get("sigterm_requested_wall_at")?,
+            sigterm_requested_monotonic_ns: row.get("sigterm_requested_monotonic_ns")?,
+            sigterm_request_result: row.get("sigterm_request_result")?,
+            child_exit_observed_wall_at: row.get("child_exit_observed_wall_at")?,
+            child_exit_observed_monotonic_ns: row.get("child_exit_observed_monotonic_ns")?,
+            child_exit_code: row.get("child_exit_code")?,
+            child_exit_signal: row.get("child_exit_signal")?,
+            sigterm_to_exit_ms: row.get("sigterm_to_exit_ms")?,
+            delivery_exit_context: row.get("delivery_exit_context")?,
+            waitpid_reaped: row.get("waitpid_reaped")?,
+            inject_cleanup_succeeded: row.get("inject_cleanup_succeeded")?,
+            delivery_cleanup_succeeded: row.get("delivery_cleanup_succeeded")?,
+            pty_cleanup_succeeded: row.get("pty_cleanup_succeeded")?,
+            screen_cleanup_succeeded: row.get("screen_cleanup_succeeded")?,
+            write_queue_cleanup_succeeded: row.get("write_queue_cleanup_succeeded")?,
+            cleanup_completed_at: row.get("cleanup_completed_at")?,
             failure_kind: row.get("failure_kind")?,
             failure_reason: row.get("failure_reason")?,
             created_at: row.get("created_at")?,
@@ -382,6 +425,18 @@ pub struct SupervisorActor {
     pub process_birth_identity: String,
 }
 
+/// Opaque supervisor-owned metadata inherited by one generation wrapper.
+///
+/// The values identify an already materialized typed generation; they never
+/// contain a bundle, task, argv snapshot, environment snapshot, or auth data.
+#[derive(Debug, Clone)]
+pub struct ManagedActorMarkers {
+    pub chain_id: String,
+    pub generation: i64,
+    pub launch_nonce: String,
+    pub process_birth_identity: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChainSpec {
     pub workspace: PathBuf,
@@ -392,6 +447,11 @@ pub struct ChainSpec {
     pub policy_ref: String,
     pub supervisor_process_id: String,
     pub supervisor_process_birth_identity: String,
+    pub supervisor_pid: i64,
+    pub supervisor_pgid: i64,
+    pub outer_foreground_pgid: i64,
+    pub outer_tty_device: i64,
+    pub outer_tty_inode: i64,
     pub launch_nonce: String,
 }
 
@@ -407,6 +467,34 @@ pub struct GenerationOutcome {
     pub replayed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorShutdownReason {
+    Explicit,
+    OuterHangup,
+}
+
+impl SupervisorShutdownReason {
+    fn failure(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Explicit => (
+                "supervisor_shutdown",
+                "foreground supervisor stopped by explicit local control",
+            ),
+            Self::OuterHangup => (
+                "outer_hangup",
+                "outer terminal hangup stopped the foreground chain",
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChainShutdownObservation {
+    pub expected_chain_version: i64,
+    pub expected_generation_version: i64,
+    pub reason: SupervisorShutdownReason,
+}
+
 #[derive(Debug, Clone)]
 pub struct StopObservation {
     pub expected_version: i64,
@@ -416,12 +504,111 @@ pub struct StopObservation {
     pub launch_nonce: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigtermRequestResult {
+    Sent,
+    NotFound,
+    PermissionDenied,
+    Error,
+}
+
+impl SigtermRequestResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::NotFound => "not_found",
+            Self::PermissionDenied => "permission_denied",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SigtermObservation {
+    pub expected_version: i64,
+    pub requested_wall_at: f64,
+    pub requested_monotonic_ns: i64,
+    pub result: SigtermRequestResult,
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetMaterialization {
+    pub expected_version: i64,
+    pub launch_nonce: String,
+    pub instance_name: String,
+    pub hcom_session_id: String,
+    pub process_id: String,
+    pub process_birth_identity: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetFailureIdentity {
+    pub instance_name: String,
+    pub hcom_session_id: String,
+    pub process_id: String,
+    pub process_birth_identity: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetLaunchFailure {
+    pub expected_version: i64,
+    pub launch_nonce: String,
+    pub identity: Option<TargetFailureIdentity>,
+    pub cleanup_completed: bool,
+    pub failure_kind: String,
+    pub failure_reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryExitContext {
+    Closed,
+    Killed,
+}
+
+impl DeliveryExitContext {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "exit:closed",
+            Self::Killed => "exit:killed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChildExitEvidence {
+    pub observed_wall_at: f64,
+    pub observed_monotonic_ns: i64,
+    pub exit_code: Option<i32>,
+    pub exit_signal: Option<i32>,
+    pub delivery_context: DeliveryExitContext,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ResourceCleanupEvidence {
+    pub inject_succeeded: bool,
+    pub delivery_succeeded: bool,
+    pub pty_succeeded: bool,
+    pub screen_succeeded: bool,
+    pub write_queue_succeeded: bool,
+}
+
+impl ResourceCleanupEvidence {
+    fn all_succeeded(self) -> bool {
+        self.inject_succeeded
+            && self.delivery_succeeded
+            && self.pty_succeeded
+            && self.screen_succeeded
+            && self.write_queue_succeeded
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CleanupObservation {
     pub expected_version: i64,
-    pub exited: bool,
+    pub exit: Option<ChildExitEvidence>,
     pub reaped: bool,
-    pub cleanup_succeeded: bool,
+    pub resources: ResourceCleanupEvidence,
+    pub failure_kind: String,
     pub failure_reason: String,
 }
 
@@ -507,6 +694,43 @@ fn validate_expected_version(expected_version: i64) -> Result<(), HandoffError> 
     if expected_version < 0 {
         return Err(HandoffError::Invalid(
             "expected version must be non-negative".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_observation_timestamp(value: f64, field: &'static str) -> Result<(), HandoffError> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(HandoffError::Invalid(format!(
+            "{field} must be a finite non-negative timestamp"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_monotonic_ns(value: i64, field: &'static str) -> Result<(), HandoffError> {
+    if value < 0 {
+        return Err(HandoffError::Invalid(format!(
+            "{field} must be non-negative"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_child_exit(exit: &ChildExitEvidence) -> Result<(), HandoffError> {
+    validate_observation_timestamp(exit.observed_wall_at, "child exit wall timestamp")?;
+    validate_monotonic_ns(exit.observed_monotonic_ns, "child exit monotonic timestamp")?;
+    if (exit.exit_code.is_some() as u8 + exit.exit_signal.is_some() as u8) != 1 {
+        return Err(HandoffError::Invalid(
+            "child exit evidence must contain exactly one exit code or signal".to_string(),
+        ));
+    }
+    if exit
+        .exit_signal
+        .is_some_and(|signal| !(1..=64).contains(&signal))
+    {
+        return Err(HandoffError::Invalid(
+            "child exit signal is outside the supported range".to_string(),
         ));
     }
     Ok(())
@@ -642,9 +866,39 @@ pub fn get_chain(db: &HcomDb, id: &str) -> Result<Option<TerminalChain>, Handoff
     load_chain(db.conn(), &id)
 }
 
+pub fn get_generation(
+    db: &HcomDb,
+    chain_id: &str,
+    generation: i64,
+) -> Result<Option<TerminalGeneration>, HandoffError> {
+    let chain_id = validate_opaque_id(chain_id, "chain ID")?;
+    if generation < 1 {
+        return Err(HandoffError::Invalid(
+            "generation must be a positive integer".to_string(),
+        ));
+    }
+    load_generation(db.conn(), &chain_id, generation)
+}
+
 pub fn get_handoff(db: &HcomDb, id: &str) -> Result<Option<TerminalHandoff>, HandoffError> {
     let id = validate_opaque_id(id, "handoff ID")?;
     load_handoff(db.conn(), &id)
+}
+
+pub fn get_open_handoff_for_chain(
+    db: &HcomDb,
+    chain_id: &str,
+) -> Result<Option<TerminalHandoff>, HandoffError> {
+    let chain_id = validate_opaque_id(chain_id, "chain ID")?;
+    db.conn()
+        .query_row(
+            "SELECT * FROM terminal_handoffs
+             WHERE chain_id = ?1 AND state NOT IN ('accepted', 'aborted')",
+            params![chain_id],
+            TerminalHandoff::from_row,
+        )
+        .optional()
+        .map_err(Into::into)
 }
 
 fn live_binding_matches(conn: &Connection, actor: &HandoffActor) -> Result<bool, HandoffError> {
@@ -754,6 +1008,73 @@ pub fn current_chain_for_actor(
     actor: &HandoffActor,
 ) -> Result<Option<(TerminalChain, TerminalGeneration)>, HandoffError> {
     find_actor_chain(db.conn(), actor)
+}
+
+/// Resolve CLI identity from exact live hcom identity plus immutable typed
+/// generation metadata. In particular, the native session is read only from
+/// `terminal_generations.native_session_id`; callers cannot supply or derive it
+/// from the mutable instance/session lifecycle rows.
+pub fn resolve_managed_actor(
+    db: &HcomDb,
+    instance_name: &str,
+    hcom_session_id: &str,
+    process_id: &str,
+    markers: &ManagedActorMarkers,
+) -> Result<HandoffActor, HandoffError> {
+    let chain_id =
+        validate_opaque_id(&markers.chain_id, "chain ID").map_err(|_| HandoffError::NotManaged)?;
+    if markers.generation < 1 {
+        return Err(HandoffError::NotManaged);
+    }
+    let launch_nonce = validate_opaque_id(&markers.launch_nonce, "launch nonce")
+        .map_err(|_| HandoffError::NotManaged)?;
+    let process_birth_identity = validate_text(
+        &markers.process_birth_identity,
+        "process birth identity",
+        MAX_IDENTITY_BYTES,
+        false,
+    )
+    .map_err(|_| HandoffError::NotManaged)?;
+    validate_text(
+        instance_name,
+        "instance identity",
+        MAX_INSTANCE_NAME_BYTES,
+        false,
+    )
+    .map_err(|_| HandoffError::NotManaged)?;
+    validate_text(
+        hcom_session_id,
+        "hcom session identity",
+        MAX_IDENTITY_BYTES,
+        false,
+    )
+    .map_err(|_| HandoffError::NotManaged)?;
+    validate_text(process_id, "process identity", MAX_PROCESS_ID_BYTES, false)
+        .map_err(|_| HandoffError::NotManaged)?;
+
+    let chain = load_chain(db.conn(), &chain_id)?.ok_or(HandoffError::NotManaged)?;
+    let generation = load_generation(db.conn(), &chain_id, markers.generation)?
+        .ok_or(HandoffError::NotManaged)?;
+    let native_session_id = generation
+        .native_session_id
+        .clone()
+        .ok_or(HandoffError::NotManaged)?;
+    let actor = HandoffActor {
+        instance_name: instance_name.to_string(),
+        hcom_session_id: hcom_session_id.to_string(),
+        native_session_id: Some(native_session_id),
+        process_id: process_id.to_string(),
+        process_birth_identity,
+        generation: markers.generation,
+    };
+    if chain.current_generation != markers.generation
+        || generation.launch_nonce != launch_nonce
+        || !generation_matches_actor(&generation, &actor, true)
+        || !live_binding_matches(db.conn(), &actor)?
+    {
+        return Err(HandoffError::NotManaged);
+    }
+    Ok(actor)
 }
 
 fn canonical_workspace(path: &Path) -> Result<String, HandoffError> {
@@ -1262,7 +1583,24 @@ pub fn create_chain(
         MAX_IDENTITY_BYTES,
         false,
     )?;
+    if spec.supervisor_pid <= 0
+        || spec.supervisor_pgid <= 0
+        || spec.outer_foreground_pgid <= 0
+        || spec.outer_tty_device <= 0
+        || spec.outer_tty_inode <= 0
+        || spec.supervisor_pgid != spec.outer_foreground_pgid
+    {
+        return Err(HandoffError::Invalid(
+            "supervisor must have positive PID/PGID/TTY evidence and own the outer foreground process group"
+                .to_string(),
+        ));
+    }
     let launch_nonce = validate_opaque_id(&spec.launch_nonce, "launch nonce")?;
+    let supervisor_pid = spec.supervisor_pid.to_string();
+    let supervisor_pgid = spec.supervisor_pgid.to_string();
+    let outer_foreground_pgid = spec.outer_foreground_pgid.to_string();
+    let outer_tty_device = spec.outer_tty_device.to_string();
+    let outer_tty_inode = spec.outer_tty_inode.to_string();
     let chain_id = generate_id("tc");
     let request_hash = hash_request(
         "create_chain",
@@ -1278,6 +1616,11 @@ pub fn create_chain(
             policy_ref.as_bytes(),
             supervisor_process_id.as_bytes(),
             supervisor_process_birth_identity.as_bytes(),
+            supervisor_pid.as_bytes(),
+            supervisor_pgid.as_bytes(),
+            outer_foreground_pgid.as_bytes(),
+            outer_tty_device.as_bytes(),
+            outer_tty_inode.as_bytes(),
             launch_nonce.as_bytes(),
         ],
     );
@@ -1287,9 +1630,14 @@ pub fn create_chain(
         "INSERT INTO terminal_chains (
              id, workspace, tool, model_ref, reasoning_ref,
              permission_policy_ref, policy_ref, supervisor_process_id,
-             supervisor_process_birth_identity, current_generation,
-             state, version, created_at, updated_at
-         ) VALUES (?1, ?2, 'codex', ?3, ?4, ?5, ?6, ?7, ?8, 1, 'active', 0, ?9, ?9)",
+             supervisor_process_birth_identity, supervisor_pid,
+             supervisor_pgid, outer_foreground_pgid, outer_tty_device,
+             outer_tty_inode, current_generation, state, version,
+             created_at, updated_at
+         ) VALUES (
+             ?1, ?2, 'codex', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+             ?12, ?13, 1, 'active', 0, ?14, ?14
+         )",
         params![
             chain_id,
             workspace,
@@ -1299,6 +1647,11 @@ pub fn create_chain(
             policy_ref,
             supervisor_process_id,
             supervisor_process_birth_identity,
+            spec.supervisor_pid,
+            spec.supervisor_pgid,
+            spec.outer_foreground_pgid,
+            spec.outer_tty_device,
+            spec.outer_tty_inode,
             now
         ],
     )?;
@@ -1485,6 +1838,225 @@ pub fn pin_native_session(
     })
 }
 
+/// Durably fail a foreground chain closed before the supervisor starts local
+/// SIGHUP or explicit-shutdown cleanup.
+///
+/// This intent transition deliberately precedes process action. A crash after
+/// it can leave only `NeedsRecovery`, never a durable `Active` row whose
+/// generation has already disappeared. The current live binding is required
+/// for the first transition; an exact replay does not depend on that binding
+/// surviving cleanup.
+pub fn begin_chain_shutdown(
+    db: &HcomDb,
+    supervisor: &SupervisorActor,
+    chain_id: &str,
+    actor: &HandoffActor,
+    observation: &ChainShutdownObservation,
+) -> Result<GenerationOutcome, HandoffError> {
+    let chain_id = validate_opaque_id(chain_id, "chain ID")?;
+    validate_supervisor_actor(supervisor)?;
+    validate_actor(actor)?;
+    validate_expected_version(observation.expected_chain_version)?;
+    validate_expected_version(observation.expected_generation_version)?;
+    let (failure_kind, failure_reason) = observation.reason.failure();
+
+    let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
+    let mut chain = load_chain(&tx, &chain_id)?.ok_or(HandoffError::NotManaged)?;
+    let mut generation =
+        load_generation(&tx, &chain_id, actor.generation)?.ok_or(HandoffError::NotManaged)?;
+    if chain.current_generation != actor.generation
+        || chain.supervisor_process_id != supervisor.process_id
+        || chain.supervisor_process_birth_identity != supervisor.process_birth_identity
+        || !generation_matches_actor(&generation, actor, true)
+    {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT shutdown actor does not match the immutable current generation"
+                .to_string(),
+        ));
+    }
+    let mut handoff = tx
+        .query_row(
+            "SELECT * FROM terminal_handoffs
+             WHERE chain_id = ?1 AND state NOT IN ('accepted', 'aborted')
+             LIMIT 1",
+            [&chain_id],
+            TerminalHandoff::from_row,
+        )
+        .optional()?;
+    let audit_actor = HandoffActor {
+        instance_name: generation
+            .instance_name
+            .clone()
+            .ok_or(HandoffError::Storage)?,
+        hcom_session_id: generation
+            .hcom_session_id
+            .clone()
+            .ok_or(HandoffError::Storage)?,
+        native_session_id: generation.native_session_id.clone(),
+        process_id: supervisor.process_id.clone(),
+        process_birth_identity: supervisor.process_birth_identity.clone(),
+        generation: generation.generation,
+    };
+    let expected_generation_version = observation.expected_generation_version.to_string();
+    let handoff_id = handoff
+        .as_ref()
+        .map(|value| value.id.as_str())
+        .unwrap_or("");
+    let request_hash = hash_request(
+        "begin_chain_shutdown",
+        &chain_id,
+        observation.expected_chain_version,
+        &audit_actor,
+        &[
+            expected_generation_version.as_bytes(),
+            actor.process_id.as_bytes(),
+            actor.process_birth_identity.as_bytes(),
+            generation.launch_nonce.as_bytes(),
+            handoff_id.as_bytes(),
+            failure_kind.as_bytes(),
+        ],
+    );
+    let chain_replay = transition_is_replay(
+        &tx,
+        ("chain", &chain_id),
+        observation.expected_chain_version,
+        chain.version,
+        chain.state.as_str(),
+        "begin_chain_shutdown",
+        &request_hash,
+    )?;
+    if chain_replay {
+        let generation_id = generation_object_id(&chain_id, actor.generation);
+        let generation_replay = transition_is_replay(
+            &tx,
+            ("generation", &generation_id),
+            observation.expected_generation_version,
+            generation.version,
+            generation.state.as_str(),
+            "begin_chain_shutdown",
+            &request_hash,
+        )?;
+        let handoff_replay = if let Some(value) = handoff.as_ref() {
+            value.state == HandoffState::NeedsRecovery
+                && tx.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM terminal_transition_audit
+                         WHERE object_kind = 'handoff' AND object_id = ?1
+                           AND to_version = ?2 AND to_state = 'needs_recovery'
+                           AND action = 'begin_chain_shutdown'
+                           AND request_hash = ?3
+                     )",
+                    params![value.id, value.version, request_hash],
+                    |row| row.get::<_, bool>(0),
+                )?
+        } else {
+            true
+        };
+        if chain.state != ChainState::NeedsRecovery
+            || generation.state != GenerationState::NeedsRecovery
+            || !generation_replay
+            || !handoff_replay
+        {
+            return Err(HandoffError::Conflict(
+                "HANDOFF_CONFLICT shutdown replay does not match every durable object".to_string(),
+            ));
+        }
+        tx.commit()?;
+        return Ok(GenerationOutcome {
+            generation,
+            replayed: true,
+        });
+    }
+    if chain.version != observation.expected_chain_version
+        || generation.version != observation.expected_generation_version
+        || chain.state == ChainState::NeedsRecovery
+        || generation.state == GenerationState::NeedsRecovery
+        || handoff
+            .as_ref()
+            .is_some_and(|value| value.state == HandoffState::NeedsRecovery)
+    {
+        return Err(conflict(
+            &chain_id,
+            observation.expected_chain_version,
+            chain.state.as_str(),
+            chain.version,
+        ));
+    }
+    authorize_generation(&tx, &chain, &generation, actor, true, true, true)?;
+
+    let now = now_epoch_f64();
+    if let Some(current) = handoff.as_mut() {
+        let from_state = current.state;
+        let from_version = current.version;
+        let updated = tx.execute(
+            "UPDATE terminal_handoffs
+             SET state = 'needs_recovery', version = ?1,
+                 failure_kind = ?2, failure_reason = ?3, updated_at = ?4
+             WHERE id = ?5 AND state = ?6 AND version = ?7",
+            params![
+                from_version + 1,
+                failure_kind,
+                failure_reason,
+                now,
+                current.id,
+                from_state.as_str(),
+                from_version
+            ],
+        )?;
+        if updated != 1 {
+            return Err(conflict(
+                &current.id,
+                from_version,
+                from_state.as_str(),
+                from_version,
+            ));
+        }
+        insert_audit(
+            &tx,
+            &chain_id,
+            "handoff",
+            &current.id,
+            from_version,
+            Some(from_state.as_str()),
+            HandoffState::NeedsRecovery.as_str(),
+            &audit_actor,
+            "supervisor",
+            "begin_chain_shutdown",
+            &request_hash,
+            now,
+        )?;
+        current.state = HandoffState::NeedsRecovery;
+        current.version += 1;
+    }
+    update_generation_state(
+        &tx,
+        &mut generation,
+        GenerationState::NeedsRecovery,
+        &audit_actor,
+        "supervisor",
+        "begin_chain_shutdown",
+        &request_hash,
+        now,
+    )?;
+    let current_generation = chain.current_generation;
+    update_chain_state(
+        &tx,
+        &mut chain,
+        ChainState::NeedsRecovery,
+        current_generation,
+        &audit_actor,
+        "supervisor",
+        "begin_chain_shutdown",
+        &request_hash,
+        now,
+    )?;
+    tx.commit()?;
+    Ok(GenerationOutcome {
+        generation,
+        replayed: false,
+    })
+}
+
 fn handoff_matches_source(
     handoff: &TerminalHandoff,
     generation: &TerminalGeneration,
@@ -1552,7 +2124,24 @@ pub fn prepare_handoff(
     bundle_event_id: i64,
     cwd: &Path,
 ) -> Result<HandoffOutcome, HandoffError> {
+    prepare_handoff_with_snapshot_provider(db, actor, bundle_event_id, cwd, snapshot_workspace)
+}
+
+fn prepare_handoff_with_snapshot_provider<F>(
+    db: &HcomDb,
+    actor: &HandoffActor,
+    bundle_event_id: i64,
+    cwd: &Path,
+    snapshot_provider: F,
+) -> Result<HandoffOutcome, HandoffError>
+where
+    F: FnOnce(&Path) -> Result<WorkspaceSnapshot, HandoffError>,
+{
     validate_actor(actor)?;
+    // Canonicalization and every git subprocess run before BEGIN IMMEDIATE.
+    // The transaction below only validates this deterministic snapshot
+    // against the exact typed chain/generation/handoff state.
+    let workspace = snapshot_provider(cwd)?;
     let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
     let Some((mut chain, mut source_generation)) = find_actor_chain(&tx, actor)? else {
         return Err(HandoffError::NotManaged);
@@ -1563,7 +2152,6 @@ pub fn prepare_handoff(
             "HANDOFF_CONFLICT source native session is not pinned".to_string(),
         ));
     }
-    let workspace = snapshot_workspace(cwd)?;
     if workspace.workspace != chain.workspace {
         return Err(HandoffError::Conflict(
             "HANDOFF_CONFLICT caller workspace does not match the pinned chain workspace"
@@ -1852,13 +2440,34 @@ pub fn commit_handoff(
     expected_version: i64,
     cwd: &Path,
 ) -> Result<HandoffOutcome, HandoffError> {
+    commit_handoff_with_snapshot_provider(
+        db,
+        actor,
+        handoff_id,
+        expected_version,
+        cwd,
+        snapshot_workspace,
+    )
+}
+
+fn commit_handoff_with_snapshot_provider<F>(
+    db: &HcomDb,
+    actor: &HandoffActor,
+    handoff_id: &str,
+    expected_version: i64,
+    cwd: &Path,
+    snapshot_provider: F,
+) -> Result<HandoffOutcome, HandoffError>
+where
+    F: FnOnce(&Path) -> Result<WorkspaceSnapshot, HandoffError>,
+{
     let handoff_id = validate_opaque_id(handoff_id, "handoff ID")?;
     validate_actor(actor)?;
     validate_expected_version(expected_version)?;
+    let workspace = snapshot_provider(cwd)?;
     let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
     let (mut handoff, mut chain, mut source) =
         load_source_context(&tx, &handoff_id, actor, true, true)?;
-    let workspace = snapshot_workspace(cwd)?;
     if workspace.workspace != chain.workspace
         || workspace.workspace != handoff.workspace
         || workspace.revision != handoff.revision
@@ -2353,29 +2962,225 @@ pub fn begin_quiesce(
     })
 }
 
-pub fn observe_source_exit_without_stop(
+/// Persist the outcome of the supervisor's single SIGTERM request.
+///
+/// The OS action happens immediately before this call. If the process crashes
+/// or this write fails, later code must not guess or resend: a quiescing row
+/// without this evidence is a recovery case, never a target-launch permit.
+pub fn record_sigterm_request(
     db: &HcomDb,
     supervisor: &SupervisorActor,
     handoff_id: &str,
-    expected_version: i64,
+    observation: &SigtermObservation,
 ) -> Result<HandoffOutcome, HandoffError> {
     let handoff_id = validate_opaque_id(handoff_id, "handoff ID")?;
     validate_supervisor_actor(supervisor)?;
-    validate_expected_version(expected_version)?;
+    validate_expected_version(observation.expected_version)?;
+    validate_observation_timestamp(
+        observation.requested_wall_at,
+        "SIGTERM request wall timestamp",
+    )?;
+    validate_monotonic_ns(
+        observation.requested_monotonic_ns,
+        "SIGTERM request monotonic timestamp",
+    )?;
+
     let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
     let (mut handoff, mut chain, mut source, audit_actor) =
-        load_supervisor_source_context(&tx, &handoff_id, supervisor, true)?;
+        load_supervisor_source_context(&tx, &handoff_id, supervisor, false)?;
+    let wall_at = observation.requested_wall_at.to_bits().to_string();
+    let monotonic_ns = observation.requested_monotonic_ns.to_string();
     let request_hash = hash_request(
-        "source_exit_without_stop",
+        "record_sigterm_request",
         &handoff_id,
-        expected_version,
+        observation.expected_version,
         &audit_actor,
-        &[],
+        &[
+            wall_at.as_bytes(),
+            monotonic_ns.as_bytes(),
+            observation.result.as_str().as_bytes(),
+            handoff.quiesce_token.as_deref().unwrap_or("").as_bytes(),
+        ],
     );
     if transition_is_replay(
         &tx,
         ("handoff", &handoff_id),
-        expected_version,
+        observation.expected_version,
+        handoff.version,
+        handoff.state.as_str(),
+        "record_sigterm_request",
+        &request_hash,
+    )? {
+        tx.commit()?;
+        return Ok(HandoffOutcome {
+            handoff,
+            replayed: true,
+        });
+    }
+    if handoff.state != HandoffState::QuiescingSource
+        || handoff.version != observation.expected_version
+        || source.state != GenerationState::Quiescing
+        || chain.state != ChainState::QuiescingSource
+        || handoff.stop_observed_at.is_none()
+        || !handoff.sigterm_request_result.is_empty()
+    {
+        return Err(conflict(
+            &handoff_id,
+            observation.expected_version,
+            handoff.state.as_str(),
+            handoff.version,
+        ));
+    }
+
+    let sent = observation.result == SigtermRequestResult::Sent;
+    let next_handoff = if sent {
+        HandoffState::QuiescingSource
+    } else {
+        HandoffState::NeedsRecovery
+    };
+    let failure_kind = if sent { "" } else { "sigterm_failed" };
+    let failure_reason = if sent {
+        ""
+    } else {
+        "SIGTERM request could not be delivered"
+    };
+    let now = now_epoch_f64();
+    let updated = tx.execute(
+        "UPDATE terminal_handoffs
+         SET state = ?1, version = ?2,
+             sigterm_requested_wall_at = ?3,
+             sigterm_requested_monotonic_ns = ?4,
+             sigterm_request_result = ?5,
+             failure_kind = ?6, failure_reason = ?7, updated_at = ?8
+         WHERE id = ?9 AND state = 'quiescing_source' AND version = ?10
+           AND stop_observed_at IS NOT NULL
+           AND sigterm_request_result = ''",
+        params![
+            next_handoff.as_str(),
+            observation.expected_version + 1,
+            observation.requested_wall_at,
+            observation.requested_monotonic_ns,
+            observation.result.as_str(),
+            failure_kind,
+            failure_reason,
+            now,
+            handoff_id,
+            observation.expected_version,
+        ],
+    )?;
+    if updated != 1 {
+        return Err(conflict(
+            &handoff_id,
+            observation.expected_version,
+            handoff.state.as_str(),
+            handoff.version,
+        ));
+    }
+    insert_audit(
+        &tx,
+        &chain.id,
+        "handoff",
+        &handoff_id,
+        observation.expected_version,
+        Some(HandoffState::QuiescingSource.as_str()),
+        next_handoff.as_str(),
+        &audit_actor,
+        "supervisor",
+        "record_sigterm_request",
+        &request_hash,
+        now,
+    )?;
+    if !sent {
+        update_generation_state(
+            &tx,
+            &mut source,
+            GenerationState::NeedsRecovery,
+            &audit_actor,
+            "supervisor",
+            "record_sigterm_request",
+            &request_hash,
+            now,
+        )?;
+        let current_generation = chain.current_generation;
+        update_chain_state(
+            &tx,
+            &mut chain,
+            ChainState::NeedsRecovery,
+            current_generation,
+            &audit_actor,
+            "supervisor",
+            "record_sigterm_request",
+            &request_hash,
+            now,
+        )?;
+    }
+    tx.commit()?;
+    handoff = load_handoff(db.conn(), &handoff_id)?.ok_or(HandoffError::Storage)?;
+    Ok(HandoffOutcome {
+        handoff,
+        replayed: false,
+    })
+}
+
+pub fn observe_source_exit_without_stop(
+    db: &HcomDb,
+    supervisor: &SupervisorActor,
+    handoff_id: &str,
+    observation: &CleanupObservation,
+) -> Result<HandoffOutcome, HandoffError> {
+    let handoff_id = validate_opaque_id(handoff_id, "handoff ID")?;
+    validate_supervisor_actor(supervisor)?;
+    validate_expected_version(observation.expected_version)?;
+    let exit = observation.exit.as_ref().ok_or_else(|| {
+        HandoffError::Invalid("source exit observation is missing exit evidence".to_string())
+    })?;
+    validate_child_exit(exit)?;
+    let failure_reason = if observation.failure_reason.trim().is_empty() {
+        "source exited before a verified typed Stop".to_string()
+    } else {
+        sanitize_reason(&observation.failure_reason)?
+    };
+    let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
+    let (mut handoff, mut chain, mut source, audit_actor) =
+        load_supervisor_source_context(&tx, &handoff_id, supervisor, true)?;
+    let wall_at = exit.observed_wall_at.to_bits().to_string();
+    let monotonic_ns = exit.observed_monotonic_ns.to_string();
+    let exit_code = exit
+        .exit_code
+        .map_or_else(String::new, |value| value.to_string());
+    let exit_signal = exit
+        .exit_signal
+        .map_or_else(String::new, |value| value.to_string());
+    let reaped = u8::from(observation.reaped).to_string();
+    let inject = u8::from(observation.resources.inject_succeeded).to_string();
+    let delivery = u8::from(observation.resources.delivery_succeeded).to_string();
+    let pty = u8::from(observation.resources.pty_succeeded).to_string();
+    let screen = u8::from(observation.resources.screen_succeeded).to_string();
+    let write_queue = u8::from(observation.resources.write_queue_succeeded).to_string();
+    let request_hash = hash_request(
+        "source_exit_without_stop",
+        &handoff_id,
+        observation.expected_version,
+        &audit_actor,
+        &[
+            wall_at.as_bytes(),
+            monotonic_ns.as_bytes(),
+            exit_code.as_bytes(),
+            exit_signal.as_bytes(),
+            exit.delivery_context.as_str().as_bytes(),
+            reaped.as_bytes(),
+            inject.as_bytes(),
+            delivery.as_bytes(),
+            pty.as_bytes(),
+            screen.as_bytes(),
+            write_queue.as_bytes(),
+            failure_reason.as_bytes(),
+        ],
+    );
+    if transition_is_replay(
+        &tx,
+        ("handoff", &handoff_id),
+        observation.expected_version,
         handoff.version,
         handoff.state.as_str(),
         "source_exit_without_stop",
@@ -2388,39 +3193,58 @@ pub fn observe_source_exit_without_stop(
         });
     }
     if handoff.state != HandoffState::Committed
-        || handoff.version != expected_version
+        || handoff.version != observation.expected_version
         || handoff.stop_observed_at.is_some()
         || chain.state != ChainState::Committed
         || source.state != GenerationState::HandoffCommitted
     {
         return Err(conflict(
             &handoff_id,
-            expected_version,
+            observation.expected_version,
             handoff.state.as_str(),
             handoff.version,
         ));
     }
     let now = now_epoch_f64();
-    let reason = "source exited before a verified typed Stop";
     let updated = tx.execute(
         "UPDATE terminal_handoffs
          SET state = 'needs_recovery', version = ?1,
              failure_kind = 'exit_without_stop', failure_reason = ?2,
-             updated_at = ?3
-         WHERE id = ?4 AND state = 'committed' AND version = ?5
+             child_exit_observed_wall_at = ?3,
+             child_exit_observed_monotonic_ns = ?4,
+             child_exit_code = ?5, child_exit_signal = ?6,
+             delivery_exit_context = ?7, waitpid_reaped = ?8,
+             inject_cleanup_succeeded = ?9,
+             delivery_cleanup_succeeded = ?10,
+             pty_cleanup_succeeded = ?11,
+             screen_cleanup_succeeded = ?12,
+             write_queue_cleanup_succeeded = ?13,
+             cleanup_completed_at = ?14, updated_at = ?14
+         WHERE id = ?15 AND state = 'committed' AND version = ?16
            AND stop_observed_at IS NULL",
         params![
-            expected_version + 1,
-            reason,
+            observation.expected_version + 1,
+            failure_reason,
+            exit.observed_wall_at,
+            exit.observed_monotonic_ns,
+            exit.exit_code,
+            exit.exit_signal,
+            exit.delivery_context.as_str(),
+            observation.reaped,
+            observation.resources.inject_succeeded,
+            observation.resources.delivery_succeeded,
+            observation.resources.pty_succeeded,
+            observation.resources.screen_succeeded,
+            observation.resources.write_queue_succeeded,
             now,
             handoff_id,
-            expected_version
+            observation.expected_version
         ],
     )?;
     if updated != 1 {
         return Err(conflict(
             &handoff_id,
-            expected_version,
+            observation.expected_version,
             handoff.state.as_str(),
             handoff.version,
         ));
@@ -2430,7 +3254,7 @@ pub fn observe_source_exit_without_stop(
         &chain.id,
         "handoff",
         &handoff_id,
-        expected_version,
+        observation.expected_version,
         Some(HandoffState::Committed.as_str()),
         HandoffState::NeedsRecovery.as_str(),
         &audit_actor,
@@ -2478,29 +3302,113 @@ pub fn complete_source_cleanup(
     let handoff_id = validate_opaque_id(handoff_id, "handoff ID")?;
     validate_supervisor_actor(supervisor)?;
     validate_expected_version(observation.expected_version)?;
-    let failure_reason =
-        if observation.exited && observation.reaped && observation.cleanup_succeeded {
-            String::new()
-        } else if observation.failure_reason.trim().is_empty() {
-            "source cleanup did not complete".to_string()
-        } else {
-            sanitize_reason(&observation.failure_reason)?
-        };
+    if let Some(exit) = observation.exit.as_ref() {
+        validate_child_exit(exit)?;
+    }
     let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
     let (mut handoff, mut chain, mut source, audit_actor) =
         load_supervisor_source_context(&tx, &handoff_id, supervisor, false)?;
-    let exited = u8::from(observation.exited).to_string();
+    let sigterm_monotonic_ns = handoff.sigterm_requested_monotonic_ns.ok_or_else(|| {
+        HandoffError::Conflict(
+            "HANDOFF_CONFLICT successful SIGTERM evidence is missing".to_string(),
+        )
+    })?;
+    if handoff.sigterm_request_result != SigtermRequestResult::Sent.as_str() {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT source cleanup cannot advance without a delivered SIGTERM"
+                .to_string(),
+        ));
+    }
+    let elapsed_ms = match observation.exit.as_ref() {
+        Some(exit) if exit.observed_monotonic_ns >= sigterm_monotonic_ns => {
+            let elapsed = (exit.observed_monotonic_ns - sigterm_monotonic_ns) / 1_000_000;
+            if elapsed > MAX_QUIESCE_ELAPSED_MS {
+                return Err(HandoffError::Invalid(
+                    "SIGTERM-to-exit elapsed time exceeds the evidence bound".to_string(),
+                ));
+            }
+            Some(elapsed)
+        }
+        Some(_) => {
+            return Err(HandoffError::Invalid(
+                "child exit monotonic timestamp precedes SIGTERM".to_string(),
+            ));
+        }
+        None => None,
+    };
+    let success =
+        observation.exit.is_some() && observation.reaped && observation.resources.all_succeeded();
+    if success
+        && (!observation.failure_kind.trim().is_empty()
+            || !observation.failure_reason.trim().is_empty())
+    {
+        return Err(HandoffError::Invalid(
+            "successful cleanup cannot contain failure evidence".to_string(),
+        ));
+    }
+    let failure_kind = if success {
+        String::new()
+    } else if observation.failure_kind.trim().is_empty() {
+        "cleanup_failed".to_string()
+    } else {
+        validate_text(
+            observation.failure_kind.trim(),
+            "failure kind",
+            MAX_FAILURE_KIND_BYTES,
+            false,
+        )?
+    };
+    let failure_reason = if success {
+        String::new()
+    } else if observation.failure_reason.trim().is_empty() {
+        "source cleanup did not complete".to_string()
+    } else {
+        sanitize_reason(&observation.failure_reason)?
+    };
+    let exit_wall_at = observation.exit.as_ref().map(|exit| exit.observed_wall_at);
+    let exit_monotonic_ns = observation
+        .exit
+        .as_ref()
+        .map(|exit| exit.observed_monotonic_ns);
+    let exit_code = observation.exit.as_ref().and_then(|exit| exit.exit_code);
+    let exit_signal = observation.exit.as_ref().and_then(|exit| exit.exit_signal);
+    let exit_context = observation
+        .exit
+        .as_ref()
+        .map(|exit| exit.delivery_context.as_str())
+        .unwrap_or("");
+    let exit_wall_hash = exit_wall_at
+        .map(f64::to_bits)
+        .map_or_else(String::new, |value| value.to_string());
+    let exit_monotonic_hash = exit_monotonic_ns.map_or_else(String::new, |value| value.to_string());
+    let exit_code_hash = exit_code.map_or_else(String::new, |value| value.to_string());
+    let exit_signal_hash = exit_signal.map_or_else(String::new, |value| value.to_string());
+    let elapsed_hash = elapsed_ms.map_or_else(String::new, |value| value.to_string());
     let reaped = u8::from(observation.reaped).to_string();
-    let cleanup = u8::from(observation.cleanup_succeeded).to_string();
+    let inject = u8::from(observation.resources.inject_succeeded).to_string();
+    let delivery = u8::from(observation.resources.delivery_succeeded).to_string();
+    let pty = u8::from(observation.resources.pty_succeeded).to_string();
+    let screen = u8::from(observation.resources.screen_succeeded).to_string();
+    let write_queue = u8::from(observation.resources.write_queue_succeeded).to_string();
     let request_hash = hash_request(
         "complete_source_cleanup",
         &handoff_id,
         observation.expected_version,
         &audit_actor,
         &[
-            exited.as_bytes(),
+            exit_wall_hash.as_bytes(),
+            exit_monotonic_hash.as_bytes(),
+            exit_code_hash.as_bytes(),
+            exit_signal_hash.as_bytes(),
+            elapsed_hash.as_bytes(),
+            exit_context.as_bytes(),
             reaped.as_bytes(),
-            cleanup.as_bytes(),
+            inject.as_bytes(),
+            delivery.as_bytes(),
+            pty.as_bytes(),
+            screen.as_bytes(),
+            write_queue.as_bytes(),
+            failure_kind.as_bytes(),
             failure_reason.as_bytes(),
             handoff.quiesce_token.as_deref().unwrap_or("").as_bytes(),
         ],
@@ -2524,6 +3432,7 @@ pub fn complete_source_cleanup(
         || handoff.version != observation.expected_version
         || handoff.stop_observed_at.is_none()
         || source.state != GenerationState::Quiescing
+        || handoff.cleanup_completed_at.is_some()
     {
         return Err(conflict(
             &handoff_id,
@@ -2532,25 +3441,93 @@ pub fn complete_source_cleanup(
             handoff.version,
         ));
     }
-    let success = observation.exited && observation.reaped && observation.cleanup_succeeded;
+    if success {
+        let binding: Option<(Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT session_id, instance_name
+                 FROM process_bindings WHERE process_id = ?1",
+                [&handoff.source_wrapper_process_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if binding.as_ref().is_some_and(|(session, instance)| {
+            session.as_deref() != Some(handoff.source_hcom_session_id.as_str())
+                || instance.as_deref() != Some(handoff.source_instance_name.as_str())
+        }) {
+            return Err(HandoffError::Conflict(
+                "HANDOFF_CONFLICT source process binding changed before cleanup".to_string(),
+            ));
+        }
+        let instance: Option<(Option<String>, String)> = tx
+            .query_row(
+                "SELECT session_id, tool FROM instances WHERE name = ?1",
+                [&handoff.source_instance_name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if instance.as_ref().is_some_and(|(session, tool)| {
+            session.as_deref() != Some(handoff.source_hcom_session_id.as_str()) || tool != "codex"
+        }) {
+            return Err(HandoffError::Conflict(
+                "HANDOFF_CONFLICT source instance changed before cleanup".to_string(),
+            ));
+        }
+        tx.execute(
+            "DELETE FROM process_bindings
+             WHERE process_id = ?1 AND session_id = ?2 AND instance_name = ?3",
+            params![
+                handoff.source_wrapper_process_id,
+                handoff.source_hcom_session_id,
+                handoff.source_instance_name
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM instances
+             WHERE name = ?1 AND session_id = ?2 AND tool = 'codex'",
+            params![handoff.source_instance_name, handoff.source_hcom_session_id],
+        )?;
+    }
     let now = now_epoch_f64();
     let next_handoff = if success {
         HandoffState::LaunchingTarget
     } else {
         HandoffState::NeedsRecovery
     };
-    let failure_kind = if success { "" } else { "cleanup_failed" };
     let updated = tx.execute(
         "UPDATE terminal_handoffs
          SET state = ?1, version = ?2, failure_kind = ?3,
-             failure_reason = ?4, updated_at = ?5
-         WHERE id = ?6 AND state = 'quiescing_source' AND version = ?7
-           AND stop_observed_at IS NOT NULL",
+             failure_reason = ?4,
+             child_exit_observed_wall_at = ?5,
+             child_exit_observed_monotonic_ns = ?6,
+             child_exit_code = ?7, child_exit_signal = ?8,
+             sigterm_to_exit_ms = ?9, delivery_exit_context = ?10,
+             waitpid_reaped = ?11, inject_cleanup_succeeded = ?12,
+             delivery_cleanup_succeeded = ?13,
+             pty_cleanup_succeeded = ?14,
+             screen_cleanup_succeeded = ?15,
+             write_queue_cleanup_succeeded = ?16,
+             cleanup_completed_at = ?17, updated_at = ?17
+         WHERE id = ?18 AND state = 'quiescing_source' AND version = ?19
+           AND stop_observed_at IS NOT NULL
+           AND sigterm_request_result = 'sent'
+           AND cleanup_completed_at IS NULL",
         params![
             next_handoff.as_str(),
             observation.expected_version + 1,
             failure_kind,
             failure_reason,
+            exit_wall_at,
+            exit_monotonic_ns,
+            exit_code,
+            exit_signal,
+            elapsed_ms,
+            exit_context,
+            observation.reaped,
+            observation.resources.inject_succeeded,
+            observation.resources.delivery_succeeded,
+            observation.resources.pty_succeeded,
+            observation.resources.screen_succeeded,
+            observation.resources.write_queue_succeeded,
             now,
             handoff_id,
             observation.expected_version
@@ -2645,6 +3622,525 @@ pub fn complete_source_cleanup(
     })
 }
 
+/// Bind the already prepared target wrapper to its exact typed reservation.
+///
+/// The wrapper must still be held behind its private bootstrap gate; callers
+/// release it only after this transaction commits. The instance is created
+/// directly as `launching`, never as a generic pending placeholder, so an old
+/// source hook cannot adopt it.
+pub fn materialize_target_generation(
+    db: &HcomDb,
+    supervisor: &SupervisorActor,
+    handoff_id: &str,
+    materialization: &TargetMaterialization,
+) -> Result<HandoffOutcome, HandoffError> {
+    let handoff_id = validate_opaque_id(handoff_id, "handoff ID")?;
+    validate_supervisor_actor(supervisor)?;
+    validate_expected_version(materialization.expected_version)?;
+    let launch_nonce = validate_opaque_id(&materialization.launch_nonce, "launch nonce")?;
+    let instance_name = validate_text(
+        &materialization.instance_name,
+        "instance identity",
+        MAX_INSTANCE_NAME_BYTES,
+        false,
+    )?;
+    let hcom_session_id = validate_text(
+        &materialization.hcom_session_id,
+        "hcom session identity",
+        MAX_IDENTITY_BYTES,
+        false,
+    )?;
+    let process_id = validate_text(
+        &materialization.process_id,
+        "process identity",
+        MAX_PROCESS_ID_BYTES,
+        false,
+    )?;
+    let process_birth_identity = validate_text(
+        &materialization.process_birth_identity,
+        "process birth identity",
+        MAX_IDENTITY_BYTES,
+        false,
+    )?;
+
+    let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
+    let (mut handoff, mut chain, _source, audit_actor) =
+        load_supervisor_source_context(&tx, &handoff_id, supervisor, false)?;
+    let mut target =
+        load_generation(&tx, &chain.id, handoff.target_generation)?.ok_or(HandoffError::Storage)?;
+    let target_generation = handoff.target_generation.to_string();
+    let request_hash = hash_request(
+        "materialize_target",
+        &handoff_id,
+        materialization.expected_version,
+        &audit_actor,
+        &[
+            target_generation.as_bytes(),
+            launch_nonce.as_bytes(),
+            instance_name.as_bytes(),
+            hcom_session_id.as_bytes(),
+            process_id.as_bytes(),
+            process_birth_identity.as_bytes(),
+        ],
+    );
+    let exact_materialization = target.launch_nonce == launch_nonce
+        && target.wrapper_process_id.as_deref() == Some(process_id.as_str())
+        && target.process_birth_identity.as_deref() == Some(process_birth_identity.as_str())
+        && target.instance_name.as_deref() == Some(instance_name.as_str())
+        && target.hcom_session_id.as_deref() == Some(hcom_session_id.as_str())
+        && target.native_session_id.is_none();
+    if exact_materialization
+        && transition_is_replay(
+            &tx,
+            ("handoff", &handoff_id),
+            materialization.expected_version,
+            handoff.version,
+            handoff.state.as_str(),
+            "materialize_target",
+            &request_hash,
+        )?
+    {
+        tx.commit()?;
+        return Ok(HandoffOutcome {
+            handoff,
+            replayed: true,
+        });
+    }
+    let cleanup_proved = handoff.sigterm_request_result == SigtermRequestResult::Sent.as_str()
+        && handoff.child_exit_observed_wall_at.is_some()
+        && handoff.waitpid_reaped == Some(true)
+        && handoff.inject_cleanup_succeeded == Some(true)
+        && handoff.delivery_cleanup_succeeded == Some(true)
+        && handoff.pty_cleanup_succeeded == Some(true)
+        && handoff.screen_cleanup_succeeded == Some(true)
+        && handoff.write_queue_cleanup_succeeded == Some(true)
+        && handoff.cleanup_completed_at.is_some();
+    if handoff.state != HandoffState::LaunchingTarget
+        || handoff.version != materialization.expected_version
+        || chain.state != ChainState::LaunchingTarget
+        || chain.current_generation != handoff.target_generation
+        || target.state != GenerationState::Launching
+        || target.launch_nonce != launch_nonce
+        || target.wrapper_process_id.is_some()
+        || target.process_birth_identity.is_some()
+        || target.instance_name.is_some()
+        || target.hcom_session_id.is_some()
+        || target.native_session_id.is_some()
+        || !cleanup_proved
+    {
+        return Err(conflict(
+            &handoff_id,
+            materialization.expected_version,
+            handoff.state.as_str(),
+            handoff.version,
+        ));
+    }
+
+    let now = now_epoch_f64();
+    tx.execute(
+        "INSERT INTO instances (
+             name, session_id, status, tool, created_at, parent_name,
+             origin_device_id, launch_context
+         ) VALUES (?1, ?2, 'launching', 'codex', ?3, '', '', ?4)",
+        params![
+            instance_name,
+            hcom_session_id,
+            now,
+            serde_json::json!({
+                "chain_id": handoff.chain_id,
+                "generation": handoff.target_generation,
+                "launch_nonce": launch_nonce,
+            })
+            .to_string(),
+        ],
+    )
+    .map_err(|_| {
+        HandoffError::Conflict(
+            "HANDOFF_CONFLICT exact target instance materialization already exists".to_string(),
+        )
+    })?;
+    tx.execute(
+        "INSERT INTO process_bindings (
+             process_id, session_id, instance_name, updated_at
+         ) VALUES (?1, ?2, ?3, ?4)",
+        params![process_id, hcom_session_id, instance_name, now],
+    )
+    .map_err(|_| {
+        HandoffError::Conflict(
+            "HANDOFF_CONFLICT exact target process materialization already exists".to_string(),
+        )
+    })?;
+
+    let target_from_version = target.version;
+    let updated_target = tx.execute(
+        "UPDATE terminal_generations
+         SET wrapper_process_id = ?1, process_birth_identity = ?2,
+             instance_name = ?3, hcom_session_id = ?4,
+             version = ?5, updated_at = ?6
+         WHERE chain_id = ?7 AND generation = ?8
+           AND state = 'launching' AND version = ?9
+           AND wrapper_process_id IS NULL
+           AND process_birth_identity IS NULL
+           AND instance_name IS NULL AND hcom_session_id IS NULL
+           AND native_session_id IS NULL AND launch_nonce = ?10",
+        params![
+            process_id,
+            process_birth_identity,
+            instance_name,
+            hcom_session_id,
+            target_from_version + 1,
+            now,
+            target.chain_id,
+            target.generation,
+            target_from_version,
+            launch_nonce,
+        ],
+    )?;
+    if updated_target != 1 {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT target reservation changed during materialization".to_string(),
+        ));
+    }
+    insert_audit(
+        &tx,
+        &chain.id,
+        "generation",
+        &generation_object_id(&chain.id, target.generation),
+        target_from_version,
+        Some(GenerationState::Launching.as_str()),
+        GenerationState::Launching.as_str(),
+        &audit_actor,
+        "supervisor",
+        "materialize_target",
+        &request_hash,
+        now,
+    )?;
+    target.wrapper_process_id = Some(process_id);
+    target.process_birth_identity = Some(process_birth_identity);
+    target.instance_name = Some(instance_name);
+    target.hcom_session_id = Some(hcom_session_id);
+    target.version += 1;
+    target.updated_at = now;
+
+    let updated_handoff = tx.execute(
+        "UPDATE terminal_handoffs
+         SET version = ?1, updated_at = ?2
+         WHERE id = ?3 AND state = 'launching_target' AND version = ?4",
+        params![
+            materialization.expected_version + 1,
+            now,
+            handoff_id,
+            materialization.expected_version
+        ],
+    )?;
+    if updated_handoff != 1 {
+        return Err(conflict(
+            &handoff_id,
+            materialization.expected_version,
+            handoff.state.as_str(),
+            handoff.version,
+        ));
+    }
+    insert_audit(
+        &tx,
+        &chain.id,
+        "handoff",
+        &handoff_id,
+        materialization.expected_version,
+        Some(HandoffState::LaunchingTarget.as_str()),
+        HandoffState::LaunchingTarget.as_str(),
+        &audit_actor,
+        "supervisor",
+        "materialize_target",
+        &request_hash,
+        now,
+    )?;
+    let current_generation = chain.current_generation;
+    update_chain_state(
+        &tx,
+        &mut chain,
+        ChainState::LaunchingTarget,
+        current_generation,
+        &audit_actor,
+        "supervisor",
+        "materialize_target",
+        &request_hash,
+        now,
+    )?;
+    tx.commit()?;
+    handoff = load_handoff(db.conn(), &handoff_id)?.ok_or(HandoffError::Storage)?;
+    Ok(HandoffOutcome {
+        handoff,
+        replayed: false,
+    })
+}
+
+/// Fail one exact target reservation closed after prepare, materialization,
+/// activation, or ready evidence fails.
+///
+/// A successfully cleaned materialized process has its generic instance and
+/// process binding removed atomically with the typed recovery transition. If
+/// cleanup is incomplete, those rows remain as recovery evidence; no caller
+/// may treat the target as accepted or active.
+pub fn fail_target_launch(
+    db: &HcomDb,
+    supervisor: &SupervisorActor,
+    handoff_id: &str,
+    observation: &TargetLaunchFailure,
+) -> Result<HandoffOutcome, HandoffError> {
+    let handoff_id = validate_opaque_id(handoff_id, "handoff ID")?;
+    validate_supervisor_actor(supervisor)?;
+    validate_expected_version(observation.expected_version)?;
+    let launch_nonce = validate_opaque_id(&observation.launch_nonce, "launch nonce")?;
+    let failure_kind = validate_text(
+        &observation.failure_kind,
+        "failure kind",
+        MAX_FAILURE_KIND_BYTES,
+        false,
+    )?;
+    let failure_reason = sanitize_reason(&observation.failure_reason)?;
+    if observation.cleanup_completed && observation.identity.is_none() {
+        return Err(HandoffError::Invalid(
+            "target cleanup cannot complete without an exact prepared identity".to_string(),
+        ));
+    }
+    let identity = observation
+        .identity
+        .as_ref()
+        .map(|identity| {
+            Ok::<_, HandoffError>(TargetFailureIdentity {
+                instance_name: validate_text(
+                    &identity.instance_name,
+                    "instance identity",
+                    MAX_INSTANCE_NAME_BYTES,
+                    false,
+                )?,
+                hcom_session_id: validate_text(
+                    &identity.hcom_session_id,
+                    "hcom session identity",
+                    MAX_IDENTITY_BYTES,
+                    false,
+                )?,
+                process_id: validate_text(
+                    &identity.process_id,
+                    "process identity",
+                    MAX_PROCESS_ID_BYTES,
+                    false,
+                )?,
+                process_birth_identity: validate_text(
+                    &identity.process_birth_identity,
+                    "process birth identity",
+                    MAX_IDENTITY_BYTES,
+                    false,
+                )?,
+            })
+        })
+        .transpose()?;
+
+    let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
+    let (mut handoff, mut chain, _source, audit_actor) =
+        load_supervisor_source_context(&tx, &handoff_id, supervisor, false)?;
+    let mut target =
+        load_generation(&tx, &chain.id, handoff.target_generation)?.ok_or(HandoffError::Storage)?;
+    let target_unmaterialized = target.wrapper_process_id.is_none()
+        && target.process_birth_identity.is_none()
+        && target.instance_name.is_none()
+        && target.hcom_session_id.is_none()
+        && target.native_session_id.is_none();
+    let target_matches_identity = identity.as_ref().is_some_and(|identity| {
+        target.wrapper_process_id.as_deref() == Some(identity.process_id.as_str())
+            && target.process_birth_identity.as_deref()
+                == Some(identity.process_birth_identity.as_str())
+            && target.instance_name.as_deref() == Some(identity.instance_name.as_str())
+            && target.hcom_session_id.as_deref() == Some(identity.hcom_session_id.as_str())
+            && target.native_session_id.is_none()
+    });
+    if identity.is_none() && !target_unmaterialized
+        || identity.is_some() && !target_unmaterialized && !target_matches_identity
+    {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT target failure identity does not match the reservation".to_string(),
+        ));
+    }
+
+    let identity_instance = identity
+        .as_ref()
+        .map(|value| value.instance_name.as_str())
+        .unwrap_or("");
+    let identity_session = identity
+        .as_ref()
+        .map(|value| value.hcom_session_id.as_str())
+        .unwrap_or("");
+    let identity_process = identity
+        .as_ref()
+        .map(|value| value.process_id.as_str())
+        .unwrap_or("");
+    let identity_birth = identity
+        .as_ref()
+        .map(|value| value.process_birth_identity.as_str())
+        .unwrap_or("");
+    let cleanup_completed = u8::from(observation.cleanup_completed).to_string();
+    let request_hash = hash_request(
+        "target_launch_failure",
+        &handoff_id,
+        observation.expected_version,
+        &audit_actor,
+        &[
+            launch_nonce.as_bytes(),
+            identity_instance.as_bytes(),
+            identity_session.as_bytes(),
+            identity_process.as_bytes(),
+            identity_birth.as_bytes(),
+            cleanup_completed.as_bytes(),
+            failure_kind.as_bytes(),
+            failure_reason.as_bytes(),
+        ],
+    );
+    if transition_is_replay(
+        &tx,
+        ("handoff", &handoff_id),
+        observation.expected_version,
+        handoff.version,
+        handoff.state.as_str(),
+        "target_launch_failure",
+        &request_hash,
+    )? {
+        tx.commit()?;
+        return Ok(HandoffOutcome {
+            handoff,
+            replayed: true,
+        });
+    }
+    if handoff.state != HandoffState::LaunchingTarget
+        || handoff.version != observation.expected_version
+        || chain.state != ChainState::LaunchingTarget
+        || chain.current_generation != handoff.target_generation
+        || target.state != GenerationState::Launching
+        || target.launch_nonce != launch_nonce
+    {
+        return Err(conflict(
+            &handoff_id,
+            observation.expected_version,
+            handoff.state.as_str(),
+            handoff.version,
+        ));
+    }
+
+    if observation.cleanup_completed
+        && target_matches_identity
+        && let Some(identity) = identity.as_ref()
+    {
+        let binding: Option<(String, String)> = tx
+            .query_row(
+                "SELECT session_id, instance_name FROM process_bindings WHERE process_id = ?1",
+                [&identity.process_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if binding.as_ref().is_some_and(|(session, instance)| {
+            session != &identity.hcom_session_id || instance != &identity.instance_name
+        }) {
+            return Err(HandoffError::Conflict(
+                "HANDOFF_CONFLICT target process binding changed before cleanup".to_string(),
+            ));
+        }
+        let instance: Option<(String, String)> = tx
+            .query_row(
+                "SELECT session_id, tool FROM instances WHERE name = ?1",
+                [&identity.instance_name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if instance
+            .as_ref()
+            .is_some_and(|(session, tool)| session != &identity.hcom_session_id || tool != "codex")
+        {
+            return Err(HandoffError::Conflict(
+                "HANDOFF_CONFLICT target instance changed before cleanup".to_string(),
+            ));
+        }
+        tx.execute(
+            "DELETE FROM process_bindings
+             WHERE process_id = ?1 AND session_id = ?2 AND instance_name = ?3",
+            params![
+                identity.process_id,
+                identity.hcom_session_id,
+                identity.instance_name
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM instances WHERE name = ?1 AND session_id = ?2 AND tool = 'codex'",
+            params![identity.instance_name, identity.hcom_session_id],
+        )?;
+    }
+
+    let now = now_epoch_f64();
+    let handoff_updated = tx.execute(
+        "UPDATE terminal_handoffs
+         SET state = 'needs_recovery', version = ?1,
+             failure_kind = ?2, failure_reason = ?3, updated_at = ?4
+         WHERE id = ?5 AND state = 'launching_target' AND version = ?6",
+        params![
+            observation.expected_version + 1,
+            failure_kind,
+            failure_reason,
+            now,
+            handoff_id,
+            observation.expected_version
+        ],
+    )?;
+    if handoff_updated != 1 {
+        return Err(conflict(
+            &handoff_id,
+            observation.expected_version,
+            handoff.state.as_str(),
+            handoff.version,
+        ));
+    }
+    insert_audit(
+        &tx,
+        &chain.id,
+        "handoff",
+        &handoff_id,
+        observation.expected_version,
+        Some(HandoffState::LaunchingTarget.as_str()),
+        HandoffState::NeedsRecovery.as_str(),
+        &audit_actor,
+        "supervisor",
+        "target_launch_failure",
+        &request_hash,
+        now,
+    )?;
+    update_generation_state(
+        &tx,
+        &mut target,
+        GenerationState::NeedsRecovery,
+        &audit_actor,
+        "supervisor",
+        "target_launch_failure",
+        &request_hash,
+        now,
+    )?;
+    let current_generation = chain.current_generation;
+    update_chain_state(
+        &tx,
+        &mut chain,
+        ChainState::NeedsRecovery,
+        current_generation,
+        &audit_actor,
+        "supervisor",
+        "target_launch_failure",
+        &request_hash,
+        now,
+    )?;
+    tx.commit()?;
+    handoff = load_handoff(db.conn(), &handoff_id)?.ok_or(HandoffError::Storage)?;
+    Ok(HandoffOutcome {
+        handoff,
+        replayed: false,
+    })
+}
+
 fn load_target_context(
     tx: &Transaction<'_>,
     handoff_id: &str,
@@ -2727,10 +4223,10 @@ pub fn target_ready(
         || handoff.version != expected_version
         || chain.state != ChainState::LaunchingTarget
         || target.state != GenerationState::Launching
-        || target.wrapper_process_id.is_some()
-        || target.process_birth_identity.is_some()
-        || target.instance_name.is_some()
-        || target.hcom_session_id.is_some()
+        || target.wrapper_process_id.as_deref() != Some(actor.process_id.as_str())
+        || target.process_birth_identity.as_deref() != Some(actor.process_birth_identity.as_str())
+        || target.instance_name.as_deref() != Some(actor.instance_name.as_str())
+        || target.hcom_session_id.as_deref() != Some(actor.hcom_session_id.as_str())
         || target.native_session_id.is_some()
     {
         return Err(conflict(
@@ -2745,28 +4241,27 @@ pub fn target_ready(
     let target_from_version = target.version;
     let target_updated = tx.execute(
         "UPDATE terminal_generations
-         SET wrapper_process_id = ?1, process_birth_identity = ?2,
-             instance_name = ?3, hcom_session_id = ?4, native_session_id = ?5,
-             state = 'awaiting_acceptance', version = ?6, updated_at = ?7
-         WHERE chain_id = ?8 AND generation = ?9
-           AND state = 'launching' AND version = ?10
-           AND wrapper_process_id IS NULL
-           AND process_birth_identity IS NULL
-           AND instance_name IS NULL
-           AND hcom_session_id IS NULL
+         SET native_session_id = ?1, state = 'awaiting_acceptance',
+             version = ?2, updated_at = ?3
+         WHERE chain_id = ?4 AND generation = ?5
+           AND state = 'launching' AND version = ?6
+           AND wrapper_process_id = ?7
+           AND process_birth_identity = ?8
+           AND instance_name = ?9
+           AND hcom_session_id = ?10
            AND native_session_id IS NULL
            AND launch_nonce = ?11",
         params![
-            actor.process_id,
-            actor.process_birth_identity,
-            actor.instance_name,
-            actor.hcom_session_id,
             native_session,
             target_from_version + 1,
             now,
             target.chain_id,
             target.generation,
             target_from_version,
+            actor.process_id,
+            actor.process_birth_identity,
+            actor.instance_name,
+            actor.hcom_session_id,
             launch_nonce,
         ],
     )?;
@@ -2789,10 +4284,6 @@ pub fn target_ready(
         &request_hash,
         now,
     )?;
-    target.wrapper_process_id = Some(actor.process_id.clone());
-    target.process_birth_identity = Some(actor.process_birth_identity.clone());
-    target.instance_name = Some(actor.instance_name.clone());
-    target.hcom_session_id = Some(actor.hcom_session_id.clone());
     target.native_session_id = Some(native_session.to_string());
     target.state = GenerationState::AwaitingAcceptance;
     target.version += 1;
@@ -2853,12 +4344,33 @@ pub fn accept_handoff(
     expected_version: i64,
     cwd: &Path,
 ) -> Result<HandoffOutcome, HandoffError> {
+    accept_handoff_with_snapshot_provider(
+        db,
+        actor,
+        handoff_id,
+        expected_version,
+        cwd,
+        snapshot_workspace,
+    )
+}
+
+fn accept_handoff_with_snapshot_provider<F>(
+    db: &HcomDb,
+    actor: &HandoffActor,
+    handoff_id: &str,
+    expected_version: i64,
+    cwd: &Path,
+    snapshot_provider: F,
+) -> Result<HandoffOutcome, HandoffError>
+where
+    F: FnOnce(&Path) -> Result<WorkspaceSnapshot, HandoffError>,
+{
     let handoff_id = validate_opaque_id(handoff_id, "handoff ID")?;
     validate_actor(actor)?;
     validate_expected_version(expected_version)?;
+    let workspace = snapshot_provider(cwd)?;
     let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
     let (mut handoff, mut chain, mut target) = load_target_context(&tx, &handoff_id, actor, true)?;
-    let workspace = snapshot_workspace(cwd)?;
     if workspace.workspace != chain.workspace
         || workspace.workspace != handoff.workspace
         || workspace.revision != handoff.revision
@@ -3264,6 +4776,11 @@ mod tests {
                 policy_ref: "policy-digest-pinned".to_string(),
                 supervisor_process_id: "supervisor-process".to_string(),
                 supervisor_process_birth_identity: "supervisor-birth".to_string(),
+                supervisor_pid: 41001,
+                supervisor_pgid: 41001,
+                outer_foreground_pgid: 41001,
+                outer_tty_device: 7,
+                outer_tty_inode: 11,
                 launch_nonce: "launch-source".to_string(),
             },
         )
@@ -3284,6 +4801,44 @@ mod tests {
         }
     }
 
+    fn record_test_sigterm(fixture: &Fixture, quiescing: &HandoffOutcome) -> HandoffOutcome {
+        record_sigterm_request(
+            &fixture.db,
+            &supervisor_actor(fixture),
+            &quiescing.handoff.id,
+            &SigtermObservation {
+                expected_version: quiescing.handoff.version,
+                requested_wall_at: 1000.0,
+                requested_monotonic_ns: 1_000_000_000,
+                result: SigtermRequestResult::Sent,
+            },
+        )
+        .unwrap()
+    }
+
+    fn successful_cleanup(expected_version: i64) -> CleanupObservation {
+        CleanupObservation {
+            expected_version,
+            exit: Some(ChildExitEvidence {
+                observed_wall_at: 1000.025,
+                observed_monotonic_ns: 1_025_000_000,
+                exit_code: None,
+                exit_signal: Some(15),
+                delivery_context: DeliveryExitContext::Killed,
+            }),
+            reaped: true,
+            resources: ResourceCleanupEvidence {
+                inject_succeeded: true,
+                delivery_succeeded: true,
+                pty_succeeded: true,
+                screen_succeeded: true,
+                write_queue_succeeded: true,
+            },
+            failure_kind: String::new(),
+            failure_reason: String::new(),
+        }
+    }
+
     fn prepare_and_commit(fixture: &Fixture) -> HandoffOutcome {
         let event_id = create_bundle(&fixture.db, &fixture.source, 0);
         let prepared =
@@ -3299,7 +4854,7 @@ mod tests {
         .unwrap()
     }
 
-    fn advance_to_launching(fixture: &Fixture) -> HandoffOutcome {
+    fn advance_to_sigterm(fixture: &Fixture) -> HandoffOutcome {
         let committed = prepare_and_commit(fixture);
         let supervisor = supervisor_actor(fixture);
         let token = committed.handoff.quiesce_token.clone().unwrap();
@@ -3324,17 +4879,46 @@ mod tests {
             &token,
         )
         .unwrap();
+        record_test_sigterm(fixture, &quiescing)
+    }
+
+    fn advance_to_unmaterialized_launching(fixture: &Fixture) -> HandoffOutcome {
+        let sigterm = advance_to_sigterm(fixture);
+        let supervisor = supervisor_actor(fixture);
         remove_live_actor(&fixture.db, &fixture.source);
         complete_source_cleanup(
             &fixture.db,
             &supervisor,
-            &quiescing.handoff.id,
-            &CleanupObservation {
-                expected_version: quiescing.handoff.version,
-                exited: true,
-                reaped: true,
-                cleanup_succeeded: true,
-                failure_reason: String::new(),
+            &sigterm.handoff.id,
+            &successful_cleanup(sigterm.handoff.version),
+        )
+        .unwrap()
+    }
+
+    fn advance_to_launching(fixture: &Fixture) -> HandoffOutcome {
+        let launching = advance_to_unmaterialized_launching(fixture);
+        materialize_target_fixture(fixture, &launching, &target_actor())
+    }
+
+    fn materialize_target_fixture(
+        fixture: &Fixture,
+        launching: &HandoffOutcome,
+        target: &HandoffActor,
+    ) -> HandoffOutcome {
+        let generation = load_generation(fixture.db.conn(), &fixture.chain.id, target.generation)
+            .unwrap()
+            .unwrap();
+        materialize_target_generation(
+            &fixture.db,
+            &supervisor_actor(fixture),
+            &launching.handoff.id,
+            &TargetMaterialization {
+                expected_version: launching.handoff.version,
+                launch_nonce: generation.launch_nonce,
+                instance_name: target.instance_name.clone(),
+                hcom_session_id: target.hcom_session_id.clone(),
+                process_id: target.process_id.clone(),
+                process_birth_identity: target.process_birth_identity.clone(),
             },
         )
         .unwrap()
@@ -3390,7 +4974,6 @@ mod tests {
     fn advance_to_awaiting_acceptance(fixture: &Fixture) -> (HandoffOutcome, HandoffActor) {
         let launching = advance_to_launching(fixture);
         let target = target_actor();
-        add_live_actor(&fixture.db, &target);
         let generation = load_generation(fixture.db.conn(), &fixture.chain.id, target.generation)
             .unwrap()
             .unwrap();
@@ -3403,6 +4986,158 @@ mod tests {
         )
         .unwrap();
         (ready, target)
+    }
+
+    #[test]
+    fn shutdown_intent_precedes_cleanup_and_replays_without_live_binding() {
+        let fixture = fixture(true);
+        let chain = get_chain(&fixture.db, &fixture.chain.id).unwrap().unwrap();
+        let generation = get_generation(&fixture.db, &fixture.chain.id, 1)
+            .unwrap()
+            .unwrap();
+        let observation = ChainShutdownObservation {
+            expected_chain_version: chain.version,
+            expected_generation_version: generation.version,
+            reason: SupervisorShutdownReason::Explicit,
+        };
+        let outcome = begin_chain_shutdown(
+            &fixture.db,
+            &supervisor_actor(&fixture),
+            &fixture.chain.id,
+            &fixture.source,
+            &observation,
+        )
+        .unwrap();
+        assert!(!outcome.replayed);
+        assert_eq!(outcome.generation.state, GenerationState::NeedsRecovery);
+        assert_eq!(
+            get_chain(&fixture.db, &fixture.chain.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ChainState::NeedsRecovery
+        );
+
+        remove_live_actor(&fixture.db, &fixture.source);
+        let audit_before = audit_count(&fixture.db);
+        assert!(
+            begin_chain_shutdown(
+                &fixture.db,
+                &supervisor_actor(&fixture),
+                &fixture.chain.id,
+                &fixture.source,
+                &observation,
+            )
+            .unwrap()
+            .replayed
+        );
+        assert_eq!(audit_count(&fixture.db), audit_before);
+    }
+
+    #[test]
+    fn outer_hangup_marks_open_handoff_and_current_generation_recovery() {
+        let fixture = fixture(true);
+        let event_id = create_bundle(&fixture.db, &fixture.source, 0);
+        let prepared =
+            prepare_handoff(&fixture.db, &fixture.source, event_id, &fixture.workspace).unwrap();
+        let chain = get_chain(&fixture.db, &fixture.chain.id).unwrap().unwrap();
+        let generation = get_generation(&fixture.db, &fixture.chain.id, 1)
+            .unwrap()
+            .unwrap();
+        begin_chain_shutdown(
+            &fixture.db,
+            &supervisor_actor(&fixture),
+            &fixture.chain.id,
+            &fixture.source,
+            &ChainShutdownObservation {
+                expected_chain_version: chain.version,
+                expected_generation_version: generation.version,
+                reason: SupervisorShutdownReason::OuterHangup,
+            },
+        )
+        .unwrap();
+
+        let failed_handoff = get_handoff(&fixture.db, &prepared.handoff.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed_handoff.state, HandoffState::NeedsRecovery);
+        assert_eq!(failed_handoff.failure_kind, "outer_hangup");
+        assert_eq!(
+            get_generation(&fixture.db, &fixture.chain.id, 1)
+                .unwrap()
+                .unwrap()
+                .state,
+            GenerationState::NeedsRecovery
+        );
+        assert_eq!(
+            get_generation(&fixture.db, &fixture.chain.id, 2)
+                .unwrap()
+                .unwrap()
+                .state,
+            GenerationState::Reserved
+        );
+        assert_eq!(
+            fixture
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM instances WHERE name = 'target'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn shutdown_audit_failure_rolls_back_chain_and_generation_intent() {
+        let fixture = fixture(true);
+        fixture
+            .db
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_shutdown_audit
+                 BEFORE INSERT ON terminal_transition_audit
+                 WHEN NEW.action = 'begin_chain_shutdown'
+                      AND NEW.object_kind = 'chain'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected shutdown audit failure');
+                 END;",
+            )
+            .unwrap();
+        let chain = get_chain(&fixture.db, &fixture.chain.id).unwrap().unwrap();
+        let generation = get_generation(&fixture.db, &fixture.chain.id, 1)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            begin_chain_shutdown(
+                &fixture.db,
+                &supervisor_actor(&fixture),
+                &fixture.chain.id,
+                &fixture.source,
+                &ChainShutdownObservation {
+                    expected_chain_version: chain.version,
+                    expected_generation_version: generation.version,
+                    reason: SupervisorShutdownReason::Explicit,
+                },
+            ),
+            Err(HandoffError::Storage)
+        ));
+        assert_eq!(
+            get_chain(&fixture.db, &fixture.chain.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ChainState::Active
+        );
+        assert_eq!(
+            get_generation(&fixture.db, &fixture.chain.id, 1)
+                .unwrap()
+                .unwrap()
+                .state,
+            GenerationState::Active
+        );
     }
 
     #[test]
@@ -3454,18 +5189,13 @@ mod tests {
             &token,
         )
         .unwrap();
+        let sigterm = record_test_sigterm(&fixture, &quiescing);
         remove_live_actor(&fixture.db, &fixture.source);
         let launching = complete_source_cleanup(
             &fixture.db,
             &supervisor_actor(&fixture),
-            &quiescing.handoff.id,
-            &CleanupObservation {
-                expected_version: 3,
-                exited: true,
-                reaped: true,
-                cleanup_succeeded: true,
-                failure_reason: String::new(),
-            },
+            &sigterm.handoff.id,
+            &successful_cleanup(sigterm.handoff.version),
         )
         .unwrap();
         assert_eq!(launching.handoff.state, HandoffState::LaunchingTarget);
@@ -3478,7 +5208,7 @@ mod tests {
         );
 
         let target = target_actor();
-        add_live_actor(&fixture.db, &target);
+        let launching = materialize_target_fixture(&fixture, &launching, &target);
         let target_generation = load_generation(fixture.db.conn(), &fixture.chain.id, 2)
             .unwrap()
             .unwrap();
@@ -3486,7 +5216,7 @@ mod tests {
             &fixture.db,
             &target,
             &launching.handoff.id,
-            4,
+            launching.handoff.version,
             &target_generation.launch_nonce,
         )
         .unwrap();
@@ -3502,7 +5232,7 @@ mod tests {
             &fixture.db,
             &target,
             &ready.handoff.id,
-            5,
+            ready.handoff.version,
             &fixture.workspace,
         )
         .unwrap();
@@ -3634,36 +5364,50 @@ mod tests {
             (supervisor.process_id.clone(), "supervisor".to_string())
         );
 
+        let sigterm = record_test_sigterm(&fixture, &quiescing);
         remove_live_actor(&fixture.db, &fixture.source);
-        let cleanup = CleanupObservation {
-            expected_version: quiescing.handoff.version,
-            exited: true,
-            reaped: true,
-            cleanup_succeeded: true,
-            failure_reason: String::new(),
-        };
+        let cleanup = successful_cleanup(sigterm.handoff.version);
         let launching =
-            complete_source_cleanup(&fixture.db, &supervisor, &quiescing.handoff.id, &cleanup)
+            complete_source_cleanup(&fixture.db, &supervisor, &sigterm.handoff.id, &cleanup)
                 .unwrap();
         let before = audit_count(&fixture.db);
         assert!(
-            complete_source_cleanup(&fixture.db, &supervisor, &quiescing.handoff.id, &cleanup,)
+            complete_source_cleanup(&fixture.db, &supervisor, &sigterm.handoff.id, &cleanup,)
                 .unwrap()
                 .replayed
         );
         assert_eq!(audit_count(&fixture.db), before);
 
         let target = target_actor();
-        add_live_actor(&fixture.db, &target);
         let launch_nonce = load_generation(fixture.db.conn(), &fixture.chain.id, target.generation)
             .unwrap()
             .unwrap()
             .launch_nonce;
+        let materialized = materialize_target_fixture(&fixture, &launching, &target);
+        let before = audit_count(&fixture.db);
+        assert!(
+            materialize_target_generation(
+                &fixture.db,
+                &supervisor,
+                &launching.handoff.id,
+                &TargetMaterialization {
+                    expected_version: launching.handoff.version,
+                    launch_nonce: launch_nonce.clone(),
+                    instance_name: target.instance_name.clone(),
+                    hcom_session_id: target.hcom_session_id.clone(),
+                    process_id: target.process_id.clone(),
+                    process_birth_identity: target.process_birth_identity.clone(),
+                },
+            )
+            .unwrap()
+            .replayed
+        );
+        assert_eq!(audit_count(&fixture.db), before);
         let ready = target_ready(
             &fixture.db,
             &target,
-            &launching.handoff.id,
-            launching.handoff.version,
+            &materialized.handoff.id,
+            materialized.handoff.version,
             &launch_nonce,
         )
         .unwrap();
@@ -3672,8 +5416,8 @@ mod tests {
             target_ready(
                 &fixture.db,
                 &target,
-                &launching.handoff.id,
-                launching.handoff.version,
+                &materialized.handoff.id,
+                materialized.handoff.version,
                 &launch_nonce,
             )
             .unwrap()
@@ -4112,7 +5856,26 @@ mod tests {
             &fixture.db,
             &supervisor_actor(&fixture),
             &committed.handoff.id,
-            committed.handoff.version,
+            &CleanupObservation {
+                expected_version: committed.handoff.version,
+                exit: Some(ChildExitEvidence {
+                    observed_wall_at: 1000.0,
+                    observed_monotonic_ns: 1_000_000_000,
+                    exit_code: Some(0),
+                    exit_signal: None,
+                    delivery_context: DeliveryExitContext::Closed,
+                }),
+                reaped: true,
+                resources: ResourceCleanupEvidence {
+                    inject_succeeded: true,
+                    delivery_succeeded: true,
+                    pty_succeeded: true,
+                    screen_succeeded: true,
+                    write_queue_succeeded: true,
+                },
+                failure_kind: "exit_without_stop".to_string(),
+                failure_reason: String::new(),
+            },
         )
         .unwrap();
         assert_eq!(outcome.handoff.state, HandoffState::NeedsRecovery);
@@ -4152,22 +5915,21 @@ mod tests {
             &token,
         )
         .unwrap();
+        let sigterm = record_test_sigterm(&cleanup_fixture, &quiescing);
         remove_live_actor(&cleanup_fixture.db, &cleanup_fixture.source);
+        let mut cleanup = successful_cleanup(sigterm.handoff.version);
+        cleanup.reaped = false;
+        cleanup.failure_kind = "waitpid_failed".to_string();
+        cleanup.failure_reason = "waitpid did not reap the source".to_string();
         let failed = complete_source_cleanup(
             &cleanup_fixture.db,
             &supervisor_actor(&cleanup_fixture),
-            &quiescing.handoff.id,
-            &CleanupObservation {
-                expected_version: quiescing.handoff.version,
-                exited: true,
-                reaped: false,
-                cleanup_succeeded: true,
-                failure_reason: "waitpid did not reap the source".to_string(),
-            },
+            &sigterm.handoff.id,
+            &cleanup,
         )
         .unwrap();
         assert_eq!(failed.handoff.state, HandoffState::NeedsRecovery);
-        assert_eq!(failed.handoff.failure_kind, "cleanup_failed");
+        assert_eq!(failed.handoff.failure_kind, "waitpid_failed");
         assert_eq!(
             get_chain(&cleanup_fixture.db, &cleanup_fixture.chain.id)
                 .unwrap()
@@ -4373,16 +6135,90 @@ mod tests {
     }
 
     #[test]
+    fn managed_actor_uses_exact_markers_and_typed_native_pin() {
+        let fixture = fixture(true);
+        let markers = ManagedActorMarkers {
+            chain_id: fixture.chain.id.clone(),
+            generation: fixture.source.generation,
+            launch_nonce: "launch-source".to_string(),
+            process_birth_identity: fixture.source.process_birth_identity.clone(),
+        };
+        let resolved = resolve_managed_actor(
+            &fixture.db,
+            &fixture.source.instance_name,
+            &fixture.source.hcom_session_id,
+            &fixture.source.process_id,
+            &markers,
+        )
+        .unwrap();
+        assert_eq!(resolved.native_session_id.as_deref(), Some("native-source"));
+        assert_ne!(
+            resolved.native_session_id.as_deref(),
+            Some(resolved.hcom_session_id.as_str())
+        );
+
+        let mut wrong = markers.clone();
+        wrong.launch_nonce = "wrong-launch".to_string();
+        assert!(matches!(
+            resolve_managed_actor(
+                &fixture.db,
+                &fixture.source.instance_name,
+                &fixture.source.hcom_session_id,
+                &fixture.source.process_id,
+                &wrong,
+            ),
+            Err(HandoffError::NotManaged)
+        ));
+        wrong = markers.clone();
+        wrong.process_birth_identity = "wrong-birth".to_string();
+        assert!(matches!(
+            resolve_managed_actor(
+                &fixture.db,
+                &fixture.source.instance_name,
+                &fixture.source.hcom_session_id,
+                &fixture.source.process_id,
+                &wrong,
+            ),
+            Err(HandoffError::NotManaged)
+        ));
+        assert!(matches!(
+            resolve_managed_actor(
+                &fixture.db,
+                &fixture.source.instance_name,
+                "wrong-hcom-session",
+                &fixture.source.process_id,
+                &markers,
+            ),
+            Err(HandoffError::NotManaged)
+        ));
+        assert!(matches!(
+            resolve_managed_actor(
+                &fixture.db,
+                &fixture.source.instance_name,
+                &fixture.source.hcom_session_id,
+                "wrong-process",
+                &markers,
+            ),
+            Err(HandoffError::NotManaged)
+        ));
+    }
+
+    #[test]
     fn ready_does_not_accept_and_wrong_target_cannot_advance() {
         let fixture = fixture(true);
         let launching = advance_to_launching(&fixture);
         let target = target_actor();
-        add_live_actor(&fixture.db, &target);
         let generation = load_generation(fixture.db.conn(), &fixture.chain.id, 2)
             .unwrap()
             .unwrap();
         assert!(matches!(
-            target_ready(&fixture.db, &target, &launching.handoff.id, 4, "ln-wrong"),
+            target_ready(
+                &fixture.db,
+                &target,
+                &launching.handoff.id,
+                launching.handoff.version,
+                "ln-wrong"
+            ),
             Err(HandoffError::Conflict(_))
         ));
         let mut resumed_source_session = target.clone();
@@ -4392,7 +6228,7 @@ mod tests {
                 &fixture.db,
                 &resumed_source_session,
                 &launching.handoff.id,
-                4,
+                launching.handoff.version,
                 &generation.launch_nonce,
             ),
             Err(HandoffError::Conflict(_))
@@ -4402,7 +6238,7 @@ mod tests {
             &fixture.db,
             &target,
             &launching.handoff.id,
-            4,
+            launching.handoff.version,
             &generation.launch_nonce,
         )
         .unwrap();
@@ -4609,6 +6445,43 @@ mod tests {
     }
 
     #[test]
+    fn slow_workspace_snapshot_does_not_hold_writer_transaction() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let fixture = fixture(true);
+        let event_id = create_bundle(&fixture.db, &fixture.source, 0);
+        let db_path = fixture.db.path().to_path_buf();
+        let actor = fixture.source.clone();
+        let workspace = fixture.workspace.clone();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+
+        let handle = std::thread::spawn(move || {
+            let db = HcomDb::open_at(&db_path).unwrap();
+            prepare_handoff_with_snapshot_provider(&db, &actor, event_id, &workspace, |path| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                snapshot_workspace(path)
+            })
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("snapshot provider did not start");
+        fixture
+            .db
+            .conn()
+            .execute(
+                "INSERT INTO kv (key, value) VALUES ('slow-git-writer', 'ok')",
+                [],
+            )
+            .expect("slow workspace snapshot held the SQLite writer lock");
+        release_tx.send(()).unwrap();
+        handle.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn target_reservation_neither_creates_nor_adopts_generic_pending_instance() {
         let fixture = fixture(true);
         fixture
@@ -4655,6 +6528,391 @@ mod tests {
         assert!(target.wrapper_process_id.is_none());
         assert!(target.instance_name.is_none());
         assert_eq!(prepared.handoff.target_generation, 2);
+    }
+
+    #[test]
+    fn exact_target_materialization_is_replayable_and_ready_does_not_accept() {
+        let fixture = fixture(true);
+        let launching = advance_to_unmaterialized_launching(&fixture);
+        let target = target_actor();
+        let generation = get_generation(&fixture.db, &fixture.chain.id, 2)
+            .unwrap()
+            .unwrap();
+        assert!(generation.wrapper_process_id.is_none());
+        let materialization = TargetMaterialization {
+            expected_version: launching.handoff.version,
+            launch_nonce: generation.launch_nonce.clone(),
+            instance_name: target.instance_name.clone(),
+            hcom_session_id: target.hcom_session_id.clone(),
+            process_id: target.process_id.clone(),
+            process_birth_identity: target.process_birth_identity.clone(),
+        };
+        let materialized = materialize_target_generation(
+            &fixture.db,
+            &supervisor_actor(&fixture),
+            &launching.handoff.id,
+            &materialization,
+        )
+        .unwrap();
+        assert!(!materialized.replayed);
+        let audit_before = audit_count(&fixture.db);
+        assert!(
+            materialize_target_generation(
+                &fixture.db,
+                &supervisor_actor(&fixture),
+                &launching.handoff.id,
+                &materialization,
+            )
+            .unwrap()
+            .replayed
+        );
+        assert_eq!(audit_count(&fixture.db), audit_before);
+
+        let mut conflicting = materialization.clone();
+        conflicting.process_id = "process-second-target".to_string();
+        conflicting.process_birth_identity = "birth-second-target".to_string();
+        assert!(matches!(
+            materialize_target_generation(
+                &fixture.db,
+                &supervisor_actor(&fixture),
+                &launching.handoff.id,
+                &conflicting,
+            ),
+            Err(HandoffError::Conflict(_))
+        ));
+        let target_instances: Vec<(String, String, String)> = fixture
+            .db
+            .conn()
+            .prepare(
+                "SELECT name, session_id, status FROM instances
+                 WHERE name IN ('target', 'pending-generic')
+                 ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            target_instances,
+            vec![(
+                "target".to_string(),
+                "hcom-target".to_string(),
+                "launching".to_string(),
+            )]
+        );
+
+        let ready = target_ready(
+            &fixture.db,
+            &target,
+            &materialized.handoff.id,
+            materialized.handoff.version,
+            &generation.launch_nonce,
+        )
+        .unwrap();
+        assert_eq!(ready.handoff.state, HandoffState::AwaitingAcceptance);
+        assert_ne!(ready.handoff.state, HandoffState::Accepted);
+        assert_eq!(
+            get_generation(&fixture.db, &fixture.chain.id, 2)
+                .unwrap()
+                .unwrap()
+                .state,
+            GenerationState::AwaitingAcceptance
+        );
+    }
+
+    #[test]
+    fn materialized_target_failure_removes_exact_live_rows_but_retains_typed_identity() {
+        let fixture = fixture(true);
+        let launching = advance_to_unmaterialized_launching(&fixture);
+        let target = target_actor();
+        let materialized = materialize_target_fixture(&fixture, &launching, &target);
+        let generation = get_generation(&fixture.db, &fixture.chain.id, 2)
+            .unwrap()
+            .unwrap();
+        let observation = TargetLaunchFailure {
+            expected_version: materialized.handoff.version,
+            launch_nonce: generation.launch_nonce.clone(),
+            identity: Some(TargetFailureIdentity {
+                instance_name: target.instance_name.clone(),
+                hcom_session_id: target.hcom_session_id.clone(),
+                process_id: target.process_id.clone(),
+                process_birth_identity: target.process_birth_identity.clone(),
+            }),
+            cleanup_completed: true,
+            failure_kind: "activation_failed".to_string(),
+            failure_reason: "target private gate did not open".to_string(),
+        };
+
+        let failed = fail_target_launch(
+            &fixture.db,
+            &supervisor_actor(&fixture),
+            &materialized.handoff.id,
+            &observation,
+        )
+        .unwrap();
+        assert!(!failed.replayed);
+        assert_eq!(failed.handoff.state, HandoffState::NeedsRecovery);
+        assert_eq!(
+            get_chain(&fixture.db, &fixture.chain.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ChainState::NeedsRecovery
+        );
+        let failed_generation = get_generation(&fixture.db, &fixture.chain.id, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed_generation.state, GenerationState::NeedsRecovery);
+        assert_eq!(
+            failed_generation.wrapper_process_id.as_deref(),
+            Some(target.process_id.as_str())
+        );
+        assert_eq!(
+            failed_generation.process_birth_identity.as_deref(),
+            Some(target.process_birth_identity.as_str())
+        );
+        assert_eq!(
+            fixture
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM instances WHERE name = ?1",
+                    [&target.instance_name],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            fixture
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM process_bindings WHERE process_id = ?1",
+                    [&target.process_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        let audit_before = audit_count(&fixture.db);
+        assert!(
+            fail_target_launch(
+                &fixture.db,
+                &supervisor_actor(&fixture),
+                &materialized.handoff.id,
+                &observation,
+            )
+            .unwrap()
+            .replayed
+        );
+        assert_eq!(audit_count(&fixture.db), audit_before);
+    }
+
+    #[test]
+    fn unmaterialized_target_prepare_failure_enters_recovery_without_generic_instance() {
+        let fixture = fixture(true);
+        let launching = advance_to_unmaterialized_launching(&fixture);
+        let generation = get_generation(&fixture.db, &fixture.chain.id, 2)
+            .unwrap()
+            .unwrap();
+        let failed = fail_target_launch(
+            &fixture.db,
+            &supervisor_actor(&fixture),
+            &launching.handoff.id,
+            &TargetLaunchFailure {
+                expected_version: launching.handoff.version,
+                launch_nonce: generation.launch_nonce,
+                identity: None,
+                cleanup_completed: false,
+                failure_kind: "prepare_failed".to_string(),
+                failure_reason: "fake adapter rejected the target reservation".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(failed.handoff.state, HandoffState::NeedsRecovery);
+        assert_eq!(
+            get_chain(&fixture.db, &fixture.chain.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ChainState::NeedsRecovery
+        );
+        let target_generation = get_generation(&fixture.db, &fixture.chain.id, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(target_generation.state, GenerationState::NeedsRecovery);
+        assert!(target_generation.wrapper_process_id.is_none());
+        assert_eq!(
+            fixture
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM instances WHERE name = 'target'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn each_incomplete_cleanup_component_blocks_target_materialization() {
+        for failure in [
+            "unreaped",
+            "inject",
+            "delivery",
+            "pty",
+            "screen",
+            "write_queue",
+            "missing_exit",
+        ] {
+            let fixture = fixture(true);
+            let sigterm = advance_to_sigterm(&fixture);
+            remove_live_actor(&fixture.db, &fixture.source);
+            let mut cleanup = successful_cleanup(sigterm.handoff.version);
+            match failure {
+                "unreaped" => cleanup.reaped = false,
+                "inject" => cleanup.resources.inject_succeeded = false,
+                "delivery" => cleanup.resources.delivery_succeeded = false,
+                "pty" => cleanup.resources.pty_succeeded = false,
+                "screen" => cleanup.resources.screen_succeeded = false,
+                "write_queue" => cleanup.resources.write_queue_succeeded = false,
+                "missing_exit" => cleanup.exit = None,
+                _ => unreachable!(),
+            }
+            cleanup.failure_kind = failure.to_string();
+            cleanup.failure_reason = format!("injected {failure} failure");
+            let outcome = complete_source_cleanup(
+                &fixture.db,
+                &supervisor_actor(&fixture),
+                &sigterm.handoff.id,
+                &cleanup,
+            )
+            .unwrap();
+            assert_eq!(
+                outcome.handoff.state,
+                HandoffState::NeedsRecovery,
+                "failure={failure}"
+            );
+            assert_eq!(
+                get_chain(&fixture.db, &fixture.chain.id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                ChainState::NeedsRecovery,
+                "failure={failure}"
+            );
+            let target = get_generation(&fixture.db, &fixture.chain.id, 2)
+                .unwrap()
+                .unwrap();
+            assert_eq!(target.state, GenerationState::Reserved);
+            assert!(target.wrapper_process_id.is_none());
+            let target_instance_count: i64 = fixture
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM instances WHERE name = 'target'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(target_instance_count, 0);
+        }
+    }
+
+    #[test]
+    fn successful_cleanup_rejects_contradictory_failure_evidence() {
+        let fixture = fixture(true);
+        let sigterm = advance_to_sigterm(&fixture);
+        let mut cleanup = successful_cleanup(sigterm.handoff.version);
+        cleanup.failure_kind = "contradictory_failure".to_string();
+        assert!(matches!(
+            complete_source_cleanup(
+                &fixture.db,
+                &supervisor_actor(&fixture),
+                &sigterm.handoff.id,
+                &cleanup,
+            ),
+            Err(HandoffError::Invalid(_))
+        ));
+        assert_eq!(
+            get_handoff(&fixture.db, &sigterm.handoff.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            HandoffState::QuiescingSource
+        );
+    }
+
+    #[test]
+    fn failed_sigterm_delivery_is_one_shot_and_enters_recovery() {
+        let fixture = fixture(true);
+        let committed = prepare_and_commit(&fixture);
+        let token = committed.handoff.quiesce_token.clone().unwrap();
+        let stopped = observe_stop(
+            &fixture.db,
+            &fixture.source,
+            &committed.handoff.id,
+            &StopObservation {
+                expected_version: committed.handoff.version,
+                quiesce_token: token.clone(),
+                committed_version: committed.handoff.version,
+                hook_native_session_id: fixture.source.native_session_id.clone().unwrap(),
+                launch_nonce: committed.handoff.source_launch_nonce.clone(),
+            },
+        )
+        .unwrap();
+        let quiescing = begin_quiesce(
+            &fixture.db,
+            &supervisor_actor(&fixture),
+            &stopped.handoff.id,
+            stopped.handoff.version,
+            &token,
+        )
+        .unwrap();
+        let observation = SigtermObservation {
+            expected_version: quiescing.handoff.version,
+            requested_wall_at: 2000.0,
+            requested_monotonic_ns: 2_000_000_000,
+            result: SigtermRequestResult::NotFound,
+        };
+        let failed = record_sigterm_request(
+            &fixture.db,
+            &supervisor_actor(&fixture),
+            &quiescing.handoff.id,
+            &observation,
+        )
+        .unwrap();
+        assert_eq!(failed.handoff.state, HandoffState::NeedsRecovery);
+        assert_eq!(failed.handoff.sigterm_request_result, "not_found");
+        let audit_before = audit_count(&fixture.db);
+        assert!(
+            record_sigterm_request(
+                &fixture.db,
+                &supervisor_actor(&fixture),
+                &quiescing.handoff.id,
+                &observation,
+            )
+            .unwrap()
+            .replayed
+        );
+        assert_eq!(audit_count(&fixture.db), audit_before);
+        let mut second_attempt = observation;
+        second_attempt.result = SigtermRequestResult::Sent;
+        assert!(matches!(
+            record_sigterm_request(
+                &fixture.db,
+                &supervisor_actor(&fixture),
+                &quiescing.handoff.id,
+                &second_attempt,
+            ),
+            Err(HandoffError::Conflict(_))
+        ));
     }
 
     #[test]
