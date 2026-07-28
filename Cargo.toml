@@ -13,6 +13,10 @@ rust-version = "1.88"
 name = "hcom"
 path = "src/main.rs"
 
+[[bin]]
+name = "hcomd"
+path = "src/bin/hcomd.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 vt100 = "0.16"

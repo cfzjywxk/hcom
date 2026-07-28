@@ -4,10 +4,13 @@ use super::protocol::{
     ActionName, CallerAuth, ControlErrorCode, ControlRequest, ControlResponse,
     canonical_action_set, parse_canonical_action_set,
 };
+use crate::orchestrator::DurableScheduler;
 use crate::project_store::{
-    ArchitectProcessBinding, DaemonStore, PendingArchitectBinding, ProjectControlLayout,
-    RequestReplay, sha256_hex,
+    ArchitectProcessBinding, PendingArchitectBinding, ProjectControlLayout, RequestReplay,
+    sha256_hex,
 };
+use crate::worker::contract::WorkerAdapterRegistry;
+use crate::worker::process::ProcessRunner;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -81,20 +84,51 @@ impl DaemonEndpoint {
         stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT))?;
         self.control.serve_stream(&mut stream)
     }
+
+    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
+        self.listener.set_nonblocking(nonblocking)?;
+        Ok(())
+    }
+
+    pub fn try_serve_one(&mut self) -> Result<bool> {
+        let (mut stream, _) = match self.listener.accept() {
+            Ok(connection) => connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => return Err(error).context("failed to accept control connection"),
+        };
+        stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT))?;
+        if let Err(error) = self.control.serve_stream(&mut stream) {
+            // A malformed, disconnected, or slow same-UID client is scoped to
+            // this accepted connection. It must not tear down the durable
+            // daemon, its scheduler, or an unrelated worker.
+            eprintln!("hcomd: rejected control connection: {error:#}");
+        }
+        Ok(true)
+    }
 }
 
 pub struct DaemonControl {
-    store: DaemonStore,
+    scheduler: DurableScheduler,
     expected_uid: u32,
+    daemon_epoch: String,
 }
 
 impl DaemonControl {
     fn open(paths: &ControlPaths) -> Result<Self> {
         // SAFETY: geteuid has no preconditions.
         let expected_uid = unsafe { libc::geteuid() };
+        let scheduler = DurableScheduler::open(
+            &paths.layout,
+            paths.layout.artifact_root_path(),
+            WorkerAdapterRegistry::default(),
+            ProcessRunner::default(),
+        )?;
+        let daemon_epoch = scheduler.daemon_epoch().to_owned();
         Ok(Self {
-            store: DaemonStore::open(&paths.layout)?,
+            scheduler,
             expected_uid,
+            daemon_epoch,
         })
     }
 
@@ -113,7 +147,8 @@ impl DaemonControl {
             b"hcom-project-control/capability/v1",
             &registration.capability,
         );
-        self.store
+        self.scheduler
+            .store_mut()
             .insert_pending_architect_binding(&PendingArchitectBinding {
                 id: &registration.binding_id,
                 repo_root: &registration.repo_root,
@@ -134,7 +169,7 @@ impl DaemonControl {
     ) -> Result<()> {
         validate_opaque_id(binding_id)?;
         validate_process_registration(registration)?;
-        self.store.bind_architect_process(
+        self.scheduler.store_mut().bind_architect_process(
             binding_id,
             i64::try_from(expected_version).context("binding version is too large")?,
             &ArchitectProcessBinding {
@@ -156,7 +191,7 @@ impl DaemonControl {
     ) -> Result<()> {
         validate_opaque_id(binding_id)?;
         validate_single_line(native_session_id, 256)?;
-        self.store.bind_architect_native_session(
+        self.scheduler.store_mut().bind_architect_native_session(
             binding_id,
             i64::try_from(expected_version).context("binding version is too large")?,
             native_session_id,
@@ -171,7 +206,7 @@ impl DaemonControl {
     ) -> Result<()> {
         validate_opaque_id(binding_id)?;
         validate_opaque_id(project_id)?;
-        self.store.bind_architect_project(
+        self.scheduler.store_mut().bind_architect_project(
             binding_id,
             i64::try_from(expected_version).context("binding version is too large")?,
             project_id,
@@ -235,7 +270,8 @@ impl DaemonControl {
             }
         };
         let payload_hash = sha256_hex(&action_bytes);
-        match self.store.begin_control_request(
+        match self.scheduler.store_mut().begin_control_request(
+            &self.daemon_epoch,
             &caller_key,
             &request.request_id,
             action_name.as_str(),
@@ -293,8 +329,10 @@ impl DaemonControl {
         };
         let response_hash = sha256_hex(response_json.as_bytes());
         if self
-            .store
+            .scheduler
+            .store_mut()
             .complete_control_request(
+                &self.daemon_epoch,
                 &caller_key,
                 &request.request_id,
                 &payload_hash,
@@ -335,7 +373,8 @@ impl DaemonControl {
                 native_session_id,
             } => {
                 let binding = self
-                    .store
+                    .scheduler
+                    .store()
                     .architect_authorization(binding_id)?
                     .ok_or_else(|| anyhow::anyhow!("architect binding is unavailable"))?;
                 if peer.pid != binding.bridge_pid
@@ -398,6 +437,11 @@ impl DaemonControl {
     fn set_expected_uid(&mut self, uid: u32) {
         self.expected_uid = uid;
     }
+
+    #[cfg(test)]
+    fn simulate_crash_on_drop(&mut self) {
+        self.scheduler.simulate_crash_on_drop();
+    }
 }
 
 pub struct ArchitectBindingRegistration {
@@ -430,7 +474,7 @@ struct SocketGuard {
 impl SocketGuard {
     fn bind(path: &Path) -> Result<Self> {
         if path.exists() {
-            bail!("control socket path already exists");
+            remove_stale_socket(path)?;
         }
         let parent = path
             .parent()
@@ -462,6 +506,35 @@ impl SocketGuard {
             inode: metadata.ino(),
         })
     }
+}
+
+fn remove_stale_socket(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    // SAFETY: geteuid has no preconditions.
+    let expected_uid = unsafe { libc::geteuid() };
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != expected_uid
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        bail!("refusing to replace an untrusted control socket path");
+    }
+    match UnixStream::connect(path) {
+        Ok(_) => bail!("control socket already has a live listener"),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) => {}
+        Err(error) => return Err(error).context("failed to probe existing control socket"),
+    }
+    let current = fs::symlink_metadata(path)?;
+    if !current.file_type().is_socket()
+        || current.dev() != metadata.dev()
+        || current.ino() != metadata.ino()
+    {
+        bail!("control socket changed during stale recovery");
+    }
+    fs::remove_file(path).context("failed to remove stale control socket")
 }
 
 impl Drop for SocketGuard {
@@ -655,6 +728,22 @@ mod tests {
     }
 
     #[test]
+    fn nonblocking_service_isolates_disconnected_observers() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut endpoint = DaemonEndpoint::bind(paths(&temp)).unwrap();
+        endpoint.set_nonblocking(true).unwrap();
+        let socket_path = endpoint.socket_path().to_path_buf();
+
+        drop(UnixStream::connect(&socket_path).unwrap());
+        assert!(endpoint.try_serve_one().unwrap());
+        assert!(socket_path.exists());
+
+        drop(UnixStream::connect(&socket_path).unwrap());
+        assert!(endpoint.try_serve_one().unwrap());
+        assert!(socket_path.exists());
+    }
+
+    #[test]
     fn architect_auth_binds_capability_nonce_process_session_and_actions() {
         let temp = tempfile::tempdir().unwrap();
         let repo_root = temp.path().join("repo");
@@ -809,7 +898,8 @@ mod tests {
         assert_eq!(
             endpoint
                 .control
-                .store
+                .scheduler
+                .store()
                 .connection()
                 .query_row("SELECT count(*) FROM control_requests", [], |row| {
                     row.get::<_, i64>(0)
@@ -863,7 +953,8 @@ mod tests {
             .unwrap();
         let stored: (String, String) = endpoint
             .control
-            .store
+            .scheduler
+            .store()
             .connection()
             .query_row(
                 "SELECT launch_nonce_hash, control_capability_hash
@@ -965,7 +1056,8 @@ mod tests {
         assert_eq!(
             endpoint
                 .control
-                .store
+                .scheduler
+                .store()
                 .connection()
                 .query_row("SELECT count(*) FROM control_requests", [], |row| {
                     row.get::<_, i64>(0)
@@ -973,5 +1065,70 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn daemon_epoch_reconciles_accepted_request_to_needs_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(&temp);
+        let caller = sha256_hex(b"caller");
+        let payload = sha256_hex(b"payload");
+        let mut first = DaemonControl::open(&paths).unwrap();
+        let first_epoch = first.daemon_epoch.clone();
+        assert_eq!(
+            first
+                .scheduler
+                .store_mut()
+                .begin_control_request(
+                    &first_epoch,
+                    &caller,
+                    "request-interrupted",
+                    "project_run",
+                    &payload,
+                )
+                .unwrap(),
+            RequestReplay::New
+        );
+        first.simulate_crash_on_drop();
+        drop(first);
+
+        let mut recovered = DaemonControl::open(&paths).unwrap();
+        assert_ne!(recovered.daemon_epoch, first_epoch);
+        let response = match recovered
+            .scheduler
+            .store_mut()
+            .begin_control_request(
+                &recovered.daemon_epoch,
+                &caller,
+                "request-interrupted",
+                "project_run",
+                &payload,
+            )
+            .unwrap()
+        {
+            RequestReplay::Completed(response) => response,
+            other => panic!("unexpected reconciled request state: {other:?}"),
+        };
+        let response: ControlResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response.error.unwrap().code,
+            ControlErrorCode::NeedsRecovery
+        );
+    }
+
+    #[test]
+    fn private_stale_socket_is_replaced_but_live_endpoint_is_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(&temp);
+        let endpoint = DaemonEndpoint::bind(paths.clone()).unwrap();
+        let socket = endpoint.socket_path().to_path_buf();
+        assert!(DaemonEndpoint::bind(paths.clone()).is_err());
+        drop(endpoint);
+        let stale = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(stale);
+        assert!(socket.exists());
+        let recovered = DaemonEndpoint::bind(paths).unwrap();
+        assert_eq!(recovered.socket_path(), socket);
     }
 }

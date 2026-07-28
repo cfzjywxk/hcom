@@ -1,3 +1,4 @@
+mod scheduler;
 mod schema;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -9,6 +10,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+pub(crate) use scheduler::{
+    ClaimedTurn, ProjectExecutionState, ReadyTurn, SchedulerSnapshot, TurnKind,
+};
+#[cfg(test)]
+pub(crate) use scheduler::{FakeProjectSeed, FakeTaskSeed};
 use schema::{APPLICATION_ID, COMPONENT_VERSION, PRODUCT_ID, SCHEMA_SQL, SCHEMA_VERSION};
 
 const CONTROL_DIR: &str = "control-v1";
@@ -70,6 +76,10 @@ impl ProjectControlLayout {
         self.runtime_root.join("control.sock")
     }
 
+    pub(crate) fn artifact_root_path(&self) -> PathBuf {
+        self.control_root().join("artifacts")
+    }
+
     fn validate(&self) -> Result<()> {
         for (label, path) in [
             ("state root", &self.state_root),
@@ -90,6 +100,22 @@ impl ProjectControlLayout {
 pub(crate) struct DaemonStore {
     connection: Connection,
     _owner_lock: File,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DaemonEpoch {
+    pub(crate) id: String,
+    pub(crate) boot_id: String,
+    pub(crate) daemon_pid: u32,
+    pub(crate) process_birth: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AcceptedControlRequest {
+    pub(crate) caller_key_hash: String,
+    pub(crate) request_id: String,
+    pub(crate) daemon_epoch: String,
+    pub(crate) payload_hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +224,74 @@ impl DaemonStore {
             connection,
             _owner_lock: owner_lock,
         })
+    }
+
+    pub(crate) fn start_daemon_epoch(
+        &mut self,
+        epoch: &DaemonEpoch,
+    ) -> Result<Vec<AcceptedControlRequest>> {
+        validate_store_id("daemon epoch", &epoch.id)?;
+        validate_store_id("boot ID", &epoch.boot_id)?;
+        if epoch.daemon_pid <= 1 {
+            bail!("daemon PID must be greater than one");
+        }
+        validate_store_text("daemon process birth", &epoch.process_birth, 256)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_epoch_seconds()?;
+        transaction.execute(
+            "UPDATE daemon_epochs
+             SET state = 'crashed', stopped_at = ?1
+             WHERE state = 'active'",
+            [now],
+        )?;
+        transaction.execute(
+            "INSERT INTO daemon_epochs (
+                 id, boot_id, daemon_pid, process_birth, state, started_at, stopped_at
+             ) VALUES (?1, ?2, ?3, ?4, 'active', ?5, NULL)",
+            params![
+                epoch.id,
+                epoch.boot_id,
+                epoch.daemon_pid,
+                epoch.process_birth,
+                now,
+            ],
+        )?;
+        let interrupted = {
+            let mut statement = transaction.prepare(
+                "SELECT caller_key_hash, request_id, daemon_epoch, payload_hash
+                 FROM control_requests
+                 WHERE state = 'accepted' AND daemon_epoch != ?1
+                 ORDER BY created_at, caller_key_hash, request_id",
+            )?;
+            statement
+                .query_map([&epoch.id], |row| {
+                    Ok(AcceptedControlRequest {
+                        caller_key_hash: row.get(0)?,
+                        request_id: row.get(1)?,
+                        daemon_epoch: row.get(2)?,
+                        payload_hash: row.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        transaction.commit()?;
+        Ok(interrupted)
+    }
+
+    pub(crate) fn retire_daemon_epoch(&mut self, epoch_id: &str) -> Result<()> {
+        validate_store_id("daemon epoch", epoch_id)?;
+        let changed = self.connection.execute(
+            "UPDATE daemon_epochs
+             SET state = 'retired', stopped_at = ?1
+             WHERE id = ?2 AND state = 'active'",
+            params![now_epoch_seconds()?, epoch_id],
+        )?;
+        if changed != 1 {
+            bail!("daemon epoch retirement CAS failed");
+        }
+        Ok(())
     }
 
     pub(crate) fn insert_pending_architect_binding(
@@ -362,6 +456,7 @@ impl DaemonStore {
 
     pub(crate) fn begin_control_request(
         &mut self,
+        daemon_epoch: &str,
         caller_key_hash: &str,
         request_id: &str,
         action: &str,
@@ -403,12 +498,13 @@ impl DaemonStore {
             None => {
                 transaction.execute(
                     "INSERT INTO control_requests (
-                         caller_key_hash, request_id, action, payload_hash, state,
+                         caller_key_hash, request_id, daemon_epoch, action, payload_hash, state,
                          response_json, response_hash, created_at, completed_at
-                     ) VALUES (?1, ?2, ?3, ?4, 'accepted', NULL, NULL, ?5, NULL)",
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, 'accepted', NULL, NULL, ?6, NULL)",
                     params![
                         caller_key_hash,
                         request_id,
+                        daemon_epoch,
                         action,
                         payload_hash,
                         now_epoch_seconds()?,
@@ -423,6 +519,7 @@ impl DaemonStore {
 
     pub(crate) fn complete_control_request(
         &mut self,
+        daemon_epoch: &str,
         caller_key_hash: &str,
         request_id: &str,
         payload_hash: &str,
@@ -433,12 +530,13 @@ impl DaemonStore {
             "UPDATE control_requests
              SET state = 'completed', response_json = ?1, response_hash = ?2,
                  completed_at = ?3
-             WHERE caller_key_hash = ?4 AND request_id = ?5
-               AND payload_hash = ?6 AND state = 'accepted'",
+             WHERE daemon_epoch = ?4 AND caller_key_hash = ?5 AND request_id = ?6
+               AND payload_hash = ?7 AND state = 'accepted'",
             params![
                 response_json,
                 response_hash,
                 now_epoch_seconds()?,
+                daemon_epoch,
                 caller_key_hash,
                 request_id,
                 payload_hash,
@@ -447,63 +545,6 @@ impl DaemonStore {
         if changed != 1 {
             bail!("control request completion CAS failed");
         }
-        Ok(())
-    }
-
-    // Phase 2 locks the CAS/audit primitive before later scheduler phases call it.
-    #[allow(dead_code)]
-    pub(crate) fn transition_project(&mut self, transition: &StateTransition<'_>) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute(
-            "UPDATE project_runs
-             SET state = ?1, version = version + 1, updated_at = ?2
-             WHERE id = ?3 AND version = ?4 AND state = ?5",
-            params![
-                transition.to_state,
-                now_epoch_seconds()?,
-                transition.scope_id,
-                transition.from_version,
-                transition.from_state,
-            ],
-        )?;
-        if changed != 1 {
-            bail!("project transition CAS failed");
-        }
-        insert_transition(&transaction, "project", transition)?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn transition_task(&mut self, transition: &StateTransition<'_>) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now = now_epoch_seconds()?;
-        let completed_at = (transition.to_state == "completed").then_some(now);
-        let changed = transaction.execute(
-            "UPDATE project_tasks
-             SET state = ?1, version = version + 1, updated_at = ?2,
-                 completed_at = ?3
-             WHERE id = ?4 AND project_id = ?5
-               AND version = ?6 AND state = ?7",
-            params![
-                transition.to_state,
-                now,
-                completed_at,
-                transition.scope_id,
-                transition.project_id,
-                transition.from_version,
-                transition.from_state,
-            ],
-        )?;
-        if changed != 1 {
-            bail!("task transition CAS failed");
-        }
-        insert_transition(&transaction, "task", transition)?;
-        transaction.commit()?;
         Ok(())
     }
 
@@ -516,54 +557,6 @@ impl DaemonStore {
     pub(crate) fn connection_mut(&mut self) -> &mut Connection {
         &mut self.connection
     }
-}
-
-#[allow(dead_code)]
-pub(crate) struct StateTransition<'a> {
-    pub(crate) project_id: &'a str,
-    pub(crate) scope_id: &'a str,
-    pub(crate) from_version: i64,
-    pub(crate) from_state: &'a str,
-    pub(crate) to_state: &'a str,
-    pub(crate) action: &'a str,
-    pub(crate) actor_kind: &'a str,
-    pub(crate) actor_identity: &'a str,
-    pub(crate) payload_hash: &'a str,
-    pub(crate) turn_id: Option<&'a str>,
-    pub(crate) result_hash: Option<&'a str>,
-}
-
-#[allow(dead_code)]
-fn insert_transition(
-    transaction: &rusqlite::Transaction<'_>,
-    scope_kind: &str,
-    transition: &StateTransition<'_>,
-) -> Result<()> {
-    transaction.execute(
-        "INSERT INTO state_transitions (
-             project_id, scope_kind, scope_id, from_version, to_version,
-             from_state, to_state, action, actor_kind, actor_identity,
-             payload_hash, turn_id, result_hash, created_at
-         ) VALUES (
-             ?1, ?2, ?3, ?4, ?4 + 1, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
-         )",
-        params![
-            transition.project_id,
-            scope_kind,
-            transition.scope_id,
-            transition.from_version,
-            transition.from_state,
-            transition.to_state,
-            transition.action,
-            transition.actor_kind,
-            transition.actor_identity,
-            transition.payload_hash,
-            transition.turn_id,
-            transition.result_hash,
-            now_epoch_seconds()?,
-        ],
-    )?;
-    Ok(())
 }
 
 fn ensure_private_dir(path: &Path) -> Result<()> {
@@ -864,7 +857,7 @@ fn schema_digest(connection: &Connection) -> Result<String> {
     Ok(hex_bytes(&hasher.finalize()))
 }
 
-fn now_epoch_seconds() -> Result<i64> {
+pub(crate) fn now_epoch_seconds() -> Result<i64> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before the Unix epoch")?;
@@ -873,6 +866,30 @@ fn now_epoch_seconds() -> Result<i64> {
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex_bytes(&Sha256::digest(bytes))
+}
+
+fn validate_store_id(label: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
+    {
+        bail!("{label} is not a bounded opaque identifier");
+    }
+    Ok(())
+}
+
+fn validate_store_text(label: &str, value: &str, max_bytes: usize) -> Result<()> {
+    if value.is_empty()
+        || value.len() > max_bytes
+        || value
+            .chars()
+            .any(|character| character.is_control() || ('\u{80}'..='\u{9f}').contains(&character))
+    {
+        bail!("{label} is not bounded single-line text");
+    }
+    Ok(())
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -984,6 +1001,8 @@ mod tests {
             vec![
                 "architect_bindings",
                 "control_requests",
+                "daemon_epochs",
+                "execution_environment_leases",
                 "project_apply_ops",
                 "project_plans",
                 "project_runs",
@@ -1168,22 +1187,15 @@ mod tests {
         let mut store = DaemonStore::open(&layout(&temp)).unwrap();
         seed_project_plan_task(&mut store);
 
-        let illegal = StateTransition {
-            project_id: "project-1",
-            scope_id: "project-1",
-            from_version: 0,
-            from_state: "draft",
-            to_state: "running",
-            action: "skip_approval",
-            actor_kind: "human",
-            actor_identity: "test",
-            payload_hash: &digest('a'),
-            turn_id: None,
-            result_hash: None,
-        };
         assert!(
             store
-                .transition_project(&illegal)
+                .connection_mut()
+                .execute(
+                    "UPDATE project_runs
+                     SET state = 'running', version = 1, updated_at = 2
+                     WHERE id = 'project-1' AND state = 'draft' AND version = 0",
+                    [],
+                )
                 .unwrap_err()
                 .to_string()
                 .contains("illegal project state transition")
@@ -1302,20 +1314,29 @@ mod tests {
                 .is_err()
         );
 
-        let queued = StateTransition {
-            project_id: "project-1",
-            scope_id: "task-1",
-            from_version: 0,
-            from_state: "draft",
-            to_state: "queued",
-            action: "task_enqueue",
-            actor_kind: "scheduler",
-            actor_identity: "daemon:test",
-            payload_hash: &digest('3'),
-            turn_id: None,
-            result_hash: None,
-        };
-        store.transition_task(&queued).unwrap();
+        store
+            .connection_mut()
+            .execute(
+                "UPDATE project_tasks
+                 SET state = 'queued', version = 1, updated_at = 2
+                 WHERE id = 'task-1' AND state = 'draft' AND version = 0",
+                [],
+            )
+            .unwrap();
+        store
+            .connection_mut()
+            .execute(
+                "INSERT INTO state_transitions (
+                     project_id, scope_kind, scope_id, from_version, to_version,
+                     from_state, to_state, action, actor_kind, actor_identity,
+                     payload_hash, turn_id, result_hash, created_at
+                 ) VALUES (
+                     'project-1', 'task', 'task-1', 0, 1, 'draft', 'queued',
+                     'task_enqueue', 'scheduler', 'daemon:test', ?1, NULL, NULL, 2
+                 )",
+                [digest('3')],
+            )
+            .unwrap();
         store
             .connection_mut()
             .execute(
@@ -1522,89 +1543,19 @@ mod tests {
     }
 
     #[test]
-    fn project_transition_is_cas_and_audit_atomic() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut store = DaemonStore::open(&layout(&temp)).unwrap();
-        seed_project_plan_task(&mut store);
-        let transition = StateTransition {
-            project_id: "project-1",
-            scope_id: "project-1",
-            from_version: 0,
-            from_state: "draft",
-            to_state: "needs_approval",
-            action: "plan_replace",
-            actor_kind: "architect",
-            actor_identity: "binding:test",
-            payload_hash: &digest('b'),
-            turn_id: None,
-            result_hash: None,
-        };
-        store.transition_project(&transition).unwrap();
-        assert!(store.transition_project(&transition).is_err());
-        let row: (String, i64) = store
-            .connection()
-            .query_row(
-                "SELECT state, version FROM project_runs WHERE id = 'project-1'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(row, ("needs_approval".into(), 1));
-        assert_eq!(
-            store
-                .connection()
-                .query_row("SELECT count(*) FROM state_transitions", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap(),
-            1
-        );
-
-        let task_transition = StateTransition {
-            project_id: "project-1",
-            scope_id: "task-1",
-            from_version: 0,
-            from_state: "draft",
-            to_state: "queued",
-            action: "task_enqueue",
-            actor_kind: "scheduler",
-            actor_identity: "daemon:test",
-            payload_hash: &digest('c'),
-            turn_id: None,
-            result_hash: None,
-        };
-        store.transition_task(&task_transition).unwrap();
-        assert!(store.transition_task(&task_transition).is_err());
-        assert_eq!(
-            store
-                .connection()
-                .query_row("SELECT count(*) FROM state_transitions", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap(),
-            2
-        );
-    }
-
-    #[test]
     fn worker_turn_attempt_retry_is_cas_bound_and_rebinds_process() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = DaemonStore::open(&layout(&temp)).unwrap();
         seed_project_plan_task(&mut store);
-        let queued = StateTransition {
-            project_id: "project-1",
-            scope_id: "task-1",
-            from_version: 0,
-            from_state: "draft",
-            to_state: "queued",
-            action: "task_enqueue",
-            actor_kind: "scheduler",
-            actor_identity: "daemon:test",
-            payload_hash: &digest('d'),
-            turn_id: None,
-            result_hash: None,
-        };
-        store.transition_task(&queued).unwrap();
+        store
+            .connection_mut()
+            .execute(
+                "UPDATE project_tasks
+                 SET state = 'queued', version = 1, updated_at = 2
+                 WHERE id = 'task-1' AND state = 'draft' AND version = 0",
+                [],
+            )
+            .unwrap();
         store
             .connection_mut()
             .execute(
@@ -1642,7 +1593,11 @@ mod tests {
             store
                 .connection_mut()
                 .execute(
-                    "UPDATE worker_turns SET attempt = 1, updated_at = 3
+                    "UPDATE worker_turns
+                     SET status = 'claimed', attempt = 1,
+                         lease_owner = 'lease-1', expires_at = 30,
+                         progress_phase = 'spawn', last_progress_at = 3,
+                         updated_at = 3
                      WHERE id = 'turn-retry' AND attempt = 0 AND status = 'queued'",
                     [],
                 )
@@ -1653,10 +1608,9 @@ mod tests {
             .connection_mut()
             .execute(
                 "UPDATE worker_turns
-                 SET status = 'running', lease_owner = 'lease-1', expires_at = 30,
-                     worker_pid = 100, process_birth = 'birth-1',
-                     progress_phase = 'spawn', started_at = 3, updated_at = 3
-                 WHERE id = 'turn-retry' AND attempt = 1 AND status = 'queued'",
+                 SET status = 'running', worker_pid = 100, process_birth = 'birth-1',
+                     progress_phase = 'running', started_at = 3, updated_at = 3
+                 WHERE id = 'turn-retry' AND attempt = 1 AND status = 'claimed'",
                 [],
             )
             .unwrap();
@@ -1664,8 +1618,7 @@ mod tests {
             .connection_mut()
             .execute(
                 "UPDATE worker_turns
-                 SET status = 'failed', lease_owner = NULL, expires_at = NULL,
-                     progress_phase = 'done', error_kind = 'spawn_failed',
+                 SET status = 'failed', progress_phase = 'done', error_kind = 'spawn_failed',
                      error_message = 'no model turn started', updated_at = 4
                  WHERE id = 'turn-retry' AND attempt = 1 AND status = 'running'",
                 [],
@@ -1676,9 +1629,10 @@ mod tests {
                 .connection_mut()
                 .execute(
                     "UPDATE worker_turns
-                     SET status = 'queued', attempt = 2,
+                     SET status = 'claimed', attempt = 2,
+                         lease_owner = 'lease-2', expires_at = 60,
                          worker_pid = NULL, process_birth = NULL,
-                         progress_phase = 'queued', last_progress_at = NULL,
+                         progress_phase = 'spawn', last_progress_at = 5,
                          error_kind = NULL, error_message = NULL,
                          started_at = NULL, result_at = NULL, applied_at = NULL,
                          updated_at = 5
@@ -1714,10 +1668,9 @@ mod tests {
             .connection_mut()
             .execute(
                 "UPDATE worker_turns
-                 SET status = 'running', lease_owner = 'lease-2', expires_at = 60,
-                     worker_pid = 101, process_birth = 'birth-2',
-                     progress_phase = 'spawn', started_at = 6, updated_at = 6
-                 WHERE id = 'turn-retry' AND attempt = 2 AND status = 'queued'",
+                 SET status = 'running', worker_pid = 101, process_birth = 'birth-2',
+                     progress_phase = 'running', started_at = 6, updated_at = 6
+                 WHERE id = 'turn-retry' AND attempt = 2 AND status = 'claimed'",
                 [],
             )
             .unwrap();
@@ -1739,23 +1692,31 @@ mod tests {
     fn control_request_id_is_idempotent_and_payload_bound() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = DaemonStore::open(&layout(&temp)).unwrap();
+        let epoch = DaemonEpoch {
+            id: "daemon-test".into(),
+            boot_id: "boot-test".into(),
+            daemon_pid: std::process::id(),
+            process_birth: "linux-proc:boot-test:1".into(),
+        };
+        store.start_daemon_epoch(&epoch).unwrap();
         let caller = digest('c');
         let payload = digest('d');
         assert_eq!(
             store
-                .begin_control_request(&caller, "req-1", "project_get", &payload)
+                .begin_control_request(&epoch.id, &caller, "req-1", "project_get", &payload)
                 .unwrap(),
             RequestReplay::New
         );
         assert_eq!(
             store
-                .begin_control_request(&caller, "req-1", "project_get", &payload)
+                .begin_control_request(&epoch.id, &caller, "req-1", "project_get", &payload)
                 .unwrap(),
             RequestReplay::InProgress
         );
         let response = r#"{"protocol_version":1,"request_id":"req-1","ok":false}"#;
         store
             .complete_control_request(
+                &epoch.id,
                 &caller,
                 "req-1",
                 &payload,
@@ -1765,13 +1726,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .begin_control_request(&caller, "req-1", "project_get", &payload)
+                .begin_control_request(&epoch.id, &caller, "req-1", "project_get", &payload)
                 .unwrap(),
             RequestReplay::Completed(response.into())
         );
         assert_eq!(
             store
-                .begin_control_request(&caller, "req-1", "project_get", &digest('f'))
+                .begin_control_request(&epoch.id, &caller, "req-1", "project_get", &digest('f'),)
                 .unwrap(),
             RequestReplay::Conflict
         );
@@ -1813,10 +1774,11 @@ mod tests {
                 .execute(
                     "INSERT INTO worker_profiles (
                          id, project_id, role, adapter, model, reasoning, policy,
-                         cli_path, cli_version, adapter_contract_ver,
+                         cli_path, executable_identity_json, cli_version, adapter_contract_ver,
                          native_session_mode, capability_json, created_at
                      ) VALUES (?1, 'project-1', ?2, 'fake', 'fake-model', 'high',
-                               'sandboxed', '/bin/false', '1', 1, 'discovered', '{}', 1)",
+                               'sandboxed', '/bin/false', '{}', '1', 1,
+                               'discovered', '{}', 1)",
                     params![id, role],
                 )
                 .unwrap();

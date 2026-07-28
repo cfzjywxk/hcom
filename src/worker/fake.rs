@@ -13,7 +13,8 @@ use std::path::PathBuf;
 pub struct FakeWorkerAdapter {
     descriptor: AdapterDescriptor,
     executable: ExecutableIdentity,
-    workspace_cwd: PathBuf,
+    developer_workspace: PathBuf,
+    reviewer_workspace: PathBuf,
 }
 
 impl FakeWorkerAdapter {
@@ -21,6 +22,7 @@ impl FakeWorkerAdapter {
         Self::new(
             "fake-envelope",
             executable,
+            workspace_cwd.clone(),
             workspace_cwd,
             NativeSessionMode::Preassigned,
             ResultTransport::Envelope,
@@ -31,16 +33,33 @@ impl FakeWorkerAdapter {
         Self::new(
             "fake-final-file",
             executable,
+            workspace_cwd.clone(),
             workspace_cwd,
             NativeSessionMode::Discovered,
             ResultTransport::FinalFile,
         )
     }
 
+    pub fn isolated_preassigned(
+        executable: ExecutableIdentity,
+        developer_workspace: PathBuf,
+        reviewer_workspace: PathBuf,
+    ) -> Result<Self> {
+        Self::new(
+            "fake-envelope",
+            executable,
+            developer_workspace,
+            reviewer_workspace,
+            NativeSessionMode::Preassigned,
+            ResultTransport::Envelope,
+        )
+    }
+
     fn new(
         name: &str,
         executable: ExecutableIdentity,
-        workspace_cwd: PathBuf,
+        developer_workspace: PathBuf,
+        reviewer_workspace: PathBuf,
         native_session_mode: NativeSessionMode,
         result_transport: ResultTransport,
     ) -> Result<Self> {
@@ -61,7 +80,8 @@ impl FakeWorkerAdapter {
         Ok(Self {
             descriptor,
             executable,
-            workspace_cwd,
+            developer_workspace,
+            reviewer_workspace,
         })
     }
 
@@ -83,7 +103,12 @@ impl FakeWorkerAdapter {
         }
     }
 
-    fn command(&self, mode: &str, native_session_id: Option<&str>) -> CommandSpec {
+    fn command(
+        &self,
+        role: WorkerRole,
+        mode: &str,
+        native_session_id: Option<&str>,
+    ) -> CommandSpec {
         let mut fixed_argv = vec!["--fake-worker".into(), mode.into(), "--structured".into()];
         if let Some(native_session_id) = native_session_id {
             fixed_argv.extend([
@@ -106,6 +131,7 @@ impl FakeWorkerAdapter {
                     kind: NativeOutputKind::StdoutEnvelope,
                     relative_path: "native.stdout.partial".into(),
                     max_bytes: 256 * 1024,
+                    output_argument: None,
                 },
             ),
             ResultTransport::FinalFile => (
@@ -119,6 +145,7 @@ impl FakeWorkerAdapter {
                     kind: NativeOutputKind::FinalFile,
                     relative_path: "native-final.partial".into(),
                     max_bytes: 256 * 1024,
+                    output_argument: Some("--output-file".into()),
                 },
             ),
         };
@@ -127,7 +154,10 @@ impl FakeWorkerAdapter {
             fixed_argv,
             schema_transport,
             expected_outputs: vec![output],
-            workspace_cwd: self.workspace_cwd.clone(),
+            workspace_cwd: match role {
+                WorkerRole::Developer => self.developer_workspace.clone(),
+                WorkerRole::Reviewer => self.reviewer_workspace.clone(),
+            },
         }
     }
 }
@@ -143,13 +173,13 @@ impl WorkerAdapter for FakeWorkerAdapter {
 
     fn build_create(&self, control: &TurnControl) -> Result<CommandSpec> {
         control.validate()?;
-        Ok(self.command("create", control.native_session_id.as_deref()))
+        Ok(self.command(control.role, "create", control.native_session_id.as_deref()))
     }
 
     fn build_resume(&self, native_session_id: &str, control: &TurnControl) -> Result<CommandSpec> {
         control.validate()?;
         validate_native_session_id(native_session_id)?;
-        Ok(self.command("resume", Some(native_session_id)))
+        Ok(self.command(control.role, "resume", Some(native_session_id)))
     }
 
     fn observe_native_record(&self, record: &[u8]) -> Result<Vec<NativeObservation>> {

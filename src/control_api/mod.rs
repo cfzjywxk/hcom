@@ -10,7 +10,7 @@ pub mod client;
 pub mod daemon;
 
 #[cfg(target_os = "linux")]
-mod peer;
+pub(crate) mod peer;
 
 pub use protocol::{
     ActionName, CallerAuth, CapabilitySnapshot, ContextKind, ContextRef, ControlAction,

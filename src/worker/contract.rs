@@ -341,6 +341,7 @@ pub struct OutputDeclaration {
     pub kind: NativeOutputKind,
     pub relative_path: String,
     pub max_bytes: usize,
+    pub output_argument: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -390,6 +391,18 @@ impl CommandSpec {
             if output.max_bytes == 0 || output.max_bytes > MAX_NATIVE_STREAM_BYTES {
                 bail!("expected output bound is invalid");
             }
+            match (output.kind, output.output_argument.as_deref()) {
+                (NativeOutputKind::FinalFile, Some(argument)) => {
+                    validate_text("final output argument", argument, 128, false)?;
+                }
+                (NativeOutputKind::FinalFile, None) => {
+                    bail!("final-file output requires an explicit path argument");
+                }
+                (_, Some(_)) => {
+                    bail!("only final-file output may declare a path argument");
+                }
+                (_, None) => {}
+            }
             if !kinds.insert(output.kind) || !paths.insert(&output.relative_path) {
                 bail!("expected output kinds and paths must be unique");
             }
@@ -423,6 +436,12 @@ impl CommandSpec {
             } => {
                 argv.push(argument.clone());
                 argv.push(relative_path.clone());
+            }
+        }
+        for output in &self.expected_outputs {
+            if let Some(argument) = &output.output_argument {
+                argv.push(argument.clone());
+                argv.push(output.relative_path.clone());
             }
         }
         argv

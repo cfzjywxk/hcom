@@ -589,6 +589,7 @@ pub enum ControlErrorCode {
     Unauthorized,
     Conflict,
     RequestInProgress,
+    NeedsRecovery,
     NotImplemented,
     Internal,
 }

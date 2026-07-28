@@ -1,0 +1,21 @@
+[Unit]
+Description=hcom durable project scheduler
+Documentation=https://github.com/aannoo/hcom
+
+[Service]
+Type=simple
+ExecStart=%h/.local/libexec/hcomd
+Restart=on-failure
+RestartSec=1s
+KillMode=control-group
+TimeoutStopSec=10s
+UMask=0077
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+RuntimeDirectory=hcom-project-control
+RuntimeDirectoryMode=0700
+
+[Install]
+WantedBy=default.target

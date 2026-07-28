@@ -5,6 +5,8 @@ pub(crate) mod validation;
 pub mod contract;
 pub mod environment;
 pub mod fake;
+#[cfg(target_os = "linux")]
+pub mod process;
 pub mod result;
 
 pub use contract::{
@@ -16,4 +18,9 @@ pub use contract::{
 pub use environment::{
     EnvironmentLeaseDescriptor, EnvironmentPolicy, ExecutionEnvironmentLease,
     MaterializedWorkerEnvironment, WorkerEnvironmentIdentity,
+};
+#[cfg(target_os = "linux")]
+pub use process::{
+    HeartbeatControl, ProcessCompletion, ProcessIdentity, ProcessRunner, RunningWorker, WorkerExit,
+    WorkerTermination,
 };

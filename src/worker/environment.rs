@@ -276,6 +276,14 @@ impl SecretRedactor {
             replacement,
         }
     }
+
+    pub(crate) fn trailing_guard_bytes(&self) -> usize {
+        self.sensitive_values
+            .iter()
+            .map(String::len)
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 fn validate_environment_names(label: &str, names: &[String]) -> Result<()> {

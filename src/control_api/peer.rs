@@ -59,6 +59,11 @@ pub fn process_birth_identity(pid: u32) -> Result<String> {
     if !start_time.bytes().all(|byte| byte.is_ascii_digit()) {
         bail!("invalid process start time");
     }
+    let boot_id = boot_identity()?;
+    Ok(format!("linux-proc:{boot_id}:{start_time}"))
+}
+
+pub(crate) fn boot_identity() -> Result<String> {
     let boot_id =
         fs::read_to_string("/proc/sys/kernel/random/boot_id").context("failed to read boot ID")?;
     let boot_id = boot_id.trim();
@@ -70,7 +75,7 @@ pub fn process_birth_identity(pid: u32) -> Result<String> {
     {
         bail!("invalid boot ID");
     }
-    Ok(format!("linux-proc:{boot_id}:{start_time}"))
+    Ok(boot_id.to_owned())
 }
 
 #[cfg(test)]

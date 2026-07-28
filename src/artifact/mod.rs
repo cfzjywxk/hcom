@@ -133,6 +133,51 @@ impl ArtifactRoot {
     pub fn path(&self) -> &Path {
         &self.canonical_path
     }
+
+    pub fn load_turn_manifest(&self, scope: &ArtifactScope) -> Result<TurnManifest> {
+        scope.validate()?;
+        let relative_path = scope.relative_path();
+        validate_relative_path("artifact attempt path", &relative_path)?;
+        let expected = self.canonical_path.join(&relative_path);
+        let canonical = fs::canonicalize(&expected)
+            .context("failed to canonicalize persisted artifact attempt")?;
+        if canonical != expected || !canonical.starts_with(&self.canonical_path) {
+            bail!("persisted artifact attempt escaped its canonical root");
+        }
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&canonical)?;
+        verify_private_directory(&directory, "persisted artifact attempt")?;
+        let manifest_file = open_private_file(
+            directory.as_raw_fd(),
+            "manifest.json",
+            MAX_MANIFEST_ARTIFACT_BYTES,
+        )?;
+        let mut encoded = Vec::new();
+        (&manifest_file)
+            .take(MAX_MANIFEST_ARTIFACT_BYTES + 1)
+            .read_to_end(&mut encoded)?;
+        if encoded.is_empty() || encoded.len() as u64 > MAX_MANIFEST_ARTIFACT_BYTES {
+            bail!("persisted artifact manifest exceeds its bound");
+        }
+        let manifest: TurnManifest =
+            serde_json::from_slice(&encoded).context("persisted artifact manifest is malformed")?;
+        manifest.validate()?;
+        if manifest.project_id != scope.project_id
+            || manifest.task_id != scope.task_id
+            || manifest.role != scope.role
+            || manifest.logical_session_id != scope.logical_session_id
+            || manifest.turn_sequence != scope.turn_sequence
+            || manifest.attempt != scope.attempt
+        {
+            bail!("persisted artifact manifest scope mismatch");
+        }
+        for receipt in &manifest.artifacts {
+            verify_receipt(&directory, receipt)?;
+        }
+        Ok(manifest)
+    }
 }
 
 pub struct ArtifactAttempt {
@@ -213,6 +258,62 @@ impl ArtifactAttempt {
 
     pub fn artifact_path(&self, kind: ArtifactKind) -> PathBuf {
         self.directory_path.join(kind.file_name())
+    }
+
+    pub fn write_control_file(&self, relative_path: &str, contents: &[u8]) -> Result<PathBuf> {
+        validate_relative_path("adapter control file", relative_path)?;
+        if Path::new(relative_path).components().count() != 1
+            || contents.is_empty()
+            || contents.len() > 64 * 1024
+            || is_reserved_artifact_name(relative_path)
+            || relative_path == "manifest.json"
+        {
+            bail!("adapter control file shape is invalid");
+        }
+        let mut file = create_private_file(self.directory.as_raw_fd(), relative_path)?;
+        file.write_all(contents)?;
+        file.flush()?;
+        file.sync_all()?;
+        verify_private_regular_file(&file, relative_path)?;
+        Ok(self.directory_path.join(relative_path))
+    }
+
+    pub fn ingest_native_final(&self, relative_path: &str, hard_cap: u64) -> Result<Vec<u8>> {
+        validate_relative_path("native final output", relative_path)?;
+        if relative_path != ArtifactKind::NativeFinal.file_name()
+            || hard_cap == 0
+            || hard_cap > ArtifactKind::NativeFinal.hard_cap()
+        {
+            bail!("native final output shape is invalid");
+        }
+        let mut file = open_private_file(self.directory.as_raw_fd(), relative_path, hard_cap)?;
+        let mut raw = Vec::new();
+        (&mut file).take(hard_cap + 1).read_to_end(&mut raw)?;
+        if raw.is_empty() || raw.len() as u64 > hard_cap {
+            bail!("native final output exceeds its declared bound");
+        }
+        verify_private_regular_file(&file, relative_path)?;
+        if file.metadata()?.len() != raw.len() as u64 {
+            bail!("native final output changed while it was ingested");
+        }
+        drop(file);
+        unlink_required(self.directory.as_raw_fd(), relative_path)?;
+
+        let sanitized = sanitize_untrusted(&raw, &self.redactor);
+        let accepted = utf8_prefix(
+            sanitized.as_bytes(),
+            usize::try_from(hard_cap).context("native final cap does not fit usize")?,
+        );
+        let truncated = accepted.len() < sanitized.len();
+        reserve_receipt(&self.registry, ArtifactKind::NativeFinal)?;
+        let receipt = atomic_write(
+            &self.directory,
+            ArtifactKind::NativeFinal,
+            accepted,
+            truncated,
+        )?;
+        complete_receipt(&self.registry, receipt)?;
+        Ok(raw)
     }
 
     pub fn start_native_stream(
@@ -360,6 +461,13 @@ impl BoundedArtifactWriter {
     }
 
     pub fn finish(mut self) -> Result<ArtifactReceipt> {
+        if self.truncated {
+            let guard = self
+                .redactor
+                .trailing_guard_bytes()
+                .min(self.raw_buffer.len());
+            self.raw_buffer.truncate(self.raw_buffer.len() - guard);
+        }
         let sanitized = sanitize_untrusted(&self.raw_buffer, &self.redactor);
         let accepted = utf8_prefix(
             sanitized.as_bytes(),
@@ -723,6 +831,40 @@ fn create_private_file(directory_fd: RawFd, file_name: &str) -> Result<File> {
     Ok(file)
 }
 
+fn open_private_file(directory_fd: RawFd, file_name: &str, hard_cap: u64) -> Result<File> {
+    let file_name = CString::new(file_name)?;
+    // SAFETY: directory_fd is live and file_name is a validated fixed C string.
+    let fd = unsafe {
+        libc::openat(
+            directory_fd,
+            file_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to open private artifact file");
+    }
+    // SAFETY: openat returned a newly owned descriptor.
+    let file = unsafe { File::from_raw_fd(fd) };
+    verify_private_regular_file(&file, "persisted artifact file")?;
+    if file.metadata()?.len() > hard_cap {
+        bail!("persisted artifact file exceeds its hard cap");
+    }
+    Ok(file)
+}
+
+fn is_reserved_artifact_name(name: &str) -> bool {
+    [
+        ArtifactKind::NativeStdout.file_name(),
+        ArtifactKind::NativeStderr.file_name(),
+        ArtifactKind::NativeFinal.file_name(),
+        ArtifactKind::Activity.file_name(),
+        ArtifactKind::Result.file_name(),
+    ]
+    .contains(&name)
+}
+
 fn atomic_write(
     directory: &File,
     kind: ArtifactKind,
@@ -807,6 +949,16 @@ fn unlink_file(directory_fd: RawFd, file_name: &str) {
             libc::unlinkat(directory_fd, file_name.as_ptr(), 0);
         }
     }
+}
+
+fn unlink_required(directory_fd: RawFd, file_name: &str) -> Result<()> {
+    let file_name = CString::new(file_name)?;
+    // SAFETY: directory_fd is live and file_name is a validated attempt-local component.
+    if unsafe { libc::unlinkat(directory_fd, file_name.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to consume native final output");
+    }
+    Ok(())
 }
 
 fn verify_private_directory(directory: &File, label: &str) -> Result<()> {
@@ -1130,13 +1282,68 @@ mod tests {
         assert!(!stored.contains('\u{1b}'));
         assert!(!stored.contains('\r'));
         assert!(!stored.contains("top-secret"));
-        assert!(stored.contains("[REDACTED]"));
+        assert!(
+            stored.len() < 64,
+            "truncated streams must drop a longest-secret tail guard before sealing"
+        );
 
         prompt_writer.finish().unwrap();
         let prompt_output =
             fs::read_to_string(attempt.artifact_path(ArtifactKind::NativeStdout)).unwrap();
         assert!(!prompt_output.contains("private turn prompt sentinel"));
         assert!(prompt_output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn truncated_stream_drops_partial_secret_at_the_cap_boundary() {
+        let (_temp, root) = fixture_root();
+        let secret = "boundary-secret-value-12345";
+        let environment = ExecutionEnvironmentLease::capture(
+            "lease-boundary",
+            "epoch-1",
+            &EnvironmentPolicy::baseline(),
+            vec![("PATH".into(), secret.into())],
+        )
+        .unwrap();
+        let attempt = ArtifactAttempt::create(&root, scope(), &environment, TEST_PROMPT).unwrap();
+        let hard_cap = (b"prefix ".len() + secret.len() - 3) as u64;
+        let mut writer = attempt
+            .start_native_stream(ArtifactKind::NativeStderr, hard_cap)
+            .unwrap();
+        writer
+            .write_chunk(format!("prefix {secret} trailing").as_bytes())
+            .unwrap();
+        let receipt = writer.finish().unwrap();
+        assert!(receipt.truncated);
+        let stored = fs::read_to_string(attempt.artifact_path(ArtifactKind::NativeStderr)).unwrap();
+        assert!(!stored.contains("boundary-secret"));
+        assert!(!stored.contains("boundary-secret-value-12"));
+    }
+
+    #[test]
+    fn native_final_ingest_keeps_raw_only_in_memory_and_seals_redacted_bytes() {
+        let (_temp, root) = fixture_root();
+        let environment =
+            fixture_environment(Some("http://worker-user:top-secret@proxy.invalid:8080"));
+        let attempt = ArtifactAttempt::create(&root, scope(), &environment, TEST_PROMPT).unwrap();
+        let raw = br#"{"summary":"top-secret","safe":"kept"}"#;
+        let mut worker_file = create_private_file(
+            attempt.directory.as_raw_fd(),
+            ArtifactKind::NativeFinal.file_name(),
+        )
+        .unwrap();
+        worker_file.write_all(raw).unwrap();
+        worker_file.sync_all().unwrap();
+        drop(worker_file);
+
+        let in_memory = attempt
+            .ingest_native_final(ArtifactKind::NativeFinal.file_name(), 1024)
+            .unwrap();
+        assert_eq!(in_memory, raw);
+        let stored = fs::read_to_string(attempt.artifact_path(ArtifactKind::NativeFinal)).unwrap();
+        assert!(!stored.contains("top-secret"));
+        assert!(stored.contains("[REDACTED]"));
+        assert!(stored.contains("kept"));
     }
 
     #[test]
@@ -1198,6 +1405,29 @@ mod tests {
         assert_eq!(stored.matches("\"kind\":\"truncated\"").count(), 1);
         assert!(!stored.contains("private turn prompt sentinel"));
         assert!(!stored.contains("must not be authority"));
+    }
+
+    #[test]
+    fn activity_is_incremental_while_native_streams_remain_unsealed() {
+        let (_temp, root) = fixture_root();
+        let attempt = create_attempt(&root, scope());
+        let mut native = attempt
+            .start_native_stream(ArtifactKind::NativeStdout, 1024)
+            .unwrap();
+        let mut activity = attempt.start_activity_log(1024).unwrap();
+        native
+            .write_chunk(b"native partial must not be followed")
+            .unwrap();
+        activity
+            .record("progress", b"safe incremental event")
+            .unwrap();
+        let native_on_disk = fs::read(attempt.artifact_path(ArtifactKind::NativeStdout)).unwrap();
+        let activity_on_disk =
+            fs::read_to_string(attempt.artifact_path(ArtifactKind::Activity)).unwrap();
+        assert!(native_on_disk.is_empty());
+        assert!(activity_on_disk.contains("safe incremental event"));
+        native.finish().unwrap();
+        activity.finish().unwrap();
     }
 
     #[test]

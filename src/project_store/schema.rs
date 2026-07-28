@@ -19,6 +19,24 @@ CREATE TABLE store_meta (
     CHECK (created_at > 0)
 );
 
+CREATE TABLE daemon_epochs (
+    id                 TEXT PRIMARY KEY,
+    boot_id            TEXT NOT NULL,
+    daemon_pid         INTEGER NOT NULL CHECK (daemon_pid > 1),
+    process_birth      TEXT NOT NULL,
+    state              TEXT NOT NULL CHECK (state IN ('active', 'retired', 'crashed')),
+    started_at         INTEGER NOT NULL,
+    stopped_at         INTEGER,
+    CHECK (length(CAST(id AS BLOB)) BETWEEN 1 AND 128),
+    CHECK (length(CAST(boot_id AS BLOB)) BETWEEN 1 AND 64),
+    CHECK (length(CAST(process_birth AS BLOB)) BETWEEN 1 AND 256),
+    CHECK ((state = 'active' AND stopped_at IS NULL)
+           OR (state IN ('retired', 'crashed') AND stopped_at IS NOT NULL))
+);
+
+CREATE UNIQUE INDEX daemon_epochs_one_active
+    ON daemon_epochs(state) WHERE state = 'active';
+
 CREATE TABLE project_runs (
     id                       TEXT PRIMARY KEY,
     state                    TEXT NOT NULL CHECK (state IN (
@@ -80,6 +98,10 @@ CREATE TABLE worker_profiles (
     reasoning             TEXT NOT NULL,
     policy                TEXT NOT NULL,
     cli_path              TEXT NOT NULL,
+    executable_identity_json TEXT NOT NULL CHECK (
+                              json_valid(executable_identity_json)
+                              AND json_type(executable_identity_json) = 'object'
+                          ),
     cli_version           TEXT NOT NULL,
     adapter_contract_ver  INTEGER NOT NULL CHECK (adapter_contract_ver > 0),
     native_session_mode   TEXT NOT NULL CHECK (
@@ -97,10 +119,40 @@ CREATE TABLE worker_profiles (
     CHECK (length(CAST(policy AS BLOB)) BETWEEN 1 AND 2048),
     CHECK (substr(cli_path, 1, 1) = '/'
            AND length(CAST(cli_path AS BLOB)) BETWEEN 1 AND 4096),
+    CHECK (length(CAST(executable_identity_json AS BLOB)) BETWEEN 2 AND 65536),
     CHECK (length(CAST(cli_version AS BLOB)) BETWEEN 1 AND 128),
     CHECK (length(CAST(capability_json AS BLOB)) BETWEEN 2 AND 65536),
     UNIQUE (project_id, id)
 );
+
+CREATE TABLE execution_environment_leases (
+    project_id           TEXT NOT NULL REFERENCES project_runs(id) ON DELETE CASCADE,
+    lease_id             TEXT NOT NULL,
+    daemon_epoch         TEXT NOT NULL REFERENCES daemon_epochs(id) ON DELETE RESTRICT,
+    environment_hash     TEXT NOT NULL,
+    inherited_names_json TEXT NOT NULL CHECK (
+                             json_valid(inherited_names_json)
+                             AND json_type(inherited_names_json) = 'array'
+                         ),
+    required_names_json  TEXT NOT NULL CHECK (
+                             json_valid(required_names_json)
+                             AND json_type(required_names_json) = 'array'
+                         ),
+    state                TEXT NOT NULL CHECK (state IN ('active', 'lost')),
+    created_at           INTEGER NOT NULL,
+    lost_at              INTEGER,
+    PRIMARY KEY (project_id, lease_id),
+    CHECK (length(CAST(lease_id AS BLOB)) BETWEEN 1 AND 128),
+    CHECK (length(environment_hash) = 64
+           AND environment_hash NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(CAST(inherited_names_json AS BLOB)) BETWEEN 2 AND 8192),
+    CHECK (length(CAST(required_names_json AS BLOB)) BETWEEN 2 AND 8192),
+    CHECK ((state = 'active' AND lost_at IS NULL)
+           OR (state = 'lost' AND lost_at IS NOT NULL))
+);
+
+CREATE UNIQUE INDEX execution_environment_one_active
+    ON execution_environment_leases(project_id) WHERE state = 'active';
 
 CREATE TABLE project_plans (
     id                         TEXT PRIMARY KEY,
@@ -233,7 +285,7 @@ CREATE TABLE worker_turns (
     review_round        INTEGER NOT NULL CHECK (review_round >= 0),
     request_hash        TEXT NOT NULL,
     status              TEXT NOT NULL CHECK (status IN (
-                            'queued', 'running', 'result_ready', 'applied',
+                            'queued', 'claimed', 'running', 'result_ready', 'applied',
                             'failed', 'indeterminate', 'stale', 'canceled'
                         )),
     attempt             INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
@@ -283,6 +335,9 @@ CREATE TABLE worker_turns (
     CHECK (status != 'queued'
            OR (lease_owner IS NULL AND worker_pid IS NULL
                AND result_json IS NULL AND progress_phase = 'queued')),
+    CHECK (status != 'claimed'
+           OR (attempt > 0 AND lease_owner IS NOT NULL AND worker_pid IS NULL
+               AND result_json IS NULL AND progress_phase = 'spawn')),
     CHECK (status != 'running'
            OR (attempt > 0 AND lease_owner IS NOT NULL AND worker_pid IS NOT NULL
                AND progress_phase IN ('spawn', 'running', 'validating'))),
@@ -426,6 +481,7 @@ CREATE TABLE project_apply_ops (
 CREATE TABLE control_requests (
     caller_key_hash  TEXT NOT NULL,
     request_id       TEXT NOT NULL,
+    daemon_epoch     TEXT NOT NULL REFERENCES daemon_epochs(id) ON DELETE RESTRICT,
     action           TEXT NOT NULL,
     payload_hash     TEXT NOT NULL,
     state            TEXT NOT NULL CHECK (state IN ('accepted', 'completed')),
@@ -460,6 +516,27 @@ CREATE TRIGGER store_meta_immutable_delete
 BEFORE DELETE ON store_meta
 BEGIN
     SELECT RAISE(ABORT, 'store metadata is immutable');
+END;
+
+CREATE TRIGGER daemon_epochs_immutable_identity
+BEFORE UPDATE OF id, boot_id, daemon_pid, process_birth, started_at
+ON daemon_epochs
+BEGIN
+    SELECT RAISE(ABORT, 'daemon epoch identity is immutable');
+END;
+CREATE TRIGGER daemon_epochs_legal_state
+BEFORE UPDATE OF state, stopped_at ON daemon_epochs
+WHEN NOT (
+    OLD.state = 'active' AND NEW.state IN ('retired', 'crashed')
+    AND OLD.stopped_at IS NULL AND NEW.stopped_at IS NOT NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'daemon epoch may close exactly once');
+END;
+CREATE TRIGGER daemon_epochs_immutable_delete
+BEFORE DELETE ON daemon_epochs
+BEGIN
+    SELECT RAISE(ABORT, 'daemon epoch history is append-only');
 END;
 
 CREATE TRIGGER project_runs_immutable_identity
@@ -506,6 +583,28 @@ CREATE TRIGGER worker_profiles_immutable_update
 BEFORE UPDATE ON worker_profiles
 BEGIN
     SELECT RAISE(ABORT, 'worker profile is immutable');
+END;
+
+CREATE TRIGGER execution_environment_immutable_identity
+BEFORE UPDATE OF project_id, lease_id, daemon_epoch, environment_hash,
+                 inherited_names_json, required_names_json, created_at
+ON execution_environment_leases
+BEGIN
+    SELECT RAISE(ABORT, 'execution environment lease identity is immutable');
+END;
+CREATE TRIGGER execution_environment_legal_state
+BEFORE UPDATE OF state, lost_at ON execution_environment_leases
+WHEN NOT (
+    OLD.state = 'active' AND NEW.state = 'lost'
+    AND OLD.lost_at IS NULL AND NEW.lost_at IS NOT NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'execution environment lease may be lost exactly once');
+END;
+CREATE TRIGGER execution_environment_immutable_delete
+BEFORE DELETE ON execution_environment_leases
+BEGIN
+    SELECT RAISE(ABORT, 'execution environment lease history cannot be deleted');
 END;
 
 CREATE TRIGGER project_plans_profile_shape_insert
@@ -681,7 +780,7 @@ END;
 CREATE TRIGGER worker_sessions_legal_state
 BEFORE UPDATE OF state ON worker_sessions
 WHEN NEW.state != OLD.state AND NOT (
-    (OLD.state = 'creating' AND NEW.state IN ('active', 'failed', 'indeterminate'))
+    (OLD.state = 'creating' AND NEW.state IN ('active', 'closed', 'failed', 'indeterminate'))
     OR (OLD.state = 'active' AND NEW.state IN ('closed', 'failed', 'indeterminate'))
     OR (OLD.state = 'indeterminate' AND NEW.state IN ('closed', 'failed'))
 )
@@ -725,12 +824,12 @@ CREATE TRIGGER worker_turns_attempt_cas
 BEFORE UPDATE OF attempt ON worker_turns
 WHEN NEW.attempt != OLD.attempt AND NOT (
     NEW.attempt = OLD.attempt + 1
-    AND NEW.status = 'queued'
+    AND NEW.status = 'claimed'
     AND ((OLD.status = 'queued' AND OLD.attempt = 0)
          OR OLD.status IN ('failed', 'indeterminate'))
-    AND NEW.lease_owner IS NULL AND NEW.expires_at IS NULL
+    AND NEW.lease_owner IS NOT NULL AND NEW.expires_at IS NOT NULL
     AND NEW.worker_pid IS NULL AND NEW.process_birth IS NULL
-    AND NEW.progress_phase = 'queued' AND NEW.last_progress_at IS NULL
+    AND NEW.progress_phase = 'spawn' AND NEW.last_progress_at IS NOT NULL
     AND NEW.result_json IS NULL AND NEW.result_hash IS NULL
     AND NEW.error_kind IS NULL AND NEW.error_message IS NULL
     AND NEW.started_at IS NULL AND NEW.result_at IS NULL AND NEW.applied_at IS NULL
@@ -742,13 +841,16 @@ CREATE TRIGGER worker_turns_legal_state
 BEFORE UPDATE OF status ON worker_turns
 WHEN NEW.status != OLD.status AND NOT (
     (OLD.status = 'queued' AND NEW.status IN (
+        'claimed', 'failed', 'indeterminate', 'stale', 'canceled'
+    ))
+    OR (OLD.status = 'claimed' AND NEW.status IN (
         'running', 'failed', 'indeterminate', 'stale', 'canceled'
     ))
     OR (OLD.status = 'running' AND NEW.status IN (
         'result_ready', 'failed', 'indeterminate', 'stale', 'canceled'
     ))
     OR (OLD.status = 'result_ready' AND NEW.status IN ('applied', 'stale', 'canceled'))
-    OR (OLD.status IN ('failed', 'indeterminate') AND NEW.status = 'queued'
+    OR (OLD.status IN ('failed', 'indeterminate') AND NEW.status = 'claimed'
         AND NEW.attempt = OLD.attempt + 1)
 )
 BEGIN
@@ -760,11 +862,11 @@ WHEN NOT (
     (NEW.worker_pid IS OLD.worker_pid AND NEW.process_birth IS OLD.process_birth)
     OR (OLD.worker_pid IS NULL AND OLD.process_birth IS NULL
         AND NEW.worker_pid IS NOT NULL AND NEW.process_birth IS NOT NULL
-        AND OLD.status = 'queued' AND NEW.status = 'running'
+        AND OLD.status = 'claimed' AND NEW.status = 'running'
         AND NEW.attempt = OLD.attempt AND NEW.attempt > 0)
     OR (OLD.worker_pid IS NOT NULL AND OLD.process_birth IS NOT NULL
         AND NEW.worker_pid IS NULL AND NEW.process_birth IS NULL
-        AND OLD.status IN ('failed', 'indeterminate') AND NEW.status = 'queued'
+        AND OLD.status IN ('failed', 'indeterminate') AND NEW.status = 'claimed'
         AND NEW.attempt = OLD.attempt + 1)
 )
 BEGIN
@@ -870,7 +972,7 @@ BEGIN
 END;
 
 CREATE TRIGGER control_requests_immutable_identity
-BEFORE UPDATE OF caller_key_hash, request_id, action, payload_hash, created_at
+BEFORE UPDATE OF caller_key_hash, request_id, daemon_epoch, action, payload_hash, created_at
 ON control_requests
 BEGIN
     SELECT RAISE(ABORT, 'control request identity is immutable');
@@ -886,5 +988,21 @@ WHEN NOT (
 )
 BEGIN
     SELECT RAISE(ABORT, 'control request may complete exactly once');
+END;
+
+CREATE TRIGGER worker_sessions_immutable_delete
+BEFORE DELETE ON worker_sessions
+BEGIN
+    SELECT RAISE(ABORT, 'worker session history cannot be deleted');
+END;
+CREATE TRIGGER worker_turns_immutable_delete
+BEFORE DELETE ON worker_turns
+BEGIN
+    SELECT RAISE(ABORT, 'worker turn history cannot be deleted');
+END;
+CREATE TRIGGER control_requests_immutable_delete
+BEFORE DELETE ON control_requests
+BEGIN
+    SELECT RAISE(ABORT, 'control request history cannot be deleted');
 END;
 "#;
