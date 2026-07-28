@@ -2156,6 +2156,112 @@ mod tests {
     }
 
     #[test]
+    fn initial_handoff_and_recovery_launches_preserve_every_chain_cli_option() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(directory.path()).unwrap();
+        let chain = TerminalChain {
+            id: "tc-pinned-profile".to_string(),
+            workspace: workspace.to_string_lossy().into_owned(),
+            tool: "codex".to_string(),
+            tag: "dev1".to_string(),
+            model_ref: "gpt-5.6-sol".to_string(),
+            reasoning_ref: "max".to_string(),
+            permission_policy_ref: "approval=never;sandbox=danger-full-access".to_string(),
+            policy_ref: "codex-0.145.0-foreground-v1".to_string(),
+            supervisor_process_id: "supervisor".to_string(),
+            supervisor_process_birth_identity: "birth".to_string(),
+            supervisor_pid: Some(10),
+            supervisor_pgid: Some(10),
+            outer_foreground_pgid: Some(10),
+            outer_tty_device: Some(7),
+            outer_tty_inode: Some(11),
+            current_generation: 1,
+            state: ChainState::Active,
+            version: 0,
+            created_at: 0.0,
+            updated_at: 0.0,
+        };
+        let adapter = std::mem::ManuallyDrop::new(CodexGenerationAdapter {
+            outer: OuterTerminalIdentity {
+                supervisor_pid: 10,
+                supervisor_pgid: 10,
+                foreground_pgid: 10,
+                tty_device: 7,
+                tty_inode: 11,
+            },
+            outer_fd: -1,
+            // launch_spec never reads terminal state.
+            saved_termios: unsafe { std::mem::zeroed() },
+            signal_read: -1,
+            signal_write: -1,
+            saved_signals: Vec::new(),
+            executable: PathBuf::from("/opt/codex"),
+            profile: CodexLaunchProfile::from_chain(&chain).unwrap(),
+            chain_id: chain.id.clone(),
+            tag: chain.tag.clone(),
+            title_stack_pushed: false,
+            current_title: None,
+            pending_title: None,
+        });
+        let cases = [
+            (1, chain.id.as_str(), "Start hcom chain tc-pinned-profile"),
+            (
+                2,
+                "ho-normal-successor",
+                "Continue hcom handoff ho-normal-successor",
+            ),
+            (
+                3,
+                "ho-recovery-successor",
+                "Continue hcom handoff ho-recovery-successor",
+            ),
+        ];
+
+        for (generation, handoff_id, prompt) in cases {
+            let reservation = TargetReservation {
+                handoff_id: handoff_id.to_string(),
+                expected_version: i64::try_from(generation).unwrap(),
+                generation,
+                launch_nonce: format!("launch-{generation}"),
+            };
+            let identity = GenerationIdentity {
+                generation,
+                launch_nonce: reservation.launch_nonce.clone(),
+                wrapper_pid: 10,
+                wrapper_pgid: 10,
+                child_pid: 11,
+                child_pgid: 11,
+                child_process_birth_identity: "child-birth".to_string(),
+                process_id: format!("process-{generation}"),
+                process_birth_identity: "wrapper-birth".to_string(),
+                instance_name: format!("chain-g{generation}"),
+                hcom_session_id: format!("session-{generation}"),
+                native_session_id: None,
+            };
+            let spec = adapter.launch_spec(&reservation, &identity).unwrap();
+            assert_eq!(spec.executable, PathBuf::from("/opt/codex"));
+            assert_eq!(spec.workspace, workspace);
+            assert_eq!(
+                spec.argv,
+                [
+                    "--model",
+                    "gpt-5.6-sol",
+                    "--config",
+                    "model_reasoning_effort=\"max\"",
+                    "--sandbox",
+                    "danger-full-access",
+                    "--ask-for-approval",
+                    "never",
+                    "--cd",
+                    workspace.to_str().unwrap(),
+                    prompt,
+                ]
+                .map(str::to_string)
+            );
+        }
+    }
+
+    #[test]
     #[serial_test::serial]
     fn adapter_drop_restores_the_terminal_title_stack() {
         let directory = tempfile::tempdir().unwrap();

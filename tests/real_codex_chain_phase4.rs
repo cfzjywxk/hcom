@@ -912,7 +912,12 @@ fn all_materialized_generations_inherit_tag(db_path: &Path, expected: &str) -> b
     chain_tag == expected && counts.0 > 0 && counts.0 == counts.1
 }
 
-fn inspect_child_argv(process: &ProcessSnapshot, expected_prompt: &str, secret: &str) {
+fn inspect_child_argv(
+    process: &ProcessSnapshot,
+    expected_prompt: &str,
+    expected_workspace: &Path,
+    secret: &str,
+) {
     assert!(process.generation >= 1);
     let cmdline = fs::read(format!("/proc/{}/cmdline", process.child_pid)).unwrap();
     let args: Vec<&[u8]> = cmdline
@@ -926,14 +931,23 @@ fn inspect_child_argv(process: &ProcessSnapshot, expected_prompt: &str, secret: 
     for forbidden in [b"resume".as_slice(), b"fork", b"--last"] {
         assert!(!args.contains(&forbidden));
     }
-    let config_index = args
-        .iter()
-        .position(|argument| *argument == b"--config")
-        .expect("missing exact reasoning config");
-    assert_eq!(
-        args.get(config_index + 1).copied(),
-        Some(b"model_reasoning_effort=\"max\"".as_slice())
-    );
+    for (flag, expected) in [
+        ("--model", "gpt-5.5"),
+        ("--config", "model_reasoning_effort=\"max\""),
+        ("--sandbox", "danger-full-access"),
+        ("--ask-for-approval", "never"),
+        ("--cd", expected_workspace.to_str().unwrap()),
+    ] {
+        let index = args
+            .iter()
+            .position(|argument| *argument == flag.as_bytes())
+            .unwrap_or_else(|| panic!("missing exact {flag} option"));
+        assert_eq!(
+            args.get(index + 1).copied(),
+            Some(expected.as_bytes()),
+            "wrong value for {flag}"
+        );
+    }
     assert!(
         !cmdline
             .windows(secret.len())
@@ -1096,6 +1110,7 @@ fn run_driver() {
     let hcom_dir = PathBuf::from(std::env::var_os("HCOM_DIR").unwrap());
     let db_path = hcom_dir.join("hcom.db");
     let root = hcom_dir.parent().unwrap().to_path_buf();
+    let workspace = fs::canonicalize(root.join("workspace")).unwrap();
     let start_args = [
         "chain",
         "codex",
@@ -1134,7 +1149,12 @@ fn run_driver() {
         Duration::from_secs(30),
         || generation_native(&db_path, 1),
     );
-    inspect_child_argv(&source, &format!("Start hcom chain {}", chain.id), &secret);
+    inspect_child_argv(
+        &source,
+        &format!("Start hcom chain {}", chain.id),
+        &workspace,
+        &secret,
+    );
 
     let generations_before_live = count_rows(&db_path, "terminal_generations");
     let attempts_before_live = count_rows(&db_path, "terminal_recovery_attempts");
@@ -1176,6 +1196,7 @@ fn run_driver() {
         inspect_child_argv(
             &target,
             &format!("Continue hcom handoff {}", latest_handoff(&db_path).0),
+            &workspace,
             &secret,
         );
         wait_with_sampling(
@@ -1293,6 +1314,7 @@ fn run_driver() {
         inspect_child_argv(
             &target,
             &format!("Continue hcom handoff {}", latest_handoff(&db_path).0),
+            &workspace,
             &secret,
         );
         wait_with_sampling(

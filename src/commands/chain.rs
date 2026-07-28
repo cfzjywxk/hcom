@@ -358,6 +358,30 @@ fn profile_from_spec(spec: &ChainSpec) -> TerminalChain {
     }
 }
 
+fn recovery_preflight_spec(
+    chain: &TerminalChain,
+    owner: &TerminalOwnerEvidence,
+    launch_nonce: String,
+) -> ChainSpec {
+    ChainSpec {
+        workspace: PathBuf::from(&chain.workspace),
+        tool: chain.tool.clone(),
+        tag: chain.tag.clone(),
+        model_ref: chain.model_ref.clone(),
+        reasoning_ref: chain.reasoning_ref.clone(),
+        permission_policy_ref: chain.permission_policy_ref.clone(),
+        policy_ref: chain.policy_ref.clone(),
+        supervisor_process_id: owner.supervisor.process_id.clone(),
+        supervisor_process_birth_identity: owner.supervisor.process_birth_identity.clone(),
+        supervisor_pid: owner.supervisor_pid,
+        supervisor_pgid: owner.supervisor_pgid,
+        outer_foreground_pgid: owner.outer_foreground_pgid,
+        outer_tty_device: owner.outer_tty_device,
+        outer_tty_inode: owner.outer_tty_inode,
+        launch_nonce,
+    }
+}
+
 fn target_materialization(
     expected_version: i64,
     reservation: &TargetReservation,
@@ -1470,10 +1494,9 @@ fn cmd_recover(db: &HcomDb, args: &ChainRecoverArgs) -> i32 {
         Ok(terminal) => terminal,
         Err(error) => return print_error(error, args.json),
     };
-    let chain = match chain_status_for_terminal_owner(db, Some(&args.id), &terminal.owner) {
-        Ok(chain) => chain,
-        Err(error) => return print_error(error, args.json),
-    };
+    if let Err(error) = chain_status_for_terminal_owner(db, Some(&args.id), &terminal.owner) {
+        return print_error(error, args.json);
+    }
     let recovery = match handoff::begin_public_recovery(db, &args.id, args.version, &terminal.owner)
     {
         Ok(recovery) => recovery,
@@ -1527,23 +1550,12 @@ fn cmd_recover(db: &HcomDb, args: &ChainRecoverArgs) -> i32 {
     // Recovery intent, append-only generation identity, new supervisor
     // identity, and absence evidence are durable before any external Codex
     // helper or target process can start.
-    let adapter_preflight = match preflight(&ChainSpec {
-        workspace: PathBuf::from(&chain.workspace),
-        tool: chain.tool.clone(),
-        tag: chain.tag.clone(),
-        model_ref: chain.model_ref.clone(),
-        reasoning_ref: chain.reasoning_ref.clone(),
-        permission_policy_ref: chain.permission_policy_ref.clone(),
-        policy_ref: chain.policy_ref.clone(),
-        supervisor_process_id: terminal.owner.supervisor.process_id.clone(),
-        supervisor_process_birth_identity: terminal.owner.supervisor.process_birth_identity.clone(),
-        supervisor_pid: terminal.owner.supervisor_pid,
-        supervisor_pgid: terminal.owner.supervisor_pgid,
-        outer_foreground_pgid: terminal.owner.outer_foreground_pgid,
-        outer_tty_device: terminal.owner.outer_tty_device,
-        outer_tty_inode: terminal.owner.outer_tty_inode,
-        launch_nonce: opaque("recovery-preflight"),
-    }) {
+    let recovery_spec = recovery_preflight_spec(
+        &recovery.chain,
+        &terminal.owner,
+        opaque("recovery-preflight"),
+    );
+    let adapter_preflight = match preflight(&recovery_spec) {
         Ok(preflight) => preflight,
         Err(error) => {
             persist_recovery_prelaunch_failure(
@@ -1754,6 +1766,118 @@ mod tests {
             ChainArgs::try_parse_from(["chain", "recover", "tc-123", "--version", "7", "--json"])
                 .unwrap();
         assert!(matches!(recover.command, ChainCommand::Recover(_)));
+    }
+
+    #[test]
+    fn public_codex_command_pins_every_launch_option_in_the_chain_spec() {
+        let parsed = ChainArgs::try_parse_from([
+            "chain",
+            "codex",
+            "--tag",
+            "dev1",
+            "--model",
+            "gpt-5.6-sol",
+            "--reasoning",
+            "max",
+            "--sandbox",
+            "danger-full-access",
+            "--approval",
+            "never",
+        ])
+        .unwrap();
+        let ChainCommand::Codex(args) = parsed.command else {
+            panic!("expected chain codex");
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(directory.path()).unwrap();
+        let terminal = HumanTerminalContext {
+            outer: OuterTerminalIdentity {
+                supervisor_pid: 10,
+                supervisor_pgid: 10,
+                foreground_pgid: 10,
+                tty_device: 7,
+                tty_inode: 8,
+            },
+            owner: TerminalOwnerEvidence {
+                workspace: workspace.clone(),
+                supervisor: SupervisorActor {
+                    process_id: "supervisor".to_string(),
+                    process_birth_identity: "birth".to_string(),
+                },
+                supervisor_pid: 10,
+                supervisor_pgid: 10,
+                outer_foreground_pgid: 10,
+                outer_tty_device: 7,
+                outer_tty_inode: 8,
+            },
+        };
+
+        let spec = build_spec(&terminal, &args).unwrap();
+        assert_eq!(spec.workspace, workspace);
+        assert_eq!(spec.tool, "codex");
+        assert_eq!(spec.tag, "dev1");
+        assert_eq!(spec.model_ref, "gpt-5.6-sol");
+        assert_eq!(spec.reasoning_ref, "max");
+        assert_eq!(
+            spec.permission_policy_ref,
+            "approval=never;sandbox=danger-full-access"
+        );
+        assert_eq!(spec.policy_ref, POLICY_REF);
+    }
+
+    #[test]
+    fn recovery_preflight_preserves_the_original_chain_profile() {
+        let chain = TerminalChain {
+            id: "tc-profile".to_string(),
+            workspace: "/workspace/original".to_string(),
+            tool: "codex".to_string(),
+            tag: "dev1".to_string(),
+            model_ref: "gpt-5.6-sol".to_string(),
+            reasoning_ref: "max".to_string(),
+            permission_policy_ref: "approval=never;sandbox=danger-full-access".to_string(),
+            policy_ref: POLICY_REF.to_string(),
+            supervisor_process_id: "old-supervisor".to_string(),
+            supervisor_process_birth_identity: "old-birth".to_string(),
+            supervisor_pid: Some(11),
+            supervisor_pgid: Some(11),
+            outer_foreground_pgid: Some(11),
+            outer_tty_device: Some(7),
+            outer_tty_inode: Some(8),
+            current_generation: 2,
+            state: ChainState::StopObserved,
+            version: 4,
+            created_at: 1.0,
+            updated_at: 2.0,
+        };
+        let owner = TerminalOwnerEvidence {
+            workspace: PathBuf::from("/workspace/original"),
+            supervisor: SupervisorActor {
+                process_id: "recovery-supervisor".to_string(),
+                process_birth_identity: "recovery-birth".to_string(),
+            },
+            supervisor_pid: 21,
+            supervisor_pgid: 21,
+            outer_foreground_pgid: 21,
+            outer_tty_device: 7,
+            outer_tty_inode: 8,
+        };
+
+        let spec = recovery_preflight_spec(&chain, &owner, "recovery-nonce".to_string());
+        assert_eq!(spec.workspace, PathBuf::from(&chain.workspace));
+        assert_eq!(spec.tool, chain.tool);
+        assert_eq!(spec.tag, chain.tag);
+        assert_eq!(spec.model_ref, chain.model_ref);
+        assert_eq!(spec.reasoning_ref, chain.reasoning_ref);
+        assert_eq!(spec.permission_policy_ref, chain.permission_policy_ref);
+        assert_eq!(spec.policy_ref, chain.policy_ref);
+        assert_eq!(spec.supervisor_process_id, owner.supervisor.process_id);
+        assert_eq!(
+            spec.supervisor_process_birth_identity,
+            owner.supervisor.process_birth_identity
+        );
+        assert_eq!(spec.supervisor_pid, owner.supervisor_pid);
+        assert_eq!(spec.supervisor_pgid, owner.supervisor_pgid);
+        assert_eq!(spec.launch_nonce, "recovery-nonce");
     }
 
     #[test]

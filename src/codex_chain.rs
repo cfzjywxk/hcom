@@ -145,15 +145,28 @@ pub(crate) fn terminal_record_persisted(
     if !metadata.is_file() {
         return Err(CodexContractError::InvalidTranscriptPath);
     }
-    let len = metadata.len();
+    terminal_record_persisted_at_len(&mut file, metadata.len(), turn_id)
+}
+
+fn terminal_record_persisted_at_len(
+    file: &mut (impl Read + Seek),
+    len: u64,
+    turn_id: &str,
+) -> Result<bool, CodexContractError> {
     let start = len.saturating_sub(MAX_TERMINAL_RECORD_TAIL_BYTES);
     let read_start = start.saturating_sub(1);
     file.seek(SeekFrom::Start(read_start))
         .map_err(|_| CodexContractError::InvalidTranscriptRecord)?;
-    let mut bytes = Vec::with_capacity((len - start) as usize);
-    file.read_to_end(&mut bytes)
+    let read_len = len
+        .checked_sub(read_start)
+        .ok_or(CodexContractError::InvalidTranscriptRecord)?;
+    let capacity =
+        usize::try_from(read_len).map_err(|_| CodexContractError::InvalidTranscriptRecord)?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(read_len)
+        .read_to_end(&mut bytes)
         .map_err(|_| CodexContractError::InvalidTranscriptRecord)?;
-    if bytes.len() as u64 > MAX_TERMINAL_RECORD_TAIL_BYTES + u64::from(start > 0) {
+    if bytes.len() != capacity {
         return Err(CodexContractError::InvalidTranscriptRecord);
     }
 
@@ -405,7 +418,7 @@ fn parse_permission_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
+    use std::io::{Cursor, Write as _};
 
     fn profile() -> CodexLaunchProfile {
         CodexLaunchProfile {
@@ -535,6 +548,44 @@ mod tests {
         file.flush().unwrap();
         assert!(terminal_record_persisted(raw, native, turn).unwrap());
         assert!(!terminal_record_persisted(raw, native, "wrong-turn").unwrap());
+    }
+
+    #[test]
+    fn terminal_gate_ignores_bytes_appended_after_its_length_snapshot() {
+        let turn = "019d-concurrent-append-turn";
+        let mut snapshot = vec![b'"'];
+        snapshot.resize(MAX_TERMINAL_RECORD_TAIL_BYTES as usize + 1024, b'x');
+        snapshot.extend_from_slice(
+            concat!(
+                "\"\n",
+                "{\"timestamp\":\"t\",\"type\":\"event_msg\",",
+                "\"payload\":{\"type\":\"task_started\",\"turn_id\":\"other\"}}\n"
+            )
+            .as_bytes(),
+        );
+        let snapshot_len = snapshot.len() as u64;
+        let mut growing_file = snapshot;
+        growing_file.extend_from_slice(b"{\"timestamp\":\"t\",\"type\":\"event_msg\",\"payload\":");
+        growing_file.extend_from_slice(
+            format!("{{\"type\":\"task_complete\",\"turn_id\":\"{turn}\"}}}}\n").as_bytes(),
+        );
+
+        let mut reader = Cursor::new(growing_file);
+        assert!(
+            !terminal_record_persisted_at_len(&mut reader, snapshot_len, turn).unwrap(),
+            "a record appended after metadata() must wait for the next snapshot"
+        );
+        let complete_len = reader.get_ref().len() as u64;
+        assert!(terminal_record_persisted_at_len(&mut reader, complete_len, turn).unwrap());
+    }
+
+    #[test]
+    fn terminal_gate_rejects_a_file_truncated_after_its_length_snapshot() {
+        let mut truncated_file = Cursor::new(b"x".to_vec());
+        assert_eq!(
+            terminal_record_persisted_at_len(&mut truncated_file, 2, "turn"),
+            Err(CodexContractError::InvalidTranscriptRecord)
+        );
     }
 
     #[test]
