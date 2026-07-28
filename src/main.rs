@@ -31,6 +31,7 @@ mod pidtrack;
 mod pty;
 pub mod relay;
 mod review;
+pub mod review_worker;
 pub mod router;
 mod runtime_env;
 pub mod scripts;

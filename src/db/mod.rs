@@ -18,7 +18,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::shared::time::now_epoch_f64;
 
@@ -36,7 +36,7 @@ pub use instances::InstanceRow;
 pub use instances::InstanceStatus;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 23;
+const SCHEMA_VERSION: i32 = 24;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
 const REVIEW_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS review_runs (
@@ -93,6 +93,477 @@ const REVIEW_SCHEMA_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_review_transitions_workflow
         ON review_transitions(workflow_id, to_version);
 ";
+const REVIEW_ROUTES_TABLE_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS review_routes (
+        id                    TEXT PRIMARY KEY,
+        developer_name        TEXT NOT NULL,
+        developer_session_id  TEXT,
+        launch_generation     TEXT NOT NULL,
+        binding_state         TEXT NOT NULL CHECK (binding_state IN ('pending', 'bound')),
+        reviewer_alias        TEXT NOT NULL,
+        adapter               TEXT NOT NULL,
+        native_session_mode   TEXT NOT NULL CHECK (native_session_mode IN (
+                                  'preassigned',
+                                  'discovered'
+                              )),
+        model                 TEXT NOT NULL,
+        reasoning             TEXT NOT NULL,
+        policy                TEXT NOT NULL,
+        workspace_root        TEXT NOT NULL,
+        base_checkpoint       TEXT NOT NULL,
+        cli_path              TEXT NOT NULL,
+        cli_version           TEXT NOT NULL,
+        adapter_contract_ver  INTEGER NOT NULL CHECK (adapter_contract_ver > 0),
+        capability_json       TEXT NOT NULL
+                              CHECK (json_valid(capability_json)
+                                     AND json_type(capability_json) = 'object'),
+        created_at            REAL NOT NULL,
+        updated_at            REAL NOT NULL,
+        CHECK (
+            (binding_state = 'pending' AND developer_session_id IS NULL)
+            OR
+            (binding_state = 'bound' AND developer_session_id IS NOT NULL)
+        ),
+        CHECK (length(CAST(id AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (length(CAST(developer_name AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (developer_session_id IS NULL OR
+               length(CAST(developer_session_id AS BLOB)) BETWEEN 1 AND 256),
+        CHECK (length(CAST(launch_generation AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (length(CAST(reviewer_alias AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (length(CAST(adapter AS BLOB)) BETWEEN 1 AND 64),
+        CHECK (length(CAST(native_session_mode AS BLOB)) BETWEEN 1 AND 32),
+        CHECK (length(CAST(model AS BLOB)) BETWEEN 1 AND 256),
+        CHECK (length(CAST(reasoning AS BLOB)) BETWEEN 1 AND 64),
+        CHECK (length(CAST(policy AS BLOB)) BETWEEN 1 AND 512),
+        CHECK (length(CAST(workspace_root AS BLOB)) BETWEEN 1 AND 4096),
+        CHECK (substr(workspace_root, 1, 1) = '/'),
+        CHECK (length(CAST(base_checkpoint AS BLOB)) BETWEEN 40 AND 64),
+        CHECK (length(CAST(cli_path AS BLOB)) BETWEEN 1 AND 4096),
+        CHECK (substr(cli_path, 1, 1) = '/'),
+        CHECK (length(CAST(cli_version AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (length(CAST(capability_json AS BLOB)) BETWEEN 2 AND 16384),
+        CHECK (updated_at >= created_at)
+    );
+";
+const REVIEW_WORKERS_TABLE_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS review_workers (
+        workflow_id          TEXT PRIMARY KEY,
+        adapter              TEXT NOT NULL,
+        native_session_mode  TEXT NOT NULL CHECK (native_session_mode IN (
+                                 'preassigned',
+                                 'discovered'
+                             )),
+        native_session_id    TEXT,
+        model                TEXT NOT NULL,
+        reasoning            TEXT NOT NULL,
+        policy               TEXT NOT NULL,
+        cli_path             TEXT NOT NULL,
+        cli_version          TEXT NOT NULL,
+        adapter_contract_ver INTEGER NOT NULL CHECK (adapter_contract_ver > 0),
+        capability_json      TEXT NOT NULL
+                             CHECK (json_valid(capability_json)
+                                    AND json_type(capability_json) = 'object'),
+        created_at           REAL NOT NULL,
+        updated_at           REAL NOT NULL,
+        CHECK (length(CAST(workflow_id AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (length(CAST(adapter AS BLOB)) BETWEEN 1 AND 64),
+        CHECK (
+            (native_session_mode = 'preassigned' AND native_session_id IS NOT NULL)
+            OR native_session_mode = 'discovered'
+        ),
+        CHECK (native_session_id IS NULL OR
+               length(CAST(native_session_id AS BLOB)) BETWEEN 1 AND 256),
+        CHECK (length(CAST(model AS BLOB)) BETWEEN 1 AND 256),
+        CHECK (length(CAST(reasoning AS BLOB)) BETWEEN 1 AND 64),
+        CHECK (length(CAST(policy AS BLOB)) BETWEEN 1 AND 512),
+        CHECK (length(CAST(cli_path AS BLOB)) BETWEEN 1 AND 4096),
+        CHECK (substr(cli_path, 1, 1) = '/'),
+        CHECK (length(CAST(cli_version AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (length(CAST(capability_json AS BLOB)) BETWEEN 2 AND 16384),
+        CHECK (updated_at >= created_at),
+        FOREIGN KEY (workflow_id) REFERENCES review_runs(id) ON DELETE CASCADE
+    );
+";
+const REVIEW_JOBS_TABLE_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS review_jobs (
+        id                   TEXT PRIMARY KEY,
+        workflow_id          TEXT NOT NULL,
+        round                INTEGER NOT NULL CHECK (round >= 1),
+        request_version      INTEGER NOT NULL CHECK (request_version >= 0),
+        base_revision        TEXT NOT NULL,
+        head_revision        TEXT NOT NULL,
+        developer_submission TEXT NOT NULL,
+        status               TEXT NOT NULL CHECK (status IN (
+                                 'queued',
+                                 'running',
+                                 'result_ready',
+                                 'applied',
+                                 'failed',
+                                 'indeterminate',
+                                 'stale',
+                                 'canceled'
+                             )),
+        attempt              INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+        lease_owner          TEXT,
+        lease_expires_at     REAL,
+        worker_pid           INTEGER,
+        worker_process_birth TEXT,
+        progress_phase       TEXT NOT NULL DEFAULT 'queued' CHECK (progress_phase IN (
+                                 'queued',
+                                 'spawn',
+                                 'running',
+                                 'validating',
+                                 'applying',
+                                 'done'
+                             )),
+        last_progress_at     REAL,
+        activity_truncated   INTEGER NOT NULL DEFAULT 0
+                             CHECK (activity_truncated IN (0, 1)),
+        artifact_dir         TEXT NOT NULL,
+        result_json          TEXT CHECK (result_json IS NULL OR json_valid(result_json)),
+        result_hash          TEXT,
+        error_kind           TEXT,
+        error_message        TEXT,
+        created_at           REAL NOT NULL,
+        started_at           REAL,
+        result_at            REAL,
+        applied_at           REAL,
+        updated_at           REAL NOT NULL,
+        UNIQUE (workflow_id, round, request_version),
+        CHECK (length(CAST(id AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (length(CAST(workflow_id AS BLOB)) BETWEEN 1 AND 128),
+        CHECK (length(CAST(base_revision AS BLOB)) BETWEEN 40 AND 64),
+        CHECK (length(CAST(head_revision AS BLOB)) BETWEEN 40 AND 64),
+        CHECK (length(CAST(developer_submission AS BLOB)) <= 262144),
+        CHECK (lease_owner IS NULL OR
+               length(CAST(lease_owner AS BLOB)) BETWEEN 1 AND 128),
+        CHECK ((lease_owner IS NULL) = (lease_expires_at IS NULL)),
+        CHECK ((worker_pid IS NULL) = (worker_process_birth IS NULL)),
+        CHECK (worker_pid IS NULL OR worker_pid > 0),
+        CHECK (worker_process_birth IS NULL OR
+               length(CAST(worker_process_birth AS BLOB)) BETWEEN 1 AND 256),
+        CHECK (length(CAST(artifact_dir AS BLOB)) BETWEEN 1 AND 4096),
+        CHECK (substr(artifact_dir, 1, 1) != '/'),
+        CHECK (instr('/' || artifact_dir || '/', '/../') = 0),
+        CHECK (instr('/' || artifact_dir || '/', '/./') = 0),
+        CHECK (result_json IS NULL OR
+               length(CAST(result_json AS BLOB)) BETWEEN 2 AND 1048576),
+        CHECK (result_hash IS NULL OR length(CAST(result_hash AS BLOB)) = 64),
+        CHECK (error_kind IS NULL OR
+               length(CAST(error_kind AS BLOB)) BETWEEN 1 AND 64),
+        CHECK (error_message IS NULL OR
+               length(CAST(error_message AS BLOB)) <= 4096),
+        CHECK (
+            status NOT IN ('result_ready', 'applied')
+            OR (result_json IS NOT NULL AND result_hash IS NOT NULL)
+        ),
+        CHECK (
+            status != 'queued'
+            OR (lease_owner IS NULL
+                AND worker_pid IS NULL
+                AND result_json IS NULL
+                AND result_hash IS NULL
+                AND progress_phase = 'queued')
+        ),
+        CHECK (status != 'running' OR
+               (lease_owner IS NOT NULL
+                AND worker_pid IS NOT NULL
+                AND progress_phase IN ('spawn', 'running', 'validating'))),
+        CHECK (status != 'result_ready' OR progress_phase = 'applying'),
+        CHECK (status != 'applied' OR
+               (progress_phase = 'done' AND applied_at IS NOT NULL)),
+        CHECK (updated_at >= created_at),
+        FOREIGN KEY (workflow_id) REFERENCES review_workers(workflow_id)
+            ON DELETE CASCADE
+    );
+";
+const REVIEW_RUNS_V24_COLUMNS: &[(&str, &str)] = &[
+    (
+        "reviewer_mode",
+        "ALTER TABLE review_runs
+         ADD COLUMN reviewer_mode TEXT NOT NULL DEFAULT 'interactive'
+         CHECK (reviewer_mode IN ('interactive', 'worker'))",
+    ),
+    (
+        "base_revision",
+        "ALTER TABLE review_runs
+         ADD COLUMN base_revision TEXT
+         CHECK (base_revision IS NULL OR
+                length(CAST(base_revision AS BLOB)) BETWEEN 40 AND 64)",
+    ),
+    (
+        "review_route_id",
+        "ALTER TABLE review_runs
+         ADD COLUMN review_route_id TEXT
+         REFERENCES review_routes(id) ON DELETE RESTRICT",
+    ),
+];
+const REVIEW_WORKER_OBJECT_DDL: &[(&str, &str, &str)] = &[
+    (
+        "index",
+        "idx_review_routes_launch_generation",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_review_routes_launch_generation
+         ON review_routes(launch_generation);",
+    ),
+    (
+        "index",
+        "idx_review_routes_bound_session",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_review_routes_bound_session
+         ON review_routes(developer_session_id)
+         WHERE binding_state = 'bound';",
+    ),
+    (
+        "index",
+        "idx_review_routes_pending_name",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_review_routes_pending_name
+         ON review_routes(developer_name)
+         WHERE binding_state = 'pending';",
+    ),
+    (
+        "index",
+        "idx_review_runs_one_non_final_worker",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_review_runs_one_non_final_worker
+         ON review_runs(developer_session_id)
+         WHERE reviewer_mode = 'worker'
+           AND state NOT IN ('approved', 'canceled');",
+    ),
+    (
+        "index",
+        "idx_review_jobs_workflow",
+        "CREATE INDEX IF NOT EXISTS idx_review_jobs_workflow
+         ON review_jobs(workflow_id, round, request_version);",
+    ),
+    (
+        "index",
+        "idx_review_jobs_claimable",
+        "CREATE INDEX IF NOT EXISTS idx_review_jobs_claimable
+         ON review_jobs(status, lease_expires_at, created_at);",
+    ),
+    (
+        "trigger",
+        "review_routes_immutable_profile",
+        "CREATE TRIGGER IF NOT EXISTS review_routes_immutable_profile
+        BEFORE UPDATE OF id, developer_name, launch_generation, reviewer_alias,
+                          adapter, native_session_mode, model, reasoning, policy,
+                          workspace_root, cli_path, cli_version,
+                          adapter_contract_ver, capability_json, created_at
+         ON review_routes
+         WHEN NEW.id IS NOT OLD.id
+           OR NEW.developer_name IS NOT OLD.developer_name
+           OR NEW.launch_generation IS NOT OLD.launch_generation
+           OR NEW.reviewer_alias IS NOT OLD.reviewer_alias
+           OR NEW.adapter IS NOT OLD.adapter
+           OR NEW.native_session_mode IS NOT OLD.native_session_mode
+           OR NEW.model IS NOT OLD.model
+           OR NEW.reasoning IS NOT OLD.reasoning
+           OR NEW.policy IS NOT OLD.policy
+           OR NEW.workspace_root IS NOT OLD.workspace_root
+           OR NEW.cli_path IS NOT OLD.cli_path
+           OR NEW.cli_version IS NOT OLD.cli_version
+           OR NEW.adapter_contract_ver IS NOT OLD.adapter_contract_ver
+           OR NEW.capability_json IS NOT OLD.capability_json
+           OR NEW.created_at IS NOT OLD.created_at
+         BEGIN
+             SELECT RAISE(ABORT, 'review route profile is immutable');
+         END;",
+    ),
+    (
+        "trigger",
+        "review_routes_bind_once",
+        "CREATE TRIGGER IF NOT EXISTS review_routes_bind_once
+         BEFORE UPDATE OF developer_session_id, binding_state
+         ON review_routes
+         WHEN NOT (
+             OLD.binding_state = 'pending'
+             AND OLD.developer_session_id IS NULL
+             AND NEW.binding_state = 'bound'
+             AND NEW.developer_session_id IS NOT NULL
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'review route session may be bound exactly once');
+         END;",
+    ),
+    (
+        "trigger",
+        "review_runs_worker_shape_insert",
+        "CREATE TRIGGER IF NOT EXISTS review_runs_worker_shape_insert
+         BEFORE INSERT ON review_runs
+         WHEN NOT (
+             (NEW.reviewer_mode = 'interactive'
+              AND NEW.base_revision IS NULL
+              AND NEW.review_route_id IS NULL)
+             OR
+             (NEW.reviewer_mode = 'worker'
+              AND NEW.base_revision IS NOT NULL
+              AND NEW.review_route_id IS NOT NULL
+              AND NEW.reviewer_session_id = 'worker:' || NEW.id)
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'review run mode snapshot is inconsistent');
+         END;",
+    ),
+    (
+        "trigger",
+        "review_runs_worker_shape_update",
+        "CREATE TRIGGER IF NOT EXISTS review_runs_worker_shape_update
+         BEFORE UPDATE OF reviewer_mode, base_revision, review_route_id,
+                          reviewer_session_id
+         ON review_runs
+         WHEN NEW.reviewer_mode IS NOT OLD.reviewer_mode
+           OR NEW.base_revision IS NOT OLD.base_revision
+           OR NEW.review_route_id IS NOT OLD.review_route_id
+           OR NEW.reviewer_session_id IS NOT OLD.reviewer_session_id
+         BEGIN
+             SELECT RAISE(ABORT, 'review run mode snapshot is immutable');
+         END;",
+    ),
+    (
+        "trigger",
+        "review_workers_require_worker_run",
+        "CREATE TRIGGER IF NOT EXISTS review_workers_require_worker_run
+         BEFORE INSERT ON review_workers
+         WHEN NOT EXISTS (
+             SELECT 1 FROM review_runs
+             WHERE id = NEW.workflow_id
+               AND reviewer_mode = 'worker'
+               AND review_route_id IS NOT NULL
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'review worker requires a worker-mode review run');
+         END;",
+    ),
+    (
+        "trigger",
+        "review_workers_immutable_profile",
+        "CREATE TRIGGER IF NOT EXISTS review_workers_immutable_profile
+         BEFORE UPDATE OF workflow_id, adapter, native_session_mode, model,
+                          reasoning, policy, cli_path, cli_version,
+                          adapter_contract_ver, capability_json, created_at
+         ON review_workers
+         WHEN NEW.workflow_id IS NOT OLD.workflow_id
+           OR NEW.adapter IS NOT OLD.adapter
+           OR NEW.native_session_mode IS NOT OLD.native_session_mode
+           OR NEW.model IS NOT OLD.model
+           OR NEW.reasoning IS NOT OLD.reasoning
+           OR NEW.policy IS NOT OLD.policy
+           OR NEW.cli_path IS NOT OLD.cli_path
+           OR NEW.cli_version IS NOT OLD.cli_version
+           OR NEW.adapter_contract_ver IS NOT OLD.adapter_contract_ver
+           OR NEW.capability_json IS NOT OLD.capability_json
+           OR NEW.created_at IS NOT OLD.created_at
+         BEGIN
+             SELECT RAISE(ABORT, 'review worker profile is immutable');
+         END;",
+    ),
+    (
+        "trigger",
+        "review_workers_session_shape_insert",
+        "CREATE TRIGGER IF NOT EXISTS review_workers_session_shape_insert
+         BEFORE INSERT ON review_workers
+         WHEN (NEW.native_session_mode = 'preassigned'
+               AND NEW.native_session_id IS NULL)
+           OR (NEW.native_session_mode = 'discovered'
+               AND NEW.native_session_id IS NOT NULL)
+         BEGIN
+             SELECT RAISE(ABORT, 'review worker native session mode is inconsistent');
+         END;",
+    ),
+    (
+        "trigger",
+        "review_workers_native_session_once",
+        "CREATE TRIGGER IF NOT EXISTS review_workers_native_session_once
+         BEFORE UPDATE OF native_session_id ON review_workers
+         WHEN OLD.native_session_mode != 'discovered'
+           OR OLD.native_session_id IS NOT NULL
+           OR NEW.native_session_id IS NULL
+         BEGIN
+             SELECT RAISE(ABORT, 'review worker native session may be bound exactly once');
+         END;",
+    ),
+    (
+        "trigger",
+        "review_jobs_immutable_request",
+        "CREATE TRIGGER IF NOT EXISTS review_jobs_immutable_request
+         BEFORE UPDATE OF id, workflow_id, round, request_version,
+                          base_revision, head_revision, developer_submission,
+                          created_at
+         ON review_jobs
+         WHEN NEW.id IS NOT OLD.id
+           OR NEW.workflow_id IS NOT OLD.workflow_id
+           OR NEW.round IS NOT OLD.round
+           OR NEW.request_version IS NOT OLD.request_version
+           OR NEW.base_revision IS NOT OLD.base_revision
+           OR NEW.head_revision IS NOT OLD.head_revision
+           OR NEW.developer_submission IS NOT OLD.developer_submission
+           OR NEW.created_at IS NOT OLD.created_at
+         BEGIN
+             SELECT RAISE(ABORT, 'review job request snapshot is immutable');
+         END;",
+    ),
+    (
+        "trigger",
+        "review_jobs_legal_status_transition",
+        "CREATE TRIGGER IF NOT EXISTS review_jobs_legal_status_transition
+         BEFORE UPDATE OF status ON review_jobs
+         WHEN NEW.status != OLD.status
+           AND NOT (
+               (OLD.status = 'queued'
+                AND NEW.status IN ('running', 'failed', 'stale', 'canceled'))
+               OR
+               (OLD.status = 'running'
+                AND NEW.status IN (
+                    'result_ready', 'failed', 'indeterminate', 'stale', 'canceled'
+                ))
+               OR
+               (OLD.status = 'result_ready'
+                AND NEW.status IN ('applied', 'stale', 'canceled'))
+               OR
+               (OLD.status IN ('failed', 'indeterminate')
+                AND NEW.status IN ('queued', 'canceled'))
+               OR
+               (OLD.status = 'stale' AND NEW.status = 'canceled')
+           )
+         BEGIN
+             SELECT RAISE(ABORT, 'illegal review job status transition');
+         END;",
+    ),
+    (
+        "trigger",
+        "review_jobs_attempt_transition",
+        "CREATE TRIGGER IF NOT EXISTS review_jobs_attempt_transition
+         BEFORE UPDATE OF attempt, artifact_dir ON review_jobs
+         WHEN NOT (
+             (NEW.attempt = OLD.attempt
+              AND NEW.artifact_dir IS OLD.artifact_dir)
+             OR
+             (OLD.status IN ('failed', 'indeterminate')
+              AND NEW.status = 'queued'
+              AND NEW.attempt = OLD.attempt + 1
+              AND NEW.artifact_dir IS NOT OLD.artifact_dir)
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'review job attempt and artifact transition is invalid');
+         END;",
+    ),
+    (
+        "trigger",
+        "review_jobs_result_once",
+        "CREATE TRIGGER IF NOT EXISTS review_jobs_result_once
+         BEFORE UPDATE OF result_json, result_hash, result_at ON review_jobs
+         WHEN NOT (
+             OLD.result_json IS NULL
+             AND OLD.result_hash IS NULL
+             AND OLD.result_at IS NULL
+             AND NEW.status = 'result_ready'
+             AND NEW.result_json IS NOT NULL
+             AND NEW.result_hash IS NOT NULL
+             AND NEW.result_at IS NOT NULL
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'review job result may be published exactly once');
+         END;",
+    ),
+];
 const HANDOFF_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS terminal_chains (
         id                                TEXT PRIMARY KEY,
@@ -1095,6 +1566,10 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (22, HANDOFF_SCHEMA_SQL),
     // v23 pins one bounded group tag across every generation and recovery.
     (23, ""),
+    // v24 adds the additive background-review route and pure worker job state.
+    // Individual columns and objects are repaired by
+    // `ensure_review_worker_v24_schema` under the migration writer transaction.
+    (24, ""),
 ];
 
 const HANDOFF_V23_COLUMNS: &[(&str, &str, &str)] = &[(
@@ -1569,6 +2044,107 @@ const REVIEW_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("index", "idx_review_transitions_workflow"),
 ];
 
+const REVIEW_WORKER_TABLE_COLUMNS: &[(&str, &[&str])] = &[
+    (
+        "review_runs",
+        &["reviewer_mode", "base_revision", "review_route_id"],
+    ),
+    (
+        "review_routes",
+        &[
+            "id",
+            "developer_name",
+            "developer_session_id",
+            "launch_generation",
+            "binding_state",
+            "reviewer_alias",
+            "adapter",
+            "native_session_mode",
+            "model",
+            "reasoning",
+            "policy",
+            "workspace_root",
+            "base_checkpoint",
+            "cli_path",
+            "cli_version",
+            "adapter_contract_ver",
+            "capability_json",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "review_workers",
+        &[
+            "workflow_id",
+            "adapter",
+            "native_session_mode",
+            "native_session_id",
+            "model",
+            "reasoning",
+            "policy",
+            "cli_path",
+            "cli_version",
+            "adapter_contract_ver",
+            "capability_json",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "review_jobs",
+        &[
+            "id",
+            "workflow_id",
+            "round",
+            "request_version",
+            "base_revision",
+            "head_revision",
+            "developer_submission",
+            "status",
+            "attempt",
+            "lease_owner",
+            "lease_expires_at",
+            "worker_pid",
+            "worker_process_birth",
+            "progress_phase",
+            "last_progress_at",
+            "activity_truncated",
+            "artifact_dir",
+            "result_json",
+            "result_hash",
+            "error_kind",
+            "error_message",
+            "created_at",
+            "started_at",
+            "result_at",
+            "applied_at",
+            "updated_at",
+        ],
+    ),
+];
+
+const REVIEW_WORKER_SCHEMA_OBJECTS: &[(&str, &str)] = &[
+    ("index", "idx_review_routes_launch_generation"),
+    ("index", "idx_review_routes_bound_session"),
+    ("index", "idx_review_routes_pending_name"),
+    ("index", "idx_review_runs_one_non_final_worker"),
+    ("index", "idx_review_jobs_workflow"),
+    ("index", "idx_review_jobs_claimable"),
+    ("trigger", "review_routes_immutable_profile"),
+    ("trigger", "review_routes_bind_once"),
+    ("trigger", "review_runs_worker_shape_insert"),
+    ("trigger", "review_runs_worker_shape_update"),
+    ("trigger", "review_workers_require_worker_run"),
+    ("trigger", "review_workers_immutable_profile"),
+    ("trigger", "review_workers_session_shape_insert"),
+    ("trigger", "review_workers_native_session_once"),
+    ("trigger", "review_jobs_immutable_request"),
+    ("trigger", "review_jobs_legal_status_transition"),
+    ("trigger", "review_jobs_attempt_transition"),
+    ("trigger", "review_jobs_result_once"),
+];
+
 fn schema_objects_are_complete(
     conn: &Connection,
     tables: &[(&str, &[&str])],
@@ -1609,6 +2185,191 @@ fn handoff_schema_is_complete(conn: &Connection) -> Result<bool> {
     schema_objects_are_complete(conn, HANDOFF_TABLE_COLUMNS, HANDOFF_SCHEMA_OBJECTS)
 }
 
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+        .replace(" if not exists", "")
+        .trim_end_matches(';')
+        .to_string()
+}
+
+fn schema_sql_matches(conn: &Connection, kind: &str, name: &str, expected: &str) -> Result<bool> {
+    let actual = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
+            rusqlite::params![kind, name],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(actual
+        .as_deref()
+        .is_some_and(|sql| normalize_schema_sql(sql) == normalize_schema_sql(expected)))
+}
+
+fn review_run_v24_columns_are_compatible(conn: &Connection) -> Result<bool> {
+    type Column = (String, String, i64, Option<String>, i64);
+    let columns: Vec<Column> = conn
+        .prepare("PRAGMA table_info(review_runs)")?
+        .query_map([], |row| {
+            Ok((
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let expected = [
+        ("reviewer_mode", "TEXT", 1, Some("'interactive'"), 0),
+        ("base_revision", "TEXT", 0, None, 0),
+        ("review_route_id", "TEXT", 0, None, 0),
+    ];
+    if !expected.iter().all(|expected| {
+        columns.iter().any(|actual| {
+            actual.0 == expected.0
+                && actual.1.eq_ignore_ascii_case(expected.1)
+                && actual.2 == expected.2
+                && actual.3.as_deref() == expected.3
+                && actual.4 == expected.4
+        })
+    }) {
+        return Ok(false);
+    }
+
+    let review_runs_sql = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'review_runs'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .map(|sql| normalize_schema_sql(&sql));
+    let Some(review_runs_sql) = review_runs_sql else {
+        return Ok(false);
+    };
+    let required_column_definitions = [
+        "reviewer_mode TEXT NOT NULL DEFAULT 'interactive'
+         CHECK (reviewer_mode IN ('interactive', 'worker'))",
+        "base_revision TEXT
+         CHECK (base_revision IS NULL OR
+                length(CAST(base_revision AS BLOB)) BETWEEN 40 AND 64)",
+        "review_route_id TEXT
+         REFERENCES review_routes(id) ON DELETE RESTRICT",
+    ];
+    if !required_column_definitions
+        .iter()
+        .all(|definition| review_runs_sql.contains(&normalize_schema_sql(definition)))
+    {
+        return Ok(false);
+    }
+
+    let route_fk = conn
+        .prepare("PRAGMA foreign_key_list(review_runs)")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .any(|(table, from, to, on_delete)| {
+            table == "review_routes"
+                && from == "review_route_id"
+                && to == "id"
+                && on_delete.eq_ignore_ascii_case("RESTRICT")
+        });
+    Ok(route_fk)
+}
+
+fn review_worker_schema_is_complete(conn: &Connection) -> Result<bool> {
+    if !schema_objects_are_complete(
+        conn,
+        REVIEW_WORKER_TABLE_COLUMNS,
+        REVIEW_WORKER_SCHEMA_OBJECTS,
+    )? || !review_run_v24_columns_are_compatible(conn)?
+    {
+        return Ok(false);
+    }
+    for (name, ddl) in [
+        ("review_routes", REVIEW_ROUTES_TABLE_SQL),
+        ("review_workers", REVIEW_WORKERS_TABLE_SQL),
+        ("review_jobs", REVIEW_JOBS_TABLE_SQL),
+    ] {
+        if !schema_sql_matches(conn, "table", name, ddl)? {
+            return Ok(false);
+        }
+    }
+    for (kind, name, ddl) in REVIEW_WORKER_OBJECT_DDL {
+        if !schema_sql_matches(conn, kind, name, ddl)? {
+            return Ok(false);
+        }
+    }
+    review_worker_data_is_compatible(conn)
+}
+
+fn review_worker_data_is_compatible(conn: &Connection) -> Result<bool> {
+    let invalid: bool = conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM review_runs run
+             LEFT JOIN review_routes route
+               ON route.id = run.review_route_id
+             LEFT JOIN review_workers worker
+               ON worker.workflow_id = run.id
+             WHERE
+                 (
+                     run.reviewer_mode = 'interactive'
+                     AND (
+                         run.base_revision IS NOT NULL
+                         OR run.review_route_id IS NOT NULL
+                         OR worker.workflow_id IS NOT NULL
+                     )
+                 )
+                 OR
+                 (
+                     run.reviewer_mode = 'worker'
+                     AND (
+                         run.base_revision IS NULL
+                         OR run.review_route_id IS NULL
+                         OR run.reviewer_session_id IS NOT ('worker:' || run.id)
+                         OR route.id IS NULL
+                         OR route.binding_state != 'bound'
+                         OR run.developer_name IS NOT route.developer_name
+                         OR run.developer_session_id IS NOT route.developer_session_id
+                         OR run.reviewer_name IS NOT route.reviewer_alias
+                         OR run.workspace IS NOT route.workspace_root
+                         OR worker.workflow_id IS NULL
+                         OR worker.adapter IS NOT route.adapter
+                         OR worker.native_session_mode IS NOT route.native_session_mode
+                         OR worker.model IS NOT route.model
+                         OR worker.reasoning IS NOT route.reasoning
+                         OR worker.policy IS NOT route.policy
+                         OR worker.cli_path IS NOT route.cli_path
+                         OR worker.cli_version IS NOT route.cli_version
+                         OR worker.adapter_contract_ver IS NOT route.adapter_contract_ver
+                         OR worker.capability_json IS NOT route.capability_json
+                         OR (
+                             run.state NOT IN ('approved', 'canceled')
+                             AND run.base_revision IS NOT route.base_checkpoint
+                         )
+                     )
+                 )
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(!invalid)
+}
+
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let present = stmt
@@ -1616,6 +2377,28 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
         .filter_map(|row| row.ok())
         .any(|name| name == column);
     Ok(present)
+}
+
+/// Add or repair only the v24 worker objects. Existing objects with an
+/// incompatible shape are never dropped or rebuilt: the exact-shape check
+/// fails and the caller's writer transaction rolls back.
+fn ensure_review_worker_v24_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(REVIEW_SCHEMA_SQL)?;
+    conn.execute_batch(REVIEW_ROUTES_TABLE_SQL)?;
+    for (column, sql) in REVIEW_RUNS_V24_COLUMNS {
+        if !table_has_column(conn, "review_runs", column)? {
+            conn.execute_batch(sql)?;
+        }
+    }
+    conn.execute_batch(REVIEW_WORKERS_TABLE_SQL)?;
+    conn.execute_batch(REVIEW_JOBS_TABLE_SQL)?;
+    for (_, _, ddl) in REVIEW_WORKER_OBJECT_DDL {
+        conn.execute_batch(ddl)?;
+    }
+    if !review_worker_schema_is_complete(conn)? {
+        anyhow::bail!("background review worker schema has an incompatible object shape");
+    }
+    Ok(())
 }
 
 /// Add only missing v20 evidence columns, then refresh the triggers whose
@@ -1819,6 +2602,7 @@ impl HcomDb {
         if current == SCHEMA_VERSION
             && review_schema_is_complete(&tx)?
             && handoff_schema_is_complete(&tx)?
+            && review_worker_schema_is_complete(&tx)?
         {
             tx.commit()?;
             return Ok(());
@@ -1986,7 +2770,11 @@ impl HcomDb {
         }
         tx.execute_batch(HANDOFF_SCHEMA_SQL)?;
         tx.execute_batch(HANDOFF_V23_SCHEMA_SQL)?;
-        if !review_schema_is_complete(&tx)? || !handoff_schema_is_complete(&tx)? {
+        ensure_review_worker_v24_schema(&tx)?;
+        if !review_schema_is_complete(&tx)?
+            || !handoff_schema_is_complete(&tx)?
+            || !review_worker_schema_is_complete(&tx)?
+        {
             anyhow::bail!("migrated control-plane schema is incomplete");
         }
 
@@ -2016,6 +2804,7 @@ impl HcomDb {
                 if current != SCHEMA_VERSION
                     || !review_schema_is_complete(&self.conn)?
                     || !handoff_schema_is_complete(&self.conn)?
+                    || !review_worker_schema_is_complete(&self.conn)?
                 {
                     self.init_db()?;
                 }
@@ -2256,6 +3045,9 @@ impl HcomDb {
         let migrated_tables = [
             "review_runs",
             "review_transitions",
+            "review_routes",
+            "review_workers",
+            "review_jobs",
             "terminal_chains",
             "terminal_generations",
             "terminal_handoffs",
@@ -2287,6 +3079,12 @@ impl HcomDb {
         if !review_schema_is_complete(&self.conn)? {
             return Ok(SchemaCompat::NeedsArchive(
                 "DB review schema is incomplete".to_string(),
+                Some(version),
+            ));
+        }
+        if !review_worker_schema_is_complete(&self.conn)? {
+            return Ok(SchemaCompat::NeedsArchive(
+                "DB background review worker schema is incomplete or incompatible".to_string(),
                 Some(version),
             ));
         }
@@ -2325,7 +3123,11 @@ impl HcomDb {
             }
             tx.execute_batch(HANDOFF_SCHEMA_SQL)?;
             tx.execute_batch(HANDOFF_V23_SCHEMA_SQL)?;
-            if !review_schema_is_complete(&tx)? || !handoff_schema_is_complete(&tx)? {
+            ensure_review_worker_v24_schema(&tx)?;
+            if !review_schema_is_complete(&tx)?
+                || !handoff_schema_is_complete(&tx)?
+                || !review_worker_schema_is_complete(&tx)?
+            {
                 return Ok(false);
             }
             tx.commit()?;
@@ -2379,12 +3181,17 @@ impl HcomDb {
                 ensure_handoff_v21_columns(&tx)?;
             } else if next_version == 23 {
                 ensure_handoff_v23_columns(&tx)?;
+            } else if next_version == 24 {
+                ensure_review_worker_v24_schema(&tx)?;
             } else {
                 tx.execute_batch(sql)?;
             }
             tx.execute_batch(&format!("PRAGMA user_version = {}", next_version))?;
         }
-        if !review_schema_is_complete(&tx)? || !handoff_schema_is_complete(&tx)? {
+        if !review_schema_is_complete(&tx)?
+            || !handoff_schema_is_complete(&tx)?
+            || !review_worker_schema_is_complete(&tx)?
+        {
             return Ok(false);
         }
         tx.commit()?;
@@ -2719,6 +3526,115 @@ pub(super) mod tests {
         .unwrap();
     }
 
+    fn rebuild_review_schema_without_v24_worker(conn: &Connection) {
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TRIGGER IF EXISTS review_routes_immutable_profile;
+             DROP TRIGGER IF EXISTS review_routes_bind_once;
+             DROP TRIGGER IF EXISTS review_runs_worker_shape_insert;
+             DROP TRIGGER IF EXISTS review_runs_worker_shape_update;
+             DROP TRIGGER IF EXISTS review_workers_require_worker_run;
+             DROP TRIGGER IF EXISTS review_workers_immutable_profile;
+             DROP TRIGGER IF EXISTS review_workers_session_shape_insert;
+             DROP TRIGGER IF EXISTS review_workers_native_session_once;
+             DROP TRIGGER IF EXISTS review_jobs_immutable_request;
+             DROP TRIGGER IF EXISTS review_jobs_legal_status_transition;
+             DROP TRIGGER IF EXISTS review_jobs_attempt_transition;
+             DROP TRIGGER IF EXISTS review_jobs_result_once;
+             DROP TABLE IF EXISTS review_jobs;
+             DROP TABLE IF EXISTS review_workers;
+             DROP TABLE IF EXISTS review_routes;
+
+             CREATE TABLE review_runs_v23 (
+                 id                    TEXT PRIMARY KEY,
+                 task                  TEXT NOT NULL,
+                 workspace             TEXT NOT NULL,
+                 thread                TEXT NOT NULL UNIQUE,
+                 developer_name        TEXT NOT NULL,
+                 developer_session_id  TEXT NOT NULL,
+                 reviewer_name         TEXT NOT NULL,
+                 reviewer_session_id   TEXT NOT NULL,
+                 state                 TEXT NOT NULL CHECK (state IN (
+                                           'awaiting_review',
+                                           'awaiting_developer',
+                                           'max_rounds',
+                                           'approved',
+                                           'canceled'
+                                       )),
+                 round                 INTEGER NOT NULL,
+                 max_rounds            INTEGER NOT NULL,
+                 version               INTEGER NOT NULL DEFAULT 0,
+                 last_message_event_id INTEGER,
+                 created_at            REAL NOT NULL,
+                 updated_at            REAL NOT NULL,
+                 CHECK (round >= 1 AND round <= max_rounds AND max_rounds <= 20),
+                 FOREIGN KEY (last_message_event_id)
+                     REFERENCES events(id) ON DELETE SET NULL
+             );
+             INSERT INTO review_runs_v23 (
+                 id, task, workspace, thread, developer_name,
+                 developer_session_id, reviewer_name, reviewer_session_id,
+                 state, round, max_rounds, version, last_message_event_id,
+                 created_at, updated_at
+             )
+             SELECT id, task, workspace, thread, developer_name,
+                    developer_session_id, reviewer_name, reviewer_session_id,
+                    state, round, max_rounds, version, last_message_event_id,
+                    created_at, updated_at
+             FROM review_runs;
+
+             CREATE TABLE review_transitions_v23 (
+                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                 workflow_id      TEXT NOT NULL,
+                 from_version     INTEGER NOT NULL,
+                 to_version       INTEGER NOT NULL,
+                 round            INTEGER NOT NULL,
+                 actor_name       TEXT NOT NULL,
+                 actor_session_id TEXT NOT NULL,
+                 actor_role       TEXT NOT NULL
+                                  CHECK (actor_role IN ('developer', 'reviewer')),
+                 action           TEXT NOT NULL CHECK (action IN (
+                                      'start', 'request_changes', 'lgtm',
+                                      'fixed', 'rebut', 'extend', 'cancel'
+                                  )),
+                 from_state       TEXT,
+                 to_state         TEXT NOT NULL,
+                 summary          TEXT NOT NULL DEFAULT '',
+                 payload_hash     TEXT NOT NULL,
+                 message_event_id INTEGER,
+                 created_at       REAL NOT NULL,
+                 UNIQUE (workflow_id, from_version),
+                 FOREIGN KEY (workflow_id)
+                     REFERENCES review_runs_v23(id) ON DELETE CASCADE,
+                 FOREIGN KEY (message_event_id)
+                     REFERENCES events(id) ON DELETE SET NULL
+             );
+             INSERT INTO review_transitions_v23 (
+                 id, workflow_id, from_version, to_version, round,
+                 actor_name, actor_session_id, actor_role, action,
+                 from_state, to_state, summary, payload_hash,
+                 message_event_id, created_at
+             )
+             SELECT id, workflow_id, from_version, to_version, round,
+                    actor_name, actor_session_id, actor_role, action,
+                    from_state, to_state, summary, payload_hash,
+                    message_event_id, created_at
+             FROM review_transitions;
+
+             DROP TABLE review_transitions;
+             DROP TABLE review_runs;
+             ALTER TABLE review_runs_v23 RENAME TO review_runs;
+             ALTER TABLE review_transitions_v23 RENAME TO review_transitions;
+             CREATE INDEX idx_review_runs_active_pair
+                 ON review_runs(developer_session_id, reviewer_session_id, state);
+             CREATE INDEX idx_review_transitions_workflow
+                 ON review_transitions(workflow_id, to_version);
+             PRAGMA user_version = 23;
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+    }
+
     fn insert_preserved_phase1_handoff(conn: &Connection) {
         conn.execute_batch(
             "PRAGMA foreign_keys = OFF;
@@ -2728,12 +3644,12 @@ pub(super) mod tests {
                  '{\"bundle_id\":\"bundle:migrate\",\"created_by\":\"source\"}'
              );
              INSERT INTO terminal_chains (
-                 id, workspace, tool, model_ref, reasoning_ref,
+                 id, workspace, tool, tag, model_ref, reasoning_ref,
                  permission_policy_ref, policy_ref, supervisor_process_id,
                  supervisor_process_birth_identity, current_generation,
                  state, version, created_at, updated_at
              ) VALUES (
-                 'tc-migrate', '/tmp', 'codex', 'model', 'reasoning',
+                 'tc-migrate', '/tmp', 'codex', 'dev1', 'model', 'reasoning',
                  'permission', 'policy', 'supervisor', 'supervisor-birth',
                  1, 'prepared', 0, 1.0, 1.0
              );
@@ -2797,6 +3713,9 @@ pub(super) mod tests {
         assert!(tables.contains(&"session_bindings".to_string()));
         assert!(tables.contains(&"review_runs".to_string()));
         assert!(tables.contains(&"review_transitions".to_string()));
+        assert!(tables.contains(&"review_routes".to_string()));
+        assert!(tables.contains(&"review_workers".to_string()));
+        assert!(tables.contains(&"review_jobs".to_string()));
         assert!(tables.contains(&"terminal_chains".to_string()));
         assert!(tables.contains(&"terminal_generations".to_string()));
         assert!(tables.contains(&"terminal_handoffs".to_string()));
@@ -3342,7 +4261,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn test_v18_to_v19_migration_preserves_all_existing_state_and_matches_fresh_schema() {
+    fn test_v18_to_v24_migration_preserves_review_state_and_defaults_interactive() {
         let (db, db_path) = setup_full_test_db();
         db.conn
             .execute(
@@ -3447,6 +4366,21 @@ pub(super) mod tests {
             )
             .unwrap();
         assert_eq!(preserved, (1, 1, 1, 1, 1, 1));
+        let migrated_review: (String, Option<String>, Option<String>) = migrated
+            .conn()
+            .query_row(
+                "SELECT reviewer_mode, base_revision, review_route_id
+                 FROM review_runs WHERE id = 'rv-preserved'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            migrated_review,
+            ("interactive".to_string(), None, None),
+            "v18 reviews must remain interactive after the continuous migration"
+        );
+        assert!(review_worker_schema_is_complete(migrated.conn()).unwrap());
 
         let (fresh, fresh_path) = setup_full_test_db();
         assert_eq!(
@@ -3626,7 +4560,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn test_v22_to_v23_migration_preserves_chain_and_pins_empty_tag() {
+    fn test_v22_to_v24_runs_tag_migration_before_worker_schema() {
         let (db, db_path) = setup_full_test_db();
         insert_preserved_phase1_handoff(db.conn());
         rebuild_terminal_chains_without_v23_tag(db.conn());
@@ -3664,6 +4598,451 @@ pub(super) mod tests {
             "migrated chain tag must be immutable"
         );
         assert!(handoff_schema_is_complete(migrated.conn()).unwrap());
+        assert!(review_worker_schema_is_complete(migrated.conn()).unwrap());
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_v23_to_v24_preserves_review_chain_recovery_evidence_and_tag_contract() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO review_runs (
+                     id, task, workspace, thread, developer_name,
+                     developer_session_id, reviewer_name, reviewer_session_id,
+                     state, round, max_rounds, version, created_at, updated_at
+                 ) VALUES (
+                     'rv-v23', 'task', '/tmp', 'review-rv-v23',
+                     'source', 'hcom-source', 'reviewer', 'reviewer-session',
+                     'awaiting_review', 1, 3, 0, 1.0, 1.0
+                 )",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO review_transitions (
+                     workflow_id, from_version, to_version, round,
+                     actor_name, actor_session_id, actor_role, action,
+                     from_state, to_state, summary, payload_hash, created_at
+                 ) VALUES (
+                     'rv-v23', -1, 0, 1, 'source', 'hcom-source',
+                     'developer', 'start', NULL, 'awaiting_review',
+                     'task', 'hash', 1.0
+                 )",
+                [],
+            )
+            .unwrap();
+        insert_preserved_phase1_handoff(db.conn());
+        db.conn()
+            .execute_batch(
+                "INSERT INTO instances (
+                     name, session_id, tag, tool, created_at
+                 ) VALUES (
+                     'source', 'hcom-source', 'dev1', 'codex', 1.0
+                 );
+                 INSERT INTO terminal_chain_claims (
+                     chain_id, workspace, outer_tty_device, outer_tty_inode,
+                     state, version, created_at, updated_at
+                 ) VALUES (
+                     'tc-migrate', '/tmp', 10, 11, 'active', 0, 1.0, 1.0
+                 );
+                 INSERT INTO terminal_generation_processes (
+                     chain_id, generation, wrapper_pid, wrapper_pgid,
+                     wrapper_birth_identity, child_pid, child_pgid,
+                     child_birth_identity, materialized_at
+                 ) VALUES (
+                     'tc-migrate', 1, 20, 19, 'wrapper-birth',
+                     21, 21, 'child-birth', 1.0
+                 );
+                 INSERT INTO terminal_generation_prepare_intents (
+                     chain_id, generation, launch_nonce,
+                     supervisor_process_id,
+                     supervisor_process_birth_identity,
+                     control_object_kind, control_object_id,
+                     control_version, generation_version, started_at
+                 ) VALUES (
+                     'tc-migrate', 2, 'nonce-2', 'supervisor',
+                     'supervisor-birth', 'handoff', 'ho-migrate',
+                     0, 0, 1.0
+                 );
+                 INSERT INTO terminal_recovery_attempts (
+                     id, chain_id, sequence, requested_chain_version,
+                     handoff_id, replaced_generation, target_generation,
+                     plan_code, state, version, supervisor_process_id,
+                     supervisor_process_birth_identity, supervisor_pid,
+                     supervisor_pgid, outer_foreground_pgid,
+                     outer_tty_device, outer_tty_inode, created_at, updated_at
+                 ) VALUES (
+                     'recovery-v23', 'tc-migrate', 1, 0,
+                     NULL, 1, NULL, 'manual-stop', 'manual', 0,
+                     'replacement-supervisor', 'replacement-birth',
+                     30, 31, 31, 12, 13, 1.0, 1.0
+                 );
+                 INSERT INTO terminal_recovery_absence_evidence (
+                     recovery_attempt_id, subject, generation, pid, pgid,
+                     process_birth_identity, observation, method, observed_at
+                 ) VALUES (
+                     'recovery-v23', 'wrapper', 1, 20, NULL,
+                     'wrapper-birth', 'absent', 'proc_birth_missing', 1.0
+                 );
+                 INSERT INTO terminal_target_validations (
+                     handoff_id, target_generation, validation_token,
+                     instructions_digest, validated_at
+                 ) VALUES (
+                     'ho-migrate', 2, 'validation-v23',
+                     'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                     1.0
+                 );",
+            )
+            .unwrap();
+        rebuild_review_schema_without_v24_worker(db.conn());
+        drop(db);
+
+        let migrated = HcomDb::open_at(&db_path).unwrap();
+        assert_eq!(
+            migrated
+                .conn()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            24
+        );
+        assert!(review_worker_schema_is_complete(migrated.conn()).unwrap());
+        let preserved: (String, i64, String, i64, i64, i64, i64, i64, i64, i64) = migrated
+            .conn()
+            .query_row(
+                "SELECT
+                     (SELECT reviewer_mode FROM review_runs WHERE id = 'rv-v23'),
+                     (SELECT COUNT(*) FROM review_transitions
+                       WHERE workflow_id = 'rv-v23' AND action = 'start'),
+                     (SELECT tag FROM terminal_chains WHERE id = 'tc-migrate'),
+                     (SELECT COUNT(*) FROM terminal_handoffs WHERE id = 'ho-migrate'),
+                     (SELECT COUNT(*) FROM terminal_chain_claims
+                       WHERE chain_id = 'tc-migrate'),
+                     (SELECT COUNT(*) FROM terminal_generation_processes
+                       WHERE chain_id = 'tc-migrate'),
+                     (SELECT COUNT(*) FROM terminal_generation_prepare_intents
+                       WHERE chain_id = 'tc-migrate'),
+                     (SELECT COUNT(*) FROM terminal_recovery_attempts
+                       WHERE id = 'recovery-v23'),
+                     (SELECT COUNT(*) FROM terminal_recovery_absence_evidence
+                       WHERE recovery_attempt_id = 'recovery-v23'),
+                     (SELECT COUNT(*) FROM terminal_target_validations
+                       WHERE handoff_id = 'ho-migrate')",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                "interactive".to_string(),
+                1,
+                "dev1".to_string(),
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+            )
+        );
+        assert!(
+            migrated
+                .conn()
+                .execute(
+                    "UPDATE instances SET tag = 'changed'
+                     WHERE name = 'source' AND session_id = 'hcom-source'",
+                    []
+                )
+                .is_err(),
+            "materialized generation tag must remain immutable after v24"
+        );
+        assert!(
+            migrated
+                .conn()
+                .execute(
+                    "UPDATE terminal_chains SET tag = 'changed'
+                     WHERE id = 'tc-migrate'",
+                    []
+                )
+                .is_err(),
+            "chain tag trigger must survive the worker migration"
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_stamped_partial_v24_worker_schema_repairs_atomically() {
+        use std::sync::{Arc, Barrier};
+
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES ('2026-07-28T00:00:00Z', 'message', 'preserved-v24', '{}')",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute_batch(
+                "DROP TABLE review_jobs;
+                 DROP INDEX idx_review_routes_pending_name;
+                 PRAGMA user_version = 24;",
+            )
+            .unwrap();
+        drop(db);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let path = db_path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    HcomDb::open_at(&path).map(|db| {
+                        (
+                            db.conn()
+                                .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                                .unwrap(),
+                            review_worker_schema_is_complete(db.conn()).unwrap(),
+                        )
+                    })
+                })
+            })
+            .collect();
+        for result in handles.into_iter().map(|handle| handle.join().unwrap()) {
+            assert_eq!(result.unwrap(), (24, true));
+        }
+        let repaired = HcomDb::open_at(&db_path).unwrap();
+        assert_eq!(
+            repaired
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE instance = 'preserved-v24'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_malformed_stamped_v24_worker_schema_fails_closed_without_archive() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES ('2026-07-28T00:00:00Z', 'message', 'preserved-v24', '{}')",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute_batch(
+                "DROP TABLE review_jobs;
+                 CREATE TABLE review_jobs (id TEXT PRIMARY KEY);
+                 PRAGMA user_version = 24;",
+            )
+            .unwrap();
+        drop(db);
+
+        assert!(HcomDb::open_at(&db_path).is_err());
+        let conn = Connection::open(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE instance = 'preserved-v24'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(review_jobs)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(columns, vec!["id".to_string()]);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'life' AND instance = '_device'
+                   AND json_extract(data, '$.action') = 'reset'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "typed v24 databases must never be archived/recreated"
+        );
+        drop(conn);
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_stamped_v24_review_run_column_without_check_fails_closed() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES ('2026-07-28T00:00:00Z', 'message', 'preserved-v24-column', '{}')",
+                [],
+            )
+            .unwrap();
+        rebuild_review_schema_without_v24_worker(db.conn());
+        db.conn().execute_batch(REVIEW_ROUTES_TABLE_SQL).unwrap();
+        db.conn()
+            .execute_batch(
+                "ALTER TABLE review_runs
+                     ADD COLUMN reviewer_mode TEXT NOT NULL DEFAULT 'interactive';
+                 ALTER TABLE review_runs
+                     ADD COLUMN base_revision TEXT
+                     CHECK (base_revision IS NULL OR
+                            length(CAST(base_revision AS BLOB)) BETWEEN 40 AND 64);
+                 ALTER TABLE review_runs
+                     ADD COLUMN review_route_id TEXT
+                     REFERENCES review_routes(id) ON DELETE RESTRICT;
+                 PRAGMA user_version = 24;",
+            )
+            .unwrap();
+        drop(db);
+
+        assert!(HcomDb::open_at(&db_path).is_err());
+        let conn = Connection::open(&db_path).unwrap();
+        let review_runs_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'table' AND name = 'review_runs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !normalize_schema_sql(&review_runs_sql)
+                .contains("check (reviewer_mode in ('interactive', 'worker'))")
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE instance = 'preserved-v24-column'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'life' AND instance = '_device'
+                   AND json_extract(data, '$.action') = 'reset'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "an incompatible v24 ALTER shape must not trigger archive/recreate"
+        );
+        drop(conn);
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_stamped_v24_inconsistent_worker_rows_fail_closed() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES (
+                     '2026-07-28T00:00:00Z', 'message',
+                     'preserved-v24-data', '{}'
+                 )",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO review_runs (
+                     id, task, workspace, thread, developer_name,
+                     developer_session_id, reviewer_name, reviewer_session_id,
+                     state, round, max_rounds, version, created_at, updated_at
+                 ) VALUES (
+                     'rv-invalid-worker', 'task', '/tmp',
+                     'review-rv-invalid-worker', 'developer',
+                     'developer-session', 'reviewer', 'reviewer-session',
+                     'awaiting_review', 1, 3, 0, 1.0, 1.0
+                 );
+                 DROP TRIGGER review_workers_require_worker_run;
+                 INSERT INTO review_workers (
+                     workflow_id, adapter, native_session_mode,
+                     native_session_id, model, reasoning, policy, cli_path,
+                     cli_version, adapter_contract_ver, capability_json,
+                     created_at, updated_at
+                 ) VALUES (
+                     'rv-invalid-worker', 'codex', 'preassigned',
+                     'native-session', 'model', 'max', 'read-only',
+                     '/usr/bin/codex', 'codex-cli 0.145.0', 1,
+                     '{\"observability\":\"structured\"}', 1.0, 1.0
+                 );
+                 PRAGMA user_version = 24;",
+            )
+            .unwrap();
+        drop(db);
+
+        assert!(HcomDb::open_at(&db_path).is_err());
+        let conn = Connection::open(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM review_workers
+                 WHERE workflow_id = 'rv-invalid-worker'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1,
+            "failed repair must roll back without deleting typed worker state"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE instance = 'preserved-v24-data'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'life' AND instance = '_device'
+                   AND json_extract(data, '$.action') = 'reset'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "inconsistent typed v24 rows must not trigger archive/recreate"
+        );
+        drop(conn);
         cleanup_test_db(db_path);
     }
 
