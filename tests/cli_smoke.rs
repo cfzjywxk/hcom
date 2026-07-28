@@ -507,6 +507,225 @@ fn ordinary_codex_session_handoff_mutations_fail_closed() {
 
 #[cfg(unix)]
 #[test]
+fn hook_only_codex_review_delivers_lgtm_without_a_new_user_prompt() {
+    let h = Hcom::new();
+    let (hooks_code, hooks_stdout, hooks_stderr) = h.run(["hooks", "add", "codex"]);
+    assert_eq!(hooks_code, 0, "stdout={hooks_stdout} stderr={hooks_stderr}");
+
+    let developer_native = "hook-only-review-developer-native";
+    let reviewer_native = "hook-only-review-reviewer-native";
+    let developer_output = h
+        .cmd()
+        .env("CODEX_SANDBOX", "1")
+        .env("CODEX_THREAD_ID", developer_native)
+        .arg("start")
+        .output()
+        .expect("start isolated hook-only Codex developer");
+    assert!(
+        developer_output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&developer_output.stdout),
+        String::from_utf8_lossy(&developer_output.stderr)
+    );
+    let developer = parse_hcom_marker(&String::from_utf8_lossy(&developer_output.stdout))
+        .expect("isolated hook-only Codex developer marker");
+
+    let reviewer_process = "hook-only-review-managed-reviewer-process";
+    let reviewer_output = h
+        .cmd()
+        .env("HCOM_PROCESS_ID", reviewer_process)
+        .env("CODEX_SANDBOX", "1")
+        .env("CODEX_THREAD_ID", reviewer_native)
+        .arg("start")
+        .output()
+        .expect("start isolated managed Codex reviewer");
+    assert!(
+        reviewer_output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&reviewer_output.stdout),
+        String::from_utf8_lossy(&reviewer_output.stderr)
+    );
+    let reviewer = parse_hcom_marker(&String::from_utf8_lossy(&reviewer_output.stdout))
+        .expect("isolated managed Codex reviewer marker");
+
+    let connection = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    for (name, session_id) in [(&developer, developer_native), (&reviewer, reviewer_native)] {
+        connection
+            .execute(
+                "UPDATE instances SET session_id = ?1, status = 'listening'
+                 WHERE name = ?2",
+                rusqlite::params![session_id, name],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_bindings (session_id, instance_name, created_at)
+                 VALUES (?1, ?2, 1.0)",
+                rusqlite::params![session_id, name],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "UPDATE process_bindings SET session_id = ?1
+             WHERE process_id = ?2 AND instance_name = ?3",
+            rusqlite::params![reviewer_native, reviewer_process, reviewer],
+        )
+        .unwrap();
+    let developer_process_bindings: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM process_bindings WHERE instance_name = ?1",
+            [&developer],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        developer_process_bindings, 0,
+        "{developer} must model a hook-only direct CLI"
+    );
+    assert!(
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM process_bindings
+                     WHERE process_id = ?1 AND instance_name = ?2
+                 )",
+                rusqlite::params![reviewer_process, reviewer],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap(),
+        "{reviewer} must model a reachable managed reviewer"
+    );
+    drop(connection);
+
+    let mut start_review = h.cmd();
+    start_review
+        .env("CODEX_SANDBOX", "1")
+        .env("CODEX_THREAD_ID", developer_native)
+        .args([
+            "review",
+            "start",
+            &format!("@{reviewer}"),
+            "--max-rounds",
+            "1",
+            "--name",
+            &developer,
+            "--",
+            "Review the hook-only foreground observer",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut blocked = start_review
+        .spawn()
+        .expect("spawn hook-only attached review start");
+    let stdout = blocked.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut first_output = String::new();
+    let mut line = String::new();
+    let mut review_id = None;
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .expect("read hook-only attached review output");
+        if read == 0 {
+            let status = blocked.wait().unwrap();
+            let mut stderr = String::new();
+            blocked
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!(
+                "hook-only review command exited instead of retaining a wake transport: status={status:?} stdout={first_output} stderr={stderr}"
+            );
+        }
+        first_output.push_str(&line);
+        if review_id.is_none()
+            && let Some(id) = line.split_whitespace().find(|part| part.starts_with("rv-"))
+        {
+            review_id = Some(id.to_string());
+        }
+        if review_id.is_some() && first_output.contains("remains attached") {
+            break;
+        }
+    }
+    let review_id = review_id.unwrap();
+    assert!(
+        blocked.try_wait().unwrap().is_none(),
+        "hook-only review command returned before the reviewer verdict"
+    );
+    std::thread::sleep(Duration::from_millis(450));
+    assert!(
+        blocked.try_wait().unwrap().is_none(),
+        "hook-only foreground observer did not remain attached across idle polls"
+    );
+
+    let verdict = h
+        .cmd()
+        .env("HCOM_PROCESS_ID", reviewer_process)
+        .env("CODEX_SANDBOX", "1")
+        .env("CODEX_THREAD_ID", reviewer_native)
+        .args([
+            "review",
+            "verdict",
+            &review_id,
+            "--round",
+            "1",
+            "--lgtm",
+            "--name",
+            &reviewer,
+            "--",
+            "LGTM from the hook-only reviewer",
+        ])
+        .output()
+        .expect("submit hook-only reviewer verdict");
+    assert!(
+        verdict.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&verdict.stdout),
+        String::from_utf8_lossy(&verdict.stderr)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = blocked.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = blocked.kill();
+            let _ = blocked.wait();
+            panic!("hook-only foreground observer did not resume after LGTM");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        status.success(),
+        "hook-only review command status={status:?}"
+    );
+    let mut remaining_stdout = String::new();
+    reader.read_to_string(&mut remaining_stdout).unwrap();
+    let mut stderr = String::new();
+    blocked
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let stdout = format!("{first_output}{remaining_stdout}");
+    assert!(
+        stdout.contains("advanced to state=approved")
+            && stdout.contains("resuming the current tool turn")
+            && stdout.contains("[hcom-review")
+            && stdout.contains("LGTM"),
+        "LGTM was not delivered into the same hook-only CLI return: stdout={stdout} stderr={stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn managed_chain_review_request_changes_fixed_and_lgtm_resume_without_user_input() {
     let h = Hcom::new();
     let (hooks_code, hooks_stdout, hooks_stderr) = h.run(["hooks", "add", "codex"]);

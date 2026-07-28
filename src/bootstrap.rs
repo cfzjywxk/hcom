@@ -46,10 +46,9 @@ You run hcom commands on behalf of the human user. The human uses natural langua
 `[hcom-review]` messages are a structured protocol. Their instructions override the
 generic response rules below: follow them exactly, use only the specified `hcom review`
 command for state transitions, never acknowledge them with `hcom send`, and never probe
-the peer for progress. If an active same-terminal chain developer's `review start`,
-`review fixed`, or `review rebut` command says its observer remains attached, keep
-waiting on that same foreground tool process until it exits; its return resumes this
-same turn with the peer transition.
+the peer for progress. If a review command says its foreground observer remains
+attached, keep waiting on that same tool process until it exits; its return resumes
+this same turn with the peer transition.
 
 Response rules:
 - From {SENDER} or intent=request → always respond
@@ -73,7 +72,7 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
   Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
   Event-based notifications, watch agents, subscribe, react: events sub [filters] | --help
 - Handoff context: bundle prepare
-- Repeated review: when the human asks for review/fix/re-review until LGTM or a round limit, use `review start @reviewer --max-rounds N --name {instance_name} -- <task>`. Follow the exact structured commands in [hcom-review] messages; ordinary text never changes review state. Ordinarily, after a successful review command leaves the peer responsible, end your turn and wait for automatic delivery. Exception: if an active chain developer command says its observer remains attached, keep waiting on that same foreground tool process until it exits, then continue the same turn. Do not run any hcom command merely to check progress; waiting on the already attached process does not start another command.
+- Repeated review: when the human asks for review/fix/re-review until LGTM or a round limit, use `review start @reviewer --max-rounds N --name {instance_name} -- <task>`. Follow the exact structured commands in [hcom-review] messages; ordinary text never changes review state. Ordinarily, after a successful review command leaves the peer responsible, end your turn and wait for automatic delivery. If the review command says its foreground observer remains attached, keep waiting on that same tool process until it exits, then continue the same turn. Do not run any hcom command merely to check progress; waiting on the already attached process does not start another command.
 - Spawn agents: [num] <{launch_tools}> [--tag labelOrGroup] [--terminal tmux|kitty|wezterm|etc]
   Example: `hcom 1 claude --tag cool` -> automatic <hcom> msg when ready -> send it task via hcom send
   Resume: hcom r <name> [args] | Fork: hcom f <name> [args] | Kill: hcom kill <name(s)>
@@ -114,10 +113,10 @@ Note: hcom command in this environment is `{hcom_cmd}`. Substitute in examples."
 // "end your turn to receive" — a behavioral nudge, not a technical requirement.
 // Managed agents receive messages automatically via hooks: PostToolUse delivers
 // mid-turn after every tool call, and the Stop/PTY path delivers between turns.
-// Agents don't need to do anything to receive.  But without this instruction
-// they instinctively run `sleep` or `hcom listen` to "wait", burning a tool
-// call for no benefit.  "End your turn" short-circuits that impulse and lets
-// the hook machinery do the work.
+// Hook-only/ad-hoc review callers cannot be woken after Stop, so their review
+// command says its foreground observer remains attached instead. Without
+// these instructions agents instinctively start another polling command and
+// race the already-owned observer.
 
 /// Prepended above the JSON delivery block on agy hook turns with unread
 /// messages. Unlike the other tools, agy's Stop fires on turn-idle and no turn
@@ -157,7 +156,7 @@ Messages instantly and automatically arrive via <hcom> tags — end your turn to
 1. Never use `sleep [sec]` instead use `hcom listen [sec]`
 2. Only use `hcom listen` when you are waiting for something not related to hcom
 - Waiting for hcom message → end your turn
-- Waiting for an expected hcom reply or ordinary review transition → end your turn; do not poll with `hcom status`, `hcom review status`, `hcom events`, `hcom listen`, or probe using `hcom send`. An active chain developer's attached review command is the exception: keep waiting on that same foreground process until it exits
+- Waiting for an expected hcom reply or ordinary review transition → end your turn; do not poll with `hcom status`, `hcom review status`, `hcom events`, `hcom listen`, or probe using `hcom send`. A review command that says its foreground observer remains attached is the exception: keep waiting on that same process until it exits
 - Use `hcom events sub` only when the human explicitly asks you to watch non-message events"#;
 
 const DELIVERY_ADHOC: &str = r#"## DELIVERY
