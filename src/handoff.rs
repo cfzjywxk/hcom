@@ -1555,6 +1555,8 @@ fn clean_git_text(
 }
 
 fn snapshot_workspace(path: &Path) -> Result<WorkspaceSnapshot, HandoffError> {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
     let workspace = canonical_workspace(path)?;
     let revision = clean_git_text(
         git_output(&workspace, &["rev-parse", "--verify", "HEAD"])?,
@@ -7759,6 +7761,7 @@ mod tests {
     }
 
     fn run_git(workspace: &Path, args: &[&str]) {
+        let _env_read = crate::hooks::test_helpers::process_env_read();
         let output = Command::new("git")
             .arg("-C")
             .arg(workspace)

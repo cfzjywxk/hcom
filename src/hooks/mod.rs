@@ -19,15 +19,104 @@ use serde_json::Value;
 /// Shared test helpers for hook test modules (claude, codex, gemini).
 #[cfg(test)]
 pub mod test_helpers {
+    use std::cell::Cell;
+    use std::ffi::OsString;
     use std::path::PathBuf;
     use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-    // Process-global serialization for tests that mutate HCOM_DIR/HOME.
-    // Env vars are process-wide; without this, parallel tests trample each
-    // other (e.g. one test's config write lands in another's tempdir).
+    // Process-global serialization for tests that mutate environment or cwd.
+    // Without this, parallel tests can observe a partial multi-variable update
+    // or resolve a subprocess through another test's temporary PATH.
     // Recover from poison so a panic in one test doesn't cascade-fail the
     // next — the shared state is just "one set of env vars at a time."
     static TEST_ENV_LOCK: OnceLock<RwLock<()>> = OnceLock::new();
+
+    thread_local! {
+        static TEST_ENV_READ_DEPTH: Cell<usize> = const { Cell::new(0) };
+        static TEST_ENV_WRITE_DEPTH: Cell<usize> = const { Cell::new(0) };
+    }
+
+    // Every literal process-global key mutated by the unit-test binary, plus
+    // dynamic config and terminal-detection keys used by local test helpers.
+    // Local guards may save additional dynamic keys, but they must still hold
+    // EnvGuard so all writers share TEST_ENV_LOCK.
+    const TEST_ENV_KEYS: &[&str] = &[
+        "ANTIGRAVITY_AGENT",
+        "CARGO_TARGET_DIR",
+        "CARGO_TEST_PARENT",
+        "CI",
+        "CLAUDECODE",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "CODEX_THREAD_ID",
+        "COPILOT_HOME",
+        "CURSOR_CONFIG_DIR",
+        "GEMINI_API_KEY",
+        "GEMINI_CLI_HOME",
+        "GEMINI_PTY_INFO",
+        "HERDR_ENV",
+        "HERDR_PANE_ID",
+        "HERDR_SOCKET_PATH",
+        "HCOM_AUTO_SUBSCRIBE",
+        "HCOM_CHAIN_CODEX_VERSION",
+        "HCOM_CHAIN_GENERATION",
+        "HCOM_CHAIN_HANDOFF_ID",
+        "HCOM_CHAIN_ID",
+        "HCOM_CHAIN_LAUNCH_NONCE",
+        "HCOM_CHAIN_PROCESS_BIRTH_IDENTITY",
+        "HCOM_DEV_ROOT",
+        "HCOM_DIR",
+        "HCOM_INSTANCE_NAME",
+        "HCOM_LAUNCHED_PRESET",
+        "HCOM_PANE_TITLE",
+        "HCOM_PROCESS_ID",
+        "HCOM_TAG",
+        "HCOM_TERMINAL",
+        "HCOM_TEST_CODEX_CLI_VERSION",
+        "HCOM_TIMEOUT",
+        "HCOM_TOOL",
+        "HOME",
+        "KILO_CONFIG_DIR",
+        "KIMI_CODE_HOME",
+        "KITTY_LISTEN_ON",
+        "KITTY_WINDOW_ID",
+        "NO_COLOR",
+        "OMP_PROFILE",
+        "OPENCODE_CONFIG_DIR",
+        "OPENROUTER_API_KEY",
+        "PATH",
+        "PI_CODING_AGENT_DIR",
+        "PI_CODING_AGENT_SESSION_DIR",
+        "PI_CONFIG_DIR",
+        "PI_PROFILE",
+        "RORI_BACKGROUND_PARENT",
+        "RORI_PARENT_SENTINEL",
+        "RORI_PARENT_VALUE",
+        "RORI_TEST_MY_VAR",
+        "RORI_TEST_OPENROUTER_API_KEY",
+        "RORI_TEST_PI_OFFLINE",
+        "TMUX_PANE",
+        "WEZTERM_PANE",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "ZELLIJ_PANE_ID",
+        "https_proxy",
+        // Terminal identity and detection variables.
+        "ALACRITTY_WINDOW_ID",
+        "CMUX_SURFACE_ID",
+        "CMUX_WORKSPACE_ID",
+        "GNOME_TERMINAL_SCREEN",
+        "GHOSTTY_RESOURCES_DIR",
+        "ITERM_SESSION_ID",
+        "KITTY_PID",
+        "KONSOLE_DBUS_WINDOW",
+        "TERM_PROGRAM",
+        "TERM_SESSION_ID",
+        "TERMINATOR_UUID",
+        "TILIX_ID",
+        "WAVETERM_BLOCKID",
+        "WT_SESSION",
+    ];
 
     fn acquire_env_lock() -> RwLockWriteGuard<'static, ()> {
         TEST_ENV_LOCK
@@ -37,47 +126,44 @@ pub mod test_helpers {
     }
 
     pub struct EnvReadGuard {
-        _lock: RwLockReadGuard<'static, ()>,
+        _lock: Option<RwLockReadGuard<'static, ()>>,
     }
 
     pub fn process_env_read() -> EnvReadGuard {
-        EnvReadGuard {
-            _lock: TEST_ENV_LOCK
-                .get_or_init(|| RwLock::new(()))
-                .read()
-                .unwrap_or_else(|error| error.into_inner()),
+        let write_depth = TEST_ENV_WRITE_DEPTH.with(Cell::get);
+        let read_depth = TEST_ENV_READ_DEPTH.with(Cell::get);
+        let lock = if write_depth > 0 || read_depth > 0 {
+            None
+        } else {
+            Some(
+                TEST_ENV_LOCK
+                    .get_or_init(|| RwLock::new(()))
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner()),
+            )
+        };
+        TEST_ENV_READ_DEPTH.with(|depth| depth.set(read_depth + 1));
+        EnvReadGuard { _lock: lock }
+    }
+
+    impl Drop for EnvReadGuard {
+        fn drop(&mut self) {
+            TEST_ENV_READ_DEPTH.with(|depth| {
+                let current = depth.get();
+                debug_assert!(current > 0);
+                depth.set(current.saturating_sub(1));
+            });
         }
     }
 
-    /// RAII guard that saves/restores HCOM_DIR and HOME env vars, and resets Config.
+    /// RAII guard that serializes process-global test mutation, restores the
+    /// complete shared env/cwd snapshot on unwind, and resets Config.
     pub struct EnvGuard {
-        saved_hcom: Option<String>,
-        saved_home: Option<String>,
-        saved_claude_config_dir: Option<String>,
-        saved_cursor_config_dir: Option<String>,
-        saved_xdg_config_home: Option<String>,
-        saved_xdg_data_home: Option<String>,
-        saved_codex_home: Option<String>,
-        saved_gemini_cli_home: Option<String>,
-        saved_kilo_config_dir: Option<String>,
-        saved_kimi_code_home: Option<String>,
-        saved_copilot_home: Option<String>,
-        saved_test_codex_cli_version: Option<String>,
-        saved_pi_coding_agent_dir: Option<String>,
-        saved_pi_coding_agent_session_dir: Option<String>,
-        saved_pi_config_dir: Option<String>,
-        saved_omp_profile: Option<String>,
-        saved_pi_profile: Option<String>,
-        saved_hcom_process_id: Option<String>,
-        saved_chain_id: Option<String>,
-        saved_chain_generation: Option<String>,
-        saved_chain_launch_nonce: Option<String>,
-        saved_chain_process_birth_identity: Option<String>,
-        saved_chain_codex_version: Option<String>,
-        saved_chain_handoff_id: Option<String>,
+        saved: Vec<(&'static str, Option<OsString>)>,
+        saved_cwd: Option<PathBuf>,
         // Declared last so it drops AFTER Drop::drop restores env vars,
         // releasing the lock only once this test's env state is gone.
-        _lock: RwLockWriteGuard<'static, ()>,
+        _lock: Option<RwLockWriteGuard<'static, ()>>,
     }
 
     impl Default for EnvGuard {
@@ -88,36 +174,20 @@ pub mod test_helpers {
 
     impl EnvGuard {
         pub fn new() -> Self {
-            let lock = acquire_env_lock();
+            let write_depth = TEST_ENV_WRITE_DEPTH.with(Cell::get);
+            let read_depth = TEST_ENV_READ_DEPTH.with(Cell::get);
+            assert!(
+                write_depth > 0 || read_depth == 0,
+                "test environment write guard cannot upgrade an active read guard"
+            );
+            let lock = (write_depth == 0).then(acquire_env_lock);
+            TEST_ENV_WRITE_DEPTH.with(|depth| depth.set(write_depth + 1));
             Self {
-                saved_hcom: std::env::var("HCOM_DIR").ok(),
-                saved_home: std::env::var("HOME").ok(),
-                saved_claude_config_dir: std::env::var("CLAUDE_CONFIG_DIR").ok(),
-                saved_cursor_config_dir: std::env::var("CURSOR_CONFIG_DIR").ok(),
-                saved_xdg_config_home: std::env::var("XDG_CONFIG_HOME").ok(),
-                saved_xdg_data_home: std::env::var("XDG_DATA_HOME").ok(),
-                saved_codex_home: std::env::var("CODEX_HOME").ok(),
-                saved_gemini_cli_home: std::env::var("GEMINI_CLI_HOME").ok(),
-                saved_kilo_config_dir: std::env::var("KILO_CONFIG_DIR").ok(),
-                saved_kimi_code_home: std::env::var("KIMI_CODE_HOME").ok(),
-                saved_copilot_home: std::env::var("COPILOT_HOME").ok(),
-                saved_test_codex_cli_version: std::env::var("HCOM_TEST_CODEX_CLI_VERSION").ok(),
-                saved_pi_coding_agent_dir: std::env::var("PI_CODING_AGENT_DIR").ok(),
-                saved_pi_coding_agent_session_dir: std::env::var("PI_CODING_AGENT_SESSION_DIR")
-                    .ok(),
-                saved_pi_config_dir: std::env::var("PI_CONFIG_DIR").ok(),
-                saved_omp_profile: std::env::var("OMP_PROFILE").ok(),
-                saved_pi_profile: std::env::var("PI_PROFILE").ok(),
-                saved_hcom_process_id: std::env::var("HCOM_PROCESS_ID").ok(),
-                saved_chain_id: std::env::var("HCOM_CHAIN_ID").ok(),
-                saved_chain_generation: std::env::var("HCOM_CHAIN_GENERATION").ok(),
-                saved_chain_launch_nonce: std::env::var("HCOM_CHAIN_LAUNCH_NONCE").ok(),
-                saved_chain_process_birth_identity: std::env::var(
-                    "HCOM_CHAIN_PROCESS_BIRTH_IDENTITY",
-                )
-                .ok(),
-                saved_chain_codex_version: std::env::var("HCOM_CHAIN_CODEX_VERSION").ok(),
-                saved_chain_handoff_id: std::env::var("HCOM_CHAIN_HANDOFF_ID").ok(),
+                saved: TEST_ENV_KEYS
+                    .iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+                saved_cwd: std::env::current_dir().ok(),
                 _lock: lock,
             }
         }
@@ -126,94 +196,23 @@ pub mod test_helpers {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             unsafe {
-                match &self.saved_hcom {
-                    Some(v) => std::env::set_var("HCOM_DIR", v),
-                    None => std::env::remove_var("HCOM_DIR"),
-                }
-                match &self.saved_home {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-                match &self.saved_claude_config_dir {
-                    Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
-                    None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
-                }
-                match &self.saved_cursor_config_dir {
-                    Some(v) => std::env::set_var("CURSOR_CONFIG_DIR", v),
-                    None => std::env::remove_var("CURSOR_CONFIG_DIR"),
-                }
-                match &self.saved_xdg_config_home {
-                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                    None => std::env::remove_var("XDG_CONFIG_HOME"),
-                }
-                match &self.saved_xdg_data_home {
-                    Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-                    None => std::env::remove_var("XDG_DATA_HOME"),
-                }
-                match &self.saved_codex_home {
-                    Some(v) => std::env::set_var("CODEX_HOME", v),
-                    None => std::env::remove_var("CODEX_HOME"),
-                }
-                match &self.saved_gemini_cli_home {
-                    Some(v) => std::env::set_var("GEMINI_CLI_HOME", v),
-                    None => std::env::remove_var("GEMINI_CLI_HOME"),
-                }
-                match &self.saved_kilo_config_dir {
-                    Some(v) => std::env::set_var("KILO_CONFIG_DIR", v),
-                    None => std::env::remove_var("KILO_CONFIG_DIR"),
-                }
-                match &self.saved_kimi_code_home {
-                    Some(v) => std::env::set_var("KIMI_CODE_HOME", v),
-                    None => std::env::remove_var("KIMI_CODE_HOME"),
-                }
-                match &self.saved_copilot_home {
-                    Some(v) => std::env::set_var("COPILOT_HOME", v),
-                    None => std::env::remove_var("COPILOT_HOME"),
-                }
-                match &self.saved_test_codex_cli_version {
-                    Some(v) => std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", v),
-                    None => std::env::remove_var("HCOM_TEST_CODEX_CLI_VERSION"),
-                }
-                match &self.saved_pi_coding_agent_dir {
-                    Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
-                    None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-                }
-                match &self.saved_pi_coding_agent_session_dir {
-                    Some(v) => std::env::set_var("PI_CODING_AGENT_SESSION_DIR", v),
-                    None => std::env::remove_var("PI_CODING_AGENT_SESSION_DIR"),
-                }
-                match &self.saved_pi_config_dir {
-                    Some(v) => std::env::set_var("PI_CONFIG_DIR", v),
-                    None => std::env::remove_var("PI_CONFIG_DIR"),
-                }
-                match &self.saved_omp_profile {
-                    Some(v) => std::env::set_var("OMP_PROFILE", v),
-                    None => std::env::remove_var("OMP_PROFILE"),
-                }
-                match &self.saved_pi_profile {
-                    Some(v) => std::env::set_var("PI_PROFILE", v),
-                    None => std::env::remove_var("PI_PROFILE"),
-                }
-                for (key, value) in [
-                    ("HCOM_PROCESS_ID", &self.saved_hcom_process_id),
-                    ("HCOM_CHAIN_ID", &self.saved_chain_id),
-                    ("HCOM_CHAIN_GENERATION", &self.saved_chain_generation),
-                    ("HCOM_CHAIN_LAUNCH_NONCE", &self.saved_chain_launch_nonce),
-                    (
-                        "HCOM_CHAIN_PROCESS_BIRTH_IDENTITY",
-                        &self.saved_chain_process_birth_identity,
-                    ),
-                    ("HCOM_CHAIN_CODEX_VERSION", &self.saved_chain_codex_version),
-                    ("HCOM_CHAIN_HANDOFF_ID", &self.saved_chain_handoff_id),
-                ] {
+                for (key, value) in &self.saved {
                     match value {
                         Some(value) => std::env::set_var(key, value),
                         None => std::env::remove_var(key),
                     }
                 }
             }
+            if let Some(cwd) = &self.saved_cwd {
+                let _ = std::env::set_current_dir(cwd);
+            }
             crate::config::Config::reset();
             crate::config::Config::init();
+            TEST_ENV_WRITE_DEPTH.with(|depth| {
+                let current = depth.get();
+                debug_assert!(current > 0);
+                depth.set(current.saturating_sub(1));
+            });
         }
     }
 
@@ -235,6 +234,86 @@ pub mod test_helpers {
         crate::config::Config::reset();
         crate::config::Config::init();
         (dir, hcom_dir, test_home, guard)
+    }
+
+    #[test]
+    fn nested_env_guards_restore_each_scope_without_deadlock() {
+        let original = std::env::var_os("OPENCODE_CONFIG_DIR");
+        {
+            let _outer = EnvGuard::new();
+            unsafe {
+                std::env::set_var("OPENCODE_CONFIG_DIR", "outer");
+            }
+            {
+                let _inner = EnvGuard::new();
+                unsafe {
+                    std::env::set_var("OPENCODE_CONFIG_DIR", "inner");
+                }
+            }
+            assert_eq!(
+                std::env::var_os("OPENCODE_CONFIG_DIR"),
+                Some(OsString::from("outer"))
+            );
+        }
+        assert_eq!(std::env::var_os("OPENCODE_CONFIG_DIR"), original);
+    }
+
+    #[test]
+    fn poisoned_env_lock_restores_before_reuse() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            let _guard = EnvGuard::new();
+            sender
+                .send(std::env::var_os("OPENCODE_CONFIG_DIR"))
+                .unwrap();
+            unsafe {
+                std::env::set_var("OPENCODE_CONFIG_DIR", "panic-value");
+            }
+            panic!("intentional test lock poison");
+        });
+        let original = receiver.recv().unwrap();
+        assert!(thread.join().is_err());
+
+        let _read = process_env_read();
+        assert_eq!(std::env::var_os("OPENCODE_CONFIG_DIR"), original);
+    }
+
+    #[test]
+    fn env_reader_waits_for_atomic_writer_snapshot() {
+        let original = crate::runtime_env::user_config_home();
+        let (writer_ready_tx, writer_ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (writer_release_tx, writer_release_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            let _guard = EnvGuard::new();
+            unsafe {
+                std::env::set_var("HOME", "/tmp/hcom-env-writer-home");
+                std::env::set_var("XDG_CONFIG_HOME", "/tmp/hcom-env-writer-xdg");
+            }
+            writer_ready_tx.send(()).unwrap();
+            writer_release_rx.recv().unwrap();
+        });
+        writer_ready_rx.recv().unwrap();
+
+        let (reader_started_tx, reader_started_rx) = std::sync::mpsc::sync_channel(1);
+        let (reader_result_tx, reader_result_rx) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            reader_started_tx.send(()).unwrap();
+            reader_result_tx
+                .send(crate::runtime_env::user_config_home())
+                .unwrap();
+        });
+        reader_started_rx.recv().unwrap();
+        assert!(
+            reader_result_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "reader observed a writer's partial process environment"
+        );
+
+        writer_release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        assert_eq!(reader_result_rx.recv().unwrap(), original);
+        reader.join().unwrap();
     }
 }
 

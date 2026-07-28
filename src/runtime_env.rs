@@ -35,6 +35,8 @@ pub(crate) fn get_hcom_prefix() -> Vec<String> {
 /// HCOM_DIR owns hcom state only and must never redirect another tool's
 /// settings, login, sessions, skills, plugins, or transcripts.
 pub(crate) fn tool_config_root() -> std::path::PathBuf {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
     user_home().unwrap_or_default()
 }
 
@@ -45,6 +47,8 @@ pub(crate) fn build_hcom_command() -> String {
 
 /// Gemini / Antigravity shared config directory (`~/.gemini` or under `GEMINI_CLI_HOME`).
 pub(crate) fn gemini_family_config_dir() -> std::path::PathBuf {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
     if let Ok(dir) = std::env::var("GEMINI_CLI_HOME")
         && !dir.is_empty()
     {
@@ -56,6 +60,8 @@ pub(crate) fn gemini_family_config_dir() -> std::path::PathBuf {
 /// User home directory, honoring an explicit `HOME` override before falling back
 /// to the platform default (`dirs::home_dir()` resolves `%USERPROFILE%` on Windows).
 pub(crate) fn user_home() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
     if let Ok(home) = std::env::var("HOME")
         && !home.is_empty()
     {
@@ -76,6 +82,8 @@ pub(crate) fn user_home() -> Option<std::path::PathBuf> {
 /// every OS. There is no `%APPDATA%` or `~/Library/Application Support`
 /// involved, so hcom must not special-case Windows here either.
 pub(crate) fn user_config_home() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
         && !xdg.is_empty()
     {
@@ -102,6 +110,8 @@ pub(crate) fn user_config_home() -> Option<std::path::PathBuf> {
 /// This is the single source of truth for opencode/kilo data-dir resolution,
 /// shared by the hook dispatcher, the transcript search, and `resume`.
 pub(crate) fn opencode_family_data_dir(tool: &str) -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
         && !xdg.is_empty()
     {
@@ -121,6 +131,8 @@ pub(crate) fn opencode_family_data_dir(tool: &str) -> Option<std::path::PathBuf>
 /// resulting path exists on disk. Callers that need "exists" semantics should
 /// apply their own `.exists()` check.
 pub(crate) fn opencode_family_db_path(tool: &str) -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
     let data_dir = opencode_family_data_dir(tool)?;
     if tool == "kilo" {
         if std::env::var("KILO_DB").as_deref() == Ok(":memory:") {
@@ -278,31 +290,6 @@ mod tests {
         assert_eq!(super::user_config_home(), Some(home.join(".config")));
     }
 
-    /// RAII guard for XDG_DATA_HOME, which crate::hooks::test_helpers::EnvGuard
-    /// does not track.
-    struct XdgDataHomeGuard(Option<String>);
-
-    impl XdgDataHomeGuard {
-        fn set(value: &str) -> Self {
-            let saved = std::env::var("XDG_DATA_HOME").ok();
-            unsafe {
-                std::env::set_var("XDG_DATA_HOME", value);
-            }
-            Self(saved)
-        }
-    }
-
-    impl Drop for XdgDataHomeGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.0 {
-                    Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-                    None => std::env::remove_var("XDG_DATA_HOME"),
-                }
-            }
-        }
-    }
-
     #[test]
     #[serial]
     fn opencode_family_data_dir_prefers_xdg_data_home_when_it_exists() {
@@ -318,7 +305,9 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", &home);
         }
-        let _xdg_guard = XdgDataHomeGuard::set(xdg_data.to_str().unwrap());
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &xdg_data);
+        }
 
         // XDG_DATA_HOME wins even though ~/.local/share/opencode also exists.
         assert_eq!(
@@ -343,7 +332,9 @@ mod tests {
         // exist on disk yet. An explicit override must win unconditionally
         // rather than falling back to a stale ~/.local/share/opencode.
         let xdg_data_missing = temp.path().join("xdg-data-missing");
-        let _xdg_guard = XdgDataHomeGuard::set(xdg_data_missing.to_str().unwrap());
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &xdg_data_missing);
+        }
 
         assert_eq!(
             super::opencode_family_data_dir("opencode"),
@@ -363,7 +354,9 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", &home);
         }
-        let _xdg_guard = XdgDataHomeGuard::set("");
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", "");
+        }
 
         // Empty XDG_DATA_HOME is treated as unset (no candidate added for it).
         assert_eq!(
@@ -383,7 +376,9 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", &home);
         }
-        let _xdg_guard = XdgDataHomeGuard::set("");
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", "");
+        }
 
         // ~/.local/share/opencode doesn't exist under this isolated HOME, but
         // it's still the only non-override candidate (OpenCode/Kilo never use

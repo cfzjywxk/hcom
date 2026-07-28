@@ -429,13 +429,26 @@ fn handle_pretooluse(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> H
         None => return hook_noop(),
     };
 
-    common::update_tool_status(
-        db,
-        &instance.name,
-        "codex",
-        &payload.tool_name,
-        &payload.tool_input,
-    );
+    if has_complete_parseable_chain_markers() {
+        // A chain bundle or task may be passed as a shell argument. Preserve
+        // bounded activity observability without copying raw tool input into
+        // the instance row or lifecycle event stream.
+        lifecycle::set_status(
+            db,
+            &instance.name,
+            ST_ACTIVE,
+            "tool:chain",
+            Default::default(),
+        );
+    } else {
+        common::update_tool_status(
+            db,
+            &instance.name,
+            "codex",
+            &payload.tool_name,
+            &payload.tool_input,
+        );
+    }
     hook_noop()
 }
 
@@ -2893,6 +2906,51 @@ mod tests {
             exact_chain_hook_context(&fixture.db, true),
             Err(HandoffError::Conflict(_))
         ));
+    }
+
+    #[test]
+    #[serial]
+    fn managed_chain_pretool_status_does_not_persist_raw_tool_input() {
+        let fixture = exact_hook_fixture();
+        set_exact_hook_env(
+            &fixture,
+            &fixture.source.process_id,
+            1,
+            "nonce-source",
+            None,
+        );
+        let sentinel = "P5_MANAGED_CHAIN_PRIVATE_TASK";
+        let payload = HookPayload::from_codex_native(
+            "PreToolUse",
+            serde_json::json!({
+                "cwd": fixture.workspace,
+                "hook_event_name": "PreToolUse",
+                "session_id": "native-source",
+                "tool_name": "Bash",
+                "tool_input": {"command": format!("hcom bundle create --description {sentinel}")},
+            }),
+        );
+
+        handle_pretooluse(&fixture.db, &HcomContext::from_os(), &payload);
+
+        let instance = fixture
+            .db
+            .get_instance_full(&fixture.source.instance_name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(instance.status, ST_ACTIVE);
+        assert_eq!(instance.status_context, "tool:chain");
+        assert!(instance.status_detail.is_empty());
+        let leaked: i64 = fixture
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE instr(data, ?1) > 0",
+                [sentinel],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked, 0);
     }
 
     #[test]

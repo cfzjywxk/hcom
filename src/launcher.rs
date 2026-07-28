@@ -253,6 +253,8 @@ pub fn launch_env_regime(run_here: bool, inside_ai_tool: bool) -> LaunchEnvRegim
 }
 
 pub fn contaminated_parent() -> bool {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
     contaminated_parent_with_inside_ai_tool(crate::shared::platform::is_inside_ai_tool())
 }
 
@@ -273,6 +275,8 @@ pub fn build_launch_env(
     hcom_config: &HcomConfig,
     regime: LaunchEnvRegime,
 ) -> HashMap<String, String> {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
     // A wrapped tool is a normal child process: inherit the caller's complete
     // environment. Only hcom-owned identity/marker variables are replaced
     // below, and explicit hcom config/env overrides are applied afterward.
@@ -2218,6 +2222,7 @@ mod tests {
 
     struct EnvVarGuard {
         saved: BTreeMap<String, Option<String>>,
+        _shared: crate::hooks::test_helpers::EnvGuard,
     }
 
     impl EnvVarGuard {
@@ -2260,6 +2265,7 @@ mod tests {
         where
             I: IntoIterator<Item = String>,
         {
+            let shared = crate::hooks::test_helpers::EnvGuard::new();
             let mut saved = BTreeMap::new();
             for key in keys {
                 saved
@@ -2267,7 +2273,10 @@ mod tests {
                     .or_insert_with(|| std::env::var(&key).ok());
                 unsafe { std::env::remove_var(key) };
             }
-            Self { saved }
+            Self {
+                saved,
+                _shared: shared,
+            }
         }
     }
 
@@ -2690,6 +2699,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_build_launch_env_inherits_parent_env() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
         unsafe { std::env::set_var("RORI_TEST_MY_VAR", "hello") }
         unsafe { std::env::set_var("RORI_TEST_OPENROUTER_API_KEY", "sk-test-123") }
         unsafe { std::env::set_var("RORI_TEST_PI_OFFLINE", "1") }
@@ -2735,6 +2745,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_build_launch_env_strips_closed_categories() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
         unsafe { std::env::set_var("HCOM_PROCESS_ID", "pid-stale") }
         unsafe { std::env::set_var("ANTIGRAVITY_AGENT", "1") }
         unsafe { std::env::set_var("CLAUDECODE", "1") }
@@ -2843,6 +2854,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_build_launch_env_config_overrides_ambient() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
         unsafe { std::env::set_var("HCOM_TAG", "ambient-tag") }
 
         let config = crate::config::HcomConfig {
@@ -3103,6 +3115,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_same_tool_nesting_preserves_native_instance_state() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
         unsafe { std::env::set_var("GEMINI_PTY_INFO", "child_process") }
         unsafe { std::env::set_var("GEMINI_API_KEY", "parent-key") }
 
@@ -3125,6 +3138,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_cross_tool_nesting_forwards_auth() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
         unsafe { std::env::set_var("OPENROUTER_API_KEY", "sk-parent") }
 
         let config = crate::config::HcomConfig::default();

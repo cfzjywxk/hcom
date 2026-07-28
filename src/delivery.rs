@@ -195,6 +195,8 @@ mod host_label {
 
     impl HostLabel {
         pub(super) fn resolve() -> Self {
+            #[cfg(test)]
+            let _env_read = crate::hooks::test_helpers::process_env_read();
             // `last_pushed` starts unset so the first delivery-loop iteration
             // *always* pushes a styled label. The built-in herdr preset
             // invokes `agent start {instance_name}` which leaves the pane
@@ -328,6 +330,7 @@ mod host_label {
         #[test]
         #[serial]
         fn resolve_does_not_seed_last_pushed_from_pane_title_env() {
+            let _env = crate::hooks::test_helpers::EnvGuard::new();
             // The built-in herdr preset launches with `agent start
             // {instance_name}`, so herdr's initial pane label is the bare
             // name (e.g. `luna`). Seeding `last_pushed` from HCOM_PANE_TITLE

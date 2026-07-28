@@ -1299,13 +1299,22 @@ fn print_chain(db: &HcomDb, chain: &TerminalChain, json_mode: bool) -> i32 {
     }
 }
 
+fn ensure_codex_hooks_ready() -> Result<(), HandoffError> {
+    let hooks_ready = crate::hooks::codex::verify_codex_hooks_installed(false)
+        && crate::hooks::codex::codex_current_feature_enabled();
+    if !hooks_ready {
+        crate::hooks::codex::try_setup_codex_hooks(false).map_err(|_| {
+            typed_runtime(
+                "codex_hook_setup_failed",
+                "required Codex hooks could not be installed or verified",
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn preflight(spec: &ChainSpec) -> Result<CodexAdapterPreflight, HandoffError> {
-    crate::hooks::codex::try_setup_codex_hooks(false).map_err(|_| {
-        typed_runtime(
-            "codex_hook_setup_failed",
-            "required Codex hooks could not be installed or verified",
-        )
-    })?;
+    ensure_codex_hooks_ready()?;
     CodexGenerationAdapter::preflight(&profile_from_spec(spec)).map_err(|_| {
         typed_runtime(
             "unsupported_codex_profile",
@@ -1639,6 +1648,37 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    #[cfg(unix)]
+    #[test]
+    fn ready_codex_hooks_are_verified_without_rewriting_user_files() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (_tmp, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        unsafe {
+            std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.145.0");
+        }
+        crate::hooks::codex::try_setup_codex_hooks(false).unwrap();
+        let config_path = crate::hooks::codex::get_codex_config_path();
+        let hooks_path = crate::hooks::codex::get_codex_hooks_path();
+        let config_before = std::fs::metadata(&config_path).unwrap();
+        let hooks_before = std::fs::metadata(&hooks_path).unwrap();
+
+        ensure_codex_hooks_ready().unwrap();
+
+        let config_after = std::fs::metadata(&config_path).unwrap();
+        let hooks_after = std::fs::metadata(&hooks_path).unwrap();
+        assert_eq!(config_after.ino(), config_before.ino());
+        assert_eq!(hooks_after.ino(), hooks_before.ino());
+        assert_eq!(
+            config_after.modified().unwrap(),
+            config_before.modified().unwrap()
+        );
+        assert_eq!(
+            hooks_after.modified().unwrap(),
+            hooks_before.modified().unwrap()
+        );
+    }
+
     #[test]
     fn parser_exposes_only_codex_status_and_recover() {
         let start = ChainArgs::try_parse_from([
@@ -1675,7 +1715,8 @@ mod tests {
                 "{unsupported} must remain unsupported by chain mode"
             );
         }
-        assert!(ChainArgs::try_parse_from(["chain", "codex", "--model", "x"]).is_err());
+        assert!(validate_model("-invalid-leading-character").is_err());
+        assert!(validate_model(&"x".repeat(MAX_MODEL_REF_BYTES + 1)).is_err());
 
         let status = ChainArgs::try_parse_from(["chain", "status", "tc-123", "--json"]).unwrap();
         assert!(matches!(status.command, ChainCommand::Status(_)));

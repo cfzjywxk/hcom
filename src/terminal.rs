@@ -178,6 +178,8 @@ pub(crate) const TERMINAL_COLOR_VARS: &[&str] = &[
 /// Used for same-terminal PTY launches (run_here=True) to enable close-on-kill.
 /// Checks built-in env map first, then TOML presets with pane_id_env defined.
 pub fn detect_terminal_from_env() -> Option<String> {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
     // Built-in mappings
     for &(env_var, preset_name) in TERMINAL_ENV_MAP {
         if std::env::var(env_var)
@@ -477,6 +479,8 @@ pub(crate) fn which_candidates(dir: &Path, name: &str) -> Vec<std::path::PathBuf
 
 /// Simple `which` implementation — find binary in PATH.
 pub fn which_bin(name: &str) -> Option<String> {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
     // `split_paths` uses the platform separator (`;` on Windows, `:` elsewhere),
     // which also avoids splitting Windows drive letters like `C:`. PATH being
     // entirely unset (rather than merely lacking `name`) still falls through
@@ -1172,6 +1176,8 @@ pub fn create_powershell_script(
 /// establish its own terminal identity, so only terminal-context vars are also
 /// removed from the terminal-launcher process.
 fn get_launcher_env() -> HashMap<String, String> {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
     get_launcher_env_from(std::env::vars())
 }
 
@@ -2174,6 +2180,8 @@ pub fn launch_terminal(
 /// Build the child env by overlaying explicit hcom launch values on the exact
 /// parent environment.
 fn build_full_env(config_env: &HashMap<String, String>) -> HashMap<String, String> {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
     let mut full = config_env.clone();
     for (k, v) in std::env::vars() {
         if k == "HCOM_TERMINAL" {
@@ -2569,10 +2577,14 @@ mod tests {
         );
     }
 
-    struct EnvGuard(Vec<(&'static str, Option<String>)>);
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+        _shared: crate::hooks::test_helpers::EnvGuard,
+    }
 
     impl EnvGuard {
         fn clear(vars: &'static [&'static str]) -> Self {
+            let shared = crate::hooks::test_helpers::EnvGuard::new();
             let saved = vars
                 .iter()
                 .map(|&var| (var, std::env::var(var).ok()))
@@ -2582,13 +2594,16 @@ mod tests {
                     std::env::remove_var(var);
                 }
             }
-            Self(saved)
+            Self {
+                saved,
+                _shared: shared,
+            }
         }
     }
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            for (var, value) in &self.0 {
+            for (var, value) in &self.saved {
                 unsafe {
                     if let Some(value) = value {
                         std::env::set_var(var, value);

@@ -34,6 +34,8 @@ fn path_exists_or_symlink(path: &Path) -> bool {
 /// missing (e.g. mid-upgrade via nvm/homebrew), unlike `which_bin`, whose
 /// results get executed and so require the target to actually resolve.
 fn is_in_path(name: &str) -> bool {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
     let Some(path_var) = std::env::var_os("PATH") else {
         return false;
     };
@@ -45,6 +47,8 @@ fn is_in_path(name: &str) -> bool {
 }
 
 fn is_antigravity_installed() -> bool {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
     is_in_path("agy")
         || is_in_path("antigravity")
         || std::env::var_os("HOME").is_some_and(|home| {
@@ -601,22 +605,16 @@ mod tests {
     #[test]
     #[serial]
     fn test_is_in_path_tolerates_broken_symlink() {
+        let _env = crate::hooks::test_helpers::EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let link = dir.path().join("definitely_not_a_real_binary_xyz123");
         std::os::unix::fs::symlink(dir.path().join("missing-target"), &link).unwrap();
 
-        let original_path = std::env::var_os("PATH");
         unsafe {
             std::env::set_var("PATH", dir.path());
         }
         assert!(is_in_path("definitely_not_a_real_binary_xyz123"));
         assert!(!is_in_path("also_not_a_real_binary_abc456"));
-        unsafe {
-            match &original_path {
-                Some(v) => std::env::set_var("PATH", v),
-                None => std::env::remove_var("PATH"),
-            }
-        }
     }
 
     #[test]

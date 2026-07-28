@@ -392,7 +392,8 @@ fn run_outer_scenario(scenario: &str) {
     let report: ProbeReport =
         serde_json::from_slice(&fs::read(&report_path).expect("read driver report")).unwrap();
     assert_eq!(report.scenario, scenario);
-    assert_ne!(report.source_native, report.target_native);
+    let native_sessions_distinct = report.source_native != report.target_native;
+    assert!(native_sessions_distinct);
     assert_eq!(report.max_live_codex_children, 1);
     assert_eq!(report.automatic_sigkill_count, 0);
     assert_eq!(
@@ -458,12 +459,10 @@ fn run_outer_scenario(scenario: &str) {
     } else {
         "hcom codex g3"
     }));
-    assert!(
-        terminal
-            .windows(b"\x1b[23;0t".len())
-            .any(|window| window == b"\x1b[23;0t"),
-        "terminal title stack was not restored"
-    );
+    let title_restored = terminal
+        .windows(b"\x1b[23;0t".len())
+        .any(|window| window == b"\x1b[23;0t");
+    assert!(title_restored, "terminal title stack was not restored");
     let db_path = h.path().join("hcom.db");
     let (audit, durable_private) = durable_privacy_values(&db_path);
     let logs = collect_text_files(h.path());
@@ -479,6 +478,30 @@ fn run_outer_scenario(scenario: &str) {
     for (label, private) in durable_private {
         assert!(!logs.contains(&private), "{label} leaked to hcom logs");
     }
+
+    let ordering_proved = if scenario == NORMAL {
+        report.normal_cleanup_proved
+    } else {
+        report.recovered_without_forged_cleanup
+            && report.concurrent_recovery_single_winner
+            && report.recovery_absence_count == 5
+    };
+    assert!(ordering_proved);
+    let summary = serde_json::json!({
+        "scenario": scenario,
+        "generation_count": report.generation_count,
+        "recovery_attempt_count": report.recovery_attempt_count,
+        "recovery_absence_count": report.recovery_absence_count,
+        "native_sessions_distinct": native_sessions_distinct,
+        "max_live_codex_children": report.max_live_codex_children,
+        "automatic_sigkill_count": report.automatic_sigkill_count,
+        "ordering_proved": ordering_proved,
+        "privacy_scan_clean": true,
+        "title_restored": title_restored,
+    });
+    let summary = serde_json::to_string(&summary).unwrap();
+    assert!(summary.len() <= 1024);
+    println!("PHASE5_REAL_JSON {summary}");
 }
 
 fn last_user_message_texts(body: &str) -> Vec<String> {

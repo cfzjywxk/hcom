@@ -585,6 +585,7 @@ mod tests {
     use crate::handoff::{ChainSpec, StopObservation};
 
     fn run_git(workspace: &Path, args: &[&str]) {
+        let _env_read = crate::hooks::test_helpers::process_env_read();
         let output = Command::new("git")
             .arg("-C")
             .arg(workspace)

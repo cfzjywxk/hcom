@@ -611,6 +611,8 @@ pub(super) fn build_title_escape_with_format(
 /// those fields degrade to absent, same as on Unix outside of tmux/zellij/kitty.
 /// `WEZTERM_PANE` is meaningful on Windows too, since WezTerm is natively cross-platform.
 pub(super) fn build_early_launch_context() -> String {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
     use serde_json::{Map, Value};
 
     let mut ctx = Map::new();
@@ -1362,6 +1364,7 @@ mod tests {
     #[test]
     #[serial]
     fn build_early_launch_context_empty_when_no_env_vars_set() {
+        let _env = crate::hooks::test_helpers::EnvGuard::new();
         clear_launch_context_env();
         let json = build_early_launch_context();
         clear_launch_context_env();
@@ -1371,6 +1374,7 @@ mod tests {
     #[test]
     #[serial]
     fn build_early_launch_context_captures_kitty_listen_on() {
+        let _env = crate::hooks::test_helpers::EnvGuard::new();
         clear_launch_context_env();
         // SAFETY: test is #[serial].
         unsafe {
@@ -1386,6 +1390,7 @@ mod tests {
     #[test]
     #[serial]
     fn build_early_launch_context_prefers_first_pane_id_var_in_priority_order() {
+        let _env = crate::hooks::test_helpers::EnvGuard::new();
         clear_launch_context_env();
         // SAFETY: test is #[serial].
         unsafe {
@@ -1401,6 +1406,7 @@ mod tests {
     #[test]
     #[serial]
     fn build_early_launch_context_ignores_multiplexer_only_vars_when_absent() {
+        let _env = crate::hooks::test_helpers::EnvGuard::new();
         // TMUX_PANE/ZELLIJ_PANE_ID never being set on Windows must degrade to
         // simply absent fields, not an error — same as on Unix outside a
         // multiplexer. This is the "no platform branching needed" behavior.

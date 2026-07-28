@@ -2392,6 +2392,7 @@ mod tests {
     }
 
     fn setup_git_workspace(workspace: &Path) {
+        let _env_read = crate::hooks::test_helpers::process_env_read();
         fs::create_dir_all(workspace).unwrap();
         for args in [
             vec!["init", "-b", "main"],

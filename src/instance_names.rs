@@ -606,21 +606,32 @@ mod reservation_tests {
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<String>,
+        _shared: crate::hooks::test_helpers::EnvGuard,
     }
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: &str) -> Self {
+            let shared = crate::hooks::test_helpers::EnvGuard::new();
             let previous = std::env::var(key).ok();
             // SAFETY: tests using this guard are marked #[serial].
             unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
+            Self {
+                key,
+                previous,
+                _shared: shared,
+            }
         }
 
         fn unset(key: &'static str) -> Self {
+            let shared = crate::hooks::test_helpers::EnvGuard::new();
             let previous = std::env::var(key).ok();
             // SAFETY: tests using this guard are marked #[serial].
             unsafe { std::env::remove_var(key) };
-            Self { key, previous }
+            Self {
+                key,
+                previous,
+                _shared: shared,
+            }
         }
     }
 

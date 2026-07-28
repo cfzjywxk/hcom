@@ -40,6 +40,8 @@ impl Config {
 
     /// Get global config, initializing it from the current environment if needed.
     pub fn get() -> Config {
+        #[cfg(test)]
+        let _env_read = crate::hooks::test_helpers::process_env_read();
         let mut config = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
         if config.is_none() {
             *config = Some(Self::from_env());
@@ -309,6 +311,8 @@ impl HcomConfig {
     /// Validate all fields, returning map of field → error message.
     /// Also normalizes fields (terminal case, etc.).
     pub fn collect_errors(&mut self) -> HashMap<String, String> {
+        #[cfg(test)]
+        let _env_read = crate::hooks::test_helpers::process_env_read();
         self.normalize();
         let mut errors: HashMap<String, String> = HashMap::new();
 
@@ -537,6 +541,8 @@ impl HcomConfig {
     /// `env_override`: If Some, use this map for env var lookups instead of std::env.
     /// Used in daemon mode where os.environ is stale.
     pub fn load(env_override: Option<&HashMap<String, String>>) -> Result<Self, HcomConfigError> {
+        #[cfg(test)]
+        let _env_read = crate::hooks::test_helpers::process_env_read();
         let toml_path = paths::config_toml_path();
 
         if !toml_path.exists() {
@@ -1055,6 +1061,8 @@ fn user_defined_preset_error(name: &str) -> Option<String> {
 
 /// Check if a terminal name matches a user-defined preset in config.toml.
 pub fn is_user_defined_preset(name: &str) -> bool {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
     let toml_path = paths::config_toml_path();
     if let Some(presets_val) = load_toml_presets(&toml_path)
         && let Some(table) = presets_val.as_table()
@@ -1083,6 +1091,8 @@ pub fn get_merged_preset_pane_id_env(name: &str) -> Option<String> {
 ///
 /// Returns None if the name matches neither a TOML preset nor a built-in preset.
 pub fn get_merged_preset(name: &str) -> Option<MergedPreset> {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
     let toml_path = paths::config_toml_path();
     let toml_preset = load_toml_presets(&toml_path).and_then(|presets| {
         let table = presets.as_table()?;
@@ -1482,7 +1492,7 @@ fn lock_down_config_permissions(_path: &std::path::Path) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hooks::test_helpers::isolated_test_env;
+    use crate::hooks::test_helpers::{EnvGuard, isolated_test_env};
     use serial_test::serial;
     use std::env;
 
@@ -1491,14 +1501,12 @@ mod tests {
     where
         F: FnOnce(),
     {
-        // SAFETY: Tests use serial_test to run single-threaded.
+        let _guard = EnvGuard::new();
         unsafe {
             env::set_var(key, value);
         }
+        Config::reset();
         f();
-        unsafe {
-            env::remove_var(key);
-        }
     }
 
     /// Helper to clear multiple env vars for test scope
@@ -1506,20 +1514,14 @@ mod tests {
     where
         F: FnOnce(),
     {
-        let saved: Vec<_> = keys.iter().map(|k| (*k, env::var(k).ok())).collect();
+        let _guard = EnvGuard::new();
         for key in keys {
             unsafe {
                 env::remove_var(key);
             }
         }
+        Config::reset();
         f();
-        for (key, val) in saved {
-            if let Some(v) = val {
-                unsafe {
-                    env::set_var(key, v);
-                }
-            }
-        }
     }
 
     // Unix-only: asserts against $HOME and POSIX absolute paths; Windows
@@ -1528,7 +1530,6 @@ mod tests {
     #[test]
     #[serial]
     fn test_default_config_uses_home_hcom() {
-        Config::reset();
         without_env(&["HCOM_DIR"], || {
             Config::init();
             let config = Config::get();
@@ -1543,7 +1544,6 @@ mod tests {
     #[test]
     #[serial]
     fn test_hcom_dir_overrides_home() {
-        Config::reset();
         with_env("HCOM_DIR", "/custom/hcom", || {
             Config::init();
             let config = Config::get();
@@ -1554,7 +1554,6 @@ mod tests {
     #[test]
     #[serial]
     fn test_instance_name_some_when_set() {
-        Config::reset();
         with_env("HCOM_INSTANCE_NAME", "test-instance", || {
             Config::init();
             let config = Config::get();
@@ -1565,7 +1564,6 @@ mod tests {
     #[test]
     #[serial]
     fn test_instance_name_none_when_unset() {
-        Config::reset();
         without_env(&["HCOM_INSTANCE_NAME"], || {
             Config::init();
             let config = Config::get();
@@ -1576,7 +1574,6 @@ mod tests {
     #[test]
     #[serial]
     fn test_process_id_some_when_set() {
-        Config::reset();
         with_env("HCOM_PROCESS_ID", "pid-123", || {
             Config::init();
             let config = Config::get();
@@ -1587,7 +1584,6 @@ mod tests {
     #[test]
     #[serial]
     fn test_process_id_none_when_unset() {
-        Config::reset();
         without_env(&["HCOM_PROCESS_ID"], || {
             Config::init();
             let config = Config::get();
@@ -1598,13 +1594,11 @@ mod tests {
     #[test]
     #[serial]
     fn test_reset_allows_reinit() {
-        Config::reset();
         with_env("HCOM_INSTANCE_NAME", "first", || {
             Config::init();
             assert_eq!(Config::get().instance_name, Some("first".to_string()));
         });
 
-        Config::reset();
         with_env("HCOM_INSTANCE_NAME", "second", || {
             Config::init();
             assert_eq!(Config::get().instance_name, Some("second".to_string()));
@@ -1614,7 +1608,6 @@ mod tests {
     #[test]
     #[serial]
     fn test_hcom_dir_tilde_expansion() {
-        Config::reset();
         with_env("HCOM_DIR", "~/.hcom", || {
             Config::init();
             let config = Config::get();
@@ -1626,7 +1619,6 @@ mod tests {
     #[test]
     #[serial]
     fn test_hcom_dir_relative_resolved_to_absolute() {
-        Config::reset();
         with_env("HCOM_DIR", "relative/path", || {
             Config::init();
             let config = Config::get();
@@ -1640,7 +1632,6 @@ mod tests {
     #[test]
     #[serial]
     fn test_hcom_dir_absolute_stays_absolute() {
-        Config::reset();
         with_env("HCOM_DIR", "/absolute/hcom", || {
             Config::init();
             let config = Config::get();

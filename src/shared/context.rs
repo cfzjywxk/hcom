@@ -115,6 +115,8 @@ impl HcomContext {
     ///
     /// Convenience for CLI mode — detects actual stdin/stdout TTY state.
     pub fn from_os() -> Self {
+        #[cfg(test)]
+        let _env_read = crate::hooks::test_helpers::process_env_read();
         use std::io::IsTerminal;
         let env: HashMap<String, String> = env::vars().collect();
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));

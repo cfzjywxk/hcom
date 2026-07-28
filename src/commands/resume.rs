@@ -3288,18 +3288,11 @@ mod tests {
     /// Point claude_config_dir() at `dir` for the duration of `f` by setting
     /// CLAUDE_CONFIG_DIR. Restored on exit. serial_test required.
     fn with_claude_config_dir<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let prev = std::env::var("CLAUDE_CONFIG_DIR").ok();
-        // SAFETY: tests using this must be serial_test::serial — only one
-        // test at a time touches this env var.
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
         unsafe {
             std::env::set_var("CLAUDE_CONFIG_DIR", dir);
         }
-        let out = f();
-        match prev {
-            Some(v) => unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", v) },
-            None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
-        }
-        out
+        f()
     }
 
     #[test]
@@ -3507,6 +3500,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_extract_cwd_gemini_reverse_hash_lookup() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
         // Gemini writes sha256(cwd) as `projectHash` in the session JSON, and
         // stores cwd → short-id in ~/.gemini/projects.json. This test wires up
         // a fake GEMINI_CLI_HOME and confirms the reverse lookup.
@@ -3538,17 +3532,10 @@ mod tests {
         std::fs::write(&session_path, format!(r#"{{"projectHash":"{hex}"}}"#)).unwrap();
 
         // Stub GEMINI_CLI_HOME so recover_gemini_cwd reads from our fake tree.
-        let prev = std::env::var("GEMINI_CLI_HOME").ok();
-        // SAFETY: test is single-threaded enough for this module; serial_test
-        // isn't in scope here, but other tests don't touch GEMINI_CLI_HOME.
         unsafe {
             std::env::set_var("GEMINI_CLI_HOME", base);
         }
         let result = extract_cwd_from_transcript(session_path.to_str().unwrap(), "gemini");
-        match prev {
-            Some(v) => unsafe { std::env::set_var("GEMINI_CLI_HOME", v) },
-            None => unsafe { std::env::remove_var("GEMINI_CLI_HOME") },
-        }
 
         assert_eq!(result, Some(fake_cwd.to_string()));
     }
@@ -3611,6 +3598,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_extract_cwd_gemini_no_registry_returns_none() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
         // When projects.json is missing, we can't reverse the hash → return None.
         let base_dir = tempfile::tempdir().unwrap();
         let base = base_dir.path();
@@ -3618,15 +3606,10 @@ mod tests {
         std::fs::create_dir_all(&gemini).unwrap();
         let path = gemini.join("test.json");
         std::fs::write(&path, r#"{"projectHash":"deadbeef"}"#).unwrap();
-        let prev = std::env::var("GEMINI_CLI_HOME").ok();
         unsafe {
             std::env::set_var("GEMINI_CLI_HOME", base);
         }
         let result = extract_cwd_from_transcript(path.to_str().unwrap(), "gemini");
-        match prev {
-            Some(v) => unsafe { std::env::set_var("GEMINI_CLI_HOME", v) },
-            None => unsafe { std::env::remove_var("GEMINI_CLI_HOME") },
-        }
         assert_eq!(result, None);
     }
 }

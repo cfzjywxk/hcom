@@ -212,6 +212,8 @@ fn cargo_target_dir(dev_root: &Path) -> PathBuf {
 /// thing. Falls back to debug if mtimes are unavailable. Returns `None` if
 /// neither binary exists.
 pub fn dev_root_binary(dev_root: &Path) -> Option<PathBuf> {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
     let target_dir = cargo_target_dir(dev_root);
     let binary = format!("hcom{}", std::env::consts::EXE_SUFFIX);
     let release = target_dir.join("release").join(&binary);
@@ -248,12 +250,15 @@ mod tests {
 
     struct CargoTargetDirGuard {
         saved: Option<String>,
+        _shared: crate::hooks::test_helpers::EnvGuard,
     }
 
     impl CargoTargetDirGuard {
         fn new() -> Self {
+            let shared = crate::hooks::test_helpers::EnvGuard::new();
             Self {
                 saved: std::env::var("CARGO_TARGET_DIR").ok(),
+                _shared: shared,
             }
         }
     }
