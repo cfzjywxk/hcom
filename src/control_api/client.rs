@@ -1,0 +1,110 @@
+use super::codec::{read_response_frame, write_request_frame};
+use super::protocol::{ControlAction, ControlRequest, ControlResponse};
+use anyhow::{Context, Result, bail};
+use std::fs;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const FOLLOW_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Debug, Clone)]
+pub struct ControlClient {
+    socket_path: PathBuf,
+}
+
+impl ControlClient {
+    pub fn new(socket_path: impl AsRef<Path>) -> Self {
+        Self {
+            socket_path: socket_path.as_ref().to_path_buf(),
+        }
+    }
+
+    pub fn request(&self, request: &ControlRequest) -> Result<ControlResponse> {
+        request
+            .validate()
+            .context("refusing to send invalid control request")?;
+        self.validate_socket_path()?;
+        let payload = serde_json::to_vec(request).context("failed to encode control request")?;
+        let mut stream = UnixStream::connect(&self.socket_path).with_context(|| {
+            format!(
+                "failed to connect to control socket {}",
+                self.socket_path.display()
+            )
+        })?;
+        stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT))?;
+        write_request_frame(&mut stream, &payload)?;
+        stream.set_read_timeout(Some(response_timeout(&request.action)))?;
+        let response_frame = read_response_frame(&mut stream)?;
+        let response: ControlResponse = serde_json::from_slice(&response_frame)
+            .context("control daemon returned malformed JSON")?;
+        response
+            .validate()
+            .context("control daemon returned an invalid response")?;
+        if response.request_id != request.request_id {
+            bail!("control daemon returned an invalid response envelope");
+        }
+        Ok(response)
+    }
+
+    fn validate_socket_path(&self) -> Result<()> {
+        if !self.socket_path.is_absolute() {
+            bail!("control socket path must be absolute");
+        }
+        let metadata = fs::symlink_metadata(&self.socket_path).with_context(|| {
+            format!(
+                "failed to inspect control socket {}",
+                self.socket_path.display()
+            )
+        })?;
+        // SAFETY: geteuid has no preconditions.
+        let expected_uid = unsafe { libc::geteuid() };
+        if !metadata.file_type().is_socket()
+            || metadata.uid() != expected_uid
+            || metadata.permissions().mode() & 0o777 != 0o600
+        {
+            bail!("control socket is not a private socket owned by the current uid");
+        }
+        let parent = self
+            .socket_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("control socket has no parent directory"))?;
+        let parent_metadata = fs::symlink_metadata(parent)?;
+        if parent_metadata.file_type().is_symlink()
+            || !parent_metadata.is_dir()
+            || parent_metadata.uid() != expected_uid
+            || parent_metadata.permissions().mode() & 0o777 != 0o700
+        {
+            bail!("control socket parent is not private");
+        }
+        Ok(())
+    }
+}
+
+fn response_timeout(action: &ControlAction) -> Duration {
+    match action {
+        ControlAction::ProjectWait { max_wait_ms, .. } => {
+            Duration::from_millis(u64::from(*max_wait_ms)) + SOCKET_IO_TIMEOUT
+        }
+        ControlAction::ProjectLogs { follow: true, .. } => FOLLOW_RESPONSE_TIMEOUT,
+        _ => SOCKET_IO_TIMEOUT,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_timeout_includes_the_declared_observer_window() {
+        let action = ControlAction::ProjectWait {
+            project_id: "project-1".into(),
+            after_project_version: 1,
+            max_wait_ms: 30_000,
+        };
+        assert_eq!(response_timeout(&action), Duration::from_secs(35));
+    }
+}
