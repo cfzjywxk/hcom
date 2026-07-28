@@ -25,6 +25,7 @@ Only these structured commands change review state. Ordinary message text does n
 
 const REVIEW_QUIET_WAIT: &str = "The peer notification is queued for automatic delivery. End your turn now; hcom will wake you if another [hcom-review] message arrives. Do not run any hcom command—including `hcom status`, `hcom review status`, `hcom events`, `hcom listen`, or `hcom send`—merely to check progress.";
 const ATTACHED_REVIEW_WAIT: &str = "The peer notification is queued. This hcom review command remains attached until the peer advances the durable workflow; keep waiting on this same foreground tool process and do not submit another user prompt or run a polling command.";
+const ATTACHED_MAX_ROUNDS_WAIT: &str = "The peer notification is queued. This hcom review command remains attached across a developer extension until the peer resubmits or ends the durable workflow. To withdraw the finding with the late-LGTM command shown above, first interrupt only this foreground waiter with Ctrl-C; the durable max_rounds state remains intact.";
 const REVIEW_OBSERVER_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Parser, Debug)]
@@ -273,7 +274,9 @@ fn mutation_output(
 ) -> String {
     let replay = if outcome.replayed { " (replayed)" } else { "" };
     let run = &outcome.run;
-    let wait_message = if attached_observer {
+    let wait_message = if attached_observer && run.state == ReviewState::MaxRounds {
+        ATTACHED_MAX_ROUNDS_WAIT
+    } else if attached_observer {
         ATTACHED_REVIEW_WAIT
     } else {
         REVIEW_QUIET_WAIT
@@ -349,8 +352,7 @@ fn print_mutation(action: ReviewAction, outcome: &ReviewOutcome, attached_observ
     println!("{}", mutation_output(action, outcome, attached_observer));
 }
 
-fn actor_waits_for_peer(actor: &ReviewActor, outcome: &ReviewOutcome) -> bool {
-    let run = &outcome.run;
+fn actor_waits_for_peer_run(actor: &ReviewActor, run: &ReviewRun) -> bool {
     match run.state {
         ReviewState::AwaitingReview => {
             run.developer_name == actor.name && run.developer_session_id == actor.session_id
@@ -360,6 +362,10 @@ fn actor_waits_for_peer(actor: &ReviewActor, outcome: &ReviewOutcome) -> bool {
         }
         ReviewState::Approved | ReviewState::Canceled => false,
     }
+}
+
+fn actor_waits_for_peer(actor: &ReviewActor, outcome: &ReviewOutcome) -> bool {
+    actor_waits_for_peer_run(actor, &outcome.run)
 }
 
 fn current_process_has_delivery_binding(db: &HcomDb, actor: &ReviewActor) -> bool {
@@ -404,8 +410,9 @@ fn should_attach_review_observer(
     )
 }
 
-fn wait_for_review_advance_with<L, W>(
+fn wait_until_actor_turn_with<L, W>(
     initial: &ReviewRun,
+    actor: &ReviewActor,
     mut load: L,
     mut wait: W,
 ) -> Result<ReviewRun, ReviewError>
@@ -413,6 +420,7 @@ where
     L: FnMut() -> Result<Option<ReviewRun>, ReviewError>,
     W: FnMut(),
 {
+    let mut observed = initial.clone();
     loop {
         let current = load()?.ok_or_else(|| {
             ReviewError::Regular(format!(
@@ -430,17 +438,31 @@ where
                 initial.id
             )));
         }
-        if current.version != initial.version || current.state != initial.state {
+        if current.version < observed.version
+            || (current.version == observed.version && current.state != observed.state)
+        {
+            return Err(ReviewError::Conflict(format!(
+                "REVIEW_CONFLICT {} state/version regressed while waiting",
+                initial.id
+            )));
+        }
+        if current.version > observed.version || current.state != observed.state {
+            if !actor_waits_for_peer_run(actor, &current) {
+                return Ok(current);
+            }
+            observed = current;
+        } else if !actor_waits_for_peer_run(actor, &current) {
             return Ok(current);
         }
         wait();
     }
 }
 
-fn attach_review_observer(db: &HcomDb, outcome: &ReviewOutcome) {
+fn attach_review_observer(db: &HcomDb, actor: &ReviewActor, outcome: &ReviewOutcome) {
     let _ = std::io::stdout().flush();
-    match wait_for_review_advance_with(
+    match wait_until_actor_turn_with(
         &outcome.run,
+        actor,
         || get_run(db, &outcome.run.id),
         || std::thread::sleep(REVIEW_OBSERVER_POLL_INTERVAL),
     ) {
@@ -487,7 +509,7 @@ pub fn cmd_review(db: &HcomDb, args: &ReviewArgs, ctx: Option<&CommandContext>) 
                     let observe = should_attach_review_observer(db, ctx, &actor, &outcome);
                     println!("{}", start_output(&outcome, observe));
                     if observe {
-                        attach_review_observer(db, &outcome);
+                        attach_review_observer(db, &actor, &outcome);
                     }
                     0
                 }
@@ -515,7 +537,7 @@ pub fn cmd_review(db: &HcomDb, args: &ReviewArgs, ctx: Option<&CommandContext>) 
                     let observe = should_attach_review_observer(db, ctx, &actor, &outcome);
                     print_mutation(action, &outcome, observe);
                     if observe {
-                        attach_review_observer(db, &outcome);
+                        attach_review_observer(db, &actor, &outcome);
                     }
                     0
                 }
@@ -543,7 +565,7 @@ pub fn cmd_review(db: &HcomDb, args: &ReviewArgs, ctx: Option<&CommandContext>) 
                     let observe = should_attach_review_observer(db, ctx, &actor, &outcome);
                     print_mutation(review_action, &outcome, observe);
                     if observe {
-                        attach_review_observer(db, &outcome);
+                        attach_review_observer(db, &actor, &outcome);
                     }
                     0
                 }
@@ -810,6 +832,12 @@ mod tests {
             false,
             false
         ));
+        assert!(should_attach_review_observer_with(
+            &reviewer_actor(),
+            &outcome(ReviewState::MaxRounds),
+            false,
+            false
+        ));
         assert!(!should_attach_review_observer_with(
             &developer_actor(),
             &awaiting_developer,
@@ -825,13 +853,26 @@ mod tests {
     }
 
     #[test]
+    fn max_rounds_attached_output_preserves_the_late_lgtm_escape() {
+        let output = mutation_output(
+            ReviewAction::RequestChanges,
+            &outcome(ReviewState::MaxRounds),
+            true,
+        );
+        assert!(output.contains("late-LGTM command shown above"));
+        assert!(output.contains("Ctrl-C"));
+        assert!(output.contains("durable max_rounds state remains intact"));
+    }
+
+    #[test]
     fn observer_rechecks_state_before_waiting_to_close_lost_wake() {
         let initial = outcome(ReviewState::AwaitingReview).run;
         let mut advanced = initial.clone();
         advanced.state = ReviewState::Approved;
         advanced.version = initial.version + 1;
-        let observed = wait_for_review_advance_with(
+        let observed = wait_until_actor_turn_with(
             &initial,
+            &developer_actor(),
             || Ok(Some(advanced.clone())),
             || panic!("observer waited after the durable verdict was already visible"),
         )
@@ -845,8 +886,9 @@ mod tests {
         let initial = outcome(ReviewState::AwaitingReview).run;
         let mut reads = 0;
         let mut waits = 0;
-        let observed = wait_for_review_advance_with(
+        let observed = wait_until_actor_turn_with(
             &initial,
+            &developer_actor(),
             || {
                 reads += 1;
                 let mut current = initial.clone();
@@ -868,8 +910,9 @@ mod tests {
     fn reviewer_observer_waits_while_awaiting_the_developer() {
         let initial = outcome(ReviewState::AwaitingDeveloper).run;
         let mut reads = 0;
-        let observed = wait_for_review_advance_with(
+        let observed = wait_until_actor_turn_with(
             &initial,
+            &reviewer_actor(),
             || {
                 reads += 1;
                 let mut current = initial.clone();
@@ -884,5 +927,37 @@ mod tests {
         .unwrap();
         assert_eq!(reads, 2);
         assert_eq!(observed.state, ReviewState::AwaitingReview);
+    }
+
+    #[test]
+    fn reviewer_observer_survives_max_rounds_extend_until_fixed() {
+        let initial = outcome(ReviewState::MaxRounds).run;
+        let mut reads = 0;
+        let mut waits = 0;
+        let observed = wait_until_actor_turn_with(
+            &initial,
+            &reviewer_actor(),
+            || {
+                reads += 1;
+                let mut current = initial.clone();
+                if reads == 2 {
+                    current.state = ReviewState::AwaitingDeveloper;
+                    current.max_rounds += 1;
+                    current.version += 1;
+                } else if reads >= 3 {
+                    current.state = ReviewState::AwaitingReview;
+                    current.round += 1;
+                    current.max_rounds += 1;
+                    current.version += 2;
+                }
+                Ok(Some(current))
+            },
+            || waits += 1,
+        )
+        .unwrap();
+        assert_eq!(reads, 3);
+        assert_eq!(waits, 2);
+        assert_eq!(observed.state, ReviewState::AwaitingReview);
+        assert_eq!(observed.round, initial.round + 1);
     }
 }
