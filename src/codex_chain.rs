@@ -10,7 +10,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use crate::handoff::{MAX_IDENTITY_BYTES, MAX_OPAQUE_ID_BYTES, TerminalChain};
+use crate::handoff::{MAX_IDENTITY_BYTES, MAX_OPAQUE_ID_BYTES, TerminalChain, validate_chain_tag};
 
 pub(crate) const SUPPORTED_CODEX_VERSION: &str = "0.145.0";
 pub(crate) const SUPPORTED_CODEX_VERSION_OUTPUT: &str = "codex-cli 0.145.0";
@@ -248,6 +248,7 @@ impl CodexLaunchProfile {
         if workspace.to_string_lossy() != chain.workspace {
             return Err(CodexContractError::NonCanonicalWorkspace);
         }
+        validate_chain_tag(&chain.tag).map_err(|_| CodexContractError::InvalidPinnedPolicy)?;
         if chain.model_ref.is_empty()
             || chain.model_ref.len() > 128
             || chain.model_ref.chars().any(char::is_control)
@@ -256,7 +257,7 @@ impl CodexLaunchProfile {
         }
         if !matches!(
             chain.reasoning_ref.as_str(),
-            "minimal" | "low" | "medium" | "high" | "xhigh"
+            "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
         ) {
             return Err(CodexContractError::InvalidPinnedPolicy);
         }

@@ -640,10 +640,13 @@ fn config_instance(
                 eprintln!("Error: Tag must be alphanumeric (hyphens and underscores allowed)");
                 return 1;
             }
-            let _ = db.conn().execute(
+            if let Err(error) = db.conn().execute(
                 "UPDATE instances SET tag = ? WHERE name = ?",
                 rusqlite::params![tag, inst_name],
-            );
+            ) {
+                eprintln!("Error: {error}");
+                return 1;
+            }
             println!(
                 "{}",
                 render_config_instance_set_feedback(inst_name, "tag", tag)

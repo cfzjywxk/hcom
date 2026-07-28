@@ -66,6 +66,7 @@ pub enum ChainReasoning {
     Medium,
     High,
     Xhigh,
+    Max,
 }
 
 impl ChainReasoning {
@@ -76,6 +77,7 @@ impl ChainReasoning {
             Self::Medium => "medium",
             Self::High => "high",
             Self::Xhigh => "xhigh",
+            Self::Max => "max",
         }
     }
 }
@@ -116,6 +118,9 @@ impl ChainApproval {
 
 #[derive(Args, Debug)]
 pub struct ChainCodexArgs {
+    /// Immutable group tag inherited by every fresh generation
+    #[arg(long)]
+    pub tag: Option<String>,
     /// Exact model reference; passed as one bounded argv value
     #[arg(long)]
     pub model: String,
@@ -304,9 +309,11 @@ fn build_spec(
     args: &ChainCodexArgs,
 ) -> Result<ChainSpec, HandoffError> {
     let model = validate_model(&args.model)?;
+    let tag = handoff::validate_chain_tag(args.tag.as_deref().unwrap_or(""))?;
     Ok(ChainSpec {
         workspace: terminal.owner.workspace.clone(),
         tool: "codex".to_string(),
+        tag,
         model_ref: model,
         reasoning_ref: args.reasoning.as_str().to_string(),
         permission_policy_ref: format!(
@@ -331,6 +338,7 @@ fn profile_from_spec(spec: &ChainSpec) -> TerminalChain {
         id: "tc-preflight".to_string(),
         workspace: spec.workspace.to_string_lossy().into_owned(),
         tool: spec.tool.clone(),
+        tag: spec.tag.clone(),
         model_ref: spec.model_ref.clone(),
         reasoning_ref: spec.reasoning_ref.clone(),
         permission_policy_ref: spec.permission_policy_ref.clone(),
@@ -1168,9 +1176,10 @@ fn fresh_start_command(chain: &TerminalChain) -> String {
     match (approval, sandbox) {
         (Some(approval), Some(sandbox))
             if validate_model(&chain.model_ref).is_ok()
+                && handoff::validate_chain_tag(&chain.tag).is_ok()
                 && matches!(
                     chain.reasoning_ref.as_str(),
-                    "minimal" | "low" | "medium" | "high" | "xhigh"
+                    "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
                 )
                 && matches!(approval, "never" | "on-request" | "untrusted")
                 && matches!(
@@ -1178,12 +1187,17 @@ fn fresh_start_command(chain: &TerminalChain) -> String {
                     "read-only" | "workspace-write" | "danger-full-access"
                 ) =>
         {
+            let tag = if chain.tag.is_empty() {
+                String::new()
+            } else {
+                format!(" --tag {}", chain.tag)
+            };
             format!(
-                "hcom chain codex --model {} --reasoning {} --sandbox {} --approval {}",
-                chain.model_ref, chain.reasoning_ref, sandbox, approval
+                "hcom chain codex{tag} --model {} --reasoning {} --sandbox {} --approval {}",
+                chain.model_ref, chain.reasoning_ref, sandbox, approval,
             )
         }
-        _ => "hcom chain codex --model MODEL --reasoning LEVEL --sandbox MODE --approval MODE"
+        _ => "hcom chain codex [--tag TAG] --model MODEL --reasoning LEVEL --sandbox MODE --approval MODE"
             .to_string(),
     }
 }
@@ -1234,6 +1248,7 @@ fn chain_json(db: &HcomDb, chain: &TerminalChain) -> serde_json::Value {
         "workspace": chain.workspace,
         "policy": {
             "tool": chain.tool,
+            "tag": chain.tag,
             "model": chain.model_ref,
             "reasoning": chain.reasoning_ref,
             "permission": chain.permission_policy_ref,
@@ -1255,7 +1270,7 @@ fn chain_human(db: &HcomDb, chain: &TerminalChain) -> Result<String, HandoffErro
     let output = format!(
         "{} state={} version={} generation={} transition={}\n\
          handoff={}\nworkspace={}\n\
-         tool={} model={} reasoning={} permission={} profile={}\n\
+         tool={} tag={} model={} reasoning={} permission={} profile={}\n\
          recovery_required={} recovery_reason={}\nnext={}",
         chain.id,
         chain.state,
@@ -1265,6 +1280,7 @@ fn chain_human(db: &HcomDb, chain: &TerminalChain) -> Result<String, HandoffErro
         handoff,
         chain.workspace,
         chain.tool,
+        chain.tag,
         chain.model_ref,
         chain.reasoning_ref,
         chain.permission_policy_ref,
@@ -1513,6 +1529,7 @@ fn cmd_recover(db: &HcomDb, args: &ChainRecoverArgs) -> i32 {
     let adapter_preflight = match preflight(&ChainSpec {
         workspace: PathBuf::from(&chain.workspace),
         tool: chain.tool.clone(),
+        tag: chain.tag.clone(),
         model_ref: chain.model_ref.clone(),
         reasoning_ref: chain.reasoning_ref.clone(),
         permission_policy_ref: chain.permission_policy_ref.clone(),
@@ -1684,17 +1701,23 @@ mod tests {
         let start = ChainArgs::try_parse_from([
             "chain",
             "codex",
+            "--tag",
+            "dev1",
             "--model",
             "gpt-5.5",
             "--reasoning",
-            "high",
+            "max",
             "--sandbox",
             "workspace-write",
             "--approval",
             "on-request",
         ])
         .unwrap();
-        assert!(matches!(start.command, ChainCommand::Codex(_)));
+        let ChainCommand::Codex(start) = start.command else {
+            panic!("expected chain codex");
+        };
+        assert_eq!(start.tag.as_deref(), Some("dev1"));
+        assert!(matches!(start.reasoning, ChainReasoning::Max));
         assert!(ChainArgs::try_parse_from(["chain", "start"]).is_err());
         assert!(ChainArgs::try_parse_from(["chain", "resume"]).is_err());
         assert!(ChainArgs::try_parse_from(["chain", "fork"]).is_err());
@@ -1717,6 +1740,12 @@ mod tests {
         }
         assert!(validate_model("-invalid-leading-character").is_err());
         assert!(validate_model(&"x".repeat(MAX_MODEL_REF_BYTES + 1)).is_err());
+        assert!(handoff::validate_chain_tag("dev1").is_ok());
+        assert!(handoff::validate_chain_tag("bad tag").is_err());
+        assert!(
+            handoff::validate_chain_tag(&"x".repeat(crate::handoff::MAX_CHAIN_TAG_BYTES + 1))
+                .is_err()
+        );
 
         let status = ChainArgs::try_parse_from(["chain", "status", "tc-123", "--json"]).unwrap();
         assert!(matches!(status.command, ChainCommand::Status(_)));
@@ -1748,10 +1777,11 @@ mod tests {
             id: "tc-sample".to_string(),
             workspace: "/workspace".to_string(),
             tool: "codex".to_string(),
-            model_ref: "model".to_string(),
-            reasoning_ref: "reasoning".to_string(),
-            permission_policy_ref: "permission".to_string(),
-            policy_ref: "policy".to_string(),
+            tag: "dev1".to_string(),
+            model_ref: "gpt-5.6-sol".to_string(),
+            reasoning_ref: "max".to_string(),
+            permission_policy_ref: "approval=never;sandbox=danger-full-access".to_string(),
+            policy_ref: POLICY_REF.to_string(),
             supervisor_process_id: "secret-supervisor-process".to_string(),
             supervisor_process_birth_identity: "secret-supervisor-birth".to_string(),
             supervisor_pid: Some(41001),
@@ -1767,6 +1797,12 @@ mod tests {
         };
         let json = bounded_json(&chain_json(&db, &chain)).unwrap();
         let human = chain_human(&db, &chain).unwrap();
+        assert_eq!(
+            fresh_start_command(&chain),
+            "hcom chain codex --tag dev1 --model gpt-5.6-sol --reasoning max --sandbox danger-full-access --approval never"
+        );
+        assert!(json.contains("\"tag\":\"dev1\""));
+        assert!(human.contains("tag=dev1"));
         assert!(json.len() <= crate::handoff::MAX_STATUS_JSON_BYTES);
         assert!(human.len() <= MAX_STATUS_HUMAN_BYTES);
         for secret in ["secret-supervisor-process", "secret-supervisor-birth"] {

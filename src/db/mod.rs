@@ -36,7 +36,7 @@ pub use instances::InstanceRow;
 pub use instances::InstanceStatus;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 22;
+const SCHEMA_VERSION: i32 = 23;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
 const REVIEW_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS review_runs (
@@ -98,6 +98,7 @@ const HANDOFF_SCHEMA_SQL: &str = "
         id                                TEXT PRIMARY KEY,
         workspace                         TEXT NOT NULL,
         tool                              TEXT NOT NULL CHECK (tool = 'codex'),
+        tag                               TEXT NOT NULL DEFAULT '',
         model_ref                         TEXT NOT NULL,
         reasoning_ref                     TEXT NOT NULL,
         permission_policy_ref             TEXT NOT NULL,
@@ -125,6 +126,8 @@ const HANDOFF_SCHEMA_SQL: &str = "
         updated_at                        REAL NOT NULL,
         CHECK (length(CAST(id AS BLOB)) BETWEEN 1 AND 64),
         CHECK (length(CAST(workspace AS BLOB)) BETWEEN 1 AND 4096),
+        CHECK (length(CAST(tag AS BLOB)) <= 64),
+        CHECK (tag NOT GLOB '*[^a-zA-Z0-9-]*'),
         CHECK (length(CAST(model_ref AS BLOB)) BETWEEN 1 AND 128),
         CHECK (length(CAST(reasoning_ref AS BLOB)) BETWEEN 1 AND 64),
         CHECK (length(CAST(permission_policy_ref AS BLOB)) BETWEEN 1 AND 512),
@@ -202,7 +205,7 @@ const HANDOFF_SCHEMA_SQL: &str = "
         WHERE wrapper_process_id IS NOT NULL;
 
     CREATE TRIGGER IF NOT EXISTS terminal_chains_immutable_identity_policy
-    BEFORE UPDATE OF workspace, tool, model_ref, reasoning_ref,
+    BEFORE UPDATE OF workspace, tool, tag, model_ref, reasoning_ref,
                      permission_policy_ref, policy_ref, supervisor_process_id,
                      supervisor_process_birth_identity, supervisor_pid,
                      supervisor_pgid, outer_foreground_pgid, outer_tty_device,
@@ -210,6 +213,7 @@ const HANDOFF_SCHEMA_SQL: &str = "
     ON terminal_chains
     WHEN NEW.workspace IS NOT OLD.workspace
       OR NEW.tool IS NOT OLD.tool
+      OR NEW.tag IS NOT OLD.tag
       OR NEW.model_ref IS NOT OLD.model_ref
       OR NEW.reasoning_ref IS NOT OLD.reasoning_ref
       OR NEW.permission_policy_ref IS NOT OLD.permission_policy_ref
@@ -1054,6 +1058,21 @@ const HANDOFF_SCHEMA_SQL: &str = "
         SELECT RAISE(ABORT, 'terminal transition audit is append-only');
     END;
 ";
+const HANDOFF_V23_SCHEMA_SQL: &str = "
+    CREATE TRIGGER IF NOT EXISTS terminal_chain_instance_tag_immutable
+    BEFORE UPDATE OF tag ON instances
+    WHEN EXISTS (
+        SELECT 1
+        FROM terminal_generations g
+        JOIN terminal_chains c ON c.id = g.chain_id
+        WHERE g.instance_name = OLD.name
+          AND g.hcom_session_id = OLD.session_id
+          AND COALESCE(NEW.tag, '') != c.tag
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'managed chain tag is immutable');
+    END;
+";
 const MIGRATIONS: &[(i32, &str)] = &[
     (
         17,
@@ -1074,7 +1093,17 @@ const MIGRATIONS: &[(i32, &str)] = &[
     // v22 adds public ownership, process, recovery, absence, and per-target
     // validation evidence without rewriting any Phase 3 lifecycle row.
     (22, HANDOFF_SCHEMA_SQL),
+    // v23 pins one bounded group tag across every generation and recovery.
+    (23, ""),
 ];
+
+const HANDOFF_V23_COLUMNS: &[(&str, &str, &str)] = &[(
+    "terminal_chains",
+    "tag",
+    "ALTER TABLE terminal_chains ADD COLUMN tag TEXT NOT NULL DEFAULT ''
+     CHECK (length(CAST(tag AS BLOB)) <= 64)
+     CHECK (tag NOT GLOB '*[^a-zA-Z0-9-]*')",
+)];
 
 const HANDOFF_V21_COLUMNS: &[(&str, &str, &str)] = &[
     (
@@ -1241,6 +1270,7 @@ const HANDOFF_TABLE_COLUMNS: &[(&str, &[&str])] = &[
             "id",
             "workspace",
             "tool",
+            "tag",
             "model_ref",
             "reasoning_ref",
             "permission_policy_ref",
@@ -1463,6 +1493,7 @@ const HANDOFF_SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("trigger", "terminal_chains_immutable_identity_policy"),
     ("trigger", "terminal_chains_outer_evidence_insert"),
     ("trigger", "terminal_chains_outer_evidence_update"),
+    ("trigger", "terminal_chain_instance_tag_immutable"),
     ("trigger", "terminal_generations_monotonic_insert"),
     ("trigger", "terminal_generations_immutable_identity"),
     ("trigger", "terminal_handoffs_immutable_snapshot"),
@@ -1645,6 +1676,21 @@ fn ensure_handoff_v21_columns(conn: &Connection) -> Result<()> {
          DROP TRIGGER IF EXISTS terminal_handoffs_target_validation_once;",
     )?;
     conn.execute_batch(HANDOFF_SCHEMA_SQL)?;
+    Ok(())
+}
+
+/// Add the immutable chain tag without rewriting any existing handoff row.
+/// Existing v22 chains migrate to the untagged empty value.
+fn ensure_handoff_v23_columns(conn: &Connection) -> Result<()> {
+    ensure_handoff_v21_columns(conn)?;
+    for (table, column, sql) in HANDOFF_V23_COLUMNS {
+        if !table_has_column(conn, table, column)? {
+            conn.execute_batch(sql)?;
+        }
+    }
+    conn.execute_batch("DROP TRIGGER IF EXISTS terminal_chains_immutable_identity_policy;")?;
+    conn.execute_batch(HANDOFF_SCHEMA_SQL)?;
+    conn.execute_batch(HANDOFF_V23_SCHEMA_SQL)?;
     Ok(())
 }
 
@@ -1936,9 +1982,10 @@ impl HcomDb {
             |row| row.get(0),
         )?;
         if has_handoff_tables {
-            ensure_handoff_v21_columns(&tx)?;
+            ensure_handoff_v23_columns(&tx)?;
         }
         tx.execute_batch(HANDOFF_SCHEMA_SQL)?;
+        tx.execute_batch(HANDOFF_V23_SCHEMA_SQL)?;
         if !review_schema_is_complete(&tx)? || !handoff_schema_is_complete(&tx)? {
             anyhow::bail!("migrated control-plane schema is incomplete");
         }
@@ -2274,9 +2321,10 @@ impl HcomDb {
                 |row| row.get(0),
             )?;
             if has_handoff_tables {
-                ensure_handoff_v21_columns(&tx)?;
+                ensure_handoff_v23_columns(&tx)?;
             }
             tx.execute_batch(HANDOFF_SCHEMA_SQL)?;
+            tx.execute_batch(HANDOFF_V23_SCHEMA_SQL)?;
             if !review_schema_is_complete(&tx)? || !handoff_schema_is_complete(&tx)? {
                 return Ok(false);
             }
@@ -2329,6 +2377,8 @@ impl HcomDb {
                 ensure_handoff_v20_columns(&tx)?;
             } else if next_version == 21 {
                 ensure_handoff_v21_columns(&tx)?;
+            } else if next_version == 23 {
+                ensure_handoff_v23_columns(&tx)?;
             } else {
                 tx.execute_batch(sql)?;
             }
@@ -2616,6 +2666,7 @@ pub(super) mod tests {
     fn rebuild_handoff_tables_with_v19_columns(conn: &Connection, stamped_version: i32) {
         conn.execute_batch(
             "PRAGMA foreign_keys = OFF;
+             DROP TRIGGER IF EXISTS terminal_chain_instance_tag_immutable;
              CREATE TABLE terminal_chains_v19 AS
              SELECT id, workspace, tool, model_ref, reasoning_ref,
                     permission_policy_ref, policy_ref, supervisor_process_id,
@@ -2645,6 +2696,26 @@ pub(super) mod tests {
             "PRAGMA user_version = {stamped_version};
              PRAGMA foreign_keys = ON;"
         ))
+        .unwrap();
+    }
+
+    fn rebuild_terminal_chains_without_v23_tag(conn: &Connection) {
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TRIGGER IF EXISTS terminal_chain_instance_tag_immutable;
+             CREATE TABLE terminal_chains_v22 AS
+             SELECT id, workspace, tool, model_ref, reasoning_ref,
+                    permission_policy_ref, policy_ref, supervisor_process_id,
+                    supervisor_process_birth_identity, supervisor_pid,
+                    supervisor_pgid, outer_foreground_pgid, outer_tty_device,
+                    outer_tty_inode, current_generation, state, version,
+                    created_at, updated_at
+             FROM terminal_chains;
+             DROP TABLE terminal_chains;
+             ALTER TABLE terminal_chains_v22 RENAME TO terminal_chains;
+             PRAGMA user_version = 22;
+             PRAGMA foreign_keys = ON;",
+        )
         .unwrap();
     }
 
@@ -3555,6 +3626,48 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn test_v22_to_v23_migration_preserves_chain_and_pins_empty_tag() {
+        let (db, db_path) = setup_full_test_db();
+        insert_preserved_phase1_handoff(db.conn());
+        rebuild_terminal_chains_without_v23_tag(db.conn());
+        drop(db);
+
+        let migrated = HcomDb::open_at(&db_path).unwrap();
+        assert_eq!(
+            migrated
+                .conn()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let preserved: (String, String, i64) = migrated
+            .conn()
+            .query_row(
+                "SELECT c.tag, c.state,
+                        (SELECT COUNT(*) FROM terminal_handoffs
+                         WHERE id = 'ho-migrate' AND bundle_size_bytes = 17)
+                 FROM terminal_chains c WHERE c.id = 'tc-migrate'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved, (String::new(), "prepared".to_string(), 1));
+        assert!(
+            migrated
+                .conn()
+                .execute(
+                    "UPDATE terminal_chains SET tag = 'changed'
+                     WHERE id = 'tc-migrate'",
+                    [],
+                )
+                .is_err(),
+            "migrated chain tag must be immutable"
+        );
+        assert!(handoff_schema_is_complete(migrated.conn()).unwrap());
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
     fn test_stamped_partial_v20_adds_only_missing_evidence_columns() {
         let (db, db_path) = setup_full_test_db();
         insert_preserved_phase1_handoff(db.conn());
@@ -3882,6 +3995,8 @@ pub(super) mod tests {
             "UPDATE terminal_generations SET version = -1
              WHERE chain_id = 'tc-valid' AND generation = 2",
             "UPDATE terminal_chains SET policy_ref = 'changed'
+             WHERE id = 'tc-valid'",
+            "UPDATE terminal_chains SET tag = 'changed'
              WHERE id = 'tc-valid'",
             "UPDATE terminal_generations SET native_session_id = 'changed'
              WHERE chain_id = 'tc-valid' AND generation = 1",

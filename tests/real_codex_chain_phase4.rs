@@ -64,6 +64,7 @@ struct ProbeReport {
     unknown_recovery_zero_spawn: bool,
     live_recovery_zero_spawn: bool,
     post_native_recovery_zero_spawn: bool,
+    tag_inherited: bool,
 }
 
 struct ForegroundJob {
@@ -402,6 +403,7 @@ fn run_outer_scenario(scenario: &str) {
     );
     assert!(report.live_recovery_zero_spawn);
     assert!(report.post_native_recovery_zero_spawn);
+    assert!(report.tag_inherited);
     if scenario == NORMAL {
         assert!(report.normal_cleanup_proved);
         assert_eq!(report.recovery_attempt_count, 0);
@@ -498,6 +500,7 @@ fn run_outer_scenario(scenario: &str) {
         "ordering_proved": ordering_proved,
         "privacy_scan_clean": true,
         "title_restored": title_restored,
+        "tag_inherited": report.tag_inherited,
     });
     let summary = serde_json::to_string(&summary).unwrap();
     assert!(summary.len() <= 1024);
@@ -887,6 +890,28 @@ fn count_rows(db_path: &Path, table: &str) -> i64 {
         .unwrap()
 }
 
+fn all_materialized_generations_inherit_tag(db_path: &Path, expected: &str) -> bool {
+    let connection = Connection::open(db_path).unwrap();
+    let chain_tag: String = connection
+        .query_row(
+            "SELECT tag FROM terminal_chains ORDER BY created_at LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let counts: (i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*),
+                    SUM(CASE WHEN i.tag = ?1 THEN 1 ELSE 0 END)
+             FROM terminal_generations g
+             JOIN instances i ON i.name = g.instance_name",
+            [expected],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    chain_tag == expected && counts.0 > 0 && counts.0 == counts.1
+}
+
 fn inspect_child_argv(process: &ProcessSnapshot, expected_prompt: &str, secret: &str) {
     assert!(process.generation >= 1);
     let cmdline = fs::read(format!("/proc/{}/cmdline", process.child_pid)).unwrap();
@@ -901,6 +926,14 @@ fn inspect_child_argv(process: &ProcessSnapshot, expected_prompt: &str, secret: 
     for forbidden in [b"resume".as_slice(), b"fork", b"--last"] {
         assert!(!args.contains(&forbidden));
     }
+    let config_index = args
+        .iter()
+        .position(|argument| *argument == b"--config")
+        .expect("missing exact reasoning config");
+    assert_eq!(
+        args.get(config_index + 1).copied(),
+        Some(b"model_reasoning_effort=\"max\"".as_slice())
+    );
     assert!(
         !cmdline
             .windows(secret.len())
@@ -1066,10 +1099,12 @@ fn run_driver() {
     let start_args = [
         "chain",
         "codex",
+        "--tag",
+        "dev1",
         "--model",
         "gpt-5.5",
         "--reasoning",
-        "high",
+        "max",
         "--sandbox",
         "danger-full-access",
         "--approval",
@@ -1353,6 +1388,7 @@ fn run_driver() {
     let generation_count = count_rows(&db_path, "terminal_generations");
     let recovery_attempt_count = count_rows(&db_path, "terminal_recovery_attempts");
     let recovery_absence_count = count_rows(&db_path, "terminal_recovery_absence_evidence");
+    let tag_inherited = all_materialized_generations_inherit_tag(&db_path, "dev1");
     let report = ProbeReport {
         scenario: scenario.clone(),
         chain_id: chain.id,
@@ -1370,6 +1406,7 @@ fn run_driver() {
         unknown_recovery_zero_spawn,
         live_recovery_zero_spawn,
         post_native_recovery_zero_spawn,
+        tag_inherited,
     };
     fs::write(
         root.join(format!("phase4-{scenario}-report.json")),

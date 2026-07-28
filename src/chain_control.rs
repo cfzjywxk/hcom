@@ -702,6 +702,7 @@ mod tests {
             &ChainSpec {
                 workspace: workspace.clone(),
                 tool: "codex".to_string(),
+                tag: String::new(),
                 model_ref: "model".to_string(),
                 reasoning_ref: "reasoning".to_string(),
                 permission_policy_ref: "permission".to_string(),

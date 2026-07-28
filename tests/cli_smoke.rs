@@ -109,6 +109,10 @@ fn handoff_and_chain_help_expose_phase4_public_surface_only() {
         chain_help.contains("Fresh create only") && chain_help.contains("Stop/task_complete gates"),
         "stdout={chain_help}"
     );
+    let (code, codex_help, stderr) = h.run(["chain", "codex", "--help"]);
+    assert_eq!(code, 0, "stdout={codex_help} stderr={stderr}");
+    assert!(codex_help.contains("--tag"), "stdout={codex_help}");
+    assert!(codex_help.contains("max"), "stdout={codex_help}");
 }
 
 #[test]
@@ -117,10 +121,12 @@ fn public_chain_process_actions_require_an_unmanaged_foreground_tty() {
     let (code, stdout, stderr) = h.run([
         "chain",
         "codex",
+        "--tag",
+        "dev1",
         "--model",
         "gpt-5.5",
         "--reasoning",
-        "high",
+        "max",
         "--sandbox",
         "workspace-write",
         "--approval",

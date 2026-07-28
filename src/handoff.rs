@@ -23,6 +23,7 @@ pub const MAX_IDENTITY_BYTES: usize = 256;
 pub const MAX_WORKSPACE_BYTES: usize = 4096;
 pub const MAX_MODEL_REF_BYTES: usize = 128;
 pub const MAX_REASONING_REF_BYTES: usize = 64;
+pub const MAX_CHAIN_TAG_BYTES: usize = 64;
 pub const MAX_POLICY_REF_BYTES: usize = 512;
 pub const MAX_REVISION_BYTES: usize = 128;
 pub const MAX_BRANCH_BYTES: usize = 1024;
@@ -208,6 +209,7 @@ pub struct TerminalChain {
     pub id: String,
     pub workspace: String,
     pub tool: String,
+    pub tag: String,
     pub model_ref: String,
     pub reasoning_ref: String,
     pub permission_policy_ref: String,
@@ -234,6 +236,7 @@ impl TerminalChain {
             id: row.get("id")?,
             workspace: row.get("workspace")?,
             tool: row.get("tool")?,
+            tag: row.get("tag")?,
             model_ref: row.get("model_ref")?,
             reasoning_ref: row.get("reasoning_ref")?,
             permission_policy_ref: row.get("permission_policy_ref")?,
@@ -453,6 +456,7 @@ pub struct ManagedActorMarkers {
 pub struct ChainSpec {
     pub workspace: PathBuf,
     pub tool: String,
+    pub tag: String,
     pub model_ref: String,
     pub reasoning_ref: String,
     pub permission_policy_ref: String,
@@ -844,6 +848,19 @@ fn validate_text(
         )));
     }
     Ok(value.to_string())
+}
+
+pub(crate) fn validate_chain_tag(value: &str) -> Result<String, HandoffError> {
+    let value = validate_text(value, "chain tag", MAX_CHAIN_TAG_BYTES, true)?;
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(HandoffError::Invalid(
+            "chain tag can only contain letters, numbers, and hyphens".to_string(),
+        ));
+    }
+    Ok(value)
 }
 
 fn validate_opaque_id(value: &str, field: &'static str) -> Result<String, HandoffError> {
@@ -2173,6 +2190,7 @@ pub fn create_public_chain_reservation(
         ));
     }
     let workspace = canonical_workspace(&spec.workspace)?;
+    let tag = validate_chain_tag(&spec.tag)?;
     let model_ref = validate_text(
         &spec.model_ref,
         "model reference",
@@ -2237,6 +2255,7 @@ pub fn create_public_chain_reservation(
         &actor,
         &[
             workspace.as_bytes(),
+            tag.as_bytes(),
             model_ref.as_bytes(),
             reasoning_ref.as_bytes(),
             permission_policy_ref.as_bytes(),
@@ -2248,7 +2267,7 @@ pub fn create_public_chain_reservation(
     let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
     tx.execute(
         "INSERT INTO terminal_chains (
-             id, workspace, tool, model_ref, reasoning_ref,
+             id, workspace, tool, tag, model_ref, reasoning_ref,
              permission_policy_ref, policy_ref, supervisor_process_id,
              supervisor_process_birth_identity, supervisor_pid,
              supervisor_pgid, outer_foreground_pgid, outer_tty_device,
@@ -2256,11 +2275,12 @@ pub fn create_public_chain_reservation(
              created_at, updated_at
          ) VALUES (
              ?1, ?2, 'codex', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-             ?12, ?13, 1, 'launching_target', 0, ?14, ?14
+             ?12, ?13, ?14, 1, 'launching_target', 0, ?15, ?15
          )",
         params![
             chain_id,
             workspace,
+            tag,
             model_ref,
             reasoning_ref,
             permission_policy_ref,
@@ -2371,6 +2391,7 @@ pub(crate) fn create_chain_with_id(
         ));
     }
     let workspace = canonical_workspace(&spec.workspace)?;
+    let tag = validate_chain_tag(&spec.tag)?;
     let model_ref = validate_text(
         &spec.model_ref,
         "model reference",
@@ -2434,6 +2455,7 @@ pub(crate) fn create_chain_with_id(
         &[
             workspace.as_bytes(),
             spec.tool.as_bytes(),
+            tag.as_bytes(),
             model_ref.as_bytes(),
             reasoning_ref.as_bytes(),
             permission_policy_ref.as_bytes(),
@@ -2452,7 +2474,7 @@ pub(crate) fn create_chain_with_id(
     let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
     tx.execute(
         "INSERT INTO terminal_chains (
-             id, workspace, tool, model_ref, reasoning_ref,
+             id, workspace, tool, tag, model_ref, reasoning_ref,
              permission_policy_ref, policy_ref, supervisor_process_id,
              supervisor_process_birth_identity, supervisor_pid,
              supervisor_pgid, outer_foreground_pgid, outer_tty_device,
@@ -2460,11 +2482,12 @@ pub(crate) fn create_chain_with_id(
              created_at, updated_at
          ) VALUES (
              ?1, ?2, 'codex', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-             ?12, ?13, 1, 'active', 0, ?14, ?14
+             ?12, ?13, ?14, 1, 'active', 0, ?15, ?15
          )",
         params![
             chain_id,
             workspace,
+            tag,
             model_ref,
             reasoning_ref,
             permission_policy_ref,
@@ -2803,14 +2826,16 @@ pub fn materialize_initial_generation(
         ));
     }
     let now = now_epoch_f64();
+    let instance_tag = (!chain.tag.is_empty()).then_some(chain.tag.as_str());
     tx.execute(
         "INSERT INTO instances (
-             name, session_id, status, tool, created_at, parent_name,
+             name, session_id, tag, status, tool, created_at, parent_name,
              origin_device_id, launch_context
-         ) VALUES (?1, ?2, 'launching', 'codex', ?3, '', '', ?4)",
+         ) VALUES (?1, ?2, ?3, 'launching', 'codex', ?4, '', '', ?5)",
         params![
             instance_name,
             hcom_session_id,
+            instance_tag,
             now,
             serde_json::json!({
                 "chain_id": chain_id,
@@ -5229,14 +5254,16 @@ pub fn materialize_target_generation(
     }
 
     let now = now_epoch_f64();
+    let instance_tag = (!chain.tag.is_empty()).then_some(chain.tag.as_str());
     tx.execute(
         "INSERT INTO instances (
-             name, session_id, status, tool, created_at, parent_name,
+             name, session_id, tag, status, tool, created_at, parent_name,
              origin_device_id, launch_context
-         ) VALUES (?1, ?2, 'launching', 'codex', ?3, '', '', ?4)",
+         ) VALUES (?1, ?2, ?3, 'launching', 'codex', ?4, '', '', ?5)",
         params![
             instance_name,
             hcom_session_id,
+            instance_tag,
             now,
             serde_json::json!({
                 "chain_id": handoff.chain_id,
@@ -7633,6 +7660,7 @@ mod tests {
         ChainSpec {
             workspace: workspace.to_path_buf(),
             tool: "codex".to_string(),
+            tag: "dev1".to_string(),
             model_ref: "gpt-test".to_string(),
             reasoning_ref: "high".to_string(),
             permission_policy_ref: "approval=never;sandbox=read-only".to_string(),
@@ -7729,6 +7757,15 @@ mod tests {
         )
         .unwrap();
         source.native_session_id = Some("public-source-native".to_string());
+        let source_tag: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT tag FROM instances WHERE name = ?1",
+                params![&source.instance_name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_tag.as_deref(), Some("dev1"));
         PublicFixture {
             _dir: dir,
             db,
@@ -7872,6 +7909,7 @@ mod tests {
             &ChainSpec {
                 workspace: workspace.clone(),
                 tool: "codex".to_string(),
+                tag: "dev1".to_string(),
                 model_ref: "model-pinned".to_string(),
                 reasoning_ref: "reasoning-pinned".to_string(),
                 permission_policy_ref: "permission-policy-pinned".to_string(),
@@ -8085,6 +8123,16 @@ mod tests {
             },
         )
         .unwrap();
+        let target_tag: Option<String> = fixture
+            .db
+            .conn()
+            .query_row(
+                "SELECT tag FROM instances WHERE name = ?1",
+                params![&actor.instance_name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(target_tag.as_deref(), Some("dev1"));
         actor
     }
 
@@ -8155,7 +8203,7 @@ mod tests {
             &generation.launch_nonce,
         )
         .unwrap();
-        materialize_target_generation(
+        let outcome = materialize_target_generation(
             &fixture.db,
             &supervisor_actor(fixture),
             &launching.handoff.id,
@@ -8173,7 +8221,18 @@ mod tests {
                 child_process_birth_identity: "child-birth-target".to_string(),
             },
         )
-        .unwrap()
+        .unwrap();
+        let target_tag: Option<String> = fixture
+            .db
+            .conn()
+            .query_row(
+                "SELECT tag FROM instances WHERE name = ?1",
+                params![&target.instance_name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(target_tag.as_deref(), Some("dev1"));
+        outcome
     }
 
     fn target_actor() -> HandoffActor {
@@ -10422,6 +10481,7 @@ mod tests {
         assert_eq!(source.version, 0);
         let chain = get_chain(&fixture.db, &fixture.chain.id).unwrap().unwrap();
         assert_eq!(chain.state, ChainState::Active);
+        assert_eq!(chain.tag, "dev1");
         assert_eq!(chain.version, 0);
         assert_eq!(audit_count(&fixture.db), 2);
     }
@@ -10704,6 +10764,29 @@ mod tests {
             generation.native_session_id.as_deref(),
             Some("public-source-native")
         );
+        assert_eq!(
+            fixture
+                .db
+                .conn()
+                .execute(
+                    "UPDATE instances SET tag = 'dev1' WHERE name = ?1",
+                    params![&fixture.source.instance_name],
+                )
+                .unwrap(),
+            1
+        );
+        assert!(
+            fixture
+                .db
+                .conn()
+                .execute(
+                    "UPDATE instances SET tag = 'other'
+                     WHERE name = ?1",
+                    params![&fixture.source.instance_name],
+                )
+                .is_err(),
+            "managed generation tag must remain pinned to its chain"
+        );
         assert!(
             get_generation_process(&fixture.db, &fixture.chain_id, 1)
                 .unwrap()
@@ -10712,6 +10795,20 @@ mod tests {
 
         let other_pid = absent_pid_and_group(1_600_000);
         let other_pgid = absent_pid_and_group(1_620_000);
+        let mut invalid_tag = public_spec(
+            &fixture.workspace,
+            other_pid,
+            other_pgid,
+            absent_birth(other_pid),
+            "invalid-tag",
+            fixture.tty_device + 2,
+            fixture.tty_inode + 2,
+        );
+        invalid_tag.tag = "bad tag".to_string();
+        assert!(matches!(
+            create_public_chain_reservation(&fixture.db, &invalid_tag),
+            Err(HandoffError::Invalid(_))
+        ));
         let conflict = create_public_chain_reservation(
             &fixture.db,
             &public_spec(

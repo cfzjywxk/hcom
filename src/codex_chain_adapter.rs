@@ -135,6 +135,7 @@ pub(crate) struct CodexGenerationAdapter {
     executable: PathBuf,
     profile: CodexLaunchProfile,
     chain_id: String,
+    tag: String,
     title_stack_pushed: bool,
     current_title: Option<Vec<u8>>,
     pending_title: Option<Vec<u8>>,
@@ -233,6 +234,7 @@ impl CodexGenerationAdapter {
             executable: preflight.executable,
             profile: preflight.profile,
             chain_id: chain.id.clone(),
+            tag: chain.tag.clone(),
             title_stack_pushed,
             current_title: None,
             pending_title: None,
@@ -270,6 +272,7 @@ impl CodexGenerationAdapter {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let environment = exact_generation_environment(
             &self.chain_id,
+            &self.tag,
             reservation,
             identity,
             SUPPORTED_CODEX_VERSION,
@@ -856,6 +859,7 @@ impl GenerationAdapter for CodexGenerationAdapter {
 
 fn exact_generation_environment(
     chain_id: &str,
+    tag: &str,
     reservation: &TargetReservation,
     identity: &GenerationIdentity,
     version: &str,
@@ -863,6 +867,7 @@ fn exact_generation_environment(
     exact_generation_environment_from(
         std::env::vars_os(),
         chain_id,
+        tag,
         reservation,
         identity,
         version,
@@ -872,6 +877,7 @@ fn exact_generation_environment(
 fn exact_generation_environment_from<I>(
     parent: I,
     chain_id: &str,
+    tag: &str,
     reservation: &TargetReservation,
     identity: &GenerationIdentity,
     version: &str,
@@ -900,6 +906,9 @@ where
         (CODEX_VERSION_ENV, version),
     ] {
         environment.push((OsString::from(key), OsString::from(value)));
+    }
+    if !tag.is_empty() {
+        environment.push((OsString::from("HCOM_TAG"), OsString::from(tag)));
     }
     if reservation.handoff_id != chain_id {
         environment.push((
@@ -2034,11 +2043,13 @@ mod tests {
             [
                 (OsString::from("PATH"), OsString::from("/usr/bin")),
                 (OsString::from("HCOM_SOURCE_SECRET"), OsString::from(secret)),
+                (OsString::from("HCOM_TAG"), OsString::from("ambient")),
                 (OsString::from("ANTIGRAVITY_AGENT"), OsString::from(secret)),
                 (OsString::from("CODEX_THREAD_ID"), OsString::from(secret)),
                 (OsString::from("HCOM_DIR"), OsString::from("/tmp/hcom")),
             ],
             "tc-opaque",
+            "dev1",
             &reservation,
             &identity,
             SUPPORTED_CODEX_VERSION,
@@ -2059,6 +2070,18 @@ mod tests {
         );
         assert!(!environment.iter().any(|(key, _)| key == "CODEX_THREAD_ID"));
         assert!(environment.iter().any(|(key, _)| key == "HCOM_DIR"));
+        assert!(
+            environment
+                .iter()
+                .any(|(key, value)| key == "HCOM_TAG" && value == "dev1")
+        );
+        assert_eq!(
+            environment
+                .iter()
+                .filter(|(key, _)| key == "HCOM_TAG")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -2087,6 +2110,7 @@ mod tests {
         let environment = exact_generation_environment_from(
             [(OsString::from("PATH"), OsString::from("/usr/bin"))],
             chain_id,
+            "",
             &reservation,
             &identity,
             SUPPORTED_CODEX_VERSION,
@@ -2140,8 +2164,9 @@ mod tests {
             id: "tc-title".to_string(),
             workspace: workspace.to_string_lossy().into_owned(),
             tool: "codex".to_string(),
+            tag: "dev1".to_string(),
             model_ref: "gpt-test".to_string(),
-            reasoning_ref: "high".to_string(),
+            reasoning_ref: "max".to_string(),
             permission_policy_ref: "approval=never;sandbox=read-only".to_string(),
             policy_ref: "codex-0.145.0-foreground-v1".to_string(),
             supervisor_process_id: "supervisor".to_string(),
@@ -2158,6 +2183,7 @@ mod tests {
             updated_at: 0.0,
         };
         let profile = CodexLaunchProfile::from_chain(&chain).unwrap();
+        assert_eq!(profile.reasoning, "max");
         let size = libc::winsize {
             ws_row: 24,
             ws_col: 80,
@@ -2184,6 +2210,7 @@ mod tests {
             executable: PathBuf::from("/usr/bin/false"),
             profile,
             chain_id: chain.id,
+            tag: chain.tag,
             title_stack_pushed: true,
             current_title: None,
             pending_title: None,
@@ -2779,6 +2806,7 @@ mod tests {
             id: chain_id.clone(),
             workspace: workspace.to_string_lossy().into_owned(),
             tool: "codex".to_string(),
+            tag: "dev1".to_string(),
             model_ref: "gpt-5.5".to_string(),
             reasoning_ref: "high".to_string(),
             permission_policy_ref: "approval=never;sandbox=danger-full-access".to_string(),
@@ -2843,6 +2871,7 @@ mod tests {
             &ChainSpec {
                 workspace: workspace.clone(),
                 tool: "codex".to_string(),
+                tag: profile.tag.clone(),
                 model_ref: profile.model_ref.clone(),
                 reasoning_ref: profile.reasoning_ref.clone(),
                 permission_policy_ref: profile.permission_policy_ref.clone(),

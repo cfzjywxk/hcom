@@ -344,7 +344,7 @@ const HANDOFF_HELP: &[HelpEntry] = &[
 
 const CHAIN_HELP: &[HelpEntry] = &[
     (
-        "chain codex --model MODEL --reasoning LEVEL --sandbox MODE --approval MODE",
+        "chain codex [--tag TAG] --model MODEL --reasoning LEVEL --sandbox MODE --approval MODE",
         "Start one fresh Codex 0.145.0 in this exact foreground terminal",
     ),
     (
@@ -359,6 +359,10 @@ const CHAIN_HELP: &[HelpEntry] = &[
     (
         "",
         "Fresh create only: no resume, fork, background, remote, relay, or new terminal.",
+    ),
+    (
+        "",
+        "Optional --tag is immutable across generations; reasoning supports minimal, low, medium, high, xhigh, and max.",
     ),
     (
         "",
