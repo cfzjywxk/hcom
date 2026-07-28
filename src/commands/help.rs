@@ -251,6 +251,10 @@ const SEND_HELP: &[HelpEntry] = &[
         "  --transcript <ranges>",
         "Format: 3-14:normal,6:full,22-30:detailed",
     ),
+    (
+        "  --repos <paths>",
+        "Snapshot explicit Git roots without changing the chain launch directory",
+    ),
     ("  --extends <id>", "Parent bundle (optional)"),
     ("", "See 'hcom bundle --help' for bundle details"),
     ("", ""),
@@ -389,11 +393,11 @@ const BUNDLE_HELP: &[HelpEntry] = &[
     ),
     (
         "  --last-transcript N",
-        "Transcript entries to suggest (default: 20)",
+        "Transcript entries to suggest (default: 40)",
     ),
     (
         "  --last-events N",
-        "Events to scan per category (default: 30)",
+        "Events to scan per category (default: 10)",
     ),
     ("  --json", "Output JSON"),
     ("  --compact", "Hide how-to section"),
@@ -439,6 +443,10 @@ const BUNDLE_HELP: &[HelpEntry] = &[
         "",
         "    normal = truncated | full = complete | detailed = tools+edits",
     ),
+    (
+        "  --repos <paths>",
+        "Comma-separated Git roots to snapshot; never changes the chain launch directory",
+    ),
     ("  --extends <id>", "Parent bundle for chaining"),
     ("  --bundle JSON", "Create from JSON payload"),
     ("  --bundle-file FILE", "Create from JSON file"),
@@ -462,6 +470,10 @@ const BUNDLE_HELP: &[HelpEntry] = &[
         "    \"transcript\": [\"10-15:normal\", \"20:full\", \"30-35:detailed\"]",
     ),
     ("", "  },"),
+    (
+        "",
+        "  \"repositories\": [\"/absolute/repo-a\", \"/absolute/repo-b\"],",
+    ),
     ("", "  \"extends\": \"bundle:abc123\""),
     ("", "}"),
     ("", ""),
@@ -1303,6 +1315,22 @@ mod tests {
             help.contains("Subscribe"),
             "events sub help should contain Subscribe section"
         );
+    }
+
+    #[test]
+    fn bundle_help_documents_repository_snapshots_and_current_defaults() {
+        let help = get_command_help("bundle");
+        for expected in [
+            "--repos <paths>",
+            "never changes the chain launch directory",
+            "\"repositories\": [\"/absolute/repo-a\", \"/absolute/repo-b\"]",
+            "Transcript entries to suggest (default: 40)",
+            "Events to scan per category (default: 10)",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
+        assert!(!help.contains("Transcript entries to suggest (default: 20)"));
+        assert!(!help.contains("Events to scan per category (default: 30)"));
     }
 
     #[test]

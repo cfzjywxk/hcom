@@ -65,6 +65,41 @@ fn help_prints_and_exits_zero() {
 }
 
 #[test]
+fn bundle_and_send_help_expose_repository_snapshot_contract() {
+    let h = Hcom::new();
+    for argv in [vec!["bundle", "--help"], vec!["bundle", "create", "--help"]] {
+        let (code, stdout, stderr) = h.run(argv);
+        assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+        assert!(stdout.contains("--repos <paths>"), "stdout={stdout}");
+        assert!(
+            stdout.contains("never changes the chain launch directory"),
+            "stdout={stdout}"
+        );
+        assert!(stdout.contains("\"repositories\""), "stdout={stdout}");
+        assert!(
+            stdout.contains("default: 40") && stdout.contains("default: 10"),
+            "stdout={stdout}"
+        );
+        assert!(
+            !stdout.contains("Transcript entries to suggest (default: 20)"),
+            "stdout={stdout}"
+        );
+        assert!(
+            !stdout.contains("Events to scan per category (default: 30)"),
+            "stdout={stdout}"
+        );
+    }
+
+    let (code, stdout, stderr) = h.run(["send", "--help"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("--repos <paths>"), "stdout={stdout}");
+    assert!(
+        stdout.contains("without changing the chain launch directory"),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
 fn handoff_and_chain_help_expose_phase4_public_surface_only() {
     let h = Hcom::new();
     let (code, handoff_help, stderr) = h.run(["handoff", "--help"]);
