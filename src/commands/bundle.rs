@@ -165,6 +165,9 @@ pub struct BundleCreateArgs {
     /// Comma-separated file paths
     #[arg(long)]
     pub files: Option<String>,
+    /// Comma-separated Git repositories to snapshot as handoff metadata
+    #[arg(long = "repos")]
+    pub repositories: Option<String>,
     /// Transcript ranges (e.g., "3-14:normal,6:full")
     #[arg(long)]
     pub transcript: Option<String>,
@@ -951,7 +954,7 @@ fn cmd_bundle_prepare(db: &HcomDb, args: &BundlePrepareArgs, ctx: Option<&Comman
             "events": categories_json,
             "files": all_files,
             "template_command": template_command,
-            "note": format!("Last {} transcript entries, {} events per category", last_transcript, last_events),
+            "note": format!("Last {} transcript entries, {} events per category. For a chain handoff, add --repos with zero or more explicit Git roots; this never changes the chain launch directory.", last_transcript, last_events),
         });
         println!(
             "{}",
@@ -984,6 +987,9 @@ fn cmd_bundle_prepare(db: &HcomDb, args: &BundlePrepareArgs, ctx: Option<&Comman
             "- For description: give comprehensive detail and prescision. explain what is in this bundle, \
 summerise specific transcript ranges and events. give deep insight so another agent can understand \
 everything you know about this. what happened, decisions, current state, issues, plans, etc.\n"
+        );
+        println!(
+            "- For a chain handoff, add --repos \"/absolute/repo-a,/absolute/repo-b\" when code repositories must be pinned. Repositories are bundle metadata and never change the agent launch directory.\n"
         );
         println!("A good bundle includes everything relevant and nothing irrelevant.\n");
         println!("View: hcom transcript {agent} [--range N-N] [--full|--detailed]");
@@ -1094,7 +1100,7 @@ everything you know about this. what happened, decisions, current state, issues,
     0
 }
 
-/// Create: `hcom bundle create [TITLE] --description DESC [--events LIST] [--files LIST] [--transcript RANGES] [--extends ID] [--json]`
+/// Create: `hcom bundle create [TITLE] --description DESC [--events LIST] [--files LIST] [--transcript RANGES] [--repos LIST] [--extends ID] [--json]`
 fn cmd_bundle_create(db: &HcomDb, args: &BundleCreateArgs, ctx: Option<&CommandContext>) -> i32 {
     let json_mode = args.json;
 
@@ -1125,7 +1131,7 @@ fn cmd_bundle_create(db: &HcomDb, args: &BundleCreateArgs, ctx: Option<&CommandC
         Some(t) => t.clone(),
         None => {
             eprintln!(
-                "Usage: hcom bundle create TITLE --description DESC [--events LIST] [--files LIST] [--transcript RANGES]"
+                "Usage: hcom bundle create TITLE --description DESC [--events LIST] [--files LIST] [--transcript RANGES] [--repos LIST]"
             );
             return 1;
         }
@@ -1142,6 +1148,7 @@ fn cmd_bundle_create(db: &HcomDb, args: &BundleCreateArgs, ctx: Option<&CommandC
     // Build bundle data
     let events_list = bundles::parse_csv_list(args.events.as_deref());
     let files_list = bundles::parse_csv_list(args.files.as_deref());
+    let repositories = bundles::parse_csv_list(args.repositories.as_deref());
 
     let transcript_refs: Vec<Value> = if let Some(ref t) = args.transcript {
         t.split(',')
@@ -1165,6 +1172,7 @@ fn cmd_bundle_create(db: &HcomDb, args: &BundleCreateArgs, ctx: Option<&CommandC
             "files": files_list.iter().map(|f| json!(f)).collect::<Vec<_>>(),
             "transcript": transcript_refs,
         },
+        "repositories": repositories,
     });
 
     if let Some(ref ext) = args.extends {
@@ -1500,6 +1508,20 @@ mod tests {
         .unwrap();
         assert_eq!(a.title_flag.as_deref(), Some("My Bundle"));
         assert_eq!(a.description.as_deref(), Some("A test"));
+    }
+
+    #[test]
+    fn test_bundle_create_parses_explicit_repository_roots() {
+        let a = BundleCreateArgs::try_parse_from([
+            "create",
+            "Handoff",
+            "--description",
+            "A test",
+            "--repos",
+            "/repo/one,/repo/two",
+        ])
+        .unwrap();
+        assert_eq!(a.repositories.as_deref(), Some("/repo/one,/repo/two"));
     }
 
     #[test]

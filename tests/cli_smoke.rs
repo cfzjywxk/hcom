@@ -3,9 +3,10 @@
 
 mod support;
 
+use std::io::{BufRead as _, BufReader, Read as _};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use support::{Hcom, parse_hcom_marker};
 
@@ -191,6 +192,111 @@ fn list_json_empty() {
     assert!(arr.is_empty(), "expected empty list, got {stdout}");
 }
 
+#[cfg(unix)]
+#[test]
+fn bundle_create_snapshots_external_repositories_from_a_non_git_launch_directory() {
+    let h = Hcom::new();
+    assert!(!h.workspace.join(".git").exists());
+    let first_repository = h.root_path().join("repository-z");
+    let second_repository = h.root_path().join("repository-a");
+
+    for repository in [&first_repository, &second_repository] {
+        std::fs::create_dir(repository).unwrap();
+        let run_git = |args: &[&str]| {
+            let output = h
+                .external_cmd("git")
+                .arg("-C")
+                .arg(repository)
+                .args(args)
+                .output()
+                .expect("run isolated git command");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&["init", "-b", "main"]);
+        run_git(&["config", "user.name", "hcom test"]);
+        run_git(&["config", "user.email", "hcom-test@example.invalid"]);
+        std::fs::write(repository.join("tracked.txt"), "repository snapshot\n").unwrap();
+        run_git(&["add", "tracked.txt"]);
+        run_git(&["commit", "-m", "fixture"]);
+    }
+    let referenced_file = h.workspace.join("handoff.txt");
+    std::fs::write(&referenced_file, "handoff evidence\n").unwrap();
+    let repositories = format!(
+        "{},{}",
+        first_repository.display(),
+        second_repository.display()
+    );
+
+    let output = h
+        .cmd()
+        .current_dir(&h.workspace)
+        .args([
+            "bundle",
+            "create",
+            "Chain continuity",
+            "--description",
+            "Pin repositories without changing the agent launch directory",
+            "--events",
+            "1",
+            "--files",
+            referenced_file.to_str().unwrap(),
+            "--transcript",
+            "1:normal",
+            "--repos",
+            &repositories,
+            "--json",
+        ])
+        .output()
+        .expect("create bundle from non-Git launch directory");
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let connection = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    let data: String = connection
+        .query_row(
+            "SELECT data FROM events WHERE type = 'bundle' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let bundle: serde_json::Value = serde_json::from_str(&data).unwrap();
+    let snapshots = bundle["repositories"].as_array().unwrap();
+    assert_eq!(snapshots.len(), 2);
+    let roots: Vec<_> = snapshots
+        .iter()
+        .map(|snapshot| snapshot["root"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        roots,
+        vec![
+            second_repository.to_str().unwrap(),
+            first_repository.to_str().unwrap()
+        ]
+    );
+    assert!(
+        snapshots.iter().all(|snapshot| {
+            snapshot["state_digest"]
+                .as_str()
+                .is_some_and(|digest| digest.len() == 64)
+        }),
+        "bundle must persist exact repository state digests: {bundle}"
+    );
+    assert!(
+        roots
+            .iter()
+            .all(|root| *root != h.workspace.to_str().unwrap()),
+        "the non-Git launch directory must not be reinterpreted as a repository"
+    );
+}
+
 #[test]
 fn events_empty_in_fresh_dir() {
     let h = Hcom::new();
@@ -362,6 +468,341 @@ fn ordinary_codex_session_handoff_mutations_fail_closed() {
             .unwrap();
         assert_eq!(count, 0, "{table} must remain empty");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_chain_review_request_changes_fixed_and_lgtm_resume_without_user_input() {
+    let h = Hcom::new();
+    let (hooks_code, hooks_stdout, hooks_stderr) = h.run(["hooks", "add", "codex"]);
+    assert_eq!(hooks_code, 0, "stdout={hooks_stdout} stderr={hooks_stderr}");
+
+    let start_codex = |process_id: &str, native_session: &str| {
+        let output = h
+            .cmd()
+            .env("HCOM_PROCESS_ID", process_id)
+            .env("CODEX_SANDBOX", "1")
+            .env("CODEX_THREAD_ID", native_session)
+            .arg("start")
+            .output()
+            .expect("start isolated Codex identity");
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        parse_hcom_marker(&String::from_utf8_lossy(&output.stdout)).expect("isolated Codex marker")
+    };
+    let developer_process = "chain-review-developer-process";
+    let reviewer_process = "chain-review-reviewer-process";
+    let developer_native = "chain-review-developer-native";
+    let reviewer_native = "chain-review-reviewer-native";
+    let developer = start_codex(developer_process, developer_native);
+    let reviewer = start_codex(reviewer_process, reviewer_native);
+
+    let db_path = h.path().join("hcom.db");
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    for (name, process_id, session_id) in [
+        (&developer, developer_process, developer_native),
+        (&reviewer, reviewer_process, reviewer_native),
+    ] {
+        connection
+            .execute(
+                "UPDATE instances SET session_id = ?1, status = 'listening'
+                 WHERE name = ?2",
+                rusqlite::params![session_id, name],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE process_bindings SET session_id = ?1
+                 WHERE process_id = ?2 AND instance_name = ?3",
+                rusqlite::params![session_id, process_id, name],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_bindings (session_id, instance_name, created_at)
+                 VALUES (?1, ?2, 1.0)",
+                rusqlite::params![session_id, name],
+            )
+            .unwrap();
+    }
+    let developer_session: String = connection
+        .query_row(
+            "SELECT session_id FROM instances WHERE name = ?1",
+            [&developer],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let process_birth =
+        hcom::chain_supervisor::linux_process_birth_identity(std::process::id() as i32).unwrap();
+    let chain_id = "tc-review-observer-test";
+    let launch_nonce = "ln-review-observer-test";
+    let now = 1.0f64;
+    let transaction = connection.unchecked_transaction().unwrap();
+    transaction
+        .execute(
+            "INSERT INTO terminal_chains (
+                 id, workspace, tool, tag, model_ref, reasoning_ref,
+                 permission_policy_ref, policy_ref,
+                 supervisor_process_id, supervisor_process_birth_identity,
+                 current_generation, state, version, created_at, updated_at
+             ) VALUES (
+                 ?1, ?2, 'codex', 'dev1', 'gpt-test', 'high',
+                 'approval=never;sandbox=read-only',
+                 'codex-0.145.0-foreground-v1',
+                 'supervisor-review-test', ?3,
+                 1, 'active', 0, ?4, ?4
+             )",
+            rusqlite::params![chain_id, h.workspace.to_string_lossy(), process_birth, now],
+        )
+        .unwrap();
+    transaction
+        .execute(
+            "INSERT INTO terminal_generations (
+                 chain_id, generation, launch_nonce, wrapper_process_id,
+                 process_birth_identity, instance_name, hcom_session_id,
+                 native_session_id, state, version, created_at, updated_at
+             ) VALUES (
+                 ?1, 1, ?2, ?3, ?4, ?5, ?6, ?7,
+                 'active', 0, ?8, ?8
+             )",
+            rusqlite::params![
+                chain_id,
+                launch_nonce,
+                developer_process,
+                process_birth,
+                developer,
+                developer_session,
+                developer_native,
+                now
+            ],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(connection);
+
+    let mut start_review = h.cmd();
+    start_review
+        .env("HCOM_PROCESS_ID", developer_process)
+        .env("HCOM_CHAIN_ID", chain_id)
+        .env("HCOM_CHAIN_GENERATION", "1")
+        .env("HCOM_CHAIN_LAUNCH_NONCE", launch_nonce)
+        .env("HCOM_CHAIN_PROCESS_BIRTH_IDENTITY", &process_birth)
+        .env("CODEX_SANDBOX", "1")
+        .env("CODEX_THREAD_ID", developer_native)
+        .args([
+            "review",
+            "start",
+            &format!("@{reviewer}"),
+            "--max-rounds",
+            "2",
+            "--",
+            "Review the chain observer integration",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut blocked = start_review.spawn().expect("spawn attached review start");
+    let stdout = blocked.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut first_output = String::new();
+    let mut line = String::new();
+    let mut review_id = None;
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .expect("read attached review output");
+        assert!(
+            read > 0,
+            "attached review command exited before publishing its ID"
+        );
+        first_output.push_str(&line);
+        if review_id.is_none()
+            && let Some(id) = line.split_whitespace().find(|part| part.starts_with("rv-"))
+        {
+            review_id = Some(id.to_string());
+        }
+        if review_id.is_some() && first_output.contains("remains attached") {
+            break;
+        }
+    }
+    let review_id = review_id.unwrap();
+    assert!(
+        first_output.contains("remains attached"),
+        "stdout={first_output}"
+    );
+    assert!(
+        blocked.try_wait().unwrap().is_none(),
+        "chain review command returned before the reviewer verdict"
+    );
+    std::thread::sleep(Duration::from_millis(450));
+    assert!(
+        blocked.try_wait().unwrap().is_none(),
+        "chain review observer did not remain attached across idle polls"
+    );
+
+    let verdict = h
+        .cmd()
+        .env("HCOM_PROCESS_ID", reviewer_process)
+        .env("CODEX_SANDBOX", "1")
+        .env("CODEX_THREAD_ID", reviewer_native)
+        .args([
+            "review",
+            "verdict",
+            &review_id,
+            "--round",
+            "1",
+            "--request-changes",
+            "--",
+            "Exercise the attached fixed path",
+        ])
+        .output()
+        .expect("submit isolated reviewer verdict");
+    assert!(
+        verdict.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&verdict.stdout),
+        String::from_utf8_lossy(&verdict.stderr)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = blocked.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = blocked.kill();
+            let _ = blocked.wait();
+            panic!("chain review observer did not resume after the durable verdict");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        status.success(),
+        "attached review command status={status:?}"
+    );
+    let mut remaining_stdout = String::new();
+    reader.read_to_string(&mut remaining_stdout).unwrap();
+    let mut stderr = String::new();
+    blocked
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let stdout = format!("{first_output}{remaining_stdout}");
+    assert!(
+        stdout.contains("advanced to state=awaiting_developer"),
+        "stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("[hcom-review") && stdout.contains("Reviewer requested changes"),
+        "request changes was not delivered into the same CLI return: stdout={stdout} stderr={stderr}"
+    );
+
+    let mut fixed = h.cmd();
+    fixed
+        .env("HCOM_PROCESS_ID", developer_process)
+        .env("HCOM_CHAIN_ID", chain_id)
+        .env("HCOM_CHAIN_GENERATION", "1")
+        .env("HCOM_CHAIN_LAUNCH_NONCE", launch_nonce)
+        .env("HCOM_CHAIN_PROCESS_BIRTH_IDENTITY", &process_birth)
+        .env("CODEX_SANDBOX", "1")
+        .env("CODEX_THREAD_ID", developer_native)
+        .args([
+            "review",
+            "fixed",
+            &review_id,
+            "--round",
+            "1",
+            "--",
+            "Exercised and verified the attached fixed path",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut fixed_blocked = fixed.spawn().expect("spawn attached review fixed");
+    let fixed_stdout = fixed_blocked.stdout.take().unwrap();
+    let mut fixed_reader = BufReader::new(fixed_stdout);
+    let mut fixed_first_output = String::new();
+    loop {
+        line.clear();
+        let read = fixed_reader
+            .read_line(&mut line)
+            .expect("read attached fixed output");
+        assert!(read > 0, "attached fixed command exited before waiting");
+        fixed_first_output.push_str(&line);
+        if fixed_first_output.contains("remains attached") {
+            break;
+        }
+    }
+    assert!(
+        fixed_blocked.try_wait().unwrap().is_none(),
+        "chain fixed command returned before the round-2 verdict"
+    );
+    std::thread::sleep(Duration::from_millis(450));
+    assert!(
+        fixed_blocked.try_wait().unwrap().is_none(),
+        "chain fixed observer did not remain attached across idle polls"
+    );
+
+    let lgtm = h
+        .cmd()
+        .env("HCOM_PROCESS_ID", reviewer_process)
+        .env("CODEX_SANDBOX", "1")
+        .env("CODEX_THREAD_ID", reviewer_native)
+        .args([
+            "review",
+            "verdict",
+            &review_id,
+            "--round",
+            "2",
+            "--lgtm",
+            "--",
+            "LGTM from the integration reviewer",
+        ])
+        .output()
+        .expect("submit isolated round-2 LGTM");
+    assert!(
+        lgtm.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&lgtm.stdout),
+        String::from_utf8_lossy(&lgtm.stderr)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = fixed_blocked.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = fixed_blocked.kill();
+            let _ = fixed_blocked.wait();
+            panic!("chain fixed observer did not resume after round-2 LGTM");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "attached fixed command status={status:?}");
+    let mut fixed_remaining = String::new();
+    fixed_reader.read_to_string(&mut fixed_remaining).unwrap();
+    let mut fixed_stderr = String::new();
+    fixed_blocked
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut fixed_stderr)
+        .unwrap();
+    let fixed_output = format!("{fixed_first_output}{fixed_remaining}");
+    assert!(
+        fixed_output.contains("advanced to state=approved")
+            && fixed_output.contains("[hcom-review")
+            && fixed_output.contains("LGTM"),
+        "round-2 LGTM was not delivered into the same fixed CLI return: stdout={fixed_output} stderr={fixed_stderr}"
+    );
 }
 
 #[test]

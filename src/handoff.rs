@@ -13,6 +13,7 @@ use std::str::FromStr;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
+use crate::core::bundles;
 use crate::db::HcomDb;
 use crate::shared::time::now_epoch_f64;
 
@@ -37,6 +38,9 @@ pub const MAX_INSTRUCTION_FILES: usize = 64;
 pub const MAX_STATUS_JSON_BYTES: usize = 16 * 1024;
 pub const MAX_STATUS_HUMAN_BYTES: usize = 16 * 1024;
 pub const MAX_QUIESCE_ELAPSED_MS: i64 = 86_400_000;
+// `:` is forbidden in Git ref names, so this marker cannot be confused with
+// the branch of a legacy in-flight handoff.
+pub(crate) const BUNDLE_REPOSITORY_SNAPSHOT_MARKER: &str = "(hcom:bundle-repositories-v1)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainState {
@@ -207,6 +211,8 @@ impl FromStr for HandoffState {
 #[derive(Debug, Clone)]
 pub struct TerminalChain {
     pub id: String,
+    /// Immutable canonical agent launch directory. The durable column keeps
+    /// its historical `workspace` name for schema compatibility.
     pub workspace: String,
     pub tool: String,
     pub tag: String,
@@ -309,9 +315,14 @@ pub struct TerminalHandoff {
     pub bundle_event_id: i64,
     pub bundle_digest: String,
     pub bundle_size_bytes: i64,
+    /// Immutable canonical launch directory (historical schema name).
     pub workspace: String,
+    /// Legacy Git revision, or the bundle repository-manifest digest for new
+    /// handoffs.
     pub revision: String,
+    /// Legacy Git branch, or `BUNDLE_REPOSITORY_SNAPSHOT_MARKER`.
     pub branch: String,
+    /// Legacy dirty counts, or the repository-manifest entry count.
     pub dirty_summary: String,
     pub policy_ref: String,
     pub state: HandoffState,
@@ -1675,6 +1686,57 @@ fn snapshot_workspace(path: &Path) -> Result<WorkspaceSnapshot, HandoffError> {
     })
 }
 
+fn snapshot_bundle_environment(
+    launch_cwd: &Path,
+    bundle: &serde_json::Value,
+) -> Result<WorkspaceSnapshot, HandoffError> {
+    let workspace = canonical_workspace(launch_cwd)?;
+    let repositories = bundles::verify_bundle_repositories(bundle).map_err(|error| {
+        HandoffError::Invalid(format!("repository snapshot is invalid: {error}"))
+    })?;
+    let revision = bundles::repository_manifest_digest(&repositories).map_err(|error| {
+        HandoffError::Invalid(format!("repository manifest cannot be serialized: {error}"))
+    })?;
+    let dirty_summary = format!("repositories={}", repositories.len());
+    validate_text(
+        &revision,
+        "repository manifest digest",
+        MAX_REVISION_BYTES,
+        false,
+    )?;
+    validate_text(
+        &dirty_summary,
+        "repository manifest summary",
+        MAX_DIRTY_SUMMARY_BYTES,
+        false,
+    )?;
+    Ok(WorkspaceSnapshot {
+        workspace,
+        revision,
+        branch: BUNDLE_REPOSITORY_SNAPSHOT_MARKER.to_string(),
+        dirty_summary,
+    })
+}
+
+pub(crate) fn uses_bundle_repository_snapshot(handoff: &TerminalHandoff) -> bool {
+    handoff.branch == BUNDLE_REPOSITORY_SNAPSHOT_MARKER
+}
+
+fn snapshot_existing_handoff_environment(
+    launch_cwd: &Path,
+    bundle: &serde_json::Value,
+    handoff: &TerminalHandoff,
+) -> Result<WorkspaceSnapshot, HandoffError> {
+    if uses_bundle_repository_snapshot(handoff) {
+        snapshot_bundle_environment(launch_cwd, bundle)
+    } else {
+        // In-flight handoffs created before bundle repository snapshots used
+        // the launch directory itself as the single Git workspace. Preserve
+        // exact replay/commit/inspection semantics for those durable rows.
+        snapshot_workspace(launch_cwd)
+    }
+}
+
 #[derive(Debug)]
 struct BundleSnapshot {
     event_id: i64,
@@ -1770,12 +1832,12 @@ fn load_current_instructions(
     let workspace = PathBuf::from(workspace);
     let canonical_workspace = std::fs::canonicalize(&workspace).map_err(|_| {
         HandoffError::Conflict(
-            "HANDOFF_CONFLICT target workspace is no longer available".to_string(),
+            "HANDOFF_CONFLICT target launch directory is no longer available".to_string(),
         )
     })?;
     if canonical_workspace != workspace {
         return Err(HandoffError::Conflict(
-            "HANDOFF_CONFLICT target workspace is no longer canonical".to_string(),
+            "HANDOFF_CONFLICT target launch directory is no longer canonical".to_string(),
         ));
     }
 
@@ -1833,6 +1895,27 @@ fn load_current_instructions(
     for directory in project_directories {
         if let Some(path) = preferred_instruction_file(&directory) {
             candidates.push(("workspace".to_string(), workspace.clone(), path));
+        }
+    }
+    let repositories = bundles::repository_snapshots(bundle).map_err(|_| {
+        HandoffError::Conflict(
+            "HANDOFF_CONFLICT bundle repository metadata is malformed".to_string(),
+        )
+    })?;
+    for (index, repository) in repositories.iter().enumerate() {
+        let root = PathBuf::from(&repository.root);
+        let canonical_root = std::fs::canonicalize(&root).map_err(|_| {
+            HandoffError::Conflict(
+                "HANDOFF_CONFLICT repository instruction root is no longer available".to_string(),
+            )
+        })?;
+        if canonical_root != root {
+            return Err(HandoffError::Conflict(
+                "HANDOFF_CONFLICT repository instruction root is no longer canonical".to_string(),
+            ));
+        }
+        if let Some(path) = preferred_instruction_file(&root) {
+            candidates.push((format!("repository:{index}"), root, path));
         }
     }
 
@@ -3467,7 +3550,7 @@ fn ensure_workspace_matches(chain: &TerminalChain, cwd: &Path) -> Result<String,
     let workspace = canonical_workspace(cwd)?;
     if workspace != chain.workspace {
         return Err(HandoffError::Conflict(
-            "HANDOFF_CONFLICT caller workspace does not match the pinned chain workspace"
+            "HANDOFF_CONFLICT caller directory does not match the pinned chain launch directory"
                 .to_string(),
         ));
     }
@@ -3515,7 +3598,16 @@ pub fn prepare_handoff(
     bundle_event_id: i64,
     cwd: &Path,
 ) -> Result<HandoffOutcome, HandoffError> {
-    prepare_handoff_with_snapshot_provider(db, actor, bundle_event_id, cwd, snapshot_workspace)
+    prepare_handoff_with_snapshot_provider(
+        db,
+        actor,
+        bundle_event_id,
+        cwd,
+        |path, bundle, existing| match existing {
+            Some(handoff) => snapshot_existing_handoff_environment(path, bundle, handoff),
+            None => snapshot_bundle_environment(path, bundle),
+        },
+    )
 }
 
 fn prepare_handoff_with_snapshot_provider<F>(
@@ -3526,13 +3618,44 @@ fn prepare_handoff_with_snapshot_provider<F>(
     snapshot_provider: F,
 ) -> Result<HandoffOutcome, HandoffError>
 where
-    F: FnOnce(&Path) -> Result<WorkspaceSnapshot, HandoffError>,
+    F: FnOnce(
+        &Path,
+        &serde_json::Value,
+        Option<&TerminalHandoff>,
+    ) -> Result<WorkspaceSnapshot, HandoffError>,
 {
     validate_actor(actor)?;
-    // Canonicalization and every git subprocess run before BEGIN IMMEDIATE.
+    let preliminary_bundle =
+        load_bundle_snapshot(db.conn(), bundle_event_id, &actor.instance_name)?;
+    let preliminary_existing = db
+        .conn()
+        .query_row(
+            "SELECT * FROM terminal_handoffs
+             WHERE source_generation = ?1
+               AND source_instance_name = ?2
+               AND source_hcom_session_id = ?3
+               AND source_wrapper_process_id = ?4
+               AND source_process_birth_identity = ?5
+               AND state NOT IN ('accepted', 'aborted')
+             LIMIT 1",
+            params![
+                actor.generation,
+                actor.instance_name,
+                actor.hcom_session_id,
+                actor.process_id,
+                actor.process_birth_identity,
+            ],
+            TerminalHandoff::from_row,
+        )
+        .optional()?;
+    // Canonicalization and every Git subprocess run before BEGIN IMMEDIATE.
     // The transaction below only validates this deterministic snapshot
     // against the exact typed chain/generation/handoff state.
-    let workspace = snapshot_provider(cwd)?;
+    let workspace = snapshot_provider(
+        cwd,
+        &preliminary_bundle.value,
+        preliminary_existing.as_ref(),
+    )?;
     let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
     let Some((mut chain, mut source_generation)) = find_actor_chain(&tx, actor)? else {
         return Err(HandoffError::NotManaged);
@@ -3545,11 +3668,18 @@ where
     }
     if workspace.workspace != chain.workspace {
         return Err(HandoffError::Conflict(
-            "HANDOFF_CONFLICT caller workspace does not match the pinned chain workspace"
+            "HANDOFF_CONFLICT caller directory does not match the pinned chain launch directory"
                 .to_string(),
         ));
     }
     let bundle = load_bundle_snapshot(&tx, bundle_event_id, &actor.instance_name)?;
+    if bundle.digest != preliminary_bundle.digest
+        || bundle.size_bytes != preliminary_bundle.size_bytes
+    {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT bundle changed during repository snapshot".to_string(),
+        ));
+    }
     let target_number = source_generation.generation + 1;
 
     let existing = tx
@@ -3562,6 +3692,20 @@ where
         )
         .optional()?;
     if let Some(existing) = existing {
+        if preliminary_existing
+            .as_ref()
+            .is_none_or(|preliminary| preliminary.id != existing.id)
+        {
+            return Err(HandoffError::Conflict(
+                "HANDOFF_CONFLICT active handoff changed during repository snapshot".to_string(),
+            ));
+        }
+        if !workspace_matches_handoff(&workspace, &existing) {
+            return Err(HandoffError::Conflict(
+                "HANDOFF_CONFLICT prepared launch directory or repository snapshot changed"
+                    .to_string(),
+            ));
+        }
         let target_generation = load_generation(&tx, &chain.id, existing.target_generation)?
             .ok_or(HandoffError::Storage)?;
         let request_hash = prepare_request_hash(
@@ -3593,6 +3737,11 @@ where
         return Err(HandoffError::Conflict(
             "HANDOFF_CONFLICT a different non-final handoff already exists for this chain"
                 .to_string(),
+        ));
+    }
+    if preliminary_existing.is_some() {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT active handoff changed during repository snapshot".to_string(),
         ));
     }
     if chain.state != ChainState::Active || source_generation.state != GenerationState::Active {
@@ -3832,31 +3981,24 @@ pub fn commit_handoff(
     expected_version: i64,
     cwd: &Path,
 ) -> Result<HandoffOutcome, HandoffError> {
-    commit_handoff_with_snapshot_provider(
-        db,
-        actor,
-        handoff_id,
-        expected_version,
-        cwd,
-        snapshot_workspace,
-    )
-}
-
-fn commit_handoff_with_snapshot_provider<F>(
-    db: &HcomDb,
-    actor: &HandoffActor,
-    handoff_id: &str,
-    expected_version: i64,
-    cwd: &Path,
-    snapshot_provider: F,
-) -> Result<HandoffOutcome, HandoffError>
-where
-    F: FnOnce(&Path) -> Result<WorkspaceSnapshot, HandoffError>,
-{
     let handoff_id = validate_opaque_id(handoff_id, "handoff ID")?;
     validate_actor(actor)?;
     validate_expected_version(expected_version)?;
-    let workspace = snapshot_provider(cwd)?;
+    let preliminary = load_handoff(db.conn(), &handoff_id)?
+        .ok_or_else(|| HandoffError::Invalid("handoff was not found".to_string()))?;
+    let preliminary_bundle = verify_pinned_bundle(db.conn(), &preliminary)?;
+    let workspace =
+        snapshot_existing_handoff_environment(cwd, &preliminary_bundle.value, &preliminary)
+            .map_err(|error| {
+                if matches!(error, HandoffError::Storage) {
+                    HandoffError::Storage
+                } else {
+                    HandoffError::Conflict(
+                "HANDOFF_CONFLICT launch directory or repository snapshot changed after prepare"
+                    .to_string(),
+            )
+                }
+            })?;
     let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)?;
     let (mut handoff, mut chain, mut source) =
         load_source_context(&tx, &handoff_id, actor, true, true)?;
@@ -3867,10 +4009,18 @@ where
         || workspace.dirty_summary != handoff.dirty_summary
     {
         return Err(HandoffError::Conflict(
-            "HANDOFF_CONFLICT workspace snapshot changed after prepare".to_string(),
+            "HANDOFF_CONFLICT launch directory or repository snapshot changed after prepare"
+                .to_string(),
         ));
     }
     let bundle = verify_pinned_bundle(&tx, &handoff)?;
+    if bundle.digest != preliminary_bundle.digest
+        || bundle.size_bytes != preliminary_bundle.size_bytes
+    {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT bundle changed during repository validation".to_string(),
+        ));
+    }
     let bundle_event_id = bundle.event_id.to_string();
     let bundle_size = bundle.size_bytes.to_string();
     let request_hash = hash_request(
@@ -5896,14 +6046,7 @@ pub fn accept_handoff(
     expected_version: i64,
     cwd: &Path,
 ) -> Result<HandoffOutcome, HandoffError> {
-    accept_handoff_with_snapshot_provider(
-        db,
-        actor,
-        handoff_id,
-        expected_version,
-        cwd,
-        snapshot_workspace,
-    )
+    accept_handoff_inner(db, actor, handoff_id, expected_version, cwd)
 }
 
 pub fn inspect_handoff(
@@ -5913,14 +6056,7 @@ pub fn inspect_handoff(
     expected_version: i64,
     cwd: &Path,
 ) -> Result<HandoffInspection, HandoffError> {
-    inspect_handoff_with_snapshot_provider(
-        db,
-        actor,
-        handoff_id,
-        expected_version,
-        cwd,
-        snapshot_workspace,
-    )
+    inspect_handoff_inner(db, actor, handoff_id, expected_version, cwd)
 }
 
 #[derive(Debug, Clone)]
@@ -5978,17 +6114,13 @@ fn map_target_actor_error(error: HandoffError) -> HandoffError {
     }
 }
 
-fn inspect_handoff_with_snapshot_provider<F>(
+fn inspect_handoff_inner(
     db: &HcomDb,
     actor: &HandoffActor,
     handoff_id: &str,
     expected_version: i64,
     cwd: &Path,
-    snapshot_provider: F,
-) -> Result<HandoffInspection, HandoffError>
-where
-    F: FnOnce(&Path) -> Result<WorkspaceSnapshot, HandoffError>,
-{
+) -> Result<HandoffInspection, HandoffError> {
     let handoff_id = validate_opaque_id(handoff_id, "handoff ID")?;
     validate_actor(actor)?;
     validate_expected_version(expected_version)?;
@@ -6011,22 +6143,7 @@ where
         }
         auth.commit()?;
     }
-    let workspace = snapshot_provider(cwd).map_err(|error| {
-        if matches!(error, HandoffError::Storage) {
-            HandoffError::Storage
-        } else {
-            typed_conflict(
-                "target_validation_changed",
-                "bundle, workspace, or project instructions changed after inspection",
-            )
-        }
-    })?;
     let preliminary = load_handoff(db.conn(), &handoff_id)?.ok_or(HandoffError::NotManaged)?;
-    if !workspace_matches_handoff(&workspace, &preliminary) {
-        return Err(HandoffError::Conflict(
-            "HANDOFF_CONFLICT target workspace does not match the prepared snapshot".to_string(),
-        ));
-    }
     let preliminary_bundle = verify_pinned_bundle(db.conn(), &preliminary).map_err(|error| {
         if matches!(error, HandoffError::Storage) {
             HandoffError::Storage
@@ -6037,6 +6154,24 @@ where
             )
         }
     })?;
+    let workspace =
+        snapshot_existing_handoff_environment(cwd, &preliminary_bundle.value, &preliminary)
+            .map_err(|error| {
+                if matches!(error, HandoffError::Storage) {
+                    HandoffError::Storage
+                } else {
+                    typed_conflict(
+                        "target_validation_changed",
+                        "bundle, launch directory, repository, or project instructions changed after inspection",
+                    )
+                }
+            })?;
+    if !workspace_matches_handoff(&workspace, &preliminary) {
+        return Err(HandoffError::Conflict(
+            "HANDOFF_CONFLICT target launch directory or repository manifest does not match the prepared snapshot"
+                .to_string(),
+        ));
+    }
     let (instructions, instructions_digest) =
         load_current_instructions(&preliminary.workspace, &preliminary_bundle.value).map_err(
             |error| {
@@ -6058,7 +6193,8 @@ where
     let existing_validation = load_target_validation(&tx, &handoff, target_generation)?;
     if !workspace_matches_handoff(&workspace, &handoff) {
         return Err(HandoffError::Conflict(
-            "HANDOFF_CONFLICT target workspace changed during validation".to_string(),
+            "HANDOFF_CONFLICT target launch directory or repository snapshot changed during validation"
+                .to_string(),
         ));
     }
     let bundle = verify_pinned_bundle(&tx, &handoff).map_err(|error| {
@@ -6214,17 +6350,13 @@ where
     })
 }
 
-fn accept_handoff_with_snapshot_provider<F>(
+fn accept_handoff_inner(
     db: &HcomDb,
     actor: &HandoffActor,
     handoff_id: &str,
     expected_version: i64,
     cwd: &Path,
-    snapshot_provider: F,
-) -> Result<HandoffOutcome, HandoffError>
-where
-    F: FnOnce(&Path) -> Result<WorkspaceSnapshot, HandoffError>,
-{
+) -> Result<HandoffOutcome, HandoffError> {
     let handoff_id = validate_opaque_id(handoff_id, "handoff ID")?;
     validate_actor(actor)?;
     validate_expected_version(expected_version)?;
@@ -6261,16 +6393,6 @@ where
         }
         auth.commit()?;
     }
-    let workspace = snapshot_provider(cwd).map_err(|error| {
-        if matches!(error, HandoffError::Storage) {
-            HandoffError::Storage
-        } else {
-            typed_conflict(
-                "target_validation_changed",
-                "bundle, workspace, or project instructions changed after inspection",
-            )
-        }
-    })?;
     let preliminary = load_handoff(db.conn(), &handoff_id)?.ok_or(HandoffError::NotManaged)?;
     let preliminary_bundle = verify_pinned_bundle(db.conn(), &preliminary).map_err(|error| {
         if matches!(error, HandoffError::Storage) {
@@ -6282,6 +6404,18 @@ where
             )
         }
     })?;
+    let workspace =
+        snapshot_existing_handoff_environment(cwd, &preliminary_bundle.value, &preliminary)
+            .map_err(|error| {
+                if matches!(error, HandoffError::Storage) {
+                    HandoffError::Storage
+                } else {
+                    typed_conflict(
+                        "target_validation_changed",
+                        "bundle, launch directory, repository, or project instructions changed after inspection",
+                    )
+                }
+            })?;
     let (_, instructions_digest) =
         load_current_instructions(&preliminary.workspace, &preliminary_bundle.value).map_err(
             |error| {
@@ -6316,6 +6450,14 @@ where
             )
         }
     })?;
+    if bundle.digest != preliminary_bundle.digest
+        || bundle.size_bytes != preliminary_bundle.size_bytes
+    {
+        return Err(typed_conflict(
+            "target_validation_changed",
+            "bundle changed during target acceptance",
+        ));
+    }
     let bundle_event_id = bundle.event_id.to_string();
     let bundle_size = bundle.size_bytes.to_string();
     let request_hash = hash_request(
@@ -7846,12 +7988,22 @@ mod tests {
     }
 
     fn create_bundle(db: &HcomDb, actor: &HandoffActor, padding: usize) -> i64 {
+        let repository_root: String = db
+            .conn()
+            .query_row(
+                "SELECT workspace FROM terminal_chains ORDER BY created_at LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let repository = bundles::snapshot_repository(Path::new(&repository_root)).unwrap();
         let data = serde_json::json!({
             "bundle_id": generate_id("bundle"),
             "created_by": actor.instance_name,
             "title": "handoff",
             "description": "x".repeat(padding),
             "refs": {"events": [], "files": [], "transcript": []},
+            "repositories": [repository],
         });
         db.log_event("bundle", &actor.instance_name, &data).unwrap();
         db.conn()
@@ -7932,6 +8084,94 @@ mod tests {
             source,
             chain,
         }
+    }
+
+    fn fixture_with_non_git_launch() -> (Fixture, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("non-git-launch");
+        let repository = dir.path().join("repository");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&repository).unwrap();
+        run_git(&repository, &["init", "-b", "main"]);
+        run_git(&repository, &["config", "user.name", "hcom test"]);
+        run_git(
+            &repository,
+            &["config", "user.email", "hcom-test@example.invalid"],
+        );
+        std::fs::write(repository.join("README.md"), "separate repository\n").unwrap();
+        std::fs::write(
+            repository.join("AGENTS.md"),
+            "separate repository instructions\n",
+        )
+        .unwrap();
+        run_git(&repository, &["add", "README.md", "AGENTS.md"]);
+        run_git(&repository, &["commit", "-m", "fixture"]);
+
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let source = HandoffActor {
+            instance_name: "source".to_string(),
+            hcom_session_id: "hcom-source".to_string(),
+            native_session_id: Some("native-source".to_string()),
+            process_id: "process-source".to_string(),
+            process_birth_identity: "birth-source".to_string(),
+            generation: 1,
+        };
+        add_live_actor(&db, &source);
+        let chain = create_chain(
+            &db,
+            &source,
+            &ChainSpec {
+                workspace: workspace.clone(),
+                tool: "codex".to_string(),
+                tag: "dev1".to_string(),
+                model_ref: "gpt-test".to_string(),
+                reasoning_ref: "high".to_string(),
+                permission_policy_ref: "approval=never;sandbox=read-only".to_string(),
+                policy_ref: "codex-0.145.0-foreground-v1".to_string(),
+                supervisor_process_id: "supervisor-process".to_string(),
+                supervisor_process_birth_identity: "supervisor-birth".to_string(),
+                supervisor_pid: 41001,
+                supervisor_pgid: 41001,
+                outer_foreground_pgid: 41001,
+                outer_tty_device: 7,
+                outer_tty_inode: 11,
+                launch_nonce: "launch-source".to_string(),
+            },
+        )
+        .unwrap();
+        (
+            Fixture {
+                _dir: dir,
+                db,
+                workspace,
+                source,
+                chain,
+            },
+            repository,
+        )
+    }
+
+    fn create_bundle_with_repositories(
+        db: &HcomDb,
+        actor: &HandoffActor,
+        repositories: &[PathBuf],
+    ) -> i64 {
+        let repositories: Vec<_> = repositories
+            .iter()
+            .map(|root| bundles::snapshot_repository(root).unwrap())
+            .collect();
+        let data = serde_json::json!({
+            "bundle_id": generate_id("bundle"),
+            "created_by": actor.instance_name,
+            "title": "handoff",
+            "description": "repository handoff",
+            "refs": {"events": [], "files": [], "transcript": []},
+            "repositories": repositories,
+        });
+        db.log_event("bundle", &actor.instance_name, &data).unwrap();
+        db.conn()
+            .query_row("SELECT MAX(id) FROM events", [], |row| row.get(0))
+            .unwrap()
     }
 
     fn supervisor_actor(fixture: &Fixture) -> SupervisorActor {
@@ -8138,6 +8378,13 @@ mod tests {
 
     fn advance_to_sigterm(fixture: &Fixture) -> HandoffOutcome {
         let committed = prepare_and_commit(fixture);
+        advance_committed_to_sigterm(fixture, committed)
+    }
+
+    fn advance_committed_to_sigterm(
+        fixture: &Fixture,
+        committed: HandoffOutcome,
+    ) -> HandoffOutcome {
         let supervisor = supervisor_actor(fixture);
         let token = committed.handoff.quiesce_token.clone().unwrap();
         let stopped = observe_stop(
@@ -8163,6 +8410,37 @@ mod tests {
         )
         .unwrap();
         record_test_sigterm(fixture, &quiescing)
+    }
+
+    fn advance_committed_to_awaiting_acceptance(
+        fixture: &Fixture,
+        committed: HandoffOutcome,
+    ) -> (HandoffOutcome, HandoffActor) {
+        let sigterm = advance_committed_to_sigterm(fixture, committed);
+        let supervisor = supervisor_actor(fixture);
+        remove_live_actor(&fixture.db, &fixture.source);
+        let launching = complete_source_cleanup(
+            &fixture.db,
+            &supervisor,
+            &sigterm.handoff.id,
+            &successful_cleanup(sigterm.handoff.version),
+        )
+        .unwrap();
+        let target = target_actor();
+        let materialized = materialize_target_fixture(fixture, &launching, &target);
+        pin_target_fixture(fixture, &target);
+        let generation = load_generation(fixture.db.conn(), &fixture.chain.id, target.generation)
+            .unwrap()
+            .unwrap();
+        let ready = target_ready(
+            &fixture.db,
+            &target,
+            &materialized.handoff.id,
+            materialized.handoff.version,
+            &generation.launch_nonce,
+        )
+        .unwrap();
+        (ready, target)
     }
 
     fn advance_to_unmaterialized_launching(fixture: &Fixture) -> HandoffOutcome {
@@ -9672,6 +9950,47 @@ mod tests {
     }
 
     #[test]
+    fn prepare_rejects_handoff_mode_drift_during_repository_snapshot() {
+        let fixture = fixture(true);
+        let event_id = create_bundle(&fixture.db, &fixture.source, 0);
+        let first =
+            prepare_handoff(&fixture.db, &fixture.source, event_id, &fixture.workspace).unwrap();
+        let audit_before = audit_count(&fixture.db);
+
+        let conflict = prepare_handoff_with_snapshot_provider(
+            &fixture.db,
+            &fixture.source,
+            event_id,
+            &fixture.workspace,
+            |path, bundle, preliminary| {
+                assert_eq!(
+                    preliminary.map(|handoff| handoff.id.as_str()),
+                    Some(first.handoff.id.as_str())
+                );
+                fixture
+                    .db
+                    .conn()
+                    .execute(
+                        "UPDATE terminal_handoffs SET state = 'aborted' WHERE id = ?1",
+                        params![first.handoff.id],
+                    )
+                    .unwrap();
+                snapshot_bundle_environment(path, bundle)
+            },
+        );
+        assert!(matches!(conflict, Err(HandoffError::Conflict(_))));
+        let handoff_count: i64 = fixture
+            .db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM terminal_handoffs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(handoff_count, 1);
+        assert_eq!(audit_count(&fixture.db), audit_before);
+    }
+
+    #[test]
     fn bundle_event_must_be_exact_local_owned_and_bounded() {
         let fixture = fixture(true);
         assert!(matches!(
@@ -9814,6 +10133,269 @@ mod tests {
     }
 
     #[test]
+    fn non_git_launch_cwd_and_external_repositories_complete_full_handoff() {
+        let (fixture, first_repository) = fixture_with_non_git_launch();
+        let second_repository = fixture._dir.path().join("second-repository");
+        std::fs::create_dir(&second_repository).unwrap();
+        run_git(&second_repository, &["init", "-b", "main"]);
+        run_git(&second_repository, &["config", "user.name", "hcom test"]);
+        run_git(
+            &second_repository,
+            &["config", "user.email", "hcom-test@example.invalid"],
+        );
+        std::fs::write(
+            second_repository.join("AGENTS.md"),
+            "second repository instructions\n",
+        )
+        .unwrap();
+        run_git(&second_repository, &["add", "AGENTS.md"]);
+        run_git(&second_repository, &["commit", "-m", "fixture"]);
+
+        let event_id = create_bundle_with_repositories(
+            &fixture.db,
+            &fixture.source,
+            &[first_repository.clone(), second_repository.clone()],
+        );
+        let prepared =
+            prepare_handoff(&fixture.db, &fixture.source, event_id, &fixture.workspace).unwrap();
+        assert_eq!(
+            prepared.handoff.workspace,
+            fixture.workspace.to_string_lossy()
+        );
+        assert_eq!(prepared.handoff.branch, BUNDLE_REPOSITORY_SNAPSHOT_MARKER);
+        assert_eq!(prepared.handoff.dirty_summary, "repositories=2");
+
+        let committed = commit_handoff(
+            &fixture.db,
+            &fixture.source,
+            &prepared.handoff.id,
+            prepared.handoff.version,
+            &fixture.workspace,
+        )
+        .unwrap();
+        let (ready, target) = advance_committed_to_awaiting_acceptance(&fixture, committed);
+        let inspection = inspect_handoff(
+            &fixture.db,
+            &target,
+            &ready.handoff.id,
+            ready.handoff.version,
+            &fixture.workspace,
+        )
+        .unwrap();
+        let roots: Vec<_> = bundles::repository_snapshots(&inspection.bundle)
+            .unwrap()
+            .into_iter()
+            .map(|snapshot| snapshot.root)
+            .collect();
+        assert_eq!(roots.len(), 2);
+        assert!(roots.contains(&first_repository.to_string_lossy().into_owned()));
+        assert!(roots.contains(&second_repository.to_string_lossy().into_owned()));
+        assert_eq!(
+            inspection
+                .instructions
+                .iter()
+                .filter(|instruction| instruction.scope.starts_with("repository:"))
+                .count(),
+            2
+        );
+
+        let accepted = accept_handoff(
+            &fixture.db,
+            &target,
+            &ready.handoff.id,
+            inspection.handoff.version,
+            &fixture.workspace,
+        )
+        .unwrap();
+        assert_eq!(accepted.handoff.state, HandoffState::Accepted);
+        let chain = get_chain(&fixture.db, &fixture.chain.id).unwrap().unwrap();
+        assert_eq!(
+            chain.workspace,
+            fixture.workspace.to_string_lossy(),
+            "successor launch cwd must remain the original non-Git directory"
+        );
+        let profile = crate::codex_chain::CodexLaunchProfile::from_chain(&chain).unwrap();
+        let successor_argv = profile.argv(&accepted.handoff.id).unwrap();
+        assert_eq!(
+            successor_argv
+                .windows(2)
+                .find(|pair| pair[0] == "--cd")
+                .map(|pair| pair[1].as_str()),
+            fixture.workspace.to_str()
+        );
+        for repository in [&first_repository, &second_repository] {
+            let repository = repository.to_string_lossy();
+            assert!(
+                successor_argv
+                    .iter()
+                    .all(|argument| !argument.contains(repository.as_ref())),
+                "repository roots must not enter successor argv or its initial prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn non_git_launch_cwd_allows_a_zero_repository_handoff() {
+        let (fixture, _) = fixture_with_non_git_launch();
+        let event_id = create_bundle_with_repositories(&fixture.db, &fixture.source, &[]);
+        let prepared =
+            prepare_handoff(&fixture.db, &fixture.source, event_id, &fixture.workspace).unwrap();
+        assert_eq!(prepared.handoff.dirty_summary, "repositories=0");
+        assert_eq!(prepared.handoff.branch, BUNDLE_REPOSITORY_SNAPSHOT_MARKER);
+        let committed = commit_handoff(
+            &fixture.db,
+            &fixture.source,
+            &prepared.handoff.id,
+            prepared.handoff.version,
+            &fixture.workspace,
+        )
+        .unwrap();
+        assert_eq!(committed.handoff.state, HandoffState::Committed);
+    }
+
+    #[test]
+    fn legacy_inflight_git_workspace_handoff_remains_committable() {
+        let fixture = fixture(true);
+        let event_id = create_bundle(&fixture.db, &fixture.source, 0);
+        let prepared = prepare_handoff_with_snapshot_provider(
+            &fixture.db,
+            &fixture.source,
+            event_id,
+            &fixture.workspace,
+            |path, _, _| snapshot_workspace(path),
+        )
+        .unwrap();
+        assert_ne!(prepared.handoff.branch, BUNDLE_REPOSITORY_SNAPSHOT_MARKER);
+        let committed = commit_handoff(
+            &fixture.db,
+            &fixture.source,
+            &prepared.handoff.id,
+            prepared.handoff.version,
+            &fixture.workspace,
+        )
+        .unwrap();
+        assert_eq!(committed.handoff.state, HandoffState::Committed);
+    }
+
+    #[test]
+    fn repository_content_change_with_same_dirty_counts_blocks_commit() {
+        let fixture = fixture(true);
+        std::fs::write(fixture.workspace.join("README.md"), "dirty version one\n").unwrap();
+        let event_id = create_bundle(&fixture.db, &fixture.source, 0);
+        let prepared =
+            prepare_handoff(&fixture.db, &fixture.source, event_id, &fixture.workspace).unwrap();
+
+        std::fs::write(fixture.workspace.join("README.md"), "dirty version two\n").unwrap();
+        let conflict = commit_handoff(
+            &fixture.db,
+            &fixture.source,
+            &prepared.handoff.id,
+            prepared.handoff.version,
+            &fixture.workspace,
+        );
+        assert!(matches!(conflict, Err(HandoffError::Conflict(_))));
+        assert_eq!(
+            get_handoff(&fixture.db, &prepared.handoff.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            HandoffState::Prepared
+        );
+    }
+
+    #[test]
+    fn repository_change_after_commit_blocks_target_inspection() {
+        let (fixture, repository) = fixture_with_non_git_launch();
+        let event_id = create_bundle_with_repositories(
+            &fixture.db,
+            &fixture.source,
+            std::slice::from_ref(&repository),
+        );
+        let prepared =
+            prepare_handoff(&fixture.db, &fixture.source, event_id, &fixture.workspace).unwrap();
+        let committed = commit_handoff(
+            &fixture.db,
+            &fixture.source,
+            &prepared.handoff.id,
+            prepared.handoff.version,
+            &fixture.workspace,
+        )
+        .unwrap();
+        let (ready, target) = advance_committed_to_awaiting_acceptance(&fixture, committed);
+
+        std::fs::write(repository.join("README.md"), "changed before inspection\n").unwrap();
+        let conflict = inspect_handoff(
+            &fixture.db,
+            &target,
+            &ready.handoff.id,
+            ready.handoff.version,
+            &fixture.workspace,
+        );
+        assert!(matches!(
+            conflict,
+            Err(HandoffError::TypedConflict {
+                code,
+                ..
+            }) if code == "target_validation_changed"
+        ));
+        let durable = get_handoff(&fixture.db, &ready.handoff.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.state, HandoffState::AwaitingAcceptance);
+        assert_eq!(durable.version, ready.handoff.version);
+    }
+
+    #[test]
+    fn repository_change_after_inspection_blocks_target_acceptance() {
+        let (fixture, repository) = fixture_with_non_git_launch();
+        let event_id = create_bundle_with_repositories(
+            &fixture.db,
+            &fixture.source,
+            std::slice::from_ref(&repository),
+        );
+        let prepared =
+            prepare_handoff(&fixture.db, &fixture.source, event_id, &fixture.workspace).unwrap();
+        let committed = commit_handoff(
+            &fixture.db,
+            &fixture.source,
+            &prepared.handoff.id,
+            prepared.handoff.version,
+            &fixture.workspace,
+        )
+        .unwrap();
+        let (ready, target) = advance_committed_to_awaiting_acceptance(&fixture, committed);
+        let inspection = inspect_handoff(
+            &fixture.db,
+            &target,
+            &ready.handoff.id,
+            ready.handoff.version,
+            &fixture.workspace,
+        )
+        .unwrap();
+
+        std::fs::write(repository.join("README.md"), "changed after inspection\n").unwrap();
+        let conflict = accept_handoff(
+            &fixture.db,
+            &target,
+            &ready.handoff.id,
+            inspection.handoff.version,
+            &fixture.workspace,
+        );
+        assert!(matches!(
+            conflict,
+            Err(HandoffError::TypedConflict {
+                code,
+                ..
+            }) if code == "target_validation_changed"
+        ));
+        let durable = get_handoff(&fixture.db, &ready.handoff.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.state, HandoffState::AwaitingAcceptance);
+        assert_eq!(durable.version, inspection.handoff.version);
+    }
+
+    #[test]
     fn slow_workspace_snapshot_does_not_hold_writer_transaction() {
         use std::sync::mpsc;
         use std::time::Duration;
@@ -9828,11 +10410,22 @@ mod tests {
 
         let handle = std::thread::spawn(move || {
             let db = HcomDb::open_at(&db_path).unwrap();
-            prepare_handoff_with_snapshot_provider(&db, &actor, event_id, &workspace, |path| {
-                entered_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-                snapshot_workspace(path)
-            })
+            prepare_handoff_with_snapshot_provider(
+                &db,
+                &actor,
+                event_id,
+                &workspace,
+                |path, bundle, existing| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    match existing {
+                        Some(handoff) => {
+                            snapshot_existing_handoff_environment(path, bundle, handoff)
+                        }
+                        None => snapshot_bundle_environment(path, bundle),
+                    }
+                },
+            )
         });
 
         entered_rx

@@ -1245,6 +1245,7 @@ fn chain_json(db: &HcomDb, chain: &TerminalChain) -> serde_json::Value {
         "generation": chain.current_generation,
         "transition": chain.state.as_str(),
         "handoff": handoff,
+        "launch_cwd": chain.workspace,
         "workspace": chain.workspace,
         "policy": {
             "tool": chain.tool,
@@ -1269,7 +1270,7 @@ fn chain_human(db: &HcomDb, chain: &TerminalChain) -> Result<String, HandoffErro
         .unwrap_or_else(|| "none".to_string());
     let output = format!(
         "{} state={} version={} generation={} transition={}\n\
-         handoff={}\nworkspace={}\n\
+         handoff={}\nlaunch_cwd={}\n\
          tool={} tag={} model={} reasoning={} permission={} profile={}\n\
          recovery_required={} recovery_reason={}\nnext={}",
         chain.id,

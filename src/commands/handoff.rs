@@ -12,7 +12,7 @@ use crate::handoff::{
     TerminalHandoff, abort_handoff, accept_handoff, commit_handoff, current_chain_for_actor,
     effective_handoff_target_generation, handoff_status_for_actor,
     handoff_status_for_terminal_owner, inspect_handoff, prepare_handoff, reject_handoff,
-    resolve_managed_actor,
+    resolve_managed_actor, uses_bundle_repository_snapshot,
 };
 use crate::shared::{CommandContext, SenderKind};
 
@@ -178,10 +178,11 @@ pub(crate) fn managed_actor_from_ctx(
 
 fn cwd() -> Result<PathBuf, HandoffError> {
     std::env::current_dir()
-        .map_err(|_| HandoffError::Invalid("current workspace is unavailable".to_string()))
+        .map_err(|_| HandoffError::Invalid("current launch directory is unavailable".to_string()))
 }
 
 fn handoff_json(handoff: &TerminalHandoff, replayed: Option<bool>) -> serde_json::Value {
+    let bundle_repositories = uses_bundle_repository_snapshot(handoff);
     let mut value = json!({
         "id": handoff.id,
         "chain_id": handoff.chain_id,
@@ -194,7 +195,21 @@ fn handoff_json(handoff: &TerminalHandoff, replayed: Option<bool>) -> serde_json
             "digest": handoff.bundle_digest,
             "size_bytes": handoff.bundle_size_bytes,
         },
+        "launch_cwd": handoff.workspace,
         "workspace": handoff.workspace,
+        "snapshot_mode": if bundle_repositories {
+            "bundle_repositories_v1"
+        } else {
+            "legacy_git_workspace"
+        },
+        "repository_manifest": if bundle_repositories {
+            json!({
+                "digest": handoff.revision,
+                "summary": handoff.dirty_summary,
+            })
+        } else {
+            serde_json::Value::Null
+        },
         "revision": handoff.revision,
         "branch": handoff.branch,
         "dirty_summary": handoff.dirty_summary,
@@ -366,6 +381,7 @@ fn handoff_status_json(db: &HcomDb, handoff: &TerminalHandoff) -> serde_json::Va
         "transition": handoff.state.as_str(),
         "source_generation": handoff.source_generation,
         "target_generation": target_generation,
+        "launch_cwd": handoff.workspace,
         "workspace": handoff.workspace,
         "policy": handoff.policy_ref,
         "recovery": {
@@ -411,7 +427,7 @@ fn handoff_human(db: &HcomDb, handoff: &TerminalHandoff) -> Result<String, Hando
     };
     let output = format!(
         "{} state={} version={} transition={} source_generation={} target_generation={}\n\
-         chain={}\nworkspace={}\npolicy={}\n\
+         chain={}\nlaunch_cwd={}\npolicy={}\n\
          recovery_required={} recovery_reason={}\nnext={}",
         handoff.id,
         handoff.state,

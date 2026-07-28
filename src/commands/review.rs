@@ -2,12 +2,15 @@
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use serde_json::json;
+use std::io::Write;
+use std::time::Duration;
 
 use crate::db::HcomDb;
+use crate::handoff::{ChainState, GenerationState};
 use crate::identity;
 use crate::review::{
     DEFAULT_MAX_ROUNDS, MutationRequest, ReviewAction, ReviewActor, ReviewError, ReviewOutcome,
-    ReviewRun, actor_role, get_run, list_runs, mutate_review, start_review,
+    ReviewRun, ReviewState, actor_role, get_run, list_runs, mutate_review, start_review,
 };
 use crate::shared::{CommandContext, SenderKind};
 
@@ -21,6 +24,8 @@ Examples:
 Only these structured commands change review state. Ordinary message text does not.";
 
 const REVIEW_QUIET_WAIT: &str = "The peer notification is queued for automatic delivery. End your turn now; hcom will wake you if another [hcom-review] message arrives. Do not run any hcom command—including `hcom status`, `hcom review status`, `hcom events`, `hcom listen`, or `hcom send`—merely to check progress.";
+const CHAIN_REVIEW_WAIT: &str = "The peer notification is queued. This active hcom chain command remains attached until the reviewer advances the durable workflow; do not submit another user prompt or run a polling command.";
+const CHAIN_REVIEW_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -261,9 +266,14 @@ fn mutate(
     mutate_review(db, actor, id, &request)
 }
 
-fn mutation_output(action: ReviewAction, outcome: &ReviewOutcome) -> String {
+fn mutation_output(action: ReviewAction, outcome: &ReviewOutcome, chain_observer: bool) -> String {
     let replay = if outcome.replayed { " (replayed)" } else { "" };
     let run = &outcome.run;
+    let wait_message = if chain_observer {
+        CHAIN_REVIEW_WAIT
+    } else {
+        REVIEW_QUIET_WAIT
+    };
     match action {
         ReviewAction::RequestChanges => {
             let mut output = format!(
@@ -275,7 +285,7 @@ fn mutation_output(action: ReviewAction, outcome: &ReviewOutcome) -> String {
                     "\nWhile the workflow remains on this round, you may withdraw the finding with:\n  hcom review verdict {} --round {} --lgtm --name {} -- '<summary>'",
                     run.id, run.round, run.reviewer_name
                 ));
-                output.push_str(&format!("\n{REVIEW_QUIET_WAIT}"));
+                output.push_str(&format!("\n{wait_message}"));
             }
             output
         }
@@ -291,7 +301,7 @@ fn mutation_output(action: ReviewAction, outcome: &ReviewOutcome) -> String {
             run.round,
             run.max_rounds,
             replay,
-            REVIEW_QUIET_WAIT
+            wait_message
         ),
         ReviewAction::Cancel => format!("Canceled {}{}.", run.id, replay),
         ReviewAction::Extend => {
@@ -313,7 +323,12 @@ fn mutation_output(action: ReviewAction, outcome: &ReviewOutcome) -> String {
     }
 }
 
-fn start_output(outcome: &ReviewOutcome) -> String {
+fn start_output(outcome: &ReviewOutcome, chain_observer: bool) -> String {
+    let wait_message = if chain_observer {
+        CHAIN_REVIEW_WAIT
+    } else {
+        REVIEW_QUIET_WAIT
+    };
     format!(
         "Started {} reviewer=@{} state={} round={}/{}.\nThread: {}\n{}",
         outcome.run.id,
@@ -322,12 +337,86 @@ fn start_output(outcome: &ReviewOutcome) -> String {
         outcome.run.round,
         outcome.run.max_rounds,
         outcome.run.thread,
-        REVIEW_QUIET_WAIT
+        wait_message
     )
 }
 
-fn print_mutation(action: ReviewAction, outcome: &ReviewOutcome) {
-    println!("{}", mutation_output(action, outcome));
+fn print_mutation(action: ReviewAction, outcome: &ReviewOutcome, chain_observer: bool) {
+    println!("{}", mutation_output(action, outcome, chain_observer));
+}
+
+fn should_attach_chain_observer(
+    db: &HcomDb,
+    ctx: Option<&CommandContext>,
+    actor: &ReviewActor,
+    outcome: &ReviewOutcome,
+) -> bool {
+    if outcome.run.state != ReviewState::AwaitingReview
+        || outcome.run.developer_name != actor.name
+        || outcome.run.developer_session_id != actor.session_id
+    {
+        return false;
+    }
+    let Ok(managed_actor) = crate::commands::handoff::managed_actor_from_ctx(db, ctx) else {
+        return false;
+    };
+    matches!(
+        crate::handoff::current_chain_for_actor(db, &managed_actor),
+        Ok(Some((chain, generation)))
+            if chain.state == ChainState::Active
+                && generation.state == GenerationState::Active
+    )
+}
+
+fn wait_for_review_advance_with<L, W>(
+    initial: &ReviewRun,
+    mut load: L,
+    mut wait: W,
+) -> Result<ReviewRun, ReviewError>
+where
+    L: FnMut() -> Result<Option<ReviewRun>, ReviewError>,
+    W: FnMut(),
+{
+    loop {
+        let current = load()?.ok_or_else(|| {
+            ReviewError::Regular(format!(
+                "Review workflow '{}' disappeared while the chain observer was attached",
+                initial.id
+            ))
+        })?;
+        if current.developer_name != initial.developer_name
+            || current.developer_session_id != initial.developer_session_id
+            || current.reviewer_name != initial.reviewer_name
+            || current.reviewer_session_id != initial.reviewer_session_id
+        {
+            return Err(ReviewError::Conflict(format!(
+                "REVIEW_CONFLICT {} participant identity changed while waiting",
+                initial.id
+            )));
+        }
+        if current.version != initial.version || current.state != ReviewState::AwaitingReview {
+            return Ok(current);
+        }
+        wait();
+    }
+}
+
+fn attach_chain_observer(db: &HcomDb, outcome: &ReviewOutcome) {
+    let _ = std::io::stdout().flush();
+    match wait_for_review_advance_with(
+        &outcome.run,
+        || get_run(db, &outcome.run.id),
+        || std::thread::sleep(CHAIN_REVIEW_POLL_INTERVAL),
+    ) {
+        Ok(current) => println!(
+            "Review {} advanced to state={} round={}/{} version={}; resuming the current chain turn.",
+            current.id, current.state, current.round, current.max_rounds, current.version
+        ),
+        Err(error) => eprintln!(
+            "[hcom] The durable review transition succeeded, but its chain observer detached: {error}. Resume with `hcom review status {}`.",
+            outcome.run.id
+        ),
+    }
 }
 
 pub fn cmd_review(db: &HcomDb, args: &ReviewArgs, ctx: Option<&CommandContext>) -> i32 {
@@ -359,7 +448,11 @@ pub fn cmd_review(db: &HcomDb, args: &ReviewArgs, ctx: Option<&CommandContext>) 
                 start.max_rounds,
             ) {
                 Ok(outcome) => {
-                    println!("{}", start_output(&outcome));
+                    let observe = should_attach_chain_observer(db, ctx, &actor, &outcome);
+                    println!("{}", start_output(&outcome, observe));
+                    if observe {
+                        attach_chain_observer(db, &outcome);
+                    }
                     0
                 }
                 Err(error) => print_error(error),
@@ -383,7 +476,7 @@ pub fn cmd_review(db: &HcomDb, args: &ReviewArgs, ctx: Option<&CommandContext>) 
                 },
             ) {
                 Ok(outcome) => {
-                    print_mutation(action, &outcome);
+                    print_mutation(action, &outcome, false);
                     0
                 }
                 Err(error) => print_error(error),
@@ -407,7 +500,11 @@ pub fn cmd_review(db: &HcomDb, args: &ReviewArgs, ctx: Option<&CommandContext>) 
                 },
             ) {
                 Ok(outcome) => {
-                    print_mutation(review_action, &outcome);
+                    let observe = should_attach_chain_observer(db, ctx, &actor, &outcome);
+                    print_mutation(review_action, &outcome, observe);
+                    if observe {
+                        attach_chain_observer(db, &outcome);
+                    }
                     0
                 }
                 Err(error) => print_error(error),
@@ -468,7 +565,7 @@ pub fn cmd_review(db: &HcomDb, args: &ReviewArgs, ctx: Option<&CommandContext>) 
             },
         ) {
             Ok(outcome) => {
-                print_mutation(ReviewAction::Cancel, &outcome);
+                print_mutation(ReviewAction::Cancel, &outcome, false);
                 0
             }
             Err(error) => print_error(error),
@@ -485,7 +582,7 @@ pub fn cmd_review(db: &HcomDb, args: &ReviewArgs, ctx: Option<&CommandContext>) 
             },
         ) {
             Ok(outcome) => {
-                print_mutation(ReviewAction::Extend, &outcome);
+                print_mutation(ReviewAction::Extend, &outcome, false);
                 0
             }
             Err(error) => print_error(error),
@@ -590,17 +687,84 @@ mod tests {
     #[test]
     fn peer_handoffs_end_the_turn_without_polling() {
         let awaiting_review = outcome(ReviewState::AwaitingReview);
-        assert_quiet_wait(&start_output(&awaiting_review));
-        assert_quiet_wait(&mutation_output(ReviewAction::Fixed, &awaiting_review));
-        assert_quiet_wait(&mutation_output(ReviewAction::Rebut, &awaiting_review));
+        assert_quiet_wait(&start_output(&awaiting_review, false));
+        assert_quiet_wait(&mutation_output(
+            ReviewAction::Fixed,
+            &awaiting_review,
+            false,
+        ));
+        assert_quiet_wait(&mutation_output(
+            ReviewAction::Rebut,
+            &awaiting_review,
+            false,
+        ));
 
         let awaiting_developer = outcome(ReviewState::AwaitingDeveloper);
         assert_quiet_wait(&mutation_output(
             ReviewAction::RequestChanges,
             &awaiting_developer,
+            false,
         ));
 
         let max_rounds = outcome(ReviewState::MaxRounds);
-        assert_quiet_wait(&mutation_output(ReviewAction::RequestChanges, &max_rounds));
+        assert_quiet_wait(&mutation_output(
+            ReviewAction::RequestChanges,
+            &max_rounds,
+            false,
+        ));
+    }
+
+    #[test]
+    fn chain_developer_output_describes_attached_observer() {
+        let awaiting_review = outcome(ReviewState::AwaitingReview);
+        for output in [
+            start_output(&awaiting_review, true),
+            mutation_output(ReviewAction::Fixed, &awaiting_review, true),
+            mutation_output(ReviewAction::Rebut, &awaiting_review, true),
+        ] {
+            assert!(output.contains("remains attached"));
+            assert!(!output.contains("End your turn now"));
+            assert!(output.contains("polling command"));
+        }
+    }
+
+    #[test]
+    fn chain_observer_rechecks_state_before_waiting_to_close_lost_wake() {
+        let initial = outcome(ReviewState::AwaitingReview).run;
+        let mut advanced = initial.clone();
+        advanced.state = ReviewState::Approved;
+        advanced.version = initial.version + 1;
+        let observed = wait_for_review_advance_with(
+            &initial,
+            || Ok(Some(advanced.clone())),
+            || panic!("observer waited after the durable verdict was already visible"),
+        )
+        .unwrap();
+        assert_eq!(observed.state, ReviewState::Approved);
+        assert_eq!(observed.version, 1);
+    }
+
+    #[test]
+    fn chain_observer_ignores_unchanged_reads_then_returns_on_request_changes() {
+        let initial = outcome(ReviewState::AwaitingReview).run;
+        let mut reads = 0;
+        let mut waits = 0;
+        let observed = wait_for_review_advance_with(
+            &initial,
+            || {
+                reads += 1;
+                let mut current = initial.clone();
+                if reads >= 3 {
+                    current.state = ReviewState::AwaitingDeveloper;
+                    current.version += 1;
+                }
+                Ok(Some(current))
+            },
+            || waits += 1,
+        )
+        .unwrap();
+        assert_eq!(reads, 3);
+        assert_eq!(waits, 2);
+        assert_eq!(observed.state, ReviewState::AwaitingDeveloper);
     }
 }

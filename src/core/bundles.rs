@@ -4,12 +4,515 @@
 //! Used by `hcom bundle` and `hcom send --title`.
 
 use rand::RngExt;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::Path;
+use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use super::detail_levels::validate_detail_level;
 use crate::shared::errors::HcomError;
 use crate::shared::{SenderIdentity, SenderKind};
+
+pub const MAX_BUNDLE_REPOSITORIES: usize = 16;
+const MAX_REPOSITORY_PATH_BYTES: usize = 4096;
+const MAX_REPOSITORY_FIELD_BYTES: usize = 1024;
+const MAX_GIT_SNAPSHOT_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_UNTRACKED_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositorySnapshot {
+    pub root: String,
+    pub revision: String,
+    pub branch: String,
+    pub dirty_summary: String,
+    pub state_digest: String,
+}
+
+fn framed_hash_update(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn finalize_hex(hasher: Sha256) -> String {
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn bounded_git_output(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("git metadata is unavailable: {error}"))?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("git snapshot output pipe is unavailable".to_string());
+    };
+    let mut output = Vec::new();
+    let read_result = stdout
+        .take((MAX_GIT_SNAPSHOT_OUTPUT_BYTES + 1) as u64)
+        .read_to_end(&mut output);
+    if let Err(error) = read_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("git snapshot output cannot be read: {error}"));
+    }
+    if output.len() > MAX_GIT_SNAPSHOT_OUTPUT_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!(
+            "git snapshot output exceeds the {} byte bound for '{}'",
+            MAX_GIT_SNAPSHOT_OUTPUT_BYTES,
+            root.display()
+        ));
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("git metadata process cannot be reaped: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "git metadata cannot be resolved for '{}'",
+            root.display(),
+        ));
+    }
+    Ok(output)
+}
+
+fn clean_git_text(bytes: Vec<u8>, field: &str, max_bytes: usize) -> Result<String, String> {
+    let value = String::from_utf8(bytes).map_err(|_| format!("{field} must be valid UTF-8"))?;
+    let value = value.trim_end_matches(['\r', '\n']);
+    if value.is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
+        return Err(format!(
+            "{field} is empty, unbounded, or contains control bytes"
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn canonical_repository_root(path: &Path) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        format!(
+            "repository path '{}' is unavailable: {error}",
+            path.display()
+        )
+    })?;
+    let top_level = clean_git_text(
+        bounded_git_output(&canonical, &["rev-parse", "--show-toplevel"])?,
+        "repository root",
+        MAX_REPOSITORY_PATH_BYTES,
+    )?;
+    let root = std::fs::canonicalize(&top_level).map_err(|error| {
+        format!(
+            "repository root '{}' cannot be canonicalized: {error}",
+            top_level
+        )
+    })?;
+    let root_text = root
+        .to_str()
+        .ok_or_else(|| "repository root must be valid UTF-8".to_string())?;
+    if root_text.is_empty() || root_text.len() > MAX_REPOSITORY_PATH_BYTES {
+        return Err("repository root exceeds the path bound".to_string());
+    }
+    Ok(root)
+}
+
+fn repository_branch(root: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .map_err(|error| format!("git branch metadata is unavailable: {error}"))?;
+    if output.status.success() {
+        clean_git_text(
+            output.stdout,
+            "repository branch",
+            MAX_REPOSITORY_FIELD_BYTES,
+        )
+    } else if output.status.code() == Some(1) {
+        Ok("(detached)".to_string())
+    } else {
+        Err(format!(
+            "git branch metadata cannot be resolved for '{}'",
+            root.display()
+        ))
+    }
+}
+
+fn dirty_summary(status: &[u8]) -> Result<String, String> {
+    let mut staged = 0usize;
+    let mut unstaged = 0usize;
+    let mut untracked = 0usize;
+    let mut conflicted = 0usize;
+    let mut records = status
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty());
+    while let Some(record) = records.next() {
+        if record.len() < 3 || record[2] != b' ' {
+            return Err("repository git status output is malformed".to_string());
+        }
+        let x = record[0];
+        let y = record[1];
+        if x == b'?' && y == b'?' {
+            untracked += 1;
+            continue;
+        }
+        if matches!(
+            (x, y),
+            (b'D', b'D')
+                | (b'A', b'U')
+                | (b'U', b'D')
+                | (b'U', b'A')
+                | (b'D', b'U')
+                | (b'A', b'A')
+                | (b'U', b'U')
+        ) {
+            conflicted += 1;
+            continue;
+        }
+        if x != b' ' {
+            staged += 1;
+        }
+        if y != b' ' {
+            unstaged += 1;
+        }
+        if matches!(x, b'R' | b'C') || matches!(y, b'R' | b'C') {
+            let Some(path_record) = records.next() else {
+                return Err("repository git rename status is incomplete".to_string());
+            };
+            if path_record.is_empty() {
+                return Err("repository git rename status is incomplete".to_string());
+            }
+        }
+    }
+    Ok(format!(
+        "staged={staged},unstaged={unstaged},untracked={untracked},conflicted={conflicted}"
+    ))
+}
+
+#[cfg(unix)]
+fn path_from_git_bytes(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()))
+}
+
+#[cfg(not(unix))]
+fn path_from_git_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
+#[cfg(unix)]
+fn os_path_bytes(path: &Path) -> &[u8] {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes()
+}
+
+#[cfg(not(unix))]
+fn os_path_bytes(path: &Path) -> &[u8] {
+    path.to_str().unwrap_or("").as_bytes()
+}
+
+fn validate_relative_git_path(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err("repository snapshot contains an empty path".to_string());
+    }
+    for component in path.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err("repository snapshot path escapes its root".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn hash_untracked_files(root: &Path, paths: &[u8], hasher: &mut Sha256) -> Result<(), String> {
+    let mut total_bytes = 0u64;
+    for raw in paths
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let relative = path_from_git_bytes(raw);
+        validate_relative_git_path(&relative)?;
+        framed_hash_update(hasher, raw);
+        let path = root.join(&relative);
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            format!(
+                "untracked repository path '{}' changed during snapshot: {error}",
+                path.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            framed_hash_update(hasher, b"symlink");
+            let target = std::fs::read_link(&path).map_err(|error| {
+                format!(
+                    "untracked symlink '{}' changed during snapshot: {error}",
+                    path.display()
+                )
+            })?;
+            framed_hash_update(hasher, os_path_bytes(&target));
+        } else if metadata.is_file() {
+            framed_hash_update(hasher, b"file");
+            let mut file = File::open(&path).map_err(|error| {
+                format!(
+                    "untracked file '{}' changed during snapshot: {error}",
+                    path.display()
+                )
+            })?;
+            let mut buffer = [0u8; 64 * 1024];
+            let mut file_hasher = Sha256::new();
+            loop {
+                let read = file.read(&mut buffer).map_err(|error| {
+                    format!(
+                        "untracked file '{}' changed during snapshot: {error}",
+                        path.display()
+                    )
+                })?;
+                if read == 0 {
+                    break;
+                }
+                total_bytes = total_bytes.checked_add(read as u64).ok_or_else(|| {
+                    "untracked repository content exceeds the snapshot bound".to_string()
+                })?;
+                if total_bytes > MAX_UNTRACKED_SNAPSHOT_BYTES {
+                    return Err(format!(
+                        "untracked repository content exceeds the {} byte snapshot bound",
+                        MAX_UNTRACKED_SNAPSHOT_BYTES
+                    ));
+                }
+                file_hasher.update(&buffer[..read]);
+            }
+            framed_hash_update(hasher, &file_hasher.finalize());
+        } else {
+            return Err(format!(
+                "untracked repository path '{}' has an unsupported file type",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_initialized_submodules_are_clean(root: &Path) -> Result<(), String> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "submodule",
+            "foreach",
+            "--recursive",
+            "--quiet",
+            "test -z \"$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)\"",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("git submodule metadata is unavailable: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "repository '{}' has a dirty or unreadable initialized submodule",
+            root.display()
+        ));
+    }
+    Ok(())
+}
+
+pub fn snapshot_repository(path: &Path) -> Result<RepositorySnapshot, String> {
+    #[cfg(test)]
+    let _env_read = crate::hooks::test_helpers::process_env_read();
+    let root = canonical_repository_root(path)?;
+    let root_text = root
+        .to_str()
+        .ok_or_else(|| "repository root must be valid UTF-8".to_string())?
+        .to_string();
+    let revision = clean_git_text(
+        bounded_git_output(&root, &["rev-parse", "--verify", "HEAD"])?,
+        "repository revision",
+        MAX_REPOSITORY_FIELD_BYTES,
+    )?;
+    let branch = repository_branch(&root)?;
+    let status = bounded_git_output(
+        &root,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+    )?;
+    let dirty_summary = dirty_summary(&status)?;
+    let unstaged = bounded_git_output(
+        &root,
+        &[
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=none",
+            "--",
+        ],
+    )?;
+    let staged = bounded_git_output(
+        &root,
+        &[
+            "diff",
+            "--cached",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=none",
+            "--",
+        ],
+    )?;
+    let untracked =
+        bounded_git_output(&root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    let submodules = bounded_git_output(&root, &["submodule", "status", "--recursive"])?;
+    ensure_initialized_submodules_are_clean(&root)?;
+
+    let mut hasher = Sha256::new();
+    for part in [
+        revision.as_bytes(),
+        branch.as_bytes(),
+        status.as_slice(),
+        unstaged.as_slice(),
+        staged.as_slice(),
+        submodules.as_slice(),
+    ] {
+        framed_hash_update(&mut hasher, part);
+    }
+    hash_untracked_files(&root, &untracked, &mut hasher)?;
+    let state_digest = finalize_hex(hasher);
+    Ok(RepositorySnapshot {
+        root: root_text,
+        revision,
+        branch,
+        dirty_summary,
+        state_digest,
+    })
+}
+
+pub fn normalize_bundle_repositories(bundle: &mut Value, base: &Path) -> Result<(), String> {
+    let Some(raw_repositories) = bundle.get("repositories").cloned() else {
+        return Ok(());
+    };
+    let repositories = raw_repositories
+        .as_array()
+        .ok_or("repositories must be a list")?;
+    if repositories.len() > MAX_BUNDLE_REPOSITORIES {
+        return Err(format!(
+            "repositories exceeds the {} entry bound",
+            MAX_BUNDLE_REPOSITORIES
+        ));
+    }
+    let mut snapshots = Vec::with_capacity(repositories.len());
+    for repository in repositories {
+        let raw = match repository {
+            Value::String(path) => path.as_str(),
+            Value::Object(object) => object
+                .get("root")
+                .and_then(Value::as_str)
+                .ok_or("repository snapshot object must contain a string root")?,
+            _ => return Err("repository entries must be paths or snapshot objects".to_string()),
+        };
+        if raw.is_empty() || raw.len() > MAX_REPOSITORY_PATH_BYTES {
+            return Err("repository path is empty or exceeds the path bound".to_string());
+        }
+        let path = Path::new(raw);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            base.join(path)
+        };
+        snapshots.push(snapshot_repository(&path)?);
+    }
+    snapshots.sort_by(|left, right| left.root.cmp(&right.root));
+    if snapshots
+        .windows(2)
+        .any(|pair| pair[0].root == pair[1].root)
+    {
+        return Err("repositories contains the same canonical Git root more than once".to_string());
+    }
+    bundle["repositories"] = serde_json::to_value(snapshots).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub fn repository_snapshots(bundle: &Value) -> Result<Vec<RepositorySnapshot>, String> {
+    let Some(value) = bundle.get("repositories") else {
+        return Ok(Vec::new());
+    };
+    let snapshots: Vec<RepositorySnapshot> = serde_json::from_value(value.clone())
+        .map_err(|error| format!("repositories contains invalid snapshot metadata: {error}"))?;
+    if snapshots.len() > MAX_BUNDLE_REPOSITORIES {
+        return Err(format!(
+            "repositories exceeds the {} entry bound",
+            MAX_BUNDLE_REPOSITORIES
+        ));
+    }
+    let mut previous: Option<&str> = None;
+    for snapshot in &snapshots {
+        if snapshot.root.is_empty()
+            || snapshot.root.len() > MAX_REPOSITORY_PATH_BYTES
+            || !Path::new(&snapshot.root).is_absolute()
+            || snapshot.revision.is_empty()
+            || snapshot.revision.len() > MAX_REPOSITORY_FIELD_BYTES
+            || snapshot.branch.is_empty()
+            || snapshot.branch.len() > MAX_REPOSITORY_FIELD_BYTES
+            || snapshot.dirty_summary.is_empty()
+            || snapshot.dirty_summary.len() > MAX_REPOSITORY_FIELD_BYTES
+            || snapshot.state_digest.len() != 64
+            || !snapshot
+                .state_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(
+                "repositories contains unbounded or malformed snapshot metadata".to_string(),
+            );
+        }
+        if previous.is_some_and(|root| root >= snapshot.root.as_str()) {
+            return Err(
+                "repositories must contain unique canonical roots in sorted order".to_string(),
+            );
+        }
+        previous = Some(&snapshot.root);
+    }
+    Ok(snapshots)
+}
+
+pub fn repository_manifest_digest(snapshots: &[RepositorySnapshot]) -> Result<String, String> {
+    let canonical = serde_json::to_vec(snapshots).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    framed_hash_update(&mut hasher, &canonical);
+    Ok(finalize_hex(hasher))
+}
+
+pub fn verify_bundle_repositories(bundle: &Value) -> Result<Vec<RepositorySnapshot>, String> {
+    let expected = repository_snapshots(bundle)?;
+    for snapshot in &expected {
+        let current = snapshot_repository(Path::new(&snapshot.root))?;
+        if current != *snapshot {
+            return Err(format!(
+                "repository '{}' changed after the bundle snapshot",
+                snapshot.root
+            ));
+        }
+    }
+    Ok(expected)
+}
 
 /// Parse comma-separated list into list of non-empty trimmed strings.
 pub fn parse_csv_list(raw: Option<&str>) -> Vec<String> {
@@ -231,6 +734,7 @@ pub fn validate_bundle(bundle: &mut Value) -> Result<(), String> {
     {
         return Err("extends must be a string".into());
     }
+    repository_snapshots(&Value::Object(obj.clone()))?;
     // Note: parent bundle existence check requires DB access.
     // Call validate_extends_reference() separately when DB is available.
 
@@ -293,6 +797,21 @@ pub fn create_bundle_event(
     created_by: Option<&str>,
     db: &crate::db::HcomDb,
 ) -> Result<String, HcomError> {
+    match bundle.get("repositories") {
+        Some(Value::Array(repositories)) if repositories.is_empty() => {
+            normalize_bundle_repositories(bundle, Path::new("."))
+                .map_err(HcomError::InvalidInput)?;
+        }
+        Some(_) => {
+            let base = std::env::current_dir().map_err(|error| {
+                HcomError::InvalidInput(format!(
+                    "Cannot resolve bundle creation directory: {error}"
+                ))
+            })?;
+            normalize_bundle_repositories(bundle, &base).map_err(HcomError::InvalidInput)?;
+        }
+        None => {}
+    }
     validate_bundle(bundle).map_err(HcomError::InvalidInput)?;
     validate_extends_reference(bundle, db);
 
@@ -327,6 +846,7 @@ pub fn parse_inline_bundle_flags(argv: &[String]) -> Result<(Option<Value>, Vec<
         "--files",
         "--transcript",
         "--extends",
+        "--repos",
     ];
 
     let has_any = bundle_flags.iter().any(|f| argv.contains(&f.to_string()));
@@ -390,6 +910,7 @@ pub fn parse_inline_bundle_flags(argv: &[String]) -> Result<(Option<Value>, Vec<
     let events = parse_csv_list(flag_values.get("--events").and_then(|v| v.as_deref()));
     let files = parse_csv_list(flag_values.get("--files").and_then(|v| v.as_deref()));
     let transcript = parse_csv_list(flag_values.get("--transcript").and_then(|v| v.as_deref()));
+    let repositories = parse_csv_list(flag_values.get("--repos").and_then(|v| v.as_deref()));
 
     let mut bundle = serde_json::json!({
         "title": title,
@@ -398,7 +919,8 @@ pub fn parse_inline_bundle_flags(argv: &[String]) -> Result<(Option<Value>, Vec<
             "events": events,
             "files": files,
             "transcript": transcript,
-        }
+        },
+        "repositories": repositories,
     });
 
     if let Some(extends) = flag_values.get("--extends").and_then(|v| v.clone()) {
@@ -419,6 +941,37 @@ pub fn is_file_op_context(context: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let _env_read = crate::hooks::test_helpers::process_env_read();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn repository(dir: &TempDir, name: &str) -> PathBuf {
+        let root = dir.path().join(name);
+        std::fs::create_dir(&root).unwrap();
+        run_git(&root, &["init", "-b", "main"]);
+        run_git(&root, &["config", "user.name", "hcom test"]);
+        run_git(
+            &root,
+            &["config", "user.email", "hcom-test@example.invalid"],
+        );
+        std::fs::write(root.join("tracked.txt"), "base\n").unwrap();
+        run_git(&root, &["add", "tracked.txt"]);
+        run_git(&root, &["commit", "-m", "base"]);
+        root
+    }
 
     // ===== parse_csv_list =====
 
@@ -541,6 +1094,79 @@ mod tests {
     }
 
     #[test]
+    fn repository_snapshot_detects_content_changes_with_identical_dirty_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = repository(&dir, "repo");
+        std::fs::write(root.join("tracked.txt"), "first dirty value\n").unwrap();
+        std::fs::write(root.join("untracked.txt"), "first untracked value\n").unwrap();
+        let first = snapshot_repository(&root).unwrap();
+        let bundle = serde_json::json!({"repositories": [first.clone()]});
+
+        std::fs::write(root.join("tracked.txt"), "second dirty value\n").unwrap();
+        std::fs::write(root.join("untracked.txt"), "second untracked value\n").unwrap();
+        let second = snapshot_repository(&root).unwrap();
+
+        assert_eq!(first.revision, second.revision);
+        assert_eq!(first.branch, second.branch);
+        assert_eq!(first.dirty_summary, second.dirty_summary);
+        assert_ne!(first.state_digest, second.state_digest);
+        assert!(verify_bundle_repositories(&bundle).is_err());
+    }
+
+    #[test]
+    fn repository_snapshot_rejects_dirty_submodules_instead_of_missing_their_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = repository(&dir, "parent");
+        let child = repository(&dir, "child-source");
+        run_git(
+            &parent,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                child.to_str().unwrap(),
+                "child",
+            ],
+        );
+        run_git(&parent, &["commit", "-am", "add submodule"]);
+        snapshot_repository(&parent).unwrap();
+
+        std::fs::write(
+            parent.join("child/tracked.txt"),
+            "dirty submodule content\n",
+        )
+        .unwrap();
+        let error = snapshot_repository(&parent).unwrap_err();
+        assert!(
+            error.contains("dirty or unreadable initialized submodule"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn bundle_repository_snapshots_support_zero_or_multiple_external_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let launch_cwd = dir.path().join("non-git-launch");
+        std::fs::create_dir(&launch_cwd).unwrap();
+        let later = repository(&dir, "z-repository");
+        let earlier = repository(&dir, "a-repository");
+
+        let mut zero = serde_json::json!({"repositories": []});
+        normalize_bundle_repositories(&mut zero, &launch_cwd).unwrap();
+        assert!(repository_snapshots(&zero).unwrap().is_empty());
+
+        let mut multiple = serde_json::json!({
+            "repositories": [later, earlier],
+        });
+        normalize_bundle_repositories(&mut multiple, &launch_cwd).unwrap();
+        let snapshots = repository_snapshots(&multiple).unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots[0].root < snapshots[1].root);
+        verify_bundle_repositories(&multiple).unwrap();
+    }
+
+    #[test]
     fn test_validate_bundle_missing_title() {
         let mut bundle = serde_json::json!({
             "description": "Testing",
@@ -606,12 +1232,16 @@ mod tests {
             "a.py".into(),
             "--transcript".into(),
             "1:normal".into(),
+            "--repos".into(),
+            "/repo/one,/repo/two".into(),
         ];
         let (bundle, remaining) = parse_inline_bundle_flags(&argv).unwrap();
         assert!(bundle.is_some());
         let b = bundle.unwrap();
         assert_eq!(b["title"], "Test");
         assert_eq!(b["description"], "Desc");
+        assert_eq!(b["repositories"][0], "/repo/one");
+        assert_eq!(b["repositories"][1], "/repo/two");
         assert!(remaining.is_empty());
     }
 
