@@ -165,7 +165,7 @@ pub struct BundleCreateArgs {
     /// Comma-separated file paths
     #[arg(long)]
     pub files: Option<String>,
-    /// Comma-separated Git repositories to snapshot as handoff metadata
+    /// Comma-separated Git repositories to snapshot as bundle metadata
     #[arg(long = "repos")]
     pub repositories: Option<String>,
     /// Transcript ranges (e.g., "3-14:normal,6:full")
@@ -954,7 +954,7 @@ fn cmd_bundle_prepare(db: &HcomDb, args: &BundlePrepareArgs, ctx: Option<&Comman
             "events": categories_json,
             "files": all_files,
             "template_command": template_command,
-            "note": format!("Last {} transcript entries, {} events per category. For a chain handoff, add --repos with zero or more explicit Git roots; this never changes the chain launch directory.", last_transcript, last_events),
+            "note": format!("Last {} transcript entries, {} events per category. Add --repos with zero or more explicit Git roots when repository state must be pinned; this never changes the current launch directory.", last_transcript, last_events),
         });
         println!(
             "{}",
@@ -989,7 +989,7 @@ summerise specific transcript ranges and events. give deep insight so another ag
 everything you know about this. what happened, decisions, current state, issues, plans, etc.\n"
         );
         println!(
-            "- For a chain handoff, add --repos \"/absolute/repo-a,/absolute/repo-b\" when code repositories must be pinned. Repositories are bundle metadata and never change the agent launch directory.\n"
+            "- Add --repos \"/absolute/repo-a,/absolute/repo-b\" when code repositories must be pinned. Repositories are bundle metadata and never change the current launch directory.\n"
         );
         println!("A good bundle includes everything relevant and nothing irrelevant.\n");
         println!("View: hcom transcript {agent} [--range N-N] [--full|--detailed]");

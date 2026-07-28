@@ -253,7 +253,7 @@ const SEND_HELP: &[HelpEntry] = &[
     ),
     (
         "  --repos <paths>",
-        "Snapshot explicit Git roots without changing the chain launch directory",
+        "Snapshot explicit Git roots without changing the current launch directory",
     ),
     ("  --extends <id>", "Parent bundle (optional)"),
     ("", "See 'hcom bundle --help' for bundle details"),
@@ -308,70 +308,6 @@ const REVIEW_HELP: &[HelpEntry] = &[
         "Only structured review commands change state; ordinary message text never does.",
     ),
     ("", "Supports local top-level Claude/Codex agents in v1."),
-];
-
-const HANDOFF_HELP: &[HelpEntry] = &[
-    (
-        "handoff prepare --bundle-event EVENT_ID [--json]",
-        "Prepare from one exact numeric bundle event",
-    ),
-    (
-        "handoff commit ID --version VERSION [--json]",
-        "Commit with expected-version CAS",
-    ),
-    (
-        "handoff abort ID --version VERSION [--json] -- REASON",
-        "Abort a prepared handoff",
-    ),
-    (
-        "handoff status [ID] [--json]",
-        "Show sanitized typed handoff metadata",
-    ),
-    (
-        "handoff inspect ID --version VERSION [--json]",
-        "Read and validate the bounded bundle and project instructions",
-    ),
-    (
-        "handoff accept ID --version VERSION [--json]",
-        "Explicitly accept after exact target validation",
-    ),
-    (
-        "handoff reject ID --version VERSION [--json] -- REASON",
-        "Reject as the exact ready target",
-    ),
-    ("", ""),
-    (
-        "",
-        "Mutations require the exact managed generation; status also supports the owning foreground terminal.",
-    ),
-];
-
-const CHAIN_HELP: &[HelpEntry] = &[
-    (
-        "chain codex [--tag TAG] --model MODEL --reasoning LEVEL --sandbox MODE --approval MODE",
-        "Start one fresh Codex 0.145.0 in this exact foreground terminal",
-    ),
-    (
-        "chain status [CHAIN_ID] [--json]",
-        "Show sanitized typed chain metadata",
-    ),
-    (
-        "chain recover CHAIN_ID --version VERSION [--json]",
-        "Re-enter after exact old-process absence proof",
-    ),
-    ("", ""),
-    (
-        "",
-        "Fresh create only: no resume, fork, background, remote, relay, or new terminal.",
-    ),
-    (
-        "",
-        "Optional --tag is immutable across generations; reasoning supports minimal, low, medium, high, xhigh, and max.",
-    ),
-    (
-        "",
-        "Handoffs occur only after an explicit typed request and the exact Stop/task_complete gates.",
-    ),
 ];
 
 const BUNDLE_HELP: &[HelpEntry] = &[
@@ -445,7 +381,7 @@ const BUNDLE_HELP: &[HelpEntry] = &[
     ),
     (
         "  --repos <paths>",
-        "Comma-separated Git roots to snapshot; never changes the chain launch directory",
+        "Comma-separated Git roots to snapshot; never changes the current launch directory",
     ),
     ("  --extends <id>", "Parent bundle for chaining"),
     ("  --bundle JSON", "Create from JSON payload"),
@@ -948,8 +884,6 @@ fn format_entries(entries: &[HelpEntry]) -> Vec<String> {
 pub const COMMAND_NAMES: &[&str] = &[
     "send",
     "review",
-    "handoff",
-    "chain",
     "list",
     "events",
     "stop",
@@ -1029,8 +963,6 @@ Launch:\n\
 Commands:\n\
   send         Send message to your buddies\n\
   review       Review/fix/re-review until LGTM or a round limit\n\
-  handoff      Typed same-terminal handoff state transitions\n\
-  chain        Inspect same-terminal handoff chain state\n\
   listen       Block until message or event arrives\n\
   list         Show agents, status, unread counts\n\
   events       Query event stream, manage subscriptions\n\
@@ -1151,8 +1083,6 @@ pub fn get_command_help(name: &str) -> String {
         "list" => Some(LIST_HELP),
         "send" => Some(SEND_HELP),
         "review" => Some(REVIEW_HELP),
-        "handoff" => Some(HANDOFF_HELP),
-        "chain" => Some(CHAIN_HELP),
         "bundle" => Some(BUNDLE_HELP),
         "stop" => Some(STOP_HELP),
         "start" => Some(START_HELP),
@@ -1265,8 +1195,6 @@ mod tests {
         let commands = [
             "send",
             "review",
-            "handoff",
-            "chain",
             "list",
             "events",
             "stop",
@@ -1322,7 +1250,7 @@ mod tests {
         let help = get_command_help("bundle");
         for expected in [
             "--repos <paths>",
-            "never changes the chain launch directory",
+            "never changes the current launch directory",
             "\"repositories\": [\"/absolute/repo-a\", \"/absolute/repo-b\"]",
             "Transcript entries to suggest (default: 40)",
             "Events to scan per category (default: 10)",

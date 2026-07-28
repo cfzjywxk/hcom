@@ -5,16 +5,12 @@
 //! as a side-channel for messaging and coordination with other agents.
 
 mod bootstrap;
-mod chain_control;
 mod cli_context;
-mod codex_chain;
-mod codex_chain_adapter;
 pub mod commands;
 mod config;
 pub mod core;
 mod db;
 mod delivery;
-pub mod handoff;
 pub mod hooks;
 pub mod identity;
 mod instance_binding;
@@ -31,7 +27,6 @@ mod pidtrack;
 mod pty;
 pub mod relay;
 mod review;
-pub mod review_worker;
 pub mod router;
 mod runtime_env;
 pub mod scripts;

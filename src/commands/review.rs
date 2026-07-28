@@ -6,7 +6,6 @@ use std::io::Write;
 use std::time::Duration;
 
 use crate::db::HcomDb;
-use crate::handoff::{ChainState, GenerationState};
 use crate::identity;
 use crate::review::{
     DEFAULT_MAX_ROUNDS, MutationRequest, ReviewAction, ReviewActor, ReviewError, ReviewOutcome,
@@ -380,32 +379,20 @@ fn current_process_has_delivery_binding(db: &HcomDb, actor: &ReviewActor) -> boo
 fn should_attach_review_observer_with(
     actor: &ReviewActor,
     outcome: &ReviewOutcome,
-    active_chain: bool,
     current_process_has_delivery: bool,
 ) -> bool {
-    actor_waits_for_peer(actor, outcome) && (active_chain || !current_process_has_delivery)
+    actor_waits_for_peer(actor, outcome) && !current_process_has_delivery
 }
 
 fn should_attach_review_observer(
     db: &HcomDb,
-    ctx: Option<&CommandContext>,
+    _ctx: Option<&CommandContext>,
     actor: &ReviewActor,
     outcome: &ReviewOutcome,
 ) -> bool {
-    let active_chain = crate::commands::handoff::managed_actor_from_ctx(db, ctx)
-        .ok()
-        .is_some_and(|managed_actor| {
-            matches!(
-                crate::handoff::current_chain_for_actor(db, &managed_actor),
-                Ok(Some((chain, generation)))
-                    if chain.state == ChainState::Active
-                        && generation.state == GenerationState::Active
-            )
-        });
     should_attach_review_observer_with(
         actor,
         outcome,
-        active_chain,
         current_process_has_delivery_binding(db, actor),
     )
 }
@@ -813,41 +800,33 @@ mod tests {
     fn observer_policy_preserves_async_delivery_and_covers_hook_only_callers() {
         let awaiting_review = outcome(ReviewState::AwaitingReview);
         assert!(
-            should_attach_review_observer_with(&developer_actor(), &awaiting_review, false, false),
+            should_attach_review_observer_with(&developer_actor(), &awaiting_review, false),
             "a hook-only developer has no transport that can wake a new turn"
         );
         assert!(
-            !should_attach_review_observer_with(&developer_actor(), &awaiting_review, false, true),
+            !should_attach_review_observer_with(&developer_actor(), &awaiting_review, true),
             "an ordinary hcom-launched agent retains asynchronous delivery"
-        );
-        assert!(
-            should_attach_review_observer_with(&developer_actor(), &awaiting_review, true, true),
-            "a same-terminal chain always requires same-tool-call continuity"
         );
 
         let awaiting_developer = outcome(ReviewState::AwaitingDeveloper);
         assert!(should_attach_review_observer_with(
             &reviewer_actor(),
             &awaiting_developer,
-            false,
             false
         ));
         assert!(should_attach_review_observer_with(
             &reviewer_actor(),
             &outcome(ReviewState::MaxRounds),
-            false,
             false
         ));
         assert!(!should_attach_review_observer_with(
             &developer_actor(),
             &awaiting_developer,
-            false,
             false
         ));
         assert!(!should_attach_review_observer_with(
             &reviewer_actor(),
             &outcome(ReviewState::Approved),
-            false,
             false
         ));
     }

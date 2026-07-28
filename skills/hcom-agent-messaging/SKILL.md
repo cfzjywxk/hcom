@@ -123,11 +123,10 @@ agents follow these rules from their bootstrap:
 `[hcom-review]` is the exception: it is a structured protocol, so use only the exact
 `hcom review` command in the message. Do not ACK it with `hcom send`. After a successful
 review command ordinarily leaves the peer responsible for the next action, end the turn and
-wait for automatic delivery; do not run any hcom command merely to check progress. If an
-active same-terminal chain developer's `review start`, `review fixed`, or `review rebut`
-command says its observer remains attached, keep waiting on that same foreground tool
-process until it exits; its return resumes the same turn with the peer transition. Status,
-events, listen, and send remain available for explicit troubleshooting and recovery.
+wait for automatic delivery; do not run any hcom command merely to check progress. If a
+review command says its observer remains attached, keep waiting on that same foreground
+tool process until it exits; its return resumes the same turn with the peer transition.
+Status, events, listen, and send remain available for explicit troubleshooting and recovery.
 
 ### sandbox / permission issues
 

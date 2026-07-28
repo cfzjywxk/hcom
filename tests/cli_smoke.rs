@@ -51,7 +51,7 @@ fn fixture_drop_terminates_registered_process_group() {
 }
 
 #[test]
-fn help_prints_and_exits_zero() {
+fn top_level_help_preserves_retained_commands_and_omits_stale_commands() {
     let h = Hcom::new();
     let (code, stdout, _stderr) = h.run(["--help"]);
     assert_eq!(code, 0, "stdout={stdout}");
@@ -60,8 +60,62 @@ fn help_prints_and_exits_zero() {
         stdout.contains("Commands:") || stdout.contains("Launch:"),
         "stdout={stdout}"
     );
-    assert!(stdout.contains("handoff"), "stdout={stdout}");
-    assert!(stdout.contains("chain"), "stdout={stdout}");
+    let commands: Vec<_> = stdout
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    for retained in [
+        "send",
+        "review",
+        "listen",
+        "list",
+        "events",
+        "bundle",
+        "transcript",
+        "start",
+        "stop",
+        "config",
+        "run",
+        "relay",
+        "archive",
+        "reset",
+        "hooks",
+        "status",
+        "term",
+        "update",
+    ] {
+        assert!(
+            commands.contains(&retained),
+            "missing retained command {retained}: stdout={stdout}"
+        );
+    }
+    for stale in ["handoff", "chain"] {
+        assert!(
+            !commands.contains(&stale),
+            "stale top-level command {stale} remains: stdout={stdout}"
+        );
+    }
+}
+
+#[test]
+fn stale_top_level_commands_are_unknown_without_opening_v24_state() {
+    let h = Hcom::new();
+    let db_path = h.path().join("hcom.db");
+    assert!(!db_path.exists());
+
+    for stale in ["handoff", "chain"] {
+        let (code, stdout, stderr) = h.run([stale, "--help"]);
+        assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
+        assert!(stdout.is_empty(), "stdout={stdout}");
+        assert!(
+            stderr.contains(&format!("Unknown command '{stale}'")),
+            "stderr={stderr}"
+        );
+        assert!(
+            !db_path.exists(),
+            "unknown stale command must not initialize v24 state"
+        );
+    }
 }
 
 #[test]
@@ -72,7 +126,7 @@ fn bundle_and_send_help_expose_repository_snapshot_contract() {
         assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
         assert!(stdout.contains("--repos <paths>"), "stdout={stdout}");
         assert!(
-            stdout.contains("never changes the chain launch directory"),
+            stdout.contains("never changes the current launch directory"),
             "stdout={stdout}"
         );
         assert!(stdout.contains("\"repositories\""), "stdout={stdout}");
@@ -94,115 +148,8 @@ fn bundle_and_send_help_expose_repository_snapshot_contract() {
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     assert!(stdout.contains("--repos <paths>"), "stdout={stdout}");
     assert!(
-        stdout.contains("without changing the chain launch directory"),
+        stdout.contains("without changing the current launch directory"),
         "stdout={stdout}"
-    );
-}
-
-#[test]
-fn handoff_and_chain_help_expose_phase4_public_surface_only() {
-    let h = Hcom::new();
-    let (code, handoff_help, stderr) = h.run(["handoff", "--help"]);
-    assert_eq!(code, 0, "stdout={handoff_help} stderr={stderr}");
-    for command in [
-        "prepare", "commit", "abort", "status", "inspect", "accept", "reject",
-    ] {
-        assert!(handoff_help.contains(command), "stdout={handoff_help}");
-    }
-    assert!(
-        handoff_help.contains("exact managed generation")
-            && handoff_help.contains("owning foreground terminal"),
-        "stdout={handoff_help}"
-    );
-
-    let (code, chain_help, stderr) = h.run(["chain", "--help"]);
-    assert_eq!(code, 0, "stdout={chain_help} stderr={stderr}");
-    for command in [
-        "hcom chain codex",
-        "hcom chain status",
-        "hcom chain recover",
-    ] {
-        assert!(chain_help.contains(command), "stdout={chain_help}");
-    }
-    for forbidden in [
-        "hcom chain start",
-        "hcom chain resume",
-        "hcom chain fork",
-        "hcom chain claude",
-        "hcom chain gemini",
-        "hcom chain opencode",
-        "hcom chain kilo",
-        "hcom chain pi",
-        "hcom chain omp",
-        "hcom chain cursor",
-        "hcom chain copilot",
-        "hcom chain kimi",
-        "hcom chain antigravity",
-    ] {
-        assert!(!chain_help.contains(forbidden), "stdout={chain_help}");
-    }
-    assert!(
-        chain_help.contains("Fresh create only") && chain_help.contains("Stop/task_complete gates"),
-        "stdout={chain_help}"
-    );
-    let (code, codex_help, stderr) = h.run(["chain", "codex", "--help"]);
-    assert_eq!(code, 0, "stdout={codex_help} stderr={stderr}");
-    assert!(codex_help.contains("--tag"), "stdout={codex_help}");
-    assert!(codex_help.contains("max"), "stdout={codex_help}");
-}
-
-#[test]
-fn public_chain_process_actions_require_an_unmanaged_foreground_tty() {
-    let h = Hcom::new();
-    let (code, stdout, stderr) = h.run([
-        "chain",
-        "codex",
-        "--tag",
-        "dev1",
-        "--model",
-        "gpt-5.5",
-        "--reasoning",
-        "max",
-        "--sandbox",
-        "workspace-write",
-        "--approval",
-        "on-request",
-    ]);
-    assert_eq!(code, 2, "stdout={stdout} stderr={stderr}");
-    assert!(stdout.is_empty(), "stdout={stdout}");
-    assert!(stderr.contains("foreground terminal"), "stderr={stderr}");
-
-    let (code, stdout, stderr) =
-        h.run(["chain", "recover", "tc-missing", "--version", "0", "--json"]);
-    assert_eq!(code, 2, "stdout={stdout} stderr={stderr}");
-    assert!(stdout.is_empty(), "stdout={stdout}");
-    let error: serde_json::Value =
-        serde_json::from_str(&stderr).unwrap_or_else(|e| panic!("json error: {e}\n{stderr}"));
-    assert_eq!(
-        error["error"]["code"].as_str(),
-        Some("foreground_terminal_required")
-    );
-
-    let mut nested = h.cmd();
-    nested.env("HCOM_PROCESS_ID", "nested-agent").args([
-        "chain",
-        "codex",
-        "--model",
-        "gpt-5.5",
-        "--reasoning",
-        "high",
-        "--sandbox",
-        "workspace-write",
-        "--approval",
-        "on-request",
-    ]);
-    let output = nested.output().expect("run nested chain start");
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("un-managed human shell"),
-        "stderr={}",
-        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -258,8 +205,8 @@ fn bundle_create_snapshots_external_repositories_from_a_non_git_launch_directory
         run_git(&["add", "tracked.txt"]);
         run_git(&["commit", "-m", "fixture"]);
     }
-    let referenced_file = h.workspace.join("handoff.txt");
-    std::fs::write(&referenced_file, "handoff evidence\n").unwrap();
+    let referenced_file = h.workspace.join("snapshot.txt");
+    std::fs::write(&referenced_file, "bundle evidence\n").unwrap();
     let repositories = format!(
         "{},{}",
         first_repository.display(),
@@ -272,7 +219,7 @@ fn bundle_create_snapshots_external_repositories_from_a_non_git_launch_directory
         .args([
             "bundle",
             "create",
-            "Chain continuity",
+            "Bundle continuity",
             "--description",
             "Pin repositories without changing the agent launch directory",
             "--events",
@@ -338,171 +285,6 @@ fn events_empty_in_fresh_dir() {
     let (code, stdout, _stderr) = h.run(["events", "--last", "5"]);
     assert_eq!(code, 0);
     assert!(stdout.trim().is_empty(), "expected no events, got {stdout}");
-}
-
-#[test]
-fn ordinary_codex_session_handoff_mutations_fail_closed() {
-    let h = Hcom::new();
-    let (hooks_code, hooks_stdout, hooks_stderr) = h.run(["hooks", "add", "codex"]);
-    assert_eq!(hooks_code, 0, "stdout={hooks_stdout} stderr={hooks_stderr}");
-
-    let process_id = "ordinary-codex-process";
-    let native_session = "ordinary-native-session";
-    let mut start = h.cmd();
-    start
-        .env("HCOM_PROCESS_ID", process_id)
-        .env("CODEX_SANDBOX", "1")
-        .env("CODEX_THREAD_ID", native_session)
-        .arg("start");
-    let output = start.output().expect("start ordinary Codex identity");
-    let start_stdout = String::from_utf8_lossy(&output.stdout);
-    let start_stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "stdout={start_stdout} stderr={start_stderr}"
-    );
-    let name = parse_hcom_marker(&start_stdout).expect("ordinary Codex marker");
-
-    let mut prepare = h.cmd();
-    prepare
-        .env("HCOM_PROCESS_ID", process_id)
-        .env("CODEX_SANDBOX", "1")
-        .env("CODEX_THREAD_ID", native_session)
-        .args(["handoff", "prepare", "--bundle-event", "1", "--json"]);
-    let output = prepare.output().expect("run fail-closed prepare");
-    assert_eq!(output.status.code(), Some(3));
-    assert!(output.stdout.is_empty());
-    let error: serde_json::Value =
-        serde_json::from_slice(&output.stderr).expect("typed JSON error");
-    assert_eq!(error["error"]["code"].as_str(), Some("not_managed"));
-    assert!(
-        error["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("not managed by a handoff chain"))
-    );
-    assert!(output.stderr.len() <= 16 * 1024);
-
-    for args in [
-        vec![
-            "handoff",
-            "commit",
-            "ho-missing",
-            "--version",
-            "0",
-            "--json",
-        ],
-        vec![
-            "handoff",
-            "abort",
-            "ho-missing",
-            "--version",
-            "0",
-            "--json",
-            "--",
-            "reason",
-        ],
-        vec![
-            "handoff",
-            "accept",
-            "ho-missing",
-            "--version",
-            "0",
-            "--json",
-        ],
-        vec![
-            "handoff",
-            "reject",
-            "ho-missing",
-            "--version",
-            "0",
-            "--json",
-            "--",
-            "reason",
-        ],
-    ] {
-        let mut mutation = h.cmd();
-        mutation
-            .env("HCOM_PROCESS_ID", process_id)
-            .env("CODEX_SANDBOX", "1")
-            .env("CODEX_THREAD_ID", native_session)
-            .args(&args);
-        let output = mutation.output().expect("run fail-closed mutation");
-        assert_eq!(
-            output.status.code(),
-            Some(3),
-            "args={args:?} stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let error: serde_json::Value =
-            serde_json::from_slice(&output.stderr).expect("typed mutation error");
-        assert_eq!(error["error"]["code"].as_str(), Some("not_managed"));
-    }
-
-    let mut go = h.cmd();
-    go.env("HCOM_PROCESS_ID", process_id)
-        .env("CODEX_SANDBOX", "1")
-        .env("CODEX_THREAD_ID", native_session)
-        .args([
-            "--go",
-            "handoff",
-            "prepare",
-            "--bundle-event",
-            "1",
-            "--json",
-        ]);
-    let output = go.output().expect("run --go fail-closed mutation");
-    assert_eq!(output.status.code(), Some(3));
-    let error: serde_json::Value =
-        serde_json::from_slice(&output.stderr).expect("--go typed error");
-    assert_eq!(error["error"]["code"].as_str(), Some("not_managed"));
-
-    let mut status = h.cmd();
-    status
-        .env("HCOM_PROCESS_ID", process_id)
-        .env("CODEX_SANDBOX", "1")
-        .env("CODEX_THREAD_ID", native_session)
-        .args(["chain", "status"]);
-    let output = status.output().expect("run fail-closed chain status");
-    assert_eq!(output.status.code(), Some(3));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("not managed by a handoff chain"),
-        "stderr={stderr}"
-    );
-
-    let mut spoof = h.cmd();
-    spoof
-        .env("HCOM_PROCESS_ID", "unbound-attacker-process")
-        .args([
-            "handoff",
-            "prepare",
-            "--bundle-event",
-            "1",
-            "--json",
-            "--name",
-            &name,
-        ]);
-    let output = spoof.output().expect("run --name spoof attempt");
-    assert_eq!(output.status.code(), Some(3));
-    let error: serde_json::Value =
-        serde_json::from_slice(&output.stderr).expect("spoof typed JSON error");
-    assert_eq!(error["error"]["code"].as_str(), Some("not_managed"));
-
-    let conn = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
-    for table in [
-        "terminal_chains",
-        "terminal_generations",
-        "terminal_handoffs",
-        "terminal_transition_audit",
-    ] {
-        let count: i64 = conn
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(count, 0, "{table} must remain empty");
-    }
 }
 
 #[cfg(unix)]
@@ -726,40 +508,40 @@ fn hook_only_codex_review_delivers_lgtm_without_a_new_user_prompt() {
 
 #[cfg(unix)]
 #[test]
-fn managed_chain_review_request_changes_fixed_and_lgtm_resume_without_user_input() {
+fn tagged_interactive_review_request_changes_fixed_and_lgtm() {
     let h = Hcom::new();
     let (hooks_code, hooks_stdout, hooks_stderr) = h.run(["hooks", "add", "codex"]);
     assert_eq!(hooks_code, 0, "stdout={hooks_stdout} stderr={hooks_stderr}");
+    let developer_process = "tagged-review-developer-process";
+    let reviewer_process = "tagged-review-reviewer-process";
+    let developer_session = "tagged-review-developer-session";
+    let reviewer_session = "tagged-review-reviewer-session";
 
-    let start_codex = |process_id: &str, native_session: &str| {
+    let start_codex = |process_id: &str, session_id: &str| {
         let output = h
             .cmd()
             .env("HCOM_PROCESS_ID", process_id)
             .env("CODEX_SANDBOX", "1")
-            .env("CODEX_THREAD_ID", native_session)
+            .env("CODEX_THREAD_ID", session_id)
             .arg("start")
             .output()
-            .expect("start isolated Codex identity");
+            .expect("start isolated tagged Codex participant");
         assert!(
             output.status.success(),
             "stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        parse_hcom_marker(&String::from_utf8_lossy(&output.stdout)).expect("isolated Codex marker")
+        parse_hcom_marker(&String::from_utf8_lossy(&output.stdout))
+            .expect("isolated tagged Codex participant marker")
     };
-    let developer_process = "chain-review-developer-process";
-    let reviewer_process = "chain-review-reviewer-process";
-    let developer_native = "chain-review-developer-native";
-    let reviewer_native = "chain-review-reviewer-native";
-    let developer = start_codex(developer_process, developer_native);
-    let reviewer = start_codex(reviewer_process, reviewer_native);
+    let developer = start_codex(developer_process, developer_session);
+    let reviewer = start_codex(reviewer_process, reviewer_session);
 
-    let db_path = h.path().join("hcom.db");
-    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    let connection = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
     for (name, process_id, session_id) in [
-        (&developer, developer_process, developer_native),
-        (&reviewer, reviewer_process, reviewer_native),
+        (&developer, developer_process, developer_session),
+        (&reviewer, reviewer_process, reviewer_session),
     ] {
         connection
             .execute(
@@ -783,279 +565,139 @@ fn managed_chain_review_request_changes_fixed_and_lgtm_resume_without_user_input
             )
             .unwrap();
     }
-    let developer_session: String = connection
-        .query_row(
-            "SELECT session_id FROM instances WHERE name = ?1",
-            [&developer],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let process_birth =
-        hcom::chain_supervisor::linux_process_birth_identity(std::process::id() as i32).unwrap();
-    let chain_id = "tc-review-observer-test";
-    let launch_nonce = "ln-review-observer-test";
-    let now = 1.0f64;
-    let transaction = connection.unchecked_transaction().unwrap();
-    transaction
-        .execute(
-            "INSERT INTO terminal_chains (
-                 id, workspace, tool, tag, model_ref, reasoning_ref,
-                 permission_policy_ref, policy_ref,
-                 supervisor_process_id, supervisor_process_birth_identity,
-                 current_generation, state, version, created_at, updated_at
-             ) VALUES (
-                 ?1, ?2, 'codex', 'dev1', 'gpt-test', 'high',
-                 'approval=never;sandbox=read-only',
-                 'codex-0.145.0-foreground-v1',
-                 'supervisor-review-test', ?3,
-                 1, 'active', 0, ?4, ?4
-             )",
-            rusqlite::params![chain_id, h.workspace.to_string_lossy(), process_birth, now],
-        )
-        .unwrap();
-    transaction
-        .execute(
-            "INSERT INTO terminal_generations (
-                 chain_id, generation, launch_nonce, wrapper_process_id,
-                 process_birth_identity, instance_name, hcom_session_id,
-                 native_session_id, state, version, created_at, updated_at
-             ) VALUES (
-                 ?1, 1, ?2, ?3, ?4, ?5, ?6, ?7,
-                 'active', 0, ?8, ?8
-             )",
-            rusqlite::params![
-                chain_id,
-                launch_nonce,
-                developer_process,
-                process_birth,
-                developer,
-                developer_session,
-                developer_native,
-                now
-            ],
-        )
-        .unwrap();
-    transaction.commit().unwrap();
     drop(connection);
 
-    let mut start_review = h.cmd();
-    start_review
-        .env("HCOM_PROCESS_ID", developer_process)
-        .env("HCOM_CHAIN_ID", chain_id)
-        .env("HCOM_CHAIN_GENERATION", "1")
-        .env("HCOM_CHAIN_LAUNCH_NONCE", launch_nonce)
-        .env("HCOM_CHAIN_PROCESS_BIRTH_IDENTITY", &process_birth)
-        .env("CODEX_SANDBOX", "1")
-        .env("CODEX_THREAD_ID", developer_native)
-        .args([
+    for (name, tag) in [(&developer, "dev1"), (&reviewer, "dev2")] {
+        let (code, stdout, stderr) = h.run(["config", "-i", name.as_str(), "tag", tag]);
+        assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    }
+    let reviewer_target = format!("@dev2-{reviewer}");
+
+    let run_review = |process_id: &str, session_id: &str, args: &[&str]| {
+        let output = h
+            .cmd()
+            .env("HCOM_PROCESS_ID", process_id)
+            .env("CODEX_SANDBOX", "1")
+            .env("CODEX_THREAD_ID", session_id)
+            .args(args)
+            .output()
+            .expect("run isolated tagged review command");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "stdout={stdout} stderr={stderr}");
+        (stdout, stderr)
+    };
+
+    let (start_stdout, start_stderr) = run_review(
+        developer_process,
+        developer_session,
+        &[
             "review",
             "start",
-            &format!("@{reviewer}"),
+            &reviewer_target,
             "--max-rounds",
             "2",
+            "--name",
+            &developer,
             "--",
-            "Review the chain observer integration",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut blocked = start_review.spawn().expect("spawn attached review start");
-    let stdout = blocked.stdout.take().unwrap();
-    let mut reader = BufReader::new(stdout);
-    let mut first_output = String::new();
-    let mut line = String::new();
-    let mut review_id = None;
-    loop {
-        line.clear();
-        let read = reader
-            .read_line(&mut line)
-            .expect("read attached review output");
-        assert!(
-            read > 0,
-            "attached review command exited before publishing its ID"
-        );
-        first_output.push_str(&line);
-        if review_id.is_none()
-            && let Some(id) = line.split_whitespace().find(|part| part.starts_with("rv-"))
-        {
-            review_id = Some(id.to_string());
-        }
-        if review_id.is_some() && first_output.contains("remains attached") {
-            break;
-        }
-    }
-    let review_id = review_id.unwrap();
-    assert!(
-        first_output.contains("remains attached"),
-        "stdout={first_output}"
+            "Review the retained tagged interactive workflow",
+        ],
     );
     assert!(
-        blocked.try_wait().unwrap().is_none(),
-        "chain review command returned before the reviewer verdict"
+        start_stdout.contains("queued for automatic delivery")
+            && !start_stdout.contains("remains attached"),
+        "managed developer must use ordinary delivery: stdout={start_stdout} stderr={start_stderr}"
     );
-    std::thread::sleep(Duration::from_millis(450));
-    assert!(
-        blocked.try_wait().unwrap().is_none(),
-        "chain review observer did not remain attached across idle polls"
-    );
+    let review_id = start_stdout
+        .split_whitespace()
+        .find(|part| part.starts_with("rv-"))
+        .expect("review id in start output")
+        .to_string();
 
-    let verdict = h
-        .cmd()
-        .env("HCOM_PROCESS_ID", reviewer_process)
-        .env("CODEX_SANDBOX", "1")
-        .env("CODEX_THREAD_ID", reviewer_native)
-        .args([
+    let (changes_stdout, _) = run_review(
+        reviewer_process,
+        reviewer_session,
+        &[
             "review",
             "verdict",
             &review_id,
             "--round",
             "1",
             "--request-changes",
+            "--name",
+            &reviewer,
             "--",
-            "Exercise the attached fixed path",
-        ])
-        .output()
-        .expect("submit isolated reviewer verdict");
+            "Add the retained workflow regression",
+        ],
+    );
     assert!(
-        verdict.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&verdict.stdout),
-        String::from_utf8_lossy(&verdict.stderr)
+        changes_stdout.contains("state=awaiting_developer"),
+        "stdout={changes_stdout}"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        if let Some(status) = blocked.try_wait().unwrap() {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = blocked.kill();
-            let _ = blocked.wait();
-            panic!("chain review observer did not resume after the durable verdict");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    assert!(
-        status.success(),
-        "attached review command status={status:?}"
-    );
-    let mut remaining_stdout = String::new();
-    reader.read_to_string(&mut remaining_stdout).unwrap();
-    let mut stderr = String::new();
-    blocked
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
-    let stdout = format!("{first_output}{remaining_stdout}");
-    assert!(
-        stdout.contains("advanced to state=awaiting_developer"),
-        "stdout={stdout} stderr={stderr}"
-    );
-    assert!(
-        stdout.contains("[hcom-review") && stdout.contains("Reviewer requested changes"),
-        "request changes was not delivered into the same CLI return: stdout={stdout} stderr={stderr}"
-    );
-
-    let mut fixed = h.cmd();
-    fixed
-        .env("HCOM_PROCESS_ID", developer_process)
-        .env("HCOM_CHAIN_ID", chain_id)
-        .env("HCOM_CHAIN_GENERATION", "1")
-        .env("HCOM_CHAIN_LAUNCH_NONCE", launch_nonce)
-        .env("HCOM_CHAIN_PROCESS_BIRTH_IDENTITY", &process_birth)
-        .env("CODEX_SANDBOX", "1")
-        .env("CODEX_THREAD_ID", developer_native)
-        .args([
+    let (fixed_stdout, _) = run_review(
+        developer_process,
+        developer_session,
+        &[
             "review",
             "fixed",
             &review_id,
             "--round",
             "1",
+            "--name",
+            &developer,
             "--",
-            "Exercised and verified the attached fixed path",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut fixed_blocked = fixed.spawn().expect("spawn attached review fixed");
-    let fixed_stdout = fixed_blocked.stdout.take().unwrap();
-    let mut fixed_reader = BufReader::new(fixed_stdout);
-    let mut fixed_first_output = String::new();
-    loop {
-        line.clear();
-        let read = fixed_reader
-            .read_line(&mut line)
-            .expect("read attached fixed output");
-        assert!(read > 0, "attached fixed command exited before waiting");
-        fixed_first_output.push_str(&line);
-        if fixed_first_output.contains("remains attached") {
-            break;
-        }
-    }
-    assert!(
-        fixed_blocked.try_wait().unwrap().is_none(),
-        "chain fixed command returned before the round-2 verdict"
+            "Added and ran the retained workflow regression",
+        ],
     );
-    std::thread::sleep(Duration::from_millis(450));
     assert!(
-        fixed_blocked.try_wait().unwrap().is_none(),
-        "chain fixed observer did not remain attached across idle polls"
+        fixed_stdout.contains("state=awaiting_review") && fixed_stdout.contains("round=2/2"),
+        "stdout={fixed_stdout}"
     );
 
-    let lgtm = h
-        .cmd()
-        .env("HCOM_PROCESS_ID", reviewer_process)
-        .env("CODEX_SANDBOX", "1")
-        .env("CODEX_THREAD_ID", reviewer_native)
-        .args([
-            "review",
-            "verdict",
-            &review_id,
-            "--round",
-            "2",
-            "--lgtm",
-            "--",
-            "LGTM from the integration reviewer",
-        ])
-        .output()
-        .expect("submit isolated round-2 LGTM");
+    let (lgtm_stdout, _) = run_review(
+        reviewer_process,
+        reviewer_session,
+        &[
+            "review", "verdict", &review_id, "--round", "2", "--lgtm", "--name", &reviewer, "--",
+            "LGTM",
+        ],
+    );
     assert!(
-        lgtm.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&lgtm.stdout),
-        String::from_utf8_lossy(&lgtm.stderr)
+        lgtm_stdout.contains("Approved") && lgtm_stdout.contains("round 2/2"),
+        "stdout={lgtm_stdout}"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        if let Some(status) = fixed_blocked.try_wait().unwrap() {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = fixed_blocked.kill();
-            let _ = fixed_blocked.wait();
-            panic!("chain fixed observer did not resume after round-2 LGTM");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    assert!(status.success(), "attached fixed command status={status:?}");
-    let mut fixed_remaining = String::new();
-    fixed_reader.read_to_string(&mut fixed_remaining).unwrap();
-    let mut fixed_stderr = String::new();
-    fixed_blocked
-        .stderr
-        .take()
+    let (status_stdout, _) = run_review(
+        developer_process,
+        developer_session,
+        &[
+            "review", "status", &review_id, "--json", "--name", &developer,
+        ],
+    );
+    let status: serde_json::Value =
+        serde_json::from_str(&status_stdout).expect("review status JSON");
+    assert_eq!(status["state"], "approved");
+    assert_eq!(status["round"], 2);
+    assert_eq!(status["max_rounds"], 2);
+    assert_eq!(status["developer"]["name"], developer);
+    assert_eq!(status["reviewer"]["name"], reviewer);
+
+    let connection = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    let actions: Vec<String> = connection
+        .prepare(
+            "SELECT action FROM review_transitions WHERE workflow_id = ?1
+             ORDER BY to_version",
+        )
         .unwrap()
-        .read_to_string(&mut fixed_stderr)
+        .query_map([&review_id], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
         .unwrap();
-    let fixed_output = format!("{fixed_first_output}{fixed_remaining}");
-    assert!(
-        fixed_output.contains("advanced to state=approved")
-            && fixed_output.contains("[hcom-review")
-            && fixed_output.contains("LGTM"),
-        "round-2 LGTM was not delivered into the same fixed CLI return: stdout={fixed_output} stderr={fixed_stderr}"
+    assert_eq!(
+        actions,
+        ["start", "request_changes", "fixed", "lgtm"],
+        "retained review audit sequence"
     );
 }
 

@@ -17,7 +17,6 @@ pub mod stop;
 
 // Diagnostics
 pub mod bundle;
-pub mod chain;
 pub mod events;
 pub mod list;
 pub mod status;
@@ -27,7 +26,6 @@ pub mod transcript;
 // Management
 pub mod archive;
 pub mod config;
-pub mod handoff;
 pub mod help;
 pub mod hooks;
 pub mod relay;

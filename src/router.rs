@@ -23,8 +23,6 @@ fn is_hook(name: &str) -> bool {
 const COMMANDS: &[&str] = &[
     "send",
     "review",
-    "handoff",
-    "chain",
     "list",
     "events",
     "stop",
@@ -54,7 +52,7 @@ fn is_launch_tool(name: &str) -> bool {
 
 fn action_allows_update_notice(action: &Action) -> bool {
     match action {
-        Action::Command { cmd, .. } => !matches!(cmd.as_str(), "update" | "chain"),
+        Action::Command { cmd, .. } => cmd != "update",
         Action::Launch { .. } | Action::Version | Action::Help => true,
         _ => false,
     }
@@ -510,7 +508,7 @@ pub fn dispatch() -> anyhow::Result<()> {
 
     let action = resolve_action(argv);
 
-    // Check for updates on ordinary CLI commands (not hooks/pty/relay/chain —
+    // Check for updates on ordinary CLI commands (not hooks/pty/relay-worker —
     // those need to be fast, silent, and free of unowned background children).
     // `hcom update` handles its own output.
     if action_allows_update_notice(&action)
@@ -592,8 +590,6 @@ pub fn dispatch() -> anyhow::Result<()> {
                 cmd.as_str(),
                 "send"
                     | "review"
-                    | "handoff"
-                    | "chain"
                     | "list"
                     | "stop"
                     | "listen"
@@ -832,15 +828,6 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
             &cmd_argv,
             |args| crate::commands::review::cmd_review(&db, &args, Some(&ctx))
         ),
-        "handoff" => clap_dispatch!(
-            crate::commands::handoff::HandoffArgs,
-            cmd,
-            &cmd_argv,
-            |args| crate::commands::handoff::cmd_handoff(&db, &args, Some(&ctx))
-        ),
-        "chain" => clap_dispatch!(crate::commands::chain::ChainArgs, cmd, &cmd_argv, |args| {
-            crate::commands::chain::cmd_chain(&db, &args, Some(&ctx))
-        }),
         "list" => clap_dispatch!(crate::commands::list::ListArgs, cmd, &cmd_argv, |args| {
             crate::commands::list::cmd_list(&db, &args, Some(&ctx))
         }),
@@ -1031,13 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn chain_commands_do_not_spawn_update_notices() {
-        assert!(!action_allows_update_notice(&resolve_action(&sv(&[
-            "chain", "codex"
-        ]))));
-        assert!(!action_allows_update_notice(&resolve_action(&sv(&[
-            "chain", "status"
-        ]))));
+    fn update_command_does_not_spawn_an_update_notice() {
         assert!(!action_allows_update_notice(&resolve_action(&sv(&[
             "update"
         ]))));

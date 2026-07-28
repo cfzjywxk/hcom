@@ -74,6 +74,10 @@ impl Hcom {
             fs::create_dir_all(dir)
                 .unwrap_or_else(|e| panic!("create isolated directory {}: {e}", dir.display()));
         }
+        let update_flags = hcom_dir.join(".tmp/flags");
+        fs::create_dir_all(&update_flags).expect("create isolated update flag directory");
+        fs::write(update_flags.join("update_check"), env!("CARGO_PKG_VERSION"))
+            .expect("seed isolated current-version update cache");
 
         let mut path_entries = Vec::new();
         if let Some(parent) = bin.parent() {

@@ -80,6 +80,37 @@ pub fn terminate(pid: u32) -> bool {
     }
 }
 
+/// Arm a freshly spawned Unix child with SIGHUP on parent death.
+///
+/// The parent check closes the standard `prctl` race where the parent exits
+/// immediately before the death signal is installed. Call this only from a
+/// `Command::pre_exec` closure.
+#[cfg(unix)]
+pub fn arm_parent_death_hangup(expected_parent_pid: i32) -> std::io::Result<()> {
+    if expected_parent_pid <= 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "expected parent PID must be greater than one",
+        ));
+    }
+    // SAFETY: reset SIGHUP in the freshly forked child before exec.
+    if unsafe { libc::signal(libc::SIGHUP, libc::SIG_DFL) } == libc::SIG_ERR {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: prctl receives scalar arguments; SIGHUP is a valid death signal.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGHUP, 0, 0, 0) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: getppid has no preconditions.
+    if unsafe { libc::getppid() } != expected_parent_pid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "parent exited before child arming completed",
+        ));
+    }
+    Ok(())
+}
+
 /// Outcome of signalling a process group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupSignal {
@@ -509,6 +540,13 @@ mod tests {
     #[test]
     fn test_is_alive_dead_process() {
         assert!(!is_alive(99_999_999));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_death_guard_rejects_invalid_parent_without_arming() {
+        let error = arm_parent_death_hangup(1).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     // Reproduces the bug fixed above: the process object stays valid (and

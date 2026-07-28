@@ -2,7 +2,6 @@
 //! Uses git ls-remote instead of the GitHub REST API to avoid rate limits.
 
 use crate::paths::{FLAGS_DIR, atomic_write, hcom_path};
-use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -14,12 +13,6 @@ const WINDOWS_INSTALL_CMD: &str = "powershell -NoProfile -ExecutionPolicy Bypass
 
 pub(crate) fn flag_path() -> PathBuf {
     hcom_path(&[FLAGS_DIR, "update_check"])
-}
-
-fn update_checks_allowed(chain_markers: &[Option<&OsStr>]) -> bool {
-    !chain_markers
-        .iter()
-        .all(|value| value.is_some_and(|value| !value.is_empty()))
 }
 
 /// Parse version string "x.y.z" into comparable tuple.
@@ -309,22 +302,6 @@ fn is_user_site_pip_install(exe: &Path) -> bool {
 /// Never blocks: if the cache is stale, spawns a background process to refresh it
 /// and returns the current (possibly stale) cached result.
 pub fn get_update_info() -> Option<(String, &'static str)> {
-    // A chain owns and audits every process in its supervisor/child groups.
-    // Never introduce an untracked updater from a command run inside one.
-    // A single stale marker still belongs to an ordinary session.
-    let chain_markers = [
-        std::env::var_os("HCOM_PROCESS_ID"),
-        std::env::var_os("HCOM_CHAIN_ID"),
-        std::env::var_os("HCOM_CHAIN_GENERATION"),
-        std::env::var_os("HCOM_CHAIN_LAUNCH_NONCE"),
-        std::env::var_os("HCOM_CHAIN_PROCESS_BIRTH_IDENTITY"),
-        std::env::var_os("HCOM_CHAIN_CODEX_VERSION"),
-    ];
-    let chain_markers = chain_markers.each_ref().map(|value| value.as_deref());
-    if !update_checks_allowed(&chain_markers) {
-        return None;
-    }
-
     let flag = flag_path();
     let current = env!("CARGO_PKG_VERSION");
 
@@ -380,35 +357,6 @@ mod tests {
         assert_eq!(parse_version("v1.2.3"), Some((1, 2, 3)));
         assert_eq!(parse_version("bad"), None);
         assert_eq!(parse_version("1.2"), None);
-    }
-
-    #[test]
-    fn update_checks_are_disabled_only_for_complete_nonempty_chain_context() {
-        assert!(update_checks_allowed(&[None; 6]));
-        assert!(update_checks_allowed(&[
-            Some(OsStr::new("process")),
-            Some(OsStr::new("tc-stale")),
-            None,
-            None,
-            None,
-            None,
-        ]));
-        assert!(update_checks_allowed(&[
-            Some(OsStr::new("process")),
-            Some(OsStr::new("tc-private")),
-            Some(OsStr::new("1")),
-            Some(OsStr::new("launch")),
-            Some(OsStr::new("birth")),
-            Some(OsStr::new("")),
-        ]));
-        assert!(!update_checks_allowed(&[
-            Some(OsStr::new("process")),
-            Some(OsStr::new("tc-private")),
-            Some(OsStr::new("1")),
-            Some(OsStr::new("launch")),
-            Some(OsStr::new("birth")),
-            Some(OsStr::new("0.145.0")),
-        ]));
     }
 
     #[test]

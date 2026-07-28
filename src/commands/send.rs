@@ -28,7 +28,7 @@ Inline bundle (attach structured context):
     --events <ids>                 Event IDs/ranges: 1,2,5-10
     --files <paths>                Comma-separated file paths
     --transcript <ranges>          Format: 3-14:normal,6:full,22-30:detailed
-    --repos <paths>                Snapshot Git roots without changing chain launch cwd
+    --repos <paths>                Snapshot Git roots without changing current launch cwd
     --extends <id>                 Parent bundle (optional)
   See 'hcom bundle --help' for bundle details
 
