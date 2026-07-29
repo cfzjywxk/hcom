@@ -31,7 +31,7 @@ use uuid::Uuid;
 const MAX_MCP_LINE_BYTES: usize = 256 * 1024;
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const RELAY_SOCKET_NAME: &str = "relay.sock";
-const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -137,8 +137,7 @@ pub(super) fn run_relay(socket_path: &Path) -> Result<()> {
             socket_path.display()
         )
     })?;
-    upstream.set_read_timeout(Some(SOCKET_IO_TIMEOUT))?;
-    upstream.set_write_timeout(Some(SOCKET_IO_TIMEOUT))?;
+    configure_persistent_mcp_stream(&upstream)?;
     let reader_stream = upstream.try_clone()?;
     let response_thread = std::thread::spawn(move || -> Result<()> {
         let mut reader = BufReader::new(reader_stream);
@@ -290,8 +289,7 @@ fn serve_bridge(
             }
         };
         stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT))?;
-        stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT))?;
+        configure_persistent_mcp_stream(&stream)?;
         if authorize_relay_peer(&stream, &configuration, &activation).is_err() {
             continue;
         }
@@ -322,6 +320,15 @@ fn serve_bridge(
     if !close.ok || close.binding_version != binding_version.checked_add(1) {
         bail!("architect binding close was not acknowledged");
     }
+    Ok(())
+}
+
+fn configure_persistent_mcp_stream(stream: &UnixStream) -> Result<()> {
+    // Human-owned architect input may remain idle for an unbounded time before
+    // the first or next MCP request. EOF and owned-process cleanup terminate
+    // the connection; human think time must not.
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(Some(SOCKET_WRITE_TIMEOUT))?;
     Ok(())
 }
 
@@ -1000,6 +1007,26 @@ mod tests {
             fs::canonicalize(&namespace_path).is_err(),
             "namespace-only executable path unexpectedly resolves on the host"
         );
+    }
+
+    #[test]
+    fn persistent_mcp_stream_has_no_human_idle_read_deadline() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(1)))
+            .unwrap();
+        configure_persistent_mcp_stream(&stream).unwrap();
+        assert_eq!(stream.read_timeout().unwrap(), None);
+        assert!(stream.write_timeout().unwrap().is_some());
+
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            peer.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n")
+                .unwrap();
+        });
+        let mut reader = BufReader::new(stream);
+        assert!(read_bounded_line(&mut reader).unwrap().is_some());
+        writer.join().unwrap();
     }
 
     #[test]
