@@ -5,7 +5,7 @@ use crate::worker::contract::{MAX_PROMPT_BYTES, validate_native_session_id};
 use crate::worker::environment::{ExecutionEnvironmentLease, SecretRedactor};
 use crate::worker::result::{DeveloperResult, ReviewerResult};
 use crate::worker::validation::{
-    validate_opaque_id, validate_relative_path, validate_sha256, validate_text,
+    validate_git_oid, validate_opaque_id, validate_relative_path, validate_sha256, validate_text,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -412,6 +412,11 @@ impl ArtifactAttempt {
             native_session_id: metadata.native_session_id,
             turn_sequence: self.scope.turn_sequence,
             attempt: self.scope.attempt,
+            task_version: metadata.task_version,
+            review_round: metadata.review_round,
+            base_revision: metadata.base_revision,
+            head_revision: metadata.head_revision,
+            review_snapshot_digest: metadata.review_snapshot_digest,
             daemon_epoch: metadata.daemon_epoch,
             environment_hash: metadata.environment_hash,
             adapter_contract_hash: metadata.adapter_contract_hash,
@@ -612,6 +617,11 @@ impl ArtifactReceipt {
 #[serde(deny_unknown_fields)]
 pub struct ManifestMetadata {
     pub native_session_id: String,
+    pub task_version: u64,
+    pub review_round: u32,
+    pub base_revision: String,
+    pub head_revision: Option<String>,
+    pub review_snapshot_digest: Option<String>,
     pub daemon_epoch: String,
     pub environment_hash: String,
     pub adapter_contract_hash: String,
@@ -624,6 +634,30 @@ impl ManifestMetadata {
     fn validate_for(&self, scope: &ArtifactScope) -> Result<()> {
         scope.validate()?;
         validate_native_session_id(&self.native_session_id)?;
+        if self.task_version == 0 {
+            bail!("manifest task version must be positive");
+        }
+        validate_git_oid("manifest base revision", &self.base_revision)?;
+        if let Some(head_revision) = &self.head_revision {
+            validate_git_oid("manifest head revision", head_revision)?;
+        }
+        match scope.role {
+            WorkerRole::Developer if self.review_snapshot_digest.is_some() => {
+                bail!("developer manifest cannot bind a reviewer snapshot");
+            }
+            WorkerRole::Reviewer => {
+                if self.review_round == 0 || self.head_revision.is_none() {
+                    bail!("reviewer manifest must bind its exact round and head revision");
+                }
+                validate_sha256(
+                    "manifest review snapshot digest",
+                    self.review_snapshot_digest
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("reviewer manifest lost its snapshot"))?,
+                )?;
+            }
+            WorkerRole::Developer => {}
+        }
         validate_opaque_id("manifest daemon epoch", &self.daemon_epoch)?;
         validate_sha256("manifest environment hash", &self.environment_hash)?;
         validate_sha256(
@@ -649,6 +683,11 @@ pub struct TurnManifest {
     pub native_session_id: String,
     pub turn_sequence: u32,
     pub attempt: u32,
+    pub task_version: u64,
+    pub review_round: u32,
+    pub base_revision: String,
+    pub head_revision: Option<String>,
+    pub review_snapshot_digest: Option<String>,
     pub daemon_epoch: String,
     pub environment_hash: String,
     pub adapter_contract_hash: String,
@@ -674,6 +713,11 @@ impl TurnManifest {
         };
         ManifestMetadata {
             native_session_id: self.native_session_id.clone(),
+            task_version: self.task_version,
+            review_round: self.review_round,
+            base_revision: self.base_revision.clone(),
+            head_revision: self.head_revision.clone(),
+            review_snapshot_digest: self.review_snapshot_digest.clone(),
             daemon_epoch: self.daemon_epoch.clone(),
             environment_hash: self.environment_hash.clone(),
             adapter_contract_hash: self.adapter_contract_hash.clone(),
@@ -1438,6 +1482,11 @@ mod tests {
         let result = attempt.write_result_json(&result_json()).unwrap();
         let metadata = ManifestMetadata {
             native_session_id: "native-1".into(),
+            task_version: 1,
+            review_round: 0,
+            base_revision: "a".repeat(40),
+            head_revision: None,
+            review_snapshot_digest: None,
             daemon_epoch: "epoch-1".into(),
             environment_hash: environment.descriptor().environment_hash.clone(),
             adapter_contract_hash: hex_bytes(&Sha256::digest(b"adapter contract")),
@@ -1471,6 +1520,11 @@ mod tests {
             attempt
                 .finalize_manifest(ManifestMetadata {
                     native_session_id: "native-1".into(),
+                    task_version: 1,
+                    review_round: 0,
+                    base_revision: "a".repeat(40),
+                    head_revision: None,
+                    review_snapshot_digest: None,
                     daemon_epoch: "epoch-1".into(),
                     environment_hash: environment.descriptor().environment_hash.clone(),
                     adapter_contract_hash: hex_bytes(&Sha256::digest(b"adapter contract")),

@@ -51,7 +51,7 @@ const CODEX_RESULT_SCHEMA_FILE: &str = "codex-developer-result-schema.json";
 const CODEX_FINAL_FILE: &str = "native-final.partial";
 const CODEX_AUTH_FILE: &str = "auth.json";
 
-const DISABLED_CODEX_FEATURES: &[&str] = &[
+pub(super) const DISABLED_CODEX_FEATURES: &[&str] = &[
     "apps",
     "auth_elicitation",
     "browser_use",
@@ -1146,10 +1146,10 @@ fn developer_result_schema() -> Vec<u8> {
     .expect("static Codex developer result schema is valid JSON")
 }
 
-struct CodexTurnEvidence {
-    native_session_id: String,
-    completed_commands: BTreeSet<String>,
-    failed_commands: BTreeSet<String>,
+pub(super) struct CodexTurnEvidence {
+    pub(super) native_session_id: String,
+    pub(super) completed_commands: BTreeSet<String>,
+    pub(super) failed_commands: BTreeSet<String>,
 }
 
 #[derive(Deserialize)]
@@ -1182,10 +1182,10 @@ struct CodexItem {
     status: Option<String>,
 }
 
-fn parse_codex_turn(control: &TurnControl, stdout: &[u8]) -> Result<CodexTurnEvidence> {
+pub(super) fn parse_codex_turn(control: &TurnControl, stdout: &[u8]) -> Result<CodexTurnEvidence> {
     control.validate()?;
-    if control.role != WorkerRole::Developer || stdout.is_empty() {
-        bail!("Codex JSONL does not match a developer turn");
+    if stdout.is_empty() {
+        bail!("Codex JSONL does not match a durable worker turn");
     }
     let text = std::str::from_utf8(stdout).context("Codex JSONL is not UTF-8")?;
     validate_text("Codex JSONL", text, 1024 * 1024, true)?;
@@ -1287,7 +1287,7 @@ fn parse_codex_turn(control: &TurnControl, stdout: &[u8]) -> Result<CodexTurnEvi
     })
 }
 
-fn observe_codex_record(record: &[u8]) -> Result<Vec<NativeObservation>> {
+pub(super) fn observe_codex_record(record: &[u8]) -> Result<Vec<NativeObservation>> {
     if record.is_empty() || record.len() > 128 * 1024 {
         bail!("Codex native record exceeds its bound");
     }

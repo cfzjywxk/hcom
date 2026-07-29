@@ -10,6 +10,8 @@ pub mod fake;
 #[cfg(target_os = "linux")]
 pub mod process;
 pub mod result;
+#[cfg(target_os = "linux")]
+pub mod reviewer;
 
 pub use contract::{
     AdapterCapabilities, AdapterDescriptor, CommandSpec, ExecutableIdentity, NativeArtifacts,

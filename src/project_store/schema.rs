@@ -301,6 +301,7 @@ CREATE TABLE worker_turns (
     last_progress_at    INTEGER,
     activity_truncated  INTEGER NOT NULL DEFAULT 0 CHECK (activity_truncated IN (0, 1)),
     artifact_dir        TEXT NOT NULL,
+    review_snapshot_digest TEXT,
     result_json         TEXT CHECK (
                             result_json IS NULL
                             OR (json_valid(result_json) AND json_type(result_json) = 'object')
@@ -325,6 +326,9 @@ CREATE TABLE worker_turns (
     CHECK (substr(artifact_dir, 1, 1) != '/'),
     CHECK (instr('/' || artifact_dir || '/', '/../') = 0),
     CHECK (instr('/' || artifact_dir || '/', '/./') = 0),
+    CHECK (review_snapshot_digest IS NULL OR
+           (length(review_snapshot_digest) = 64
+            AND review_snapshot_digest NOT GLOB '*[^0-9a-f]*')),
     CHECK ((result_json IS NULL) = (result_hash IS NULL)),
     CHECK (result_hash IS NULL OR
            (length(result_hash) = 64 AND result_hash NOT GLOB '*[^0-9a-f]*')),
@@ -836,6 +840,42 @@ WHEN NEW.attempt != OLD.attempt AND NOT (
 )
 BEGIN
     SELECT RAISE(ABORT, 'worker turn attempt must advance through a clean queued CAS');
+END;
+CREATE TRIGGER worker_turns_review_snapshot_once
+BEFORE UPDATE OF review_snapshot_digest ON worker_turns
+WHEN NOT (
+    NEW.review_snapshot_digest IS OLD.review_snapshot_digest
+    OR (
+        OLD.review_snapshot_digest IS NULL
+        AND NEW.review_snapshot_digest IS NOT NULL
+        AND OLD.status = 'claimed' AND NEW.status = 'claimed'
+        AND OLD.attempt = NEW.attempt AND NEW.attempt > 0
+        AND EXISTS (
+            SELECT 1 FROM worker_sessions s
+            WHERE s.id = NEW.session_id AND s.role = 'reviewer'
+        )
+    )
+    OR (
+        OLD.review_snapshot_digest IS NOT NULL
+        AND NEW.review_snapshot_digest IS NULL
+        AND OLD.status IN ('failed', 'indeterminate')
+        AND NEW.status = 'claimed'
+        AND NEW.attempt = OLD.attempt + 1
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'review snapshot may bind once per exact reviewer attempt');
+END;
+CREATE TRIGGER worker_turns_reviewer_result_requires_snapshot
+BEFORE UPDATE OF status ON worker_turns
+WHEN NEW.status IN ('result_ready', 'applied')
+  AND EXISTS (
+      SELECT 1 FROM worker_sessions s
+      WHERE s.id = NEW.session_id AND s.role = 'reviewer'
+  )
+  AND NEW.review_snapshot_digest IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'reviewer result requires an exact snapshot binding');
 END;
 CREATE TRIGGER worker_turns_legal_state
 BEFORE UPDATE OF status ON worker_turns

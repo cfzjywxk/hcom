@@ -45,6 +45,7 @@ pub(crate) struct ReadyTurn {
     pub(crate) profile: WorkerProfile,
     pub(crate) result_hash: Option<String>,
     pub(crate) lease_owner: Option<String>,
+    pub(crate) review_snapshot_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -544,8 +545,7 @@ impl DaemonStore {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         let session_id = format!("session-{}", Uuid::new_v4());
-        let native_session_id =
-            (native_mode == "preassigned").then(|| format!("native-{}", Uuid::new_v4()));
+        let native_session_id = (native_mode == "preassigned").then(|| Uuid::new_v4().to_string());
         transaction.execute(
             "INSERT INTO worker_sessions (
                  id, project_id, task_id, role, profile_id, adapter,
@@ -692,6 +692,53 @@ impl DaemonStore {
         )?;
         if changed != 1 {
             bail!("spawned worker bind CAS failed");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn bind_review_snapshot(
+        &mut self,
+        claim: &ClaimedTurn,
+        snapshot_digest: &str,
+    ) -> Result<()> {
+        if claim.ready.role != WorkerRole::Reviewer {
+            bail!("only a reviewer turn may bind a review snapshot");
+        }
+        crate::worker::validation::validate_sha256("review snapshot digest", snapshot_digest)?;
+        let changed = self.connection.execute(
+            "UPDATE worker_turns
+             SET review_snapshot_digest = ?1, updated_at = ?2
+             WHERE id = ?3 AND status = 'claimed' AND attempt = ?4
+               AND lease_owner = ?5 AND review_snapshot_digest IS NULL
+               AND EXISTS (
+                   SELECT 1
+                   FROM worker_sessions s
+                   JOIN project_tasks t
+                     ON t.id = s.task_id AND t.project_id = s.project_id
+                   WHERE s.id = worker_turns.session_id
+                     AND s.role = 'reviewer'
+                     AND t.state = 'awaiting_review'
+                     AND t.version = worker_turns.task_version
+                     AND t.review_round = worker_turns.review_round
+                     AND t.base_revision = ?6
+                     AND t.head_revision = ?7
+               )",
+            params![
+                snapshot_digest,
+                now_epoch_seconds()?,
+                claim.ready.turn_id,
+                claim.attempt,
+                claim.lease_owner,
+                claim.ready.base_revision,
+                claim
+                    .ready
+                    .head_revision
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("reviewer turn lost its exact head revision"))?,
+            ],
+        )?;
+        if changed != 1 {
+            bail!("review snapshot bind CAS failed");
         }
         Ok(())
     }
@@ -999,6 +1046,38 @@ impl DaemonStore {
         )?;
         if sha256_hex(result_json.as_bytes()) != result_hash {
             bail!("stored result_ready hash mismatch");
+        }
+        if ready.role == WorkerRole::Reviewer {
+            let (task_state, task_version, review_round, base_revision, head_revision): (
+                String,
+                i64,
+                i64,
+                String,
+                String,
+            ) = transaction.query_row(
+                "SELECT state, version, review_round, base_revision, head_revision
+                 FROM project_tasks
+                 WHERE id = ?1 AND project_id = ?2",
+                params![ready.task_id, ready.project_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?;
+            if task_state != "awaiting_review"
+                || task_version != to_i64(ready.task_version)?
+                || review_round != i64::from(ready.review_round)
+                || base_revision != ready.base_revision
+                || Some(head_revision.as_str()) != ready.head_revision.as_deref()
+                || ready.review_snapshot_digest.is_none()
+            {
+                bail!("reviewer result_ready lost its exact task and revision binding");
+            }
         }
         let now = now_epoch_seconds()?;
         let applied = transaction.execute(
@@ -1723,7 +1802,8 @@ SELECT wt.id, wt.session_id, s.project_id, s.task_id, s.role, wt.sequence,
        s.native_session_id, wt.artifact_dir,
        p.role, p.adapter, p.model, p.reasoning, p.policy, p.cli_path,
        p.executable_identity_json, p.cli_version, p.adapter_contract_ver,
-       p.native_session_mode, p.capability_json, wt.result_hash, wt.lease_owner
+       p.native_session_mode, p.capability_json, wt.result_hash, wt.lease_owner,
+       wt.review_snapshot_digest
 FROM worker_turns wt
 JOIN worker_sessions s ON s.id = wt.session_id
 JOIN project_tasks t ON t.id = s.task_id
@@ -1750,7 +1830,8 @@ SELECT wt.id, wt.session_id, s.project_id, s.task_id, s.role, wt.sequence,
        s.native_session_id, wt.artifact_dir,
        p.role, p.adapter, p.model, p.reasoning, p.policy, p.cli_path,
        p.executable_identity_json, p.cli_version, p.adapter_contract_ver,
-       p.native_session_mode, p.capability_json, wt.result_hash, wt.lease_owner
+       p.native_session_mode, p.capability_json, wt.result_hash, wt.lease_owner,
+       wt.review_snapshot_digest
 FROM worker_turns wt
 JOIN worker_sessions s ON s.id = wt.session_id
 JOIN project_tasks t ON t.id = s.task_id
@@ -1819,6 +1900,7 @@ fn read_ready_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReadyTurn> {
         },
         result_hash: row.get(27)?,
         lease_owner: row.get(28)?,
+        review_snapshot_digest: row.get(29)?,
     })
 }
 
@@ -1860,51 +1942,51 @@ fn apply_completed_developer(
     if review_round >= max_rounds {
         bail!("developer completion exceeds the approved review-round bound");
     }
-    let (reviewer_session, reviewer_turn_kind, reviewer_sequence) =
-        if let Some(existing) = existing_reviewer_session {
-            let state: String = transaction.query_row(
-                "SELECT state FROM worker_sessions
+    let (reviewer_session, reviewer_turn_kind, reviewer_sequence) = if let Some(existing) =
+        existing_reviewer_session
+    {
+        let state: String = transaction.query_row(
+            "SELECT state FROM worker_sessions
                  WHERE id = ?1 AND task_id = ?2 AND role = 'reviewer'",
-                params![existing, ready.task_id],
-                |row| row.get(0),
-            )?;
-            if state != "active" {
-                bail!("reviewer resume requires the exact active task session");
-            }
-            let sequence: i64 = transaction.query_row(
-                "SELECT COALESCE(MAX(sequence), 0) + 1
+            params![existing, ready.task_id],
+            |row| row.get(0),
+        )?;
+        if state != "active" {
+            bail!("reviewer resume requires the exact active task session");
+        }
+        let sequence: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) + 1
                  FROM worker_turns WHERE session_id = ?1",
-                [&existing],
-                |row| row.get(0),
-            )?;
-            (existing, TurnKind::Resume, sequence)
-        } else {
-            let (adapter, native_mode): (String, String) = transaction.query_row(
-                "SELECT adapter, native_session_mode FROM worker_profiles WHERE id = ?1",
-                [&reviewer_profile],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            let reviewer_session = format!("session-{}", Uuid::new_v4());
-            let reviewer_native =
-                (native_mode == "preassigned").then(|| format!("native-{}", Uuid::new_v4()));
-            transaction.execute(
-                "INSERT INTO worker_sessions (
+            [&existing],
+            |row| row.get(0),
+        )?;
+        (existing, TurnKind::Resume, sequence)
+    } else {
+        let (adapter, native_mode): (String, String) = transaction.query_row(
+            "SELECT adapter, native_session_mode FROM worker_profiles WHERE id = ?1",
+            [&reviewer_profile],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let reviewer_session = format!("session-{}", Uuid::new_v4());
+        let reviewer_native = (native_mode == "preassigned").then(|| Uuid::new_v4().to_string());
+        transaction.execute(
+            "INSERT INTO worker_sessions (
                      id, project_id, task_id, role, profile_id, adapter,
                      native_session_id, state, created_at, closed_at, updated_at
                  ) VALUES (?1, ?2, ?3, 'reviewer', ?4, ?5, ?6,
                            'creating', ?7, NULL, ?7)",
-                params![
-                    reviewer_session,
-                    ready.project_id,
-                    ready.task_id,
-                    reviewer_profile,
-                    adapter,
-                    reviewer_native,
-                    now,
-                ],
-            )?;
-            (reviewer_session, TurnKind::Create, 1)
-        };
+            params![
+                reviewer_session,
+                ready.project_id,
+                ready.task_id,
+                reviewer_profile,
+                adapter,
+                reviewer_native,
+                now,
+            ],
+        )?;
+        (reviewer_session, TurnKind::Create, 1)
+    };
     let changed = if reviewer_turn_kind == TurnKind::Create {
         transaction.execute(
             "UPDATE project_tasks
