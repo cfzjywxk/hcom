@@ -18,6 +18,31 @@ use std::time::Duration;
 
 const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
+pub(crate) const REGISTRATION_REFUSAL_GENERIC: &str = "architect_registration";
+pub(crate) const NATIVE_SESSION_REFUSAL_UNAVAILABLE: &str = "native_session_binding_unavailable";
+pub(crate) const NATIVE_SESSION_REFUSAL_BRIDGE_PROCESS: &str = "native_session_bridge_process";
+pub(crate) const NATIVE_SESSION_REFUSAL_ARCHITECT_LIVENESS: &str =
+    "native_session_architect_liveness";
+pub(crate) const NATIVE_SESSION_REFUSAL_CAPABILITY: &str = "native_session_capability";
+pub(crate) const NATIVE_SESSION_REFUSAL_IDENTITY: &str = "native_session_identity";
+pub(crate) const NATIVE_SESSION_REFUSAL_VERSION: &str = "native_session_binding_version";
+pub(crate) const NATIVE_SESSION_REFUSAL_STATE: &str = "native_session_binding_state";
+
+pub(crate) fn closed_native_session_refusal_code(value: Option<&str>) -> &'static str {
+    match value {
+        Some(NATIVE_SESSION_REFUSAL_UNAVAILABLE) => NATIVE_SESSION_REFUSAL_UNAVAILABLE,
+        Some(NATIVE_SESSION_REFUSAL_BRIDGE_PROCESS) => NATIVE_SESSION_REFUSAL_BRIDGE_PROCESS,
+        Some(NATIVE_SESSION_REFUSAL_ARCHITECT_LIVENESS) => {
+            NATIVE_SESSION_REFUSAL_ARCHITECT_LIVENESS
+        }
+        Some(NATIVE_SESSION_REFUSAL_CAPABILITY) => NATIVE_SESSION_REFUSAL_CAPABILITY,
+        Some(NATIVE_SESSION_REFUSAL_IDENTITY) => NATIVE_SESSION_REFUSAL_IDENTITY,
+        Some(NATIVE_SESSION_REFUSAL_VERSION) => NATIVE_SESSION_REFUSAL_VERSION,
+        Some(NATIVE_SESSION_REFUSAL_STATE) => NATIVE_SESSION_REFUSAL_STATE,
+        _ => REGISTRATION_REFUSAL_GENERIC,
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RegistrationRequest {

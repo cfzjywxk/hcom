@@ -10,6 +10,7 @@ use crate::control_api::peer::{
 use crate::control_api::protocol::PROTOCOL_VERSION;
 use crate::control_api::registration::{
     RegistrationAction, RegistrationCaller, RegistrationClient, RegistrationRequest,
+    closed_native_session_refusal_code,
 };
 use crate::control_api::supervisor::ControlPaths;
 use crate::control_api::{CallerAuth, ControlRequest, ControlResponse};
@@ -33,6 +34,17 @@ const MAX_MCP_LINE_BYTES: usize = 256 * 1024;
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const RELAY_SOCKET_NAME: &str = "relay.sock";
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Debug)]
+struct NativeSessionBindingRefusal(&'static str);
+
+impl std::fmt::Display for NativeSessionBindingRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for NativeSessionBindingRefusal {}
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -485,7 +497,9 @@ fn handle_tool_call(
                         },
                     })?;
                 if !response.ok {
-                    bail!("architect native session binding was refused");
+                    bail!(NativeSessionBindingRefusal(
+                        closed_native_session_refusal_code(response.error.as_deref())
+                    ));
                 }
                 let next_version = binding_version
                     .checked_add(1)
@@ -526,14 +540,21 @@ fn handle_tool_call(
                 }
             })
         }
-        Err(_) => json!({
+        Err(error) => json!({
             "jsonrpc":"2.0",
             "id":id,
             "result":{
-                "content":[{"type":"text","text":"architect control request was refused"}],
+                "content":[{"type":"text","text":tool_call_refusal_text(&error)}],
                 "isError":true
             }
         }),
+    }
+}
+
+fn tool_call_refusal_text(error: &anyhow::Error) -> String {
+    match error.downcast_ref::<NativeSessionBindingRefusal>() {
+        Some(error) => format!("architect control request was refused: {}", error.0),
+        None => "architect control request was refused".into(),
     }
 }
 
@@ -867,6 +888,12 @@ struct CodexSessionPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_api::registration::{
+        NATIVE_SESSION_REFUSAL_ARCHITECT_LIVENESS, NATIVE_SESSION_REFUSAL_BRIDGE_PROCESS,
+        NATIVE_SESSION_REFUSAL_CAPABILITY, NATIVE_SESSION_REFUSAL_IDENTITY,
+        NATIVE_SESSION_REFUSAL_STATE, NATIVE_SESSION_REFUSAL_UNAVAILABLE,
+        NATIVE_SESSION_REFUSAL_VERSION,
+    };
     use std::process::{Command, Stdio};
     use std::time::Instant;
 
@@ -1030,6 +1057,36 @@ mod tests {
         let mut reader = BufReader::new(stream);
         assert!(read_bounded_line(&mut reader).unwrap().is_some());
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn native_binding_refusal_exposes_only_closed_stage_codes() {
+        for code in [
+            NATIVE_SESSION_REFUSAL_UNAVAILABLE,
+            NATIVE_SESSION_REFUSAL_BRIDGE_PROCESS,
+            NATIVE_SESSION_REFUSAL_ARCHITECT_LIVENESS,
+            NATIVE_SESSION_REFUSAL_CAPABILITY,
+            NATIVE_SESSION_REFUSAL_IDENTITY,
+            NATIVE_SESSION_REFUSAL_VERSION,
+            NATIVE_SESSION_REFUSAL_STATE,
+        ] {
+            let error = anyhow::Error::new(NativeSessionBindingRefusal(code));
+            assert_eq!(
+                tool_call_refusal_text(&error),
+                format!("architect control request was refused: {code}")
+            );
+        }
+        let unknown = anyhow::Error::new(NativeSessionBindingRefusal(
+            closed_native_session_refusal_code(Some("must-not-echo-value")),
+        ));
+        assert_eq!(
+            tool_call_refusal_text(&unknown),
+            "architect control request was refused: architect_registration"
+        );
+        assert_eq!(
+            tool_call_refusal_text(&anyhow::anyhow!("must-not-echo-value")),
+            "architect control request was refused"
+        );
     }
 
     #[test]

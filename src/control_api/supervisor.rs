@@ -10,8 +10,11 @@ use super::protocol::{
     ControlResult, canonical_action_set, parse_canonical_action_set,
 };
 use super::registration::{
-    RegistrationAction, RegistrationCaller, RegistrationRequest, RegistrationResponse,
-    validate_request_envelope,
+    NATIVE_SESSION_REFUSAL_ARCHITECT_LIVENESS, NATIVE_SESSION_REFUSAL_BRIDGE_PROCESS,
+    NATIVE_SESSION_REFUSAL_CAPABILITY, NATIVE_SESSION_REFUSAL_IDENTITY,
+    NATIVE_SESSION_REFUSAL_STATE, NATIVE_SESSION_REFUSAL_UNAVAILABLE,
+    NATIVE_SESSION_REFUSAL_VERSION, REGISTRATION_REFUSAL_GENERIC, RegistrationAction,
+    RegistrationCaller, RegistrationRequest, RegistrationResponse, validate_request_envelope,
 };
 use crate::orchestrator::{SessionRuntimeSources, SessionStartup, SessionSupervisor};
 use anyhow::{Context, Result, bail};
@@ -247,9 +250,9 @@ impl SessionSupervisorControl {
             .and_then(|()| self.handle_registration_request(peer, &request))
         {
             Ok(version) => RegistrationResponse::success(&request.request_id, version),
-            Err(_) => RegistrationResponse::error(
+            Err(error) => RegistrationResponse::error(
                 &request.request_id,
-                "architect registration request was refused",
+                registration_refusal_code(&request.action, &error),
             ),
         };
         write_registration_response(stream, &response)
@@ -701,6 +704,33 @@ impl SessionSupervisorControl {
     }
 }
 
+fn registration_refusal_code(action: &RegistrationAction, error: &anyhow::Error) -> &'static str {
+    if !matches!(action, RegistrationAction::ObserveNativeSession { .. }) {
+        return REGISTRATION_REFUSAL_GENERIC;
+    }
+    let has = |message: &str| error.chain().any(|cause| cause.to_string() == message);
+    if has("architect binding is unavailable") {
+        NATIVE_SESSION_REFUSAL_UNAVAILABLE
+    } else if has("bridge process binding mismatch") {
+        NATIVE_SESSION_REFUSAL_BRIDGE_PROCESS
+    } else if has("architect PID is unavailable")
+        || has("architect birth is unavailable")
+        || has("architect process is no longer live")
+    {
+        NATIVE_SESSION_REFUSAL_ARCHITECT_LIVENESS
+    } else if has("architect binding secret mismatch") {
+        NATIVE_SESSION_REFUSAL_CAPABILITY
+    } else if has("invalid bounded registration text") {
+        NATIVE_SESSION_REFUSAL_IDENTITY
+    } else if has("architect binding version is stale") {
+        NATIVE_SESSION_REFUSAL_VERSION
+    } else if has("architect native session can bind exactly once") {
+        NATIVE_SESSION_REFUSAL_STATE
+    } else {
+        REGISTRATION_REFUSAL_GENERIC
+    }
+}
+
 struct SocketGuard {
     path: PathBuf,
     listener: UnixListener,
@@ -955,6 +985,68 @@ mod tests {
         }
         assert!(!control_socket.exists());
         assert!(!registration_socket.exists());
+    }
+
+    #[test]
+    fn native_session_registration_refusal_codes_are_closed_and_non_secret() {
+        let action = RegistrationAction::ObserveNativeSession {
+            binding_id: "binding-refusal-code".into(),
+            expected_version: 1,
+            native_session_id: "native-refusal-code".into(),
+        };
+        for (message, expected) in [
+            (
+                "architect binding is unavailable",
+                NATIVE_SESSION_REFUSAL_UNAVAILABLE,
+            ),
+            (
+                "bridge process binding mismatch",
+                NATIVE_SESSION_REFUSAL_BRIDGE_PROCESS,
+            ),
+            (
+                "architect process is no longer live",
+                NATIVE_SESSION_REFUSAL_ARCHITECT_LIVENESS,
+            ),
+            (
+                "architect binding secret mismatch",
+                NATIVE_SESSION_REFUSAL_CAPABILITY,
+            ),
+            (
+                "invalid bounded registration text",
+                NATIVE_SESSION_REFUSAL_IDENTITY,
+            ),
+            (
+                "architect binding version is stale",
+                NATIVE_SESSION_REFUSAL_VERSION,
+            ),
+            (
+                "architect native session can bind exactly once",
+                NATIVE_SESSION_REFUSAL_STATE,
+            ),
+        ] {
+            assert_eq!(
+                registration_refusal_code(&action, &anyhow::anyhow!(message)),
+                expected
+            );
+        }
+        assert_eq!(
+            registration_refusal_code(
+                &action,
+                &anyhow::anyhow!("unclassified must-not-echo-value")
+            ),
+            REGISTRATION_REFUSAL_GENERIC
+        );
+        let unrelated = RegistrationAction::CloseBinding {
+            binding_id: "binding-refusal-code".into(),
+            expected_version: 1,
+        };
+        assert_eq!(
+            registration_refusal_code(
+                &unrelated,
+                &anyhow::anyhow!("architect binding secret mismatch")
+            ),
+            REGISTRATION_REFUSAL_GENERIC
+        );
     }
 
     #[test]
