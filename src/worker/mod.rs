@@ -1,4 +1,4 @@
-//! Tool-neutral contracts for durable, no-TUI task workers.
+//! Tool-neutral contracts for foreground-session, no-TUI task workers.
 
 pub(crate) mod validation;
 
@@ -12,6 +12,8 @@ pub mod process;
 pub mod result;
 #[cfg(target_os = "linux")]
 pub mod reviewer;
+#[cfg(target_os = "linux")]
+pub(crate) mod sandbox;
 
 pub use contract::{
     AdapterCapabilities, AdapterDescriptor, CommandSpec, ExecutableIdentity, NativeArtifacts,

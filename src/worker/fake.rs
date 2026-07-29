@@ -437,7 +437,7 @@ mod tests {
             let role = WorkerRole::Developer;
             let profile = adapter.profile(role);
             let control = TurnControl {
-                project_id: "project-1".into(),
+                run_id: "run-1".into(),
                 task_id: "task-1".into(),
                 role,
                 logical_session_id: "logical-1".into(),
@@ -453,7 +453,7 @@ mod tests {
                 review_round: 0,
                 base_revision: std::iter::repeat_n('a', 40).collect(),
                 head_revision: None,
-                artifact_dir: "project-1/task-1/developer/logical-1/turn-1/attempt-1".into(),
+                artifact_dir: "run-1/task-1/developer/logical-1/turn-1/attempt-1".into(),
             };
             let prompt = b"private fake task sentinel 180c4b55".to_vec();
             let mut invalid_create_control = control.clone();
@@ -526,7 +526,7 @@ mod tests {
 
     fn control(role: WorkerRole, native_session_id: Option<&str>) -> TurnControl {
         TurnControl {
-            project_id: "project-1".into(),
+            run_id: "run-1".into(),
             task_id: "task-1".into(),
             role,
             logical_session_id: "logical-1".into(),
@@ -537,7 +537,7 @@ mod tests {
             review_round: if role == WorkerRole::Reviewer { 1 } else { 0 },
             base_revision: "a".repeat(40),
             head_revision: (role == WorkerRole::Reviewer).then(|| "b".repeat(40)),
-            artifact_dir: "project-1/task-1/developer/logical-1/turn-1/attempt-1".into(),
+            artifact_dir: "run-1/task-1/developer/logical-1/turn-1/attempt-1".into(),
         }
     }
 }

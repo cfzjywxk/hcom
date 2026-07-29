@@ -10,10 +10,14 @@ use super::environment::{EnvironmentPolicy, ExactEnvironmentRequirement};
 use super::result::{
     CheckStatus, CommitSummary, DeveloperDecision, DeveloperResult, MAX_RESULT_BYTES,
 };
+use super::sandbox::{
+    EmptyRootContract, EmptyRootMounts, INSIDE_ARTIFACTS, INSIDE_CARGO_HOME, INSIDE_CODEX,
+    INSIDE_HOME, INSIDE_NATIVE_CONFIG, INSIDE_PATH, INSIDE_RUNTIME, INSIDE_RUSTUP_HOME,
+    INSIDE_TEMP, INSIDE_WORKSPACE,
+};
 use super::validation::{
     MAX_ITEMS, MAX_PATH_BYTES, validate_git_oid, validate_relative_path, validate_text,
 };
-use crate::control_api::daemon::ControlPaths;
 use crate::control_api::{CapabilitySnapshot, NativeSessionMode, WorkerRole};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -41,9 +45,9 @@ pub const GIT_EXECUTABLE: &str = "/usr/bin/git";
 pub const GIT_VERSION: &str = "git version 2.43.0";
 
 const ADAPTER_NAME: &str = "codex-developer-0.145.0";
-const ADAPTER_CONTRACT_VERSION: u32 = 1;
+const ADAPTER_CONTRACT_VERSION: u32 = 2;
 const EFFECTIVE_POLICY: &str =
-    "native=danger-full-access;outer=bubblewrap-0.9.0-developer-v1;approval=never";
+    "native=danger-full-access;outer=bubblewrap-0.9.0-empty-root-developer-v2;approval=never";
 const MAX_CODEX_EVENTS: usize = 4096;
 const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_DURATION: Duration = Duration::from_secs(30);
@@ -78,6 +82,7 @@ pub(crate) const DISABLED_CODEX_FEATURES: &[&str] = &[
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct CodexDeveloperConfig {
+    pub run_id: String,
     pub workspace_cwd: PathBuf,
     pub artifact_root: PathBuf,
     pub isolated_home: PathBuf,
@@ -86,6 +91,8 @@ pub struct CodexDeveloperConfig {
     pub runtime_dir: PathBuf,
     pub host_runtime_dir: PathBuf,
     pub auth_source: PathBuf,
+    pub cargo_bin_source: PathBuf,
+    pub rustup_home_source: PathBuf,
 }
 
 pub struct CodexDeveloperAdapter {
@@ -110,18 +117,28 @@ impl CodexDeveloperAdapter {
     pub fn environment_policy() -> Result<EnvironmentPolicy> {
         let mut inherited = EnvironmentPolicy::baseline().inherited_names;
         inherited.extend(
-            ["CODEX_HOME", "HOME", "TMPDIR", "XDG_RUNTIME_DIR"]
-                .into_iter()
-                .map(str::to_owned),
+            [
+                "CARGO_HOME",
+                "CODEX_HOME",
+                "HOME",
+                "PATH",
+                "RUSTUP_HOME",
+                "TMPDIR",
+                "XDG_RUNTIME_DIR",
+            ]
+            .into_iter()
+            .map(str::to_owned),
         );
         inherited.sort();
         inherited.dedup();
         EnvironmentPolicy::new(
             inherited,
             vec![
+                "CARGO_HOME".into(),
                 "CODEX_HOME".into(),
                 "HOME".into(),
                 "PATH".into(),
+                "RUSTUP_HOME".into(),
                 "TMPDIR".into(),
                 "XDG_RUNTIME_DIR".into(),
             ],
@@ -157,25 +174,7 @@ impl CodexDeveloperAdapter {
         let git_executable = capture_exact_tool(git_path, GIT_VERSION)?;
         let sandbox =
             SandboxContract::capture(config, &executable, &outer_executable, &git_executable)?;
-        let descriptor = AdapterDescriptor::new(
-            ADAPTER_NAME,
-            ADAPTER_CONTRACT_VERSION,
-            CODEX_DEVELOPER_CLI_VERSION,
-            CODEX_DEVELOPER_MODEL,
-            CODEX_DEVELOPER_REASONING,
-            EFFECTIVE_POLICY,
-            AdapterCapabilities {
-                roles: vec![WorkerRole::Developer],
-                native_session_mode: NativeSessionMode::Discovered,
-                result_transport: ResultTransport::FinalFile,
-                features: vec![
-                    "exact-resume".into(),
-                    "host-git-evidence".into(),
-                    "outer-bwrap-v1".into(),
-                    "structured-result".into(),
-                ],
-            },
-        )?;
+        let descriptor = developer_descriptor()?;
         Ok(Self {
             descriptor,
             executable,
@@ -226,22 +225,33 @@ impl CodexDeveloperAdapter {
             fixed_argv.extend(["--disable".into(), (*feature).into()]);
         }
         if resume_session_id.is_none() {
-            fixed_argv.extend([
-                "--cd".into(),
-                path_text("Codex developer workspace", self.sandbox.workspace.path())?.into(),
-            ]);
+            fixed_argv.extend(["--cd".into(), INSIDE_WORKSPACE.into()]);
         }
         let expected_artifact_dir = self
             .sandbox
             .artifact_root
             .path()
             .join(&control.artifact_dir);
+        let production_outer = self.outer_executable.canonical_path == Path::new(BWRAP_EXECUTABLE);
         let outer_launch = OuterLaunchEnvelope {
             executable: self.outer_executable.clone(),
             fixed_argv: self
                 .sandbox
                 .outer_argv(&expected_artifact_dir, &self.executable)?,
             expected_artifact_dir,
+            inside_executable: if production_outer {
+                INSIDE_CODEX.into()
+            } else {
+                self.executable.canonical_path.clone()
+            },
+            inside_artifact_dir: if production_outer {
+                INSIDE_ARTIFACTS.into()
+            } else {
+                self.sandbox
+                    .artifact_root
+                    .path()
+                    .join(&control.artifact_dir)
+            },
         };
         Ok(CommandSpec {
             executable: self.executable.clone(),
@@ -291,7 +301,7 @@ impl WorkerAdapter for CodexDeveloperAdapter {
 
     fn build_resume(&self, native_session_id: &str, control: &TurnControl) -> Result<CommandSpec> {
         if control.native_session_id.as_deref() != Some(native_session_id) {
-            bail!("Codex resume must use the exact durable native session");
+            bail!("Codex resume must use the exact session-bound native session");
         }
         self.command(control, Some(native_session_id))
     }
@@ -341,7 +351,30 @@ impl WorkerAdapter for CodexDeveloperAdapter {
     }
 }
 
+fn developer_descriptor() -> Result<AdapterDescriptor> {
+    AdapterDescriptor::new(
+        ADAPTER_NAME,
+        ADAPTER_CONTRACT_VERSION,
+        CODEX_DEVELOPER_CLI_VERSION,
+        CODEX_DEVELOPER_MODEL,
+        CODEX_DEVELOPER_REASONING,
+        EFFECTIVE_POLICY,
+        AdapterCapabilities {
+            roles: vec![WorkerRole::Developer],
+            native_session_mode: NativeSessionMode::Discovered,
+            result_transport: ResultTransport::FinalFile,
+            features: vec![
+                "exact-resume".into(),
+                "host-git-evidence".into(),
+                "outer-bwrap-empty-root-v2".into(),
+                "structured-result".into(),
+            ],
+        },
+    )
+}
+
 struct SandboxContract {
+    run_id: String,
     workspace: DirectoryIdentity,
     artifact_root: DirectoryIdentity,
     isolated_home: DirectoryIdentity,
@@ -349,10 +382,10 @@ struct SandboxContract {
     temp_dir: DirectoryIdentity,
     runtime_dir: DirectoryIdentity,
     host_runtime_dir: DirectoryIdentity,
-    control_socket_path: PathBuf,
     auth_source: FileIdentity,
     auth_target: FileIdentity,
     git_workspace: GitWorkspaceIdentity,
+    empty_root: EmptyRootContract,
 }
 
 impl SandboxContract {
@@ -369,14 +402,14 @@ impl SandboxContract {
         let temp_dir = DirectoryIdentity::capture(&config.temp_dir, true)?;
         let runtime_dir = DirectoryIdentity::capture(&config.runtime_dir, true)?;
         let host_runtime_dir = DirectoryIdentity::capture(&config.host_runtime_dir, true)?;
-        let control_socket_path = host_runtime_dir
-            .path()
-            .join("hcom-project-control/control.sock");
         let auth_source = FileIdentity::capture(&config.auth_source)?;
         let auth_target_path = codex_home.path().join(CODEX_AUTH_FILE);
         let auth_target = FileIdentity::capture(&auth_target_path)?;
         if auth_source.path() == auth_target.path() {
             bail!("Codex auth source must be distinct from the isolated mount target");
+        }
+        if paths_overlap(auth_source.path(), host_runtime_dir.path()) {
+            bail!("Codex auth source must not overlap the masked host runtime directory");
         }
 
         for (left_label, left, right_label, right) in [
@@ -399,24 +432,6 @@ impl SandboxContract {
                 codex_home.path(),
             ),
             (
-                "workspace",
-                workspace.path(),
-                "isolated temp",
-                temp_dir.path(),
-            ),
-            (
-                "workspace",
-                workspace.path(),
-                "private runtime",
-                runtime_dir.path(),
-            ),
-            (
-                "workspace",
-                workspace.path(),
-                "host runtime mask",
-                host_runtime_dir.path(),
-            ),
-            (
                 "artifact root",
                 artifact_root.path(),
                 "isolated HOME",
@@ -427,66 +442,6 @@ impl SandboxContract {
                 artifact_root.path(),
                 "isolated CODEX_HOME",
                 codex_home.path(),
-            ),
-            (
-                "artifact root",
-                artifact_root.path(),
-                "isolated temp",
-                temp_dir.path(),
-            ),
-            (
-                "artifact root",
-                artifact_root.path(),
-                "private runtime",
-                runtime_dir.path(),
-            ),
-            (
-                "artifact root",
-                artifact_root.path(),
-                "host runtime mask",
-                host_runtime_dir.path(),
-            ),
-            (
-                "isolated CODEX_HOME",
-                codex_home.path(),
-                "isolated temp",
-                temp_dir.path(),
-            ),
-            (
-                "isolated CODEX_HOME",
-                codex_home.path(),
-                "private runtime",
-                runtime_dir.path(),
-            ),
-            (
-                "isolated HOME",
-                isolated_home.path(),
-                "host runtime mask",
-                host_runtime_dir.path(),
-            ),
-            (
-                "isolated CODEX_HOME",
-                codex_home.path(),
-                "host runtime mask",
-                host_runtime_dir.path(),
-            ),
-            (
-                "isolated temp",
-                temp_dir.path(),
-                "private runtime",
-                runtime_dir.path(),
-            ),
-            (
-                "isolated temp",
-                temp_dir.path(),
-                "host runtime mask",
-                host_runtime_dir.path(),
-            ),
-            (
-                "private runtime",
-                runtime_dir.path(),
-                "host runtime mask",
-                host_runtime_dir.path(),
             ),
         ] {
             if paths_overlap(left, right) {
@@ -499,21 +454,13 @@ impl SandboxContract {
             bail!("isolated CODEX_HOME must be a strict child of isolated HOME");
         }
 
-        let writable_roots = [
-            workspace.path(),
-            isolated_home.path(),
-            temp_dir.path(),
-            artifact_root.path(),
-        ];
+        let writable_roots = [workspace.path(), isolated_home.path(), artifact_root.path()];
         for protected in [
             codex.canonical_path.as_path(),
             bwrap.canonical_path.as_path(),
             git.canonical_path.as_path(),
             auth_source.path(),
         ] {
-            if protected.starts_with(host_runtime_dir.path()) {
-                bail!("host runtime mask must not hide a required Codex sandbox file");
-            }
             if writable_roots
                 .iter()
                 .any(|root| protected.starts_with(root))
@@ -522,7 +469,10 @@ impl SandboxContract {
             }
         }
         let git_workspace = GitWorkspaceIdentity::capture(workspace.path(), git)?;
+        let empty_root =
+            EmptyRootContract::capture(&config.cargo_bin_source, &config.rustup_home_source)?;
         Ok(Self {
+            run_id: config.run_id,
             workspace,
             artifact_root,
             isolated_home,
@@ -530,10 +480,10 @@ impl SandboxContract {
             temp_dir,
             runtime_dir,
             host_runtime_dir,
-            control_socket_path,
             auth_source,
             auth_target,
             git_workspace,
+            empty_root,
         })
     }
 
@@ -553,37 +503,22 @@ impl SandboxContract {
         self.temp_dir.revalidate(true)?;
         self.runtime_dir.revalidate(true)?;
         self.host_runtime_dir.revalidate(true)?;
-        if self.control_socket_path
-            != self
-                .host_runtime_dir
-                .path()
-                .join("hcom-project-control/control.sock")
-        {
-            bail!("Codex durable control socket mask contract drifted");
-        }
+        super::validation::validate_opaque_id("Codex worker run id", &self.run_id)?;
         self.auth_source.revalidate()?;
         self.auth_target.revalidate()?;
+        self.empty_root.revalidate()?;
         self.git_workspace.revalidate(self.workspace.path(), git)
     }
 
     fn exact_environment(&self) -> Result<Vec<ExactEnvironmentRequirement>> {
         Ok(vec![
-            ExactEnvironmentRequirement::new(
-                "CODEX_HOME",
-                path_text("isolated CODEX_HOME", self.codex_home.path())?,
-            )?,
-            ExactEnvironmentRequirement::new(
-                "HOME",
-                path_text("isolated HOME", self.isolated_home.path())?,
-            )?,
-            ExactEnvironmentRequirement::new(
-                "TMPDIR",
-                path_text("isolated temp", self.temp_dir.path())?,
-            )?,
-            ExactEnvironmentRequirement::new(
-                "XDG_RUNTIME_DIR",
-                path_text("private runtime", self.runtime_dir.path())?,
-            )?,
+            ExactEnvironmentRequirement::new("CARGO_HOME", INSIDE_CARGO_HOME)?,
+            ExactEnvironmentRequirement::new("CODEX_HOME", INSIDE_NATIVE_CONFIG)?,
+            ExactEnvironmentRequirement::new("HOME", INSIDE_HOME)?,
+            ExactEnvironmentRequirement::new("PATH", INSIDE_PATH)?,
+            ExactEnvironmentRequirement::new("RUSTUP_HOME", INSIDE_RUSTUP_HOME)?,
+            ExactEnvironmentRequirement::new("TMPDIR", INSIDE_TEMP)?,
+            ExactEnvironmentRequirement::new("XDG_RUNTIME_DIR", INSIDE_RUNTIME)?,
         ])
     }
 
@@ -591,59 +526,19 @@ impl SandboxContract {
         if !artifact_dir.starts_with(self.artifact_root.path()) {
             bail!("Codex artifact attempt escaped its pinned artifact root");
         }
-        let mut argv: Vec<String> = vec![
-            "--die-with-parent".into(),
-            "--unshare-pid".into(),
-            "--unshare-ipc".into(),
-            "--unshare-uts".into(),
-            "--ro-bind".into(),
-            "/".into(),
-            "/".into(),
-            "--proc".into(),
-            "/proc".into(),
-            "--dev".into(),
-            "/dev".into(),
-            "--tmpfs".into(),
-            path_text("host XDG runtime mask", self.host_runtime_dir.path())?.into(),
-        ];
-        for path in [
-            self.isolated_home.path(),
-            self.codex_home.path(),
-            self.temp_dir.path(),
-            self.workspace.path(),
+        let argv = self.empty_root.outer_argv(EmptyRootMounts {
+            native: codex,
+            inside_native: INSIDE_CODEX,
+            isolated_home: self.isolated_home.path(),
+            native_config: self.codex_home.path(),
+            workspace: self.workspace.path(),
+            workspace_writable: true,
             artifact_dir,
-        ] {
-            let path = path_text("Codex writable sandbox mount", path)?;
-            argv.extend(["--bind".into(), path.into(), path.into()]);
-        }
-        argv.extend([
-            "--tmpfs".into(),
-            path_text("Codex private runtime mount", self.runtime_dir.path())?.into(),
-            "--ro-bind".into(),
-            path_text("Codex auth source", self.auth_source.path())?.into(),
-            path_text("Codex auth target", self.auth_target.path())?.into(),
-            "--chdir".into(),
-            path_text("Codex developer workspace", self.workspace.path())?.into(),
-        ]);
-        let host_runtime = path_text("host XDG runtime mask", self.host_runtime_dir.path())?;
-        let private_runtime = path_text("Codex private runtime mount", self.runtime_dir.path())?;
-        let tmpfs_targets: BTreeSet<_> = argv
-            .windows(2)
-            .filter(|pair| pair[0] == "--tmpfs")
-            .map(|pair| pair[1].as_str())
-            .collect();
-        if !self
-            .control_socket_path
-            .starts_with(self.host_runtime_dir.path())
-            || !tmpfs_targets.contains(host_runtime)
-            || !tmpfs_targets.contains(private_runtime)
-        {
-            bail!("Codex outer sandbox does not mask its resolved durable runtime endpoints");
-        }
+            auth_source: self.auth_source.path(),
+            auth_target: "/hcom/native/auth.json",
+        })?;
         if argv.iter().any(|argument| {
-            argument == "--"
-                || argument == &codex.canonical_path.to_string_lossy()
-                || argument.contains("hcom-project-control/control.sock")
+            argument == "--" || argument.contains("control.sock") || argument == "/"
         }) {
             bail!("Codex outer sandbox manifest contains forbidden launch authority");
         }
@@ -778,8 +673,8 @@ impl DirectoryIdentity {
     fn validate_metadata(&self, private: bool) -> Result<()> {
         // SAFETY: geteuid has no preconditions.
         let uid = unsafe { libc::geteuid() };
-        if self.uid != uid || self.mode & 0o022 != 0 {
-            bail!("Codex sandbox directory has unsafe ownership or write permissions");
+        if self.uid != uid {
+            bail!("Codex sandbox directory is not owned by the current user");
         }
         if private && (self.mode & 0o077 != 0 || self.mode & 0o700 != 0o700) {
             bail!("Codex private directory must be mode 0700");
@@ -1080,11 +975,11 @@ fn capture_exact_tool(path: &Path, expected: &str) -> Result<ExecutableIdentity>
     let mut expected_output = expected.as_bytes().to_vec();
     expected_output.push(b'\n');
     if !output.status.success() || !output.stderr.is_empty() || output.stdout != expected_output {
-        bail!("durable worker tool version does not match its exact enabled contract");
+        bail!("session worker tool version does not match its exact enabled contract");
     }
     let after = ExecutableIdentity::capture(path)?;
     if before != after {
-        bail!("durable worker tool identity changed during version validation");
+        bail!("session worker tool identity changed during version validation");
     }
     Ok(after)
 }
@@ -1092,7 +987,7 @@ fn capture_exact_tool(path: &Path, expected: &str) -> Result<ExecutableIdentity>
 fn revalidate_exact_tool(identity: &ExecutableIdentity, expected: &str) -> Result<()> {
     let current = capture_exact_tool(&identity.canonical_path, expected)?;
     if current != *identity {
-        bail!("durable Codex tool identity or version drifted");
+        bail!("session Codex tool identity or version drifted");
     }
     Ok(())
 }
@@ -1185,7 +1080,7 @@ struct CodexItem {
 pub(super) fn parse_codex_turn(control: &TurnControl, stdout: &[u8]) -> Result<CodexTurnEvidence> {
     control.validate()?;
     if stdout.is_empty() {
-        bail!("Codex JSONL does not match a durable worker turn");
+        bail!("Codex JSONL does not match a session worker turn");
     }
     let text = std::str::from_utf8(stdout).context("Codex JSONL is not UTF-8")?;
     validate_text("Codex JSONL", text, 1024 * 1024, true)?;
@@ -1403,27 +1298,16 @@ fn parse_nul_paths(bytes: &[u8]) -> Result<Vec<String>> {
 }
 
 fn validate_production_runtime_contract(config: &CodexDeveloperConfig) -> Result<()> {
+    super::validation::validate_opaque_id("Codex worker run id", &config.run_id)?;
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("XDG_RUNTIME_DIR is required for the Codex worker sandbox"))?;
     let canonical_runtime =
         fs::canonicalize(&runtime).context("failed to resolve host XDG_RUNTIME_DIR")?;
     if runtime != canonical_runtime || config.host_runtime_dir != canonical_runtime {
-        bail!("Codex worker host runtime mask does not match canonical XDG_RUNTIME_DIR");
-    }
-    let resolved_control_socket = ControlPaths::discover()?.socket_path();
-    if resolved_control_socket != canonical_runtime.join("hcom-project-control/control.sock") {
-        bail!("Codex worker could not resolve the exact durable control socket under its mask");
+        bail!("Codex worker host runtime root does not match canonical XDG_RUNTIME_DIR");
     }
     Ok(())
-}
-
-fn path_text<'a>(label: &str, path: &'a Path) -> Result<&'a str> {
-    let text = path
-        .to_str()
-        .ok_or_else(|| anyhow!("{label} must be valid UTF-8"))?;
-    validate_text(label, text, MAX_PATH_BYTES, false)?;
-    Ok(text)
 }
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
@@ -1463,6 +1347,8 @@ mod tests {
             let temp_dir = temp.path().join("isolated-tmp");
             let runtime_dir = temp.path().join("isolated-runtime");
             let host_runtime_dir = temp.path().join("host-runtime");
+            let cargo_bin_source = temp.path().join("cargo-bin");
+            let rustup_home_source = temp.path().join("rustup-home");
             let tools = temp.path().join("tools");
             for directory in [
                 &workspace,
@@ -1472,6 +1358,8 @@ mod tests {
                 &temp_dir,
                 &runtime_dir,
                 &host_runtime_dir,
+                &cargo_bin_source,
+                &rustup_home_source,
                 &tools,
             ] {
                 fs::create_dir(directory).unwrap();
@@ -1523,6 +1411,7 @@ mod tests {
             Self {
                 _temp: temp,
                 config: CodexDeveloperConfig {
+                    run_id: "run-codex-fixture".into(),
                     workspace_cwd: fs::canonicalize(workspace).unwrap(),
                     artifact_root: fs::canonicalize(artifact_root).unwrap(),
                     isolated_home: fs::canonicalize(isolated_home).unwrap(),
@@ -1531,6 +1420,8 @@ mod tests {
                     runtime_dir: fs::canonicalize(runtime_dir).unwrap(),
                     host_runtime_dir: fs::canonicalize(host_runtime_dir).unwrap(),
                     auth_source: fs::canonicalize(auth_source).unwrap(),
+                    cargo_bin_source: fs::canonicalize(cargo_bin_source).unwrap(),
+                    rustup_home_source: fs::canonicalize(rustup_home_source).unwrap(),
                 },
                 codex: fs::canonicalize(codex).unwrap(),
                 bwrap: fs::canonicalize(bwrap).unwrap(),
@@ -1562,23 +1453,13 @@ mod tests {
                 epoch,
                 &CodexDeveloperAdapter::environment_policy().unwrap(),
                 vec![
-                    (
-                        "CODEX_HOME".into(),
-                        self.config.codex_home.to_string_lossy().into_owned(),
-                    ),
-                    (
-                        "HOME".into(),
-                        self.config.isolated_home.to_string_lossy().into_owned(),
-                    ),
-                    ("PATH".into(), "/usr/bin:/bin".into()),
-                    (
-                        "TMPDIR".into(),
-                        self.config.temp_dir.to_string_lossy().into_owned(),
-                    ),
-                    (
-                        "XDG_RUNTIME_DIR".into(),
-                        self.config.runtime_dir.to_string_lossy().into_owned(),
-                    ),
+                    ("CARGO_HOME".into(), INSIDE_CARGO_HOME.into()),
+                    ("CODEX_HOME".into(), INSIDE_NATIVE_CONFIG.into()),
+                    ("HOME".into(), INSIDE_HOME.into()),
+                    ("PATH".into(), INSIDE_PATH.into()),
+                    ("RUSTUP_HOME".into(), INSIDE_RUSTUP_HOME.into()),
+                    ("TMPDIR".into(), INSIDE_TEMP.into()),
+                    ("XDG_RUNTIME_DIR".into(), INSIDE_RUNTIME.into()),
                 ],
             )
             .unwrap()
@@ -1603,7 +1484,7 @@ mod tests {
             let attempt = ArtifactAttempt::create(
                 &root,
                 ArtifactScope {
-                    project_id: control.project_id.clone(),
+                    run_id: control.run_id.clone(),
                     task_id: control.task_id.clone(),
                     role: WorkerRole::Developer,
                     logical_session_id: control.logical_session_id.clone(),
@@ -1619,7 +1500,7 @@ mod tests {
                     "epoch-codex",
                     &WorkerEnvironmentIdentity {
                         role: WorkerRole::Developer,
-                        project_id: control.project_id.clone(),
+                        run_id: control.run_id.clone(),
                         task_id: control.task_id.clone(),
                     },
                 )
@@ -1658,7 +1539,7 @@ mod tests {
 
     fn control(native_session_id: Option<&str>) -> TurnControl {
         TurnControl {
-            project_id: "project-1".into(),
+            run_id: "run-1".into(),
             task_id: "task-1".into(),
             role: WorkerRole::Developer,
             logical_session_id: "logical-1".into(),
@@ -1670,7 +1551,7 @@ mod tests {
             base_revision: "a".repeat(40),
             head_revision: None,
             artifact_dir: format!(
-                "project-1/task-1/developer/logical-1/turn-{}/attempt-1",
+                "run-1/task-1/developer/logical-1/turn-{}/attempt-1",
                 if native_session_id.is_some() { 2 } else { 1 }
             ),
         }
@@ -1785,16 +1666,14 @@ mod tests {
         assert!(argv.windows(2).any(|pair| pair == ["--disable", "hooks"]));
         assert!(
             argv.windows(2)
-                .any(|pair| pair == ["--tmpfs", fixture.config.runtime_dir.to_str().unwrap()])
+                .any(|pair| pair == ["--tmpfs", INSIDE_RUNTIME])
         );
-        assert!(
-            argv.windows(2)
-                .any(|pair| pair == ["--tmpfs", fixture.config.host_runtime_dir.to_str().unwrap()])
-        );
+        assert!(argv.windows(2).any(|pair| pair == ["--tmpfs", INSIDE_TEMP]));
+        assert!(!argv.windows(3).any(|part| part == ["--ro-bind", "/", "/"]));
         assert!(
             !argv
                 .join("\0")
-                .contains("hcom-project-control/control.sock")
+                .contains("hcom-architect-session/control.sock")
         );
         assert!(!argv.iter().any(|argument| argument == "--last"));
         assert!(!argv.iter().any(|argument| argument == "--ephemeral"));
@@ -1867,7 +1746,10 @@ mod tests {
     #[test]
     fn real_bwrap_masks_all_live_host_control_and_architect_sockets() {
         let fixture = Fixture::new();
-        let control_root = fixture.config.host_runtime_dir.join("hcom-project-control");
+        let control_root = fixture
+            .config
+            .host_runtime_dir
+            .join("hcom-architect-session");
         let architect_root = control_root.join("architect");
         let launch_root = architect_root.join("launch-mask-proof");
         fs::create_dir(&control_root).unwrap();
@@ -2315,27 +2197,20 @@ mod tests {
             "epoch-drift",
             &policy,
             vec![
-                (
-                    "CODEX_HOME".into(),
-                    fixture.config.codex_home.to_string_lossy().into_owned(),
-                ),
+                ("CARGO_HOME".into(), INSIDE_CARGO_HOME.into()),
+                ("CODEX_HOME".into(), INSIDE_NATIVE_CONFIG.into()),
                 ("HOME".into(), "/wrong/isolated-home".into()),
-                ("PATH".into(), "/usr/bin:/bin".into()),
-                (
-                    "TMPDIR".into(),
-                    fixture.config.temp_dir.to_string_lossy().into_owned(),
-                ),
-                (
-                    "XDG_RUNTIME_DIR".into(),
-                    fixture.config.runtime_dir.to_string_lossy().into_owned(),
-                ),
+                ("PATH".into(), INSIDE_PATH.into()),
+                ("RUSTUP_HOME".into(), INSIDE_RUSTUP_HOME.into()),
+                ("TMPDIR".into(), INSIDE_TEMP.into()),
+                ("XDG_RUNTIME_DIR".into(), INSIDE_RUNTIME.into()),
             ],
         )
         .unwrap();
         let attempt = ArtifactAttempt::create(
             &root,
             ArtifactScope {
-                project_id: control.project_id.clone(),
+                run_id: control.run_id.clone(),
                 task_id: control.task_id.clone(),
                 role: WorkerRole::Developer,
                 logical_session_id: control.logical_session_id.clone(),
@@ -2351,7 +2226,7 @@ mod tests {
                 "epoch-drift",
                 &WorkerEnvironmentIdentity {
                     role: WorkerRole::Developer,
-                    project_id: control.project_id,
+                    run_id: control.run_id,
                     task_id: control.task_id,
                 },
             )
@@ -2429,10 +2304,13 @@ fi
 # SOCKET_REACHABILITY_PROBE
 [ ! -t 0 ] && [ ! -t 1 ] && [ ! -t 2 ]
 [ "${HCOM_WORKER_ROLE-}" = developer ]
-[ -n "${HCOM_PROJECT_ID-}" ] && [ -n "${HCOM_TASK_ID-}" ]
+[ -n "${HCOM_RUN_ID-}" ] && [ -n "${HCOM_TASK_ID-}" ]
 [ -z "${HCOM_AGENT-}" ] && [ -z "${TERM-}" ] && [ -z "${STY-}" ]
 [ -n "${HOME-}" ] && [ -n "${CODEX_HOME-}" ] && [ -n "${TMPDIR-}" ]
-[ -n "${XDG_RUNTIME_DIR-}" ] && [ -f "$CODEX_HOME/auth.json" ]
+[ "${HOME-}" = /hcom/home ] && [ "${CODEX_HOME-}" = /hcom/native ]
+[ "${TMPDIR-}" = /tmp ] && [ "${XDG_RUNTIME_DIR-}" = /hcom/run ]
+[ "${CARGO_HOME-}" = /hcom/home/.cargo ]
+[ "${RUSTUP_HOME-}" = /hcom/toolchains/rust/rustup ]
 [ "$1" = exec ]
 shift
 session=native-codex-1

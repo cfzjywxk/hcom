@@ -2,8 +2,8 @@
 //!
 //! This socket is never mounted into an architect or worker sandbox. It carries
 //! launch/process binding material between the foreground `hcom architect`
-//! launcher, the separately spawned bridge, and `hcomd`; it is not an MCP or
-//! public project-action surface.
+//! launcher, the separately spawned bridge, and the in-process session
+//! supervisor; it is not an MCP or public task-action surface.
 
 use super::codec::{read_response_frame, write_request_frame};
 use super::protocol::{ActionName, PROTOCOL_VERSION};
@@ -62,11 +62,6 @@ pub enum RegistrationAction {
         relay_executable_contract_hash: String,
         relay_runtime_scope_hash: String,
     },
-    BindProject {
-        binding_id: String,
-        expected_version: u64,
-        project_id: String,
-    },
     ObserveNativeSession {
         binding_id: String,
         expected_version: u64,
@@ -116,14 +111,14 @@ impl RegistrationResponse {
             || self.ok != self.binding_version.is_some()
             || self.ok == self.error.is_some()
         {
-            bail!("registration daemon returned an invalid response");
+            bail!("session supervisor returned an invalid registration response");
         }
         if self
             .error
             .as_deref()
             .is_some_and(|message| message.is_empty() || message.len() > 1024)
         {
-            bail!("registration daemon returned an invalid error");
+            bail!("session supervisor returned an invalid registration error");
         }
         Ok(())
     }
@@ -157,10 +152,10 @@ impl RegistrationClient {
         write_request_frame(&mut stream, &payload)?;
         let frame = read_response_frame(&mut stream)?;
         let response: RegistrationResponse = serde_json::from_slice(&frame)
-            .context("registration daemon returned malformed JSON")?;
+            .context("session supervisor returned malformed registration JSON")?;
         response.validate()?;
         if response.request_id != request.request_id {
-            bail!("registration daemon returned a mismatched request id");
+            bail!("session supervisor returned a mismatched registration request id");
         }
         Ok(response)
     }

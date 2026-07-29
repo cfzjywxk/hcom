@@ -71,7 +71,7 @@ impl EnvironmentPolicy {
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentLeaseDescriptor {
     pub lease_id: String,
-    pub daemon_epoch: String,
+    pub supervisor_epoch: String,
     pub environment_hash: String,
     pub inherited_names: Vec<String>,
     pub required_names: Vec<String>,
@@ -80,7 +80,7 @@ pub struct EnvironmentLeaseDescriptor {
 impl EnvironmentLeaseDescriptor {
     pub fn validate(&self) -> Result<()> {
         validate_opaque_id("environment lease id", &self.lease_id)?;
-        validate_opaque_id("environment daemon epoch", &self.daemon_epoch)?;
+        validate_opaque_id("environment supervisor epoch", &self.supervisor_epoch)?;
         validate_sha256("environment hash", &self.environment_hash)?;
         validate_environment_names("inherited environment", &self.inherited_names)?;
         validate_environment_names("required environment", &self.required_names)?;
@@ -102,15 +102,16 @@ impl EnvironmentLeaseDescriptor {
         Ok(())
     }
 
-    pub fn require_daemon_epoch(&self, daemon_epoch: &str) -> Result<()> {
-        validate_opaque_id("current daemon epoch", daemon_epoch)?;
-        if self.daemon_epoch != daemon_epoch {
-            bail!("environment lease belongs to a different daemon epoch");
+    pub fn require_supervisor_epoch(&self, supervisor_epoch: &str) -> Result<()> {
+        validate_opaque_id("current supervisor epoch", supervisor_epoch)?;
+        if self.supervisor_epoch != supervisor_epoch {
+            bail!("environment lease belongs to a different supervisor epoch");
         }
         Ok(())
     }
 }
 
+#[derive(Clone)]
 pub struct ExecutionEnvironmentLease {
     descriptor: EnvironmentLeaseDescriptor,
     values: BTreeMap<String, String>,
@@ -119,7 +120,7 @@ pub struct ExecutionEnvironmentLease {
 impl ExecutionEnvironmentLease {
     pub fn capture(
         lease_id: impl Into<String>,
-        daemon_epoch: impl Into<String>,
+        supervisor_epoch: impl Into<String>,
         policy: &EnvironmentPolicy,
         values: Vec<(String, String)>,
     ) -> Result<Self> {
@@ -129,16 +130,20 @@ impl ExecutionEnvironmentLease {
         }
         let approved: BTreeSet<_> = policy.inherited_names.iter().map(String::as_str).collect();
         let mut captured = BTreeMap::new();
-        let mut captured_casefolded = BTreeSet::new();
+        let mut captured_casefolded: BTreeMap<String, String> = BTreeMap::new();
         for (name, value) in values {
             validate_environment_name(&name)?;
             if !approved.contains(name.as_str()) {
                 bail!("environment name {name} is outside the closed lease policy");
             }
             validate_environment_value(&name, &value)?;
-            if !captured_casefolded.insert(name.to_ascii_uppercase()) {
+            let folded = name.to_ascii_uppercase();
+            if let Some(existing) = captured_casefolded.get(&folded)
+                && !allowed_proxy_case_pair(existing, &name)
+            {
                 bail!("environment lease contains a case-ambiguous name");
             }
+            captured_casefolded.insert(folded, name.clone());
             if captured.insert(name, value).is_some() {
                 bail!("environment lease contains a duplicate name");
             }
@@ -150,12 +155,12 @@ impl ExecutionEnvironmentLease {
         }
 
         let lease_id = lease_id.into();
-        let daemon_epoch = daemon_epoch.into();
+        let supervisor_epoch = supervisor_epoch.into();
         validate_opaque_id("environment lease id", &lease_id)?;
-        validate_opaque_id("environment daemon epoch", &daemon_epoch)?;
+        validate_opaque_id("environment supervisor epoch", &supervisor_epoch)?;
         let descriptor = EnvironmentLeaseDescriptor {
             lease_id,
-            daemon_epoch,
+            supervisor_epoch,
             environment_hash: environment_hash(&captured),
             inherited_names: captured.keys().cloned().collect(),
             required_names: policy.required_names.clone(),
@@ -173,10 +178,10 @@ impl ExecutionEnvironmentLease {
 
     pub fn materialize(
         &self,
-        daemon_epoch: &str,
+        supervisor_epoch: &str,
         identity: &WorkerEnvironmentIdentity,
     ) -> Result<MaterializedWorkerEnvironment> {
-        self.descriptor.require_daemon_epoch(daemon_epoch)?;
+        self.descriptor.require_supervisor_epoch(supervisor_epoch)?;
         identity.validate()?;
         if environment_hash(&self.values) != self.descriptor.environment_hash {
             bail!("in-memory environment lease no longer matches its descriptor");
@@ -190,7 +195,7 @@ impl ExecutionEnvironmentLease {
             }
             .into(),
         );
-        values.insert("HCOM_PROJECT_ID".into(), identity.project_id.clone());
+        values.insert("HCOM_RUN_ID".into(), identity.run_id.clone());
         values.insert("HCOM_TASK_ID".into(), identity.task_id.clone());
         Ok(MaterializedWorkerEnvironment { values })
     }
@@ -203,13 +208,13 @@ impl ExecutionEnvironmentLease {
 #[derive(Clone, PartialEq, Eq)]
 pub struct WorkerEnvironmentIdentity {
     pub role: WorkerRole,
-    pub project_id: String,
+    pub run_id: String,
     pub task_id: String,
 }
 
 impl WorkerEnvironmentIdentity {
     fn validate(&self) -> Result<()> {
-        validate_opaque_id("worker project id", &self.project_id)?;
+        validate_opaque_id("worker run id", &self.run_id)?;
         validate_opaque_id("worker task id", &self.task_id)
     }
 }
@@ -349,13 +354,29 @@ fn validate_environment_names(label: &str, names: &[String]) -> Result<()> {
 }
 
 fn validate_case_unique(label: &str, names: &[String]) -> Result<()> {
-    let mut casefolded = BTreeSet::new();
+    let mut casefolded: BTreeMap<String, String> = BTreeMap::new();
     for name in names {
-        if !casefolded.insert(name.to_ascii_uppercase()) {
+        let folded = name.to_ascii_uppercase();
+        if let Some(existing) = casefolded.get(&folded)
+            && !allowed_proxy_case_pair(existing, name)
+        {
             bail!("{label} names must not be case-ambiguous");
         }
+        casefolded.insert(folded, name.clone());
     }
     Ok(())
+}
+
+fn allowed_proxy_case_pair(left: &str, right: &str) -> bool {
+    const PAIRS: &[(&str, &str)] = &[
+        ("all_proxy", "ALL_PROXY"),
+        ("http_proxy", "HTTP_PROXY"),
+        ("https_proxy", "HTTPS_PROXY"),
+        ("no_proxy", "NO_PROXY"),
+    ];
+    PAIRS.iter().any(|(lower, upper)| {
+        (left == *lower && right == *upper) || (left == *upper && right == *lower)
+    })
 }
 
 fn validate_environment_name(name: &str) -> Result<()> {
@@ -529,15 +550,66 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn exact_lower_and_upper_proxy_names_coexist_without_normalization() {
+        let lease = ExecutionEnvironmentLease::capture(
+            "lease-proxy-pairs",
+            "epoch-1",
+            &EnvironmentPolicy::baseline(),
+            vec![
+                ("PATH".into(), "/usr/bin".into()),
+                ("HTTPS_PROXY".into(), "http://upper.invalid".into()),
+                ("https_proxy".into(), "http://lower.invalid".into()),
+                ("HTTP_PROXY".into(), "http://upper-http.invalid".into()),
+                ("http_proxy".into(), "http://lower-http.invalid".into()),
+            ],
+        )
+        .unwrap();
+        let materialized = lease
+            .materialize(
+                "epoch-1",
+                &WorkerEnvironmentIdentity {
+                    role: WorkerRole::Developer,
+                    run_id: "run-1".into(),
+                    task_id: "task-1".into(),
+                },
+            )
+            .unwrap();
+        let values: BTreeMap<_, _> = materialized.iter().collect();
+        assert_eq!(values["HTTPS_PROXY"], "http://upper.invalid");
+        assert_eq!(values["https_proxy"], "http://lower.invalid");
+        assert_eq!(values["HTTP_PROXY"], "http://upper-http.invalid");
+        assert_eq!(values["http_proxy"], "http://lower-http.invalid");
+        assert_eq!(
+            lease.descriptor().inherited_names,
+            vec![
+                "HTTPS_PROXY",
+                "HTTP_PROXY",
+                "PATH",
+                "http_proxy",
+                "https_proxy"
+            ]
+        );
+    }
+
+    #[test]
+    fn non_proxy_case_ambiguity_still_fails_closed() {
+        let policy = EnvironmentPolicy::new(
+            vec!["FOO".into(), "PATH".into(), "foo".into()],
+            vec!["PATH".into()],
+        )
+        .unwrap();
         assert!(
             ExecutionEnvironmentLease::capture(
-                "lease-1",
+                "lease-case-conflict",
                 "epoch-1",
                 &policy,
                 vec![
                     ("PATH".into(), "/usr/bin".into()),
-                    ("HTTPS_PROXY".into(), "http://upper.invalid".into()),
-                    ("https_proxy".into(), "http://lower.invalid".into()),
+                    ("FOO".into(), "upper".into()),
+                    ("foo".into(), "lower".into()),
                 ],
             )
             .is_err()
@@ -587,7 +659,12 @@ mod tests {
             lease.descriptor().environment_hash,
             changed.descriptor().environment_hash
         );
-        assert!(lease.descriptor().require_daemon_epoch("epoch-2").is_err());
+        assert!(
+            lease
+                .descriptor()
+                .require_supervisor_epoch("epoch-2")
+                .is_err()
+        );
     }
 
     #[test]
@@ -598,14 +675,14 @@ mod tests {
                 "epoch-1",
                 &WorkerEnvironmentIdentity {
                     role: WorkerRole::Reviewer,
-                    project_id: "project-1".into(),
+                    run_id: "run-1".into(),
                     task_id: "task-2".into(),
                 },
             )
             .unwrap();
         let values: BTreeMap<_, _> = materialized.iter().collect();
         assert_eq!(values["HCOM_WORKER_ROLE"], "reviewer");
-        assert_eq!(values["HCOM_PROJECT_ID"], "project-1");
+        assert_eq!(values["HCOM_RUN_ID"], "run-1");
         assert_eq!(values["HCOM_TASK_ID"], "task-2");
         assert!(!values.contains_key("HCOM_AGENT"));
         assert!(!values.contains_key("TERM_PROGRAM"));
@@ -638,7 +715,7 @@ mod tests {
                 "epoch-1",
                 &WorkerEnvironmentIdentity {
                     role: WorkerRole::Developer,
-                    project_id: "project-1".into(),
+                    run_id: "run-1".into(),
                     task_id: "task-1".into(),
                 },
             )

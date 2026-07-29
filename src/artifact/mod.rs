@@ -1,4 +1,4 @@
-//! Private, bounded artifacts for one durable worker turn attempt.
+//! Private, bounded artifacts for one foreground-session worker turn attempt.
 
 use crate::control_api::WorkerRole;
 use crate::worker::contract::{MAX_PROMPT_BYTES, validate_native_session_id};
@@ -59,7 +59,7 @@ impl ArtifactKind {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ArtifactScope {
-    pub project_id: String,
+    pub run_id: String,
     pub task_id: String,
     pub role: WorkerRole,
     pub logical_session_id: String,
@@ -69,7 +69,7 @@ pub struct ArtifactScope {
 
 impl ArtifactScope {
     pub fn validate(&self) -> Result<()> {
-        validate_opaque_id("artifact project id", &self.project_id)?;
+        validate_opaque_id("artifact run id", &self.run_id)?;
         validate_opaque_id("artifact task id", &self.task_id)?;
         validate_opaque_id("artifact logical session id", &self.logical_session_id)?;
         if self.turn_sequence == 0 || self.attempt == 0 {
@@ -81,7 +81,7 @@ impl ArtifactScope {
     pub fn relative_path(&self) -> String {
         format!(
             "{}/{}/{}/{}/turn-{}/attempt-{}",
-            self.project_id,
+            self.run_id,
             self.task_id,
             role_name(self.role),
             self.logical_session_id,
@@ -164,7 +164,7 @@ impl ArtifactRoot {
         let manifest: TurnManifest =
             serde_json::from_slice(&encoded).context("persisted artifact manifest is malformed")?;
         manifest.validate()?;
-        if manifest.project_id != scope.project_id
+        if manifest.run_id != scope.run_id
             || manifest.task_id != scope.task_id
             || manifest.role != scope.role
             || manifest.logical_session_id != scope.logical_session_id
@@ -185,7 +185,7 @@ pub struct ArtifactAttempt {
     relative_path: String,
     directory_path: PathBuf,
     directory: Arc<File>,
-    daemon_epoch: String,
+    supervisor_epoch: String,
     environment_hash: String,
     redactor: Arc<SecretRedactor>,
     registry: Arc<Mutex<ReceiptRegistry>>,
@@ -237,7 +237,7 @@ impl ArtifactAttempt {
             directory_path: root.canonical_path.join(&relative_path),
             relative_path,
             directory: Arc::new(parent),
-            daemon_epoch: environment.descriptor().daemon_epoch.clone(),
+            supervisor_epoch: environment.descriptor().supervisor_epoch.clone(),
             environment_hash: environment.descriptor().environment_hash.clone(),
             redactor: Arc::new(environment.redactor().with_value(prompt)),
             registry: Arc::new(Mutex::new(ReceiptRegistry::default())),
@@ -388,7 +388,7 @@ impl ArtifactAttempt {
 
     pub fn finalize_manifest(&self, metadata: ManifestMetadata) -> Result<TurnManifest> {
         metadata.validate_for(&self.scope)?;
-        if metadata.daemon_epoch != self.daemon_epoch
+        if metadata.supervisor_epoch != self.supervisor_epoch
             || metadata.environment_hash != self.environment_hash
         {
             bail!("manifest environment lease does not match its artifact attempt");
@@ -405,7 +405,7 @@ impl ArtifactAttempt {
         }
         let manifest = TurnManifest {
             format_version: 1,
-            project_id: self.scope.project_id.clone(),
+            run_id: self.scope.run_id.clone(),
             task_id: self.scope.task_id.clone(),
             role: self.scope.role,
             logical_session_id: self.scope.logical_session_id.clone(),
@@ -416,8 +416,8 @@ impl ArtifactAttempt {
             review_round: metadata.review_round,
             base_revision: metadata.base_revision,
             head_revision: metadata.head_revision,
-            review_snapshot_digest: metadata.review_snapshot_digest,
-            daemon_epoch: metadata.daemon_epoch,
+            review_workspace_digest: metadata.review_workspace_digest,
+            supervisor_epoch: metadata.supervisor_epoch,
             environment_hash: metadata.environment_hash,
             adapter_contract_hash: metadata.adapter_contract_hash,
             result_hash: metadata.result_hash,
@@ -621,8 +621,8 @@ pub struct ManifestMetadata {
     pub review_round: u32,
     pub base_revision: String,
     pub head_revision: Option<String>,
-    pub review_snapshot_digest: Option<String>,
-    pub daemon_epoch: String,
+    pub review_workspace_digest: Option<String>,
+    pub supervisor_epoch: String,
     pub environment_hash: String,
     pub adapter_contract_hash: String,
     pub result_hash: String,
@@ -642,23 +642,23 @@ impl ManifestMetadata {
             validate_git_oid("manifest head revision", head_revision)?;
         }
         match scope.role {
-            WorkerRole::Developer if self.review_snapshot_digest.is_some() => {
-                bail!("developer manifest cannot bind a reviewer snapshot");
+            WorkerRole::Developer if self.review_workspace_digest.is_some() => {
+                bail!("developer manifest cannot bind a reviewer workspace");
             }
             WorkerRole::Reviewer => {
                 if self.review_round == 0 || self.head_revision.is_none() {
                     bail!("reviewer manifest must bind its exact round and head revision");
                 }
                 validate_sha256(
-                    "manifest review snapshot digest",
-                    self.review_snapshot_digest
+                    "manifest review workspace digest",
+                    self.review_workspace_digest
                         .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("reviewer manifest lost its snapshot"))?,
+                        .ok_or_else(|| anyhow::anyhow!("reviewer manifest lost its workspace"))?,
                 )?;
             }
             WorkerRole::Developer => {}
         }
-        validate_opaque_id("manifest daemon epoch", &self.daemon_epoch)?;
+        validate_opaque_id("manifest supervisor epoch", &self.supervisor_epoch)?;
         validate_sha256("manifest environment hash", &self.environment_hash)?;
         validate_sha256(
             "manifest adapter contract hash",
@@ -676,7 +676,7 @@ impl ManifestMetadata {
 #[serde(deny_unknown_fields)]
 pub struct TurnManifest {
     pub format_version: u32,
-    pub project_id: String,
+    pub run_id: String,
     pub task_id: String,
     pub role: WorkerRole,
     pub logical_session_id: String,
@@ -687,8 +687,8 @@ pub struct TurnManifest {
     pub review_round: u32,
     pub base_revision: String,
     pub head_revision: Option<String>,
-    pub review_snapshot_digest: Option<String>,
-    pub daemon_epoch: String,
+    pub review_workspace_digest: Option<String>,
+    pub supervisor_epoch: String,
     pub environment_hash: String,
     pub adapter_contract_hash: String,
     pub result_hash: String,
@@ -704,7 +704,7 @@ impl TurnManifest {
             bail!("unsupported artifact manifest format");
         }
         let scope = ArtifactScope {
-            project_id: self.project_id.clone(),
+            run_id: self.run_id.clone(),
             task_id: self.task_id.clone(),
             role: self.role,
             logical_session_id: self.logical_session_id.clone(),
@@ -717,8 +717,8 @@ impl TurnManifest {
             review_round: self.review_round,
             base_revision: self.base_revision.clone(),
             head_revision: self.head_revision.clone(),
-            review_snapshot_digest: self.review_snapshot_digest.clone(),
-            daemon_epoch: self.daemon_epoch.clone(),
+            review_workspace_digest: self.review_workspace_digest.clone(),
+            supervisor_epoch: self.supervisor_epoch.clone(),
             environment_hash: self.environment_hash.clone(),
             adapter_contract_hash: self.adapter_contract_hash.clone(),
             result_hash: self.result_hash.clone(),
@@ -1196,7 +1196,7 @@ mod tests {
 
     fn scope() -> ArtifactScope {
         ArtifactScope {
-            project_id: "project-1".into(),
+            run_id: "run-1".into(),
             task_id: "task-1".into(),
             role: WorkerRole::Developer,
             logical_session_id: "session-1".into(),
@@ -1252,7 +1252,7 @@ mod tests {
         let attempt = create_attempt(&root, scope());
         assert_eq!(
             attempt.relative_path(),
-            "project-1/task-1/developer/session-1/turn-1/attempt-1"
+            "run-1/task-1/developer/session-1/turn-1/attempt-1"
         );
         assert!(
             ArtifactAttempt::create(&root, scope(), &fixture_environment(None), TEST_PROMPT)
@@ -1264,7 +1264,7 @@ mod tests {
         assert_eq!(metadata.uid(), effective_uid());
 
         let mut traversal = scope();
-        traversal.project_id = "..".into();
+        traversal.run_id = "..".into();
         assert!(
             ArtifactAttempt::create(&root, traversal, &fixture_environment(None), TEST_PROMPT)
                 .is_err()
@@ -1275,7 +1275,7 @@ mod tests {
     fn symlink_and_hardlink_escape_fail_closed() {
         let (temp, root) = fixture_root();
         let outside = tempfile::tempdir().unwrap();
-        symlink(outside.path(), temp.path().join("project-1")).unwrap();
+        symlink(outside.path(), temp.path().join("run-1")).unwrap();
         assert!(
             ArtifactAttempt::create(&root, scope(), &fixture_environment(None), TEST_PROMPT)
                 .is_err()
@@ -1486,8 +1486,8 @@ mod tests {
             review_round: 0,
             base_revision: "a".repeat(40),
             head_revision: None,
-            review_snapshot_digest: None,
-            daemon_epoch: "epoch-1".into(),
+            review_workspace_digest: None,
+            supervisor_epoch: "epoch-1".into(),
             environment_hash: environment.descriptor().environment_hash.clone(),
             adapter_contract_hash: hex_bytes(&Sha256::digest(b"adapter contract")),
             result_hash: result.sha256.clone(),
@@ -1498,7 +1498,7 @@ mod tests {
         wrong_environment.environment_hash = hex_bytes(&Sha256::digest(b"wrong environment"));
         assert!(attempt.finalize_manifest(wrong_environment).is_err());
         let mut wrong_epoch = metadata.clone();
-        wrong_epoch.daemon_epoch = "epoch-other".into();
+        wrong_epoch.supervisor_epoch = "epoch-other".into();
         assert!(attempt.finalize_manifest(wrong_epoch).is_err());
         let manifest = attempt.finalize_manifest(metadata).unwrap();
         manifest.validate().unwrap();
@@ -1524,8 +1524,8 @@ mod tests {
                     review_round: 0,
                     base_revision: "a".repeat(40),
                     head_revision: None,
-                    review_snapshot_digest: None,
-                    daemon_epoch: "epoch-1".into(),
+                    review_workspace_digest: None,
+                    supervisor_epoch: "epoch-1".into(),
                     environment_hash: environment.descriptor().environment_hash.clone(),
                     adapter_contract_hash: hex_bytes(&Sha256::digest(b"adapter contract")),
                     result_hash: result.sha256,

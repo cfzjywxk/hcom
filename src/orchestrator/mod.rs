@@ -1,987 +1,2056 @@
-//! Durable single-writer scheduler and the `hcomd` service entry point.
-//
-// The daemon endpoint owns this engine and its sole Store v1 handle. Phase 4
-// exercises the same engine through fake workers; typed public project actions
-// intentionally remain disconnected until Phase 8.
-#![cfg_attr(not(test), allow(dead_code))]
+//! Foreground, in-memory task supervisor for one `hcom architect` invocation.
 
-use crate::artifact::{ArtifactRoot, ArtifactScope, ManifestMetadata};
-use crate::control_api::daemon::{ControlPaths, DaemonEndpoint};
-use crate::control_api::peer::{boot_identity, process_birth_identity};
-use crate::control_api::{ControlErrorCode, ControlResponse, WorkerRole};
-use crate::project_store::{
-    ClaimedTurn, DaemonEpoch, DaemonStore, ProjectControlLayout, ProjectExecutionState, ReadyTurn,
-    SchedulerSnapshot, TurnKind, now_epoch_seconds, sha256_hex,
+use crate::artifact::{
+    ArtifactAttempt, ArtifactRoot, ArtifactScope, ManifestMetadata, TurnManifest,
 };
-use crate::worker::contract::{NativeResult, TurnControl, WorkerAdapterRegistry};
-use crate::worker::environment::{ExecutionEnvironmentLease, WorkerEnvironmentIdentity};
-use crate::worker::process::{HeartbeatControl, ProcessRunner, WorkerTermination};
-use crate::worker::{prepare_create_turn, prepare_resume_turn};
+use crate::control_api::{
+    NativeSessionMode, SessionState, SessionStatusSnapshot, TaskDraft, TaskState,
+    TaskStatusSnapshot, WorkerRole,
+};
+use crate::worker::codex::{
+    CodexDeveloperAdapter, CodexDeveloperConfig, GIT_EXECUTABLE, GIT_VERSION,
+};
+use crate::worker::contract::{
+    NativeObservation, NativeResult, TurnControl, WorkerAdapter, WorkerAdapterRegistry,
+    WorkerProfile,
+};
+use crate::worker::environment::{
+    EnvironmentPolicy, ExecutionEnvironmentLease, WorkerEnvironmentIdentity,
+};
+use crate::worker::process::{
+    HeartbeatControl, ProcessCompletion, ProcessRunner, WorkerTermination,
+};
+use crate::worker::result::{
+    CheckResult, CheckStatus, DeveloperDecision, DeveloperResult, ReviewDecision, ReviewerResult,
+};
+use crate::worker::reviewer::{
+    ClaudeReviewerAdapter, ClaudeReviewerConfig, CodexReviewerAdapter, CodexReviewerConfig,
+};
+use crate::worker::{ExecutableIdentity, prepare_create_turn, prepare_resume_turn};
 use anyhow::{Context, Result, anyhow, bail};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver, TryRecvError},
 };
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-const TURN_LEASE_DURATION: Duration = Duration::from_secs(30);
-const MAX_REVIEW_SNAPSHOT_ENTRIES: usize = 100_000;
-const MAX_REVIEW_SNAPSHOT_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const MAX_REVIEW_SNAPSHOT_TOTAL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_WORKER_ATTEMPTS: u32 = 3;
+const MAX_GIT_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_STATUS_OUTCOME_BYTES: usize = 1024;
+const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub fn run_hcomd_service() -> Result<()> {
-    if [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO]
-        .into_iter()
-        .any(fd_is_tty)
-    {
-        bail!("hcomd refuses to attach to an interactive terminal");
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionStartup {
+    pub(crate) run_id: String,
+    pub(crate) repo_root: PathBuf,
+    pub(crate) start_branch: String,
+    pub(crate) start_head: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct SessionRuntimeSources {
+    parent_values: BTreeMap<String, String>,
+    codex_auth_source: Option<PathBuf>,
+    claude_auth_source: Option<PathBuf>,
+    cargo_bin_source: PathBuf,
+    rustup_home_source: PathBuf,
+    host_runtime_dir: PathBuf,
+}
+
+impl SessionRuntimeSources {
+    pub(crate) fn capture(
+        parent_values: BTreeMap<String, String>,
+        host_runtime_dir: PathBuf,
+    ) -> Result<Self> {
+        let home = parent_values
+            .get("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("session worker environment requires parent HOME"))?;
+        let host_runtime_dir =
+            canonical_private_directory(&host_runtime_dir, "host XDG runtime directory")?;
+        let codex_home = parent_values
+            .get("CODEX_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".codex"));
+        let claude_home = parent_values
+            .get("CLAUDE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".claude"));
+        let codex_auth_source = Some(canonical_private_file(
+            &codex_home.join("auth.json"),
+            "Codex auth source",
+        )?);
+        let claude_auth_path = claude_home.join(".credentials.json");
+        let claude_auth_source = match fs::symlink_metadata(&claude_auth_path) {
+            Ok(_) => Some(canonical_private_file(
+                &claude_auth_path,
+                "Claude auth source",
+            )?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("failed to inspect Claude auth source"),
+        };
+        let cargo_bin_source = parent_values
+            .get("CARGO_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".cargo"))
+            .join("bin");
+        let rustup_home_source = parent_values
+            .get("RUSTUP_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".rustup"));
+        let cargo_bin_source =
+            canonical_readable_directory(&cargo_bin_source, "Rust cargo-bin source")?;
+        let rustup_home_source =
+            canonical_readable_directory(&rustup_home_source, "Rust rustup source")?;
+        Ok(Self {
+            parent_values,
+            codex_auth_source,
+            claude_auth_source,
+            cargo_bin_source,
+            rustup_home_source,
+            host_runtime_dir,
+        })
     }
-    let mut endpoint = DaemonEndpoint::bind(ControlPaths::discover()?)?;
-    endpoint.set_nonblocking(true)?;
-    let stopping = Arc::new(AtomicBool::new(false));
-    for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
-        signal_hook::flag::register(signal, stopping.clone())?;
-    }
-    while !stopping.load(Ordering::Acquire) {
-        let served_control = endpoint.try_serve_one()?;
-        let served_registration = endpoint.try_serve_registration_one()?;
-        if !served_control && !served_registration {
-            std::thread::sleep(Duration::from_millis(25));
+
+    #[cfg(test)]
+    pub(crate) fn fake(path: &Path) -> Self {
+        Self {
+            parent_values: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
+            codex_auth_source: None,
+            claude_auth_source: None,
+            cargo_bin_source: path.to_owned(),
+            rustup_home_source: path.to_owned(),
+            host_runtime_dir: path.to_owned(),
         }
     }
-    Ok(())
-}
 
-fn fd_is_tty(fd: i32) -> bool {
-    // SAFETY: isatty only inspects the supplied integer file descriptor.
-    unsafe { libc::isatty(fd) == 1 }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SchedulerStep {
-    Progress,
-    Idle,
-    Terminal,
-    InjectedStop,
+    fn environment_for(
+        &self,
+        adapter: &str,
+        epoch: &str,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<ExecutionEnvironmentLease> {
+        let policy = match adapter {
+            "codex-developer-0.145.0" => CodexDeveloperAdapter::environment_policy()?,
+            "codex-reviewer-0.145.0" => CodexReviewerAdapter::environment_policy()?,
+            "claude-reviewer-2.1.220" => ClaudeReviewerAdapter::environment_policy()?,
+            _ => EnvironmentPolicy::baseline(),
+        };
+        let mut values: BTreeMap<String, String> = policy
+            .inherited_names
+            .iter()
+            .filter_map(|name| {
+                self.parent_values
+                    .get(name)
+                    .map(|value| (name.clone(), value.clone()))
+            })
+            .collect();
+        for (name, value) in [
+            ("PATH", "/hcom/toolchains/rust/bin:/usr/bin:/bin"),
+            ("HOME", "/hcom/home"),
+            ("CARGO_HOME", "/hcom/home/.cargo"),
+            ("RUSTUP_HOME", "/hcom/toolchains/rust/rustup"),
+            ("TMPDIR", "/tmp"),
+            ("XDG_RUNTIME_DIR", "/hcom/run"),
+            ("CODEX_HOME", "/hcom/native"),
+            ("CLAUDE_CONFIG_DIR", "/hcom/native"),
+            ("XDG_CONFIG_HOME", "/hcom/home/.config"),
+            ("XDG_STATE_HOME", "/hcom/home/.state"),
+            ("XDG_CACHE_HOME", "/hcom/home/.cache"),
+            ("XDG_DATA_HOME", "/hcom/home/.data"),
+            ("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1"),
+            ("CLAUDE_CODE_DISABLE_FAST_MODE", "1"),
+            ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+            ("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION", "false"),
+        ] {
+            if policy.inherited_names.iter().any(|allowed| allowed == name) {
+                values.insert(name.into(), value.into());
+            }
+        }
+        ExecutionEnvironmentLease::capture(
+            format!("lease-{}", Uuid::new_v4()),
+            epoch,
+            &policy,
+            values.into_iter().collect(),
+        )
+        .with_context(|| format!("failed to capture worker environment for {run_id}/{task_id}"))
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct SchedulerMetrics {
-    pub(crate) current_developers: u64,
-    pub(crate) current_reviewers: u64,
-    pub(crate) max_live_developers: u64,
-    pub(crate) max_live_reviewers: u64,
+pub(crate) struct SessionMetrics {
+    pub(crate) current_workers: u64,
+    pub(crate) max_live_workers: u64,
     pub(crate) developer_spawns: u64,
     pub(crate) reviewer_spawns: u64,
-    pub(crate) heartbeats: u64,
-    pub(crate) controlled_cancellations: u64,
-    pub(crate) controlled_pauses: u64,
+    pub(crate) worker_retries: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SpawnAudit {
-    pub(crate) task_id: String,
+    pub(crate) task_key: String,
     pub(crate) role: WorkerRole,
+    pub(crate) logical_session_id: String,
+    pub(crate) native_session_id: Option<String>,
     pub(crate) turn_sequence: u32,
+    pub(crate) attempt: u32,
+    pub(crate) resume: bool,
     pub(crate) workspace_cwd: PathBuf,
-    pub(crate) argv_hash: String,
-    pub(crate) prompt_hash: String,
     pub(crate) prompt_in_argv: bool,
-    pub(crate) developer_path_exposed: bool,
 }
 
-pub(crate) struct DurableScheduler {
-    store: DaemonStore,
-    epoch: String,
-    retire_epoch_on_drop: bool,
-    adapters: WorkerAdapterRegistry,
-    artifacts: ArtifactRoot,
-    environments: BTreeMap<String, ExecutionEnvironmentLease>,
-    runner: ProcessRunner,
-    metrics: SchedulerMetrics,
-    spawn_audit: Vec<SpawnAudit>,
-    fail_after_result_ready_once: bool,
-    cancel_on_next_heartbeat: bool,
-    pause_on_next_heartbeat: bool,
+#[derive(Clone)]
+struct DraftPlan {
+    version: u64,
+    hash: String,
+    developer_adapter: String,
+    reviewer_adapter: String,
 }
 
-impl DurableScheduler {
-    pub(crate) fn open(
-        layout: &ProjectControlLayout,
-        artifact_root: impl AsRef<Path>,
-        adapters: WorkerAdapterRegistry,
-        runner: ProcessRunner,
-    ) -> Result<Self> {
-        let mut store = DaemonStore::open(layout)?;
-        let artifact_root = artifact_root.as_ref();
-        match fs::symlink_metadata(artifact_root) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(artifact_root)?;
-                fs::set_permissions(artifact_root, fs::Permissions::from_mode(0o700))?;
-            }
-            Err(error) => return Err(error).context("failed to inspect scheduler artifact root"),
+struct WorkerSession {
+    logical_session_id: String,
+    native_session_id: Option<String>,
+    turn_sequence: u32,
+    adapter: Option<Arc<dyn WorkerAdapter>>,
+    profile: Option<WorkerProfile>,
+}
+
+impl WorkerSession {
+    fn fresh() -> Self {
+        Self {
+            logical_session_id: Uuid::new_v4().to_string(),
+            native_session_id: None,
+            turn_sequence: 0,
+            adapter: None,
+            profile: None,
         }
-        let artifacts = ArtifactRoot::open(artifact_root)?;
-        let epoch = format!("daemon-{}", Uuid::new_v4());
-        let interrupted = store.start_daemon_epoch(&DaemonEpoch {
-            id: epoch.clone(),
-            boot_id: boot_identity()?,
-            daemon_pid: std::process::id(),
-            process_birth: process_birth_identity(std::process::id())?,
-        })?;
-        for request in interrupted {
-            let response = ControlResponse::error(
-                &request.request_id,
-                ControlErrorCode::NeedsRecovery,
-                "control request was interrupted by a daemon restart; inspect durable state",
-            );
-            let response_json = serde_json::to_string(&response)?;
-            let response_hash = sha256_hex(response_json.as_bytes());
-            store.complete_control_request(
-                &request.daemon_epoch,
-                &request.caller_key_hash,
-                &request.request_id,
-                &request.payload_hash,
-                &response_json,
-                &response_hash,
-            )?;
+    }
+}
+
+struct TaskRuntime {
+    spec: TaskDraft,
+    state: TaskState,
+    base_revision: Option<String>,
+    head_revision: Option<String>,
+    review_round: u32,
+    developer: WorkerSession,
+    reviewer: WorkerSession,
+    last_review: Option<ReviewerResult>,
+    outcome_detail: Option<String>,
+}
+
+impl TaskRuntime {
+    fn new(spec: TaskDraft) -> Self {
+        Self {
+            spec,
+            state: TaskState::Pending,
+            base_revision: None,
+            head_revision: None,
+            review_round: 0,
+            developer: WorkerSession::fresh(),
+            reviewer: WorkerSession::fresh(),
+            last_review: None,
+            outcome_detail: None,
         }
-        store.recover_daemon_state(&epoch)?;
-        Ok(Self {
-            store,
-            epoch,
-            retire_epoch_on_drop: true,
-            adapters,
-            artifacts,
-            environments: BTreeMap::new(),
-            runner,
-            metrics: SchedulerMetrics::default(),
-            spawn_audit: Vec::new(),
-            fail_after_result_ready_once: false,
-            cancel_on_next_heartbeat: false,
-            pause_on_next_heartbeat: false,
-        })
     }
 
-    pub(crate) fn daemon_epoch(&self) -> &str {
-        &self.epoch
+    fn session(&self, role: WorkerRole) -> &WorkerSession {
+        match role {
+            WorkerRole::Developer => &self.developer,
+            WorkerRole::Reviewer => &self.reviewer,
+        }
     }
 
-    pub(crate) fn store(&self) -> &DaemonStore {
-        &self.store
+    fn session_mut(&mut self, role: WorkerRole) -> &mut WorkerSession {
+        match role {
+            WorkerRole::Developer => &mut self.developer,
+            WorkerRole::Reviewer => &mut self.reviewer,
+        }
     }
+}
 
-    pub(crate) fn store_mut(&mut self) -> &mut DaemonStore {
-        &mut self.store
-    }
+#[derive(Clone)]
+struct RetryTurn {
+    task_index: usize,
+    role: WorkerRole,
+    turn_sequence: u32,
+    next_attempt: u32,
+    review_round: u32,
+    must_resume: bool,
+}
 
-    pub(crate) fn attach_environment(
-        &mut self,
-        project_id: &str,
-        environment: ExecutionEnvironmentLease,
-    ) -> Result<()> {
-        environment.descriptor().require_daemon_epoch(&self.epoch)?;
-        self.store
-            .record_environment_lease(project_id, environment.descriptor())?;
-        self.environments.insert(project_id.to_owned(), environment);
+struct ActiveTurn {
+    token: String,
+    task_index: usize,
+    role: WorkerRole,
+    turn_sequence: u32,
+    attempt: u32,
+    review_round: u32,
+    adapter: Arc<dyn WorkerAdapter>,
+    profile: WorkerProfile,
+    control: TurnControl,
+    environment: ExecutionEnvironmentLease,
+    cancel: Arc<AtomicBool>,
+    completion: Receiver<Result<ProcessCompletion>>,
+    waiter: Option<JoinHandle<()>>,
+    reviewer_drifted: bool,
+    created_at: i64,
+}
+
+#[derive(Default)]
+struct CompletionGate {
+    active: Option<String>,
+    accepted: BTreeSet<String>,
+}
+
+impl CompletionGate {
+    fn begin(&mut self, token: &str) -> Result<()> {
+        if self.active.is_some() || self.accepted.contains(token) {
+            bail!("completion gate already owns an active or accepted turn");
+        }
+        self.active = Some(token.to_owned());
         Ok(())
     }
 
-    pub(crate) fn request_run(
-        &mut self,
-        project_id: &str,
-        expected_version: u64,
-        plan_version: u64,
-        plan_hash: &str,
-        environment: ExecutionEnvironmentLease,
-    ) -> Result<()> {
-        self.attach_environment(project_id, environment)?;
-        self.store.request_project_run(
-            project_id,
-            expected_version,
-            plan_version,
-            plan_hash,
-            &self.epoch,
+    fn accept(&mut self, token: &str) -> bool {
+        if self.active.as_deref() != Some(token) || self.accepted.contains(token) {
+            return false;
+        }
+        self.active = None;
+        self.accepted.insert(token.to_owned());
+        true
+    }
+
+    fn abandon(&mut self, token: &str) {
+        if self.active.as_deref() == Some(token) {
+            self.active = None;
+        }
+    }
+}
+
+pub(crate) struct SessionSupervisor {
+    startup: SessionStartup,
+    epoch: String,
+    state: SessionState,
+    version: u64,
+    next_plan_version: u64,
+    draft: Option<DraftPlan>,
+    tasks: Vec<TaskRuntime>,
+    current_task: Option<usize>,
+    current_head: String,
+    terminal_detail: Option<String>,
+    repository: CanonicalRepository,
+    _repository_lock: RepositoryLock,
+    run_root: PathBuf,
+    artifact_root: ArtifactRoot,
+    artifact_root_path: PathBuf,
+    sources: SessionRuntimeSources,
+    adapters: WorkerAdapterRegistry,
+    runner: ProcessRunner,
+    active: Option<ActiveTurn>,
+    retry: Option<RetryTurn>,
+    used_native_sessions: BTreeMap<String, (usize, WorkerRole)>,
+    completion_gate: CompletionGate,
+    metrics: SessionMetrics,
+    spawn_audit: Vec<SpawnAudit>,
+}
+
+impl SessionSupervisor {
+    pub(crate) fn open(
+        run_id: String,
+        repo_root: PathBuf,
+        run_root: PathBuf,
+        lock_root: PathBuf,
+        sources: SessionRuntimeSources,
+    ) -> Result<Self> {
+        Self::open_with(
+            run_id,
+            repo_root,
+            run_root,
+            lock_root,
+            sources,
+            WorkerAdapterRegistry::default(),
+            ProcessRunner::default(),
         )
     }
 
-    pub(crate) fn resume(
+    fn open_with(
+        run_id: String,
+        repo_root: PathBuf,
+        run_root: PathBuf,
+        lock_root: PathBuf,
+        sources: SessionRuntimeSources,
+        adapters: WorkerAdapterRegistry,
+        runner: ProcessRunner,
+    ) -> Result<Self> {
+        validate_id("run id", &run_id)?;
+        let repository = CanonicalRepository::open(&repo_root)?;
+        let repository_lock = RepositoryLock::acquire(&repository, &lock_root)?;
+        let start_branch = repository.branch()?.to_owned();
+        let start_head = repository.head()?;
+        repository.require_exact(&start_branch, &start_head)?;
+        let run_root = canonical_private_directory(&run_root, "session runtime root")?;
+        let artifact_root_path = run_root.join("artifacts");
+        ensure_private_directory(&artifact_root_path)?;
+        let artifact_root = ArtifactRoot::open(&artifact_root_path)?;
+        let startup = SessionStartup {
+            run_id,
+            repo_root: repository.root.clone(),
+            start_branch,
+            start_head: start_head.clone(),
+        };
+        Ok(Self {
+            startup,
+            epoch: format!("supervisor-{}", Uuid::new_v4()),
+            state: SessionState::AwaitingPlan,
+            version: 0,
+            next_plan_version: 1,
+            draft: None,
+            tasks: Vec::new(),
+            current_task: None,
+            current_head: start_head,
+            terminal_detail: None,
+            repository,
+            _repository_lock: repository_lock,
+            run_root,
+            artifact_root,
+            artifact_root_path,
+            sources,
+            adapters,
+            runner,
+            active: None,
+            retry: None,
+            used_native_sessions: BTreeMap::new(),
+            completion_gate: CompletionGate::default(),
+            metrics: SessionMetrics::default(),
+            spawn_audit: Vec::new(),
+        })
+    }
+
+    pub(crate) fn startup(&self) -> &SessionStartup {
+        &self.startup
+    }
+
+    pub(crate) fn replace_plan(
         &mut self,
-        project_id: &str,
-        expected_version: u64,
-        environment: ExecutionEnvironmentLease,
-    ) -> Result<()> {
-        self.attach_environment(project_id, environment)?;
-        self.store
-            .resume_project_with_epoch(project_id, expected_version, &self.epoch)
-    }
-
-    pub(crate) fn run_until_blocked(&mut self, project_id: &str, max_steps: usize) -> Result<()> {
-        for _ in 0..max_steps {
-            match self.step(project_id)? {
-                SchedulerStep::Progress => {}
-                SchedulerStep::Idle | SchedulerStep::Terminal | SchedulerStep::InjectedStop => {
-                    return Ok(());
-                }
+        expected_session_version: u64,
+        developer_adapter: &str,
+        reviewer_adapter: &str,
+        tasks: Vec<TaskDraft>,
+    ) -> Result<(u64, String)> {
+        self.require_version(expected_session_version)?;
+        if !matches!(
+            self.state,
+            SessionState::AwaitingPlan | SessionState::AwaitingApproval
+        ) {
+            bail!("task plan cannot change after this run starts");
+        }
+        if developer_adapter != "codex-developer-0.145.0"
+            && self.adapters.resolve(developer_adapter).is_err()
+        {
+            bail!("unknown or disabled developer adapter");
+        }
+        if !matches!(
+            reviewer_adapter,
+            "codex-reviewer-0.145.0" | "claude-reviewer-2.1.220"
+        ) && self.adapters.resolve(reviewer_adapter).is_err()
+        {
+            bail!("unknown or disabled reviewer adapter");
+        }
+        if tasks.is_empty() || tasks.len() > 64 {
+            bail!("ordered plan must contain between 1 and 64 tasks");
+        }
+        let mut task_keys = BTreeSet::new();
+        for task in &tasks {
+            task.validate()
+                .map_err(|error| anyhow!("invalid task plan: {error}"))?;
+            if !task_keys.insert(&task.task_key) {
+                bail!("ordered plan task keys must be unique");
             }
         }
-        bail!("durable scheduler exceeded its deterministic step bound")
+        self.repository
+            .require_exact(&self.startup.start_branch, &self.startup.start_head)?;
+        let plan_version = self.next_plan_version;
+        self.next_plan_version = self
+            .next_plan_version
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("plan version overflow"))?;
+        let canonical = serde_json::to_vec(&(
+            "hcom-session-plan-v1",
+            plan_version,
+            &self.startup.repo_root,
+            &self.startup.start_branch,
+            &self.startup.start_head,
+            developer_adapter,
+            reviewer_adapter,
+            &tasks,
+        ))?;
+        let plan_hash = sha256_hex(&canonical);
+        self.tasks = tasks.iter().cloned().map(TaskRuntime::new).collect();
+        self.draft = Some(DraftPlan {
+            version: plan_version,
+            hash: plan_hash.clone(),
+            developer_adapter: developer_adapter.to_owned(),
+            reviewer_adapter: reviewer_adapter.to_owned(),
+        });
+        self.current_task = None;
+        self.current_head.clone_from(&self.startup.start_head);
+        self.state = SessionState::AwaitingApproval;
+        self.terminal_detail = None;
+        self.bump_version()?;
+        Ok((plan_version, plan_hash))
     }
 
-    pub(crate) fn pause(
+    pub(crate) fn approve_and_start(
         &mut self,
-        project_id: &str,
-        expected_version: u64,
-        reason: &str,
+        expected_session_version: u64,
+        plan_version: u64,
+        plan_hash: &str,
+        approval_confirmed: bool,
     ) -> Result<()> {
-        self.store
-            .pause_project(project_id, expected_version, reason)
+        self.require_version(expected_session_version)?;
+        if self.state != SessionState::AwaitingApproval || !approval_confirmed {
+            bail!("run start requires explicit human approval of the exact draft");
+        }
+        let draft = self
+            .draft
+            .as_ref()
+            .ok_or_else(|| anyhow!("approved plan disappeared"))?;
+        if draft.version != plan_version || draft.hash != plan_hash {
+            bail!("approved plan version or hash is stale");
+        }
+        self.repository
+            .require_exact(&self.startup.start_branch, &self.startup.start_head)?;
+        let first = self
+            .tasks
+            .first_mut()
+            .ok_or_else(|| anyhow!("approved plan contains no tasks"))?;
+        first.base_revision = Some(self.startup.start_head.clone());
+        first.state = TaskState::Developing;
+        self.current_task = Some(0);
+        self.state = SessionState::Running;
+        self.bump_version()
     }
 
-    pub(crate) fn cancel(
-        &mut self,
-        project_id: &str,
-        expected_version: u64,
-        reason: &str,
-    ) -> Result<()> {
-        self.store
-            .cancel_project(project_id, expected_version, reason)
+    pub(crate) fn cancel(&mut self, expected_session_version: u64, reason: &str) -> Result<()> {
+        self.require_version(expected_session_version)?;
+        validate_text("cancel reason", reason, 4096)?;
+        if self.state.is_terminal() {
+            bail!("session is already terminal");
+        }
+        if let Some(active) = &self.active {
+            active.cancel.store(true, Ordering::Release);
+        }
+        if let Some(index) = self.current_task
+            && let Some(task) = self.tasks.get_mut(index)
+        {
+            task.state = TaskState::Canceled;
+        }
+        self.retry = None;
+        self.state = SessionState::Canceled;
+        self.terminal_detail = Some("canceled by explicit architect-session request".into());
+        self.bump_version()?;
+        self.shutdown()
     }
 
-    fn step(&mut self, project_id: &str) -> Result<SchedulerStep> {
-        if let Some(ready) = self.store.next_result_ready_turn(project_id)? {
-            if let Err(error) = self.verify_persisted_manifest(&ready) {
-                self.store.mark_result_ready_invalid(
-                    &ready,
-                    "manifest_validation",
-                    "persisted result_ready manifest failed validation",
-                )?;
-                return Err(error);
-            }
-            if let Err(error) = self.store.apply_result_ready(&ready) {
-                self.store.mark_result_ready_invalid(
-                    &ready,
-                    "result_apply",
-                    "persisted result_ready failed its durable apply transaction",
-                )?;
-                return Err(error);
-            }
-            return Ok(SchedulerStep::Progress);
+    pub(crate) fn snapshot(&self) -> SessionStatusSnapshot {
+        SessionStatusSnapshot {
+            run_id: self.startup.run_id.clone(),
+            state: self.state,
+            version: self.version,
+            repo_root: self.startup.repo_root.to_string_lossy().into_owned(),
+            start_branch: self.startup.start_branch.clone(),
+            start_head: self.startup.start_head.clone(),
+            current_head: self.current_head.clone(),
+            plan_version: self.draft.as_ref().map(|plan| plan.version),
+            plan_hash: self.draft.as_ref().map(|plan| plan.hash.clone()),
+            current_task_ordinal: self
+                .current_task
+                .and_then(|index| u32::try_from(index).ok()),
+            terminal_detail: self.terminal_detail.clone(),
+            tasks: self
+                .tasks
+                .iter()
+                .enumerate()
+                .map(|(index, task)| TaskStatusSnapshot {
+                    task_key: task.spec.task_key.clone(),
+                    ordinal: u32::try_from(index).unwrap_or(u32::MAX),
+                    state: task.state,
+                    review_round: task.review_round,
+                    max_review_rounds: task.spec.max_review_rounds,
+                    base_revision: task.base_revision.clone(),
+                    head_revision: task.head_revision.clone(),
+                    developer_session_bound: task.developer.native_session_id.is_some(),
+                    reviewer_session_bound: task.reviewer.native_session_id.is_some(),
+                    outcome_detail: task.outcome_detail.clone(),
+                })
+                .collect(),
         }
-        if self.store.finalize_next_task(project_id)? {
-            return Ok(SchedulerStep::Progress);
-        }
-        let (state, _) = self.store.project_state(project_id)?;
-        match state {
-            ProjectExecutionState::Completed
-            | ProjectExecutionState::Failed
-            | ProjectExecutionState::Canceled => return Ok(SchedulerStep::Terminal),
-            ProjectExecutionState::Paused
-            | ProjectExecutionState::NeedsInput
-            | ProjectExecutionState::NeedsRecovery => return Ok(SchedulerStep::Idle),
-            ProjectExecutionState::Approved => return Ok(SchedulerStep::Idle),
-            ProjectExecutionState::Running => {}
-        }
-        if let Some(ready) = self.store.next_queued_turn(project_id)? {
-            if !self.environments.contains_key(project_id) {
-                self.store
-                    .mark_missing_environment(project_id, &self.epoch)?;
-                return Ok(SchedulerStep::Progress);
-            }
-            return self.execute_turn(ready);
-        }
-        if self.store.enqueue_next_ready_task(project_id)? {
-            return Ok(SchedulerStep::Progress);
-        }
-        Ok(SchedulerStep::Idle)
     }
 
-    fn execute_turn(&mut self, ready: ReadyTurn) -> Result<SchedulerStep> {
-        let environment = self
-            .environments
-            .get(&ready.project_id)
-            .ok_or_else(|| anyhow!("worker environment lease is unavailable"))?;
-        let environment_hash = environment.descriptor().environment_hash.clone();
-        let claim = self
-            .store
-            .claim_turn(&ready.turn_id, &self.epoch, TURN_LEASE_DURATION)?;
-        let adapter_result = self.adapters.resolve(&claim.ready.profile.adapter);
-        let adapter = pre_spawn_result(
-            &mut self.store,
-            &claim,
-            adapter_result,
-            "adapter_unavailable",
-            "pinned worker adapter is unavailable before spawn",
-        )?;
-        let scope = artifact_scope(&claim);
-        let prompt_result = build_turn_prompt(&claim);
-        let prompt = pre_spawn_result(
-            &mut self.store,
-            &claim,
-            prompt_result,
-            "prompt_validation",
-            "durable worker prompt could not be built before spawn",
-        )?;
+    pub(crate) fn poll_once(&mut self) -> Result<()> {
+        if self.state != SessionState::Running {
+            return Ok(());
+        }
+        let result = if self.active.is_some() {
+            self.poll_active_turn()
+        } else {
+            self.spawn_next_turn()
+        };
+        if let Err(error) = result {
+            if self.state == SessionState::Running {
+                self.needs_human("session worker loop failed a closed safety gate");
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn shutdown(&mut self) -> Result<()> {
+        self.retry = None;
+        let Some(mut active) = self.active.take() else {
+            return Ok(());
+        };
+        active.cancel.store(true, Ordering::Release);
+        self.completion_gate.abandon(&active.token);
+        if let Some(waiter) = active.waiter.take() {
+            waiter
+                .join()
+                .map_err(|_| anyhow!("worker waiter panicked during parent shutdown"))?;
+        }
+        self.finish_worker_metric();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn metrics(&self) -> &SessionMetrics {
+        &self.metrics
+    }
+
+    #[cfg(test)]
+    fn spawn_audit(&self) -> &[SpawnAudit] {
+        &self.spawn_audit
+    }
+
+    fn spawn_next_turn(&mut self) -> Result<()> {
+        let task_index = self
+            .current_task
+            .ok_or_else(|| anyhow!("running session has no current task"))?;
+        let role = match self.tasks[task_index].state {
+            TaskState::Developing => WorkerRole::Developer,
+            TaskState::Reviewing => WorkerRole::Reviewer,
+            _ => bail!("current task has no spawnable state"),
+        };
+        let retry = self.retry.take();
+        if retry
+            .as_ref()
+            .is_some_and(|retry| retry.task_index != task_index || retry.role != role)
+        {
+            bail!("retry token no longer matches the current task state");
+        }
+        self.ensure_task_adapter(task_index, role)?;
+        let task = &self.tasks[task_index];
+        let session = task.session(role);
+        let adapter = session
+            .adapter
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("task adapter disappeared"))?;
+        let profile = session
+            .profile
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("task profile disappeared"))?;
+        let base_revision = task
+            .base_revision
+            .clone()
+            .ok_or_else(|| anyhow!("task base revision is unavailable"))?;
+        let expected_head = task
+            .head_revision
+            .clone()
+            .unwrap_or_else(|| base_revision.clone());
+        self.repository
+            .require_exact(&self.startup.start_branch, &expected_head)?;
+
+        let (turn_sequence, attempt, review_round, must_resume) = match retry {
+            Some(retry) => (
+                retry.turn_sequence,
+                retry.next_attempt,
+                retry.review_round,
+                retry.must_resume,
+            ),
+            None => {
+                let sequence = session
+                    .turn_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("worker turn sequence overflow"))?;
+                let round = if role == WorkerRole::Reviewer {
+                    task.review_round
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("review round overflow"))?
+                } else {
+                    task.review_round
+                };
+                (sequence, 1, round, sequence > 1)
+            }
+        };
+        let native_session_id = session.native_session_id.clone();
+        if must_resume && native_session_id.is_none() {
+            bail!("resume retry lost its exact native session");
+        }
+        let scope = ArtifactScope {
+            run_id: self.startup.run_id.clone(),
+            task_id: task.spec.task_key.clone(),
+            role,
+            logical_session_id: session.logical_session_id.clone(),
+            turn_sequence,
+            attempt,
+        };
         let control = TurnControl {
-            project_id: claim.ready.project_id.clone(),
-            task_id: claim.ready.task_id.clone(),
-            role: claim.ready.role,
-            logical_session_id: claim.ready.session_id.clone(),
-            native_session_id: claim.ready.native_session_id.clone(),
-            turn_sequence: claim.ready.sequence,
-            attempt: claim.attempt,
-            task_version: claim.ready.task_version,
-            review_round: claim.ready.review_round,
-            base_revision: claim.ready.base_revision.clone(),
-            head_revision: claim.ready.head_revision.clone(),
+            run_id: self.startup.run_id.clone(),
+            task_id: task.spec.task_key.clone(),
+            role,
+            logical_session_id: session.logical_session_id.clone(),
+            native_session_id: native_session_id.clone(),
+            turn_sequence,
+            attempt,
+            task_version: self.version.saturating_add(1).max(1),
+            review_round,
+            base_revision,
+            head_revision: (role == WorkerRole::Reviewer).then_some(expected_head),
             artifact_dir: scope.relative_path(),
         };
-        let prepared = (|| -> Result<_> {
-            Ok(match claim.ready.kind {
-                TurnKind::Create => prepare_create_turn(
-                    adapter.as_ref(),
-                    &claim.ready.profile,
-                    &control,
-                    prompt.clone(),
-                )?,
-                TurnKind::Resume => {
-                    let native_session_id = claim
-                        .ready
-                        .native_session_id
-                        .as_deref()
-                        .ok_or_else(|| anyhow!("resume turn lost its exact native session"))?;
-                    prepare_resume_turn(
-                        adapter.as_ref(),
-                        &claim.ready.profile,
-                        &control,
-                        native_session_id,
-                        prompt.clone(),
-                    )?
-                }
-            })
-        })();
-        let prepared = pre_spawn_result(
-            &mut self.store,
-            &claim,
-            prepared,
-            "profile_validation",
-            "worker profile or command validation failed before spawn",
-        )?;
-        let command = prepared.command();
-        let argv = command.materialized_control_argv();
-        let developer_worktree_result = self.store.project_worktree_root(&claim.ready.project_id);
-        let developer_worktree = pre_spawn_result(
-            &mut self.store,
-            &claim,
-            developer_worktree_result,
-            "workspace_validation",
-            "developer workspace identity is unavailable before spawn",
-        )?;
-        let developer_path_exposed = pre_spawn_result(
-            &mut self.store,
-            &claim,
-            if claim.ready.role == WorkerRole::Reviewer {
-                reviewer_exposes_developer_path(
-                    &command.workspace_cwd,
-                    &argv,
-                    &prompt,
-                    &developer_worktree,
-                )
-            } else {
-                Ok(false)
-            },
-            "review_workspace_exposure",
-            "reviewer workspace could not be checked for developer worktree exposure",
-        )?;
-        pre_spawn_result(
-            &mut self.store,
-            &claim,
-            if developer_path_exposed {
-                Err(anyhow!(
-                    "reviewer command exposes the developer writable worktree"
-                ))
-            } else {
-                Ok(())
-            },
-            "review_workspace_exposure",
-            "reviewer command exposed the developer writable worktree",
-        )?;
-        let workspace_before = if claim.ready.role == WorkerRole::Reviewer {
-            let digest_result = snapshot_digest(&command.workspace_cwd);
-            let digest = pre_spawn_result(
-                &mut self.store,
-                &claim,
-                digest_result,
-                "review_snapshot_validation",
-                "review snapshot failed validation before spawn",
-            )?;
-            let bind_result = self.store.bind_review_snapshot(&claim, &digest);
-            pre_spawn_result(
-                &mut self.store,
-                &claim,
-                bind_result,
-                "review_snapshot_binding",
-                "review snapshot could not be bound before spawn",
-            )?;
-            Some(digest)
+        let prompt = self.build_turn_prompt(task_index, role, review_round)?;
+        let prepared = if must_resume {
+            prepare_resume_turn(
+                adapter.as_ref(),
+                &profile,
+                &control,
+                native_session_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("resume turn lost native session"))?,
+                prompt.clone(),
+            )?
         } else {
-            None
+            prepare_create_turn(adapter.as_ref(), &profile, &control, prompt.clone())?
         };
-        self.spawn_audit.push(SpawnAudit {
-            task_id: claim.ready.task_id.clone(),
-            role: claim.ready.role,
-            turn_sequence: claim.ready.sequence,
-            workspace_cwd: command.workspace_cwd.clone(),
-            argv_hash: sha256_hex(argv.join("\0").as_bytes()),
-            prompt_hash: sha256_hex(&prompt),
-            prompt_in_argv: argv.iter().any(|argument| {
-                argument
-                    .as_bytes()
-                    .windows(prompt.len())
-                    .any(|w| w == prompt)
-            }),
-            developer_path_exposed,
-        });
-        let attempt_result =
-            crate::artifact::ArtifactAttempt::create(&self.artifacts, scope, environment, &prompt);
-        let attempt = pre_spawn_result(
-            &mut self.store,
-            &claim,
-            attempt_result,
-            "artifact_prepare",
-            "artifact attempt could not be prepared before spawn",
+        let environment = self.sources.environment_for(
+            &profile.adapter,
+            &self.epoch,
+            &self.startup.run_id,
+            &task.spec.task_key,
         )?;
-        let materialized_result = environment.materialize(
+        let attempt_artifact =
+            ArtifactAttempt::create(&self.artifact_root, scope, &environment, &prompt)?;
+        let materialized = environment.materialize(
             &self.epoch,
             &WorkerEnvironmentIdentity {
-                role: claim.ready.role,
-                project_id: claim.ready.project_id.clone(),
-                task_id: claim.ready.task_id.clone(),
+                role,
+                run_id: self.startup.run_id.clone(),
+                task_id: task.spec.task_key.clone(),
             },
-        );
-        let materialized = pre_spawn_result(
-            &mut self.store,
-            &claim,
-            materialized_result,
-            "environment_validation",
-            "worker environment lease failed validation before spawn",
         )?;
-        pre_spawn_result(
-            &mut self.store,
-            &claim,
-            if claim.ready.role == WorkerRole::Reviewer
-                && materialized
-                    .iter()
-                    .any(|(_, value)| value.contains(&developer_worktree))
-            {
-                Err(anyhow!(
-                    "reviewer environment exposes the developer writable worktree"
-                ))
-            } else {
-                Ok(())
-            },
-            "review_environment_exposure",
-            "reviewer environment exposed the developer writable worktree",
-        )?;
+        let argv = prepared.command().materialized_control_argv();
+        self.spawn_audit.push(SpawnAudit {
+            task_key: task.spec.task_key.clone(),
+            role,
+            logical_session_id: session.logical_session_id.clone(),
+            native_session_id: native_session_id.clone(),
+            turn_sequence,
+            attempt,
+            resume: must_resume,
+            workspace_cwd: prepared.command().workspace_cwd.clone(),
+            prompt_in_argv: argv
+                .iter()
+                .any(|argument| contains_bytes(argument.as_bytes(), &prompt)),
+        });
         let worker = match self
             .runner
-            .spawn(claim.ready.role, prepared, &materialized, attempt)
+            .spawn(role, prepared, &materialized, attempt_artifact)
         {
             Ok(worker) => worker,
             Err(error) => {
-                self.store.mark_spawn_failed(
-                    &claim,
-                    "spawn_failed",
-                    "worker process did not start",
-                )?;
-                return Err(error);
+                self.schedule_spawn_retry(
+                    task_index,
+                    role,
+                    turn_sequence,
+                    attempt,
+                    review_round,
+                    must_resume,
+                );
+                let _ = error;
+                return Ok(());
             }
         };
-        let identity = worker.identity().clone();
-        if let Err(error) =
-            self.store
-                .bind_spawned_turn(&claim, identity.pid, &identity.process_birth)
-        {
-            drop(worker);
-            self.store.mark_turn_indeterminate(
-                &claim,
-                "spawn_bind",
-                "worker spawned but its durable process identity could not be bound",
-            )?;
-            return Err(error);
+        if role == WorkerRole::Reviewer && review_round > self.tasks[task_index].review_round {
+            self.tasks[task_index].review_round = review_round;
         }
-        self.start_metric(claim.ready.role);
-        let completion = worker.wait(|live| {
-            self.metrics.heartbeats = self.metrics.heartbeats.saturating_add(1);
-            if self.cancel_on_next_heartbeat {
-                let (_, version) = self.store.project_state(&claim.ready.project_id)?;
-                self.store.cancel_project(
-                    &claim.ready.project_id,
-                    version,
-                    "test_controlled_cancel",
-                )?;
-                self.cancel_on_next_heartbeat = false;
-            }
-            if self.pause_on_next_heartbeat {
-                let (_, version) = self.store.project_state(&claim.ready.project_id)?;
-                self.store.pause_project(
-                    &claim.ready.project_id,
-                    version,
-                    "test_controlled_pause",
-                )?;
-                self.pause_on_next_heartbeat = false;
-            }
-            Ok(
-                if self.store.heartbeat_turn(
-                    &claim,
-                    live.pid,
-                    &live.process_birth,
-                    TURN_LEASE_DURATION,
-                )? {
-                    HeartbeatControl::Continue
-                } else {
-                    HeartbeatControl::Cancel
-                },
-            )
+        let token = format!("turn-{}", Uuid::new_v4());
+        self.completion_gate.begin(&token)?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let waiter_cancel = Arc::clone(&cancel);
+        let (completion_tx, completion_rx) = mpsc::sync_channel(1);
+        let waiter = std::thread::Builder::new()
+            .name(format!(
+                "hcom-session-worker-{}-{}",
+                role_name(role),
+                turn_sequence
+            ))
+            .spawn(move || {
+                let completion =
+                    worker.wait_with_cancel(waiter_cancel, |_| Ok(HeartbeatControl::Continue));
+                let _ = completion_tx.send(completion);
+            })
+            .context("failed to start session worker waiter")?;
+        self.start_worker_metric(role);
+        self.active = Some(ActiveTurn {
+            token,
+            task_index,
+            role,
+            turn_sequence,
+            attempt,
+            review_round,
+            adapter,
+            profile,
+            control,
+            environment,
+            cancel,
+            completion: completion_rx,
+            waiter: Some(waiter),
+            reviewer_drifted: false,
+            created_at: now_epoch_seconds()?,
         });
-        self.finish_metric(claim.ready.role);
+        Ok(())
+    }
+
+    fn poll_active_turn(&mut self) -> Result<()> {
+        let mut active = self
+            .active
+            .take()
+            .ok_or_else(|| anyhow!("active session worker disappeared"))?;
+        if active.role == WorkerRole::Reviewer && !active.reviewer_drifted {
+            let expected = active
+                .control
+                .head_revision
+                .as_deref()
+                .ok_or_else(|| anyhow!("reviewer turn lost exact HEAD"))?;
+            if self
+                .repository
+                .require_exact(&self.startup.start_branch, expected)
+                .is_err()
+            {
+                active.reviewer_drifted = true;
+                active.cancel.store(true, Ordering::Release);
+            }
+        }
+        if self.state == SessionState::Canceled {
+            active.cancel.store(true, Ordering::Release);
+        }
+        let completion = match active.completion.try_recv() {
+            Ok(completion) => completion,
+            Err(TryRecvError::Empty) => {
+                self.active = Some(active);
+                return Ok(());
+            }
+            Err(TryRecvError::Disconnected) => {
+                if let Some(waiter) = active.waiter.take() {
+                    let _ = waiter.join();
+                }
+                self.finish_worker_metric();
+                self.completion_gate.abandon(&active.token);
+                self.needs_human("worker completion channel disconnected");
+                bail!("worker waiter disconnected")
+            }
+        };
+        if let Some(waiter) = active.waiter.take() {
+            waiter
+                .join()
+                .map_err(|_| anyhow!("session worker waiter panicked"))?;
+        }
+        self.finish_worker_metric();
+        if active.reviewer_drifted {
+            self.completion_gate.abandon(&active.token);
+            self.needs_human("canonical checkout drifted during reviewer turn");
+            bail!("reviewer HEAD or worktree drifted")
+        }
         let completion = match completion {
             Ok(completion) => completion,
             Err(error) => {
-                self.store.mark_turn_indeterminate(
-                    &claim,
-                    "process_transport",
-                    "worker transport outcome is indeterminate",
-                )?;
-                return Err(error);
+                self.completion_gate.abandon(&active.token);
+                self.schedule_runtime_retry(&active, None)?;
+                let _ = error;
+                return Ok(());
             }
         };
-        let project_state = self.store.project_state(&claim.ready.project_id)?.0;
-        if project_state == ProjectExecutionState::Canceled {
-            self.store.mark_canceled_after_signal(&claim)?;
-            self.metrics.controlled_cancellations =
-                self.metrics.controlled_cancellations.saturating_add(1);
-            return Ok(SchedulerStep::Progress);
-        }
-        if project_state == ProjectExecutionState::Paused {
-            self.store.mark_paused_attempt_indeterminate(&claim)?;
-            self.metrics.controlled_pauses = self.metrics.controlled_pauses.saturating_add(1);
-            return Ok(SchedulerStep::Progress);
-        }
-        if completion.exit.termination == WorkerTermination::Canceled {
-            self.store.mark_turn_indeterminate(
-                &claim,
-                "lease_revoked",
-                "worker lease ended without a supported durable control state",
-            )?;
-            return Ok(SchedulerStep::Progress);
-        }
-        if project_state != ProjectExecutionState::Running {
-            self.store.mark_turn_indeterminate(
-                &claim,
-                "project_state_changed",
-                "worker completed after its durable project left running state",
-            )?;
-            return Ok(SchedulerStep::Progress);
-        }
         if completion.exit.termination != WorkerTermination::Exited
             || completion.exit.code != Some(0)
             || completion.exit.signal.is_some()
         {
-            self.store.mark_turn_indeterminate(
-                &claim,
-                "worker_exit",
-                "worker turn may have executed but did not produce an admissible exit",
-            )?;
-            return Ok(SchedulerStep::Progress);
+            let observed = observe_native_session(active.adapter.as_ref(), &completion);
+            self.completion_gate.abandon(&active.token);
+            self.schedule_runtime_retry(&active, observed.as_deref())?;
+            return Ok(());
         }
-        if let Some(before) = workspace_before.as_ref() {
-            let after_result = snapshot_digest(
-                &self
-                    .spawn_audit
-                    .last()
-                    .expect("spawn audit was recorded")
-                    .workspace_cwd,
-            );
-            let after = post_turn_result(
-                &mut self.store,
-                &claim,
-                after_result,
-                "review_snapshot_validation",
-                "review snapshot could not be revalidated after the worker turn",
-            )?;
-            if before != &after {
-                self.store.mark_turn_indeterminate(
-                    &claim,
-                    "review_snapshot_changed",
-                    "reviewer snapshot changed during its read-only turn",
-                )?;
-                return Ok(SchedulerStep::Progress);
-            }
+        let native = active
+            .adapter
+            .extract_result(&active.control, &completion.artifacts)
+            .context("worker result failed its exact adapter contract")?;
+        if native.role() != active.role {
+            self.completion_gate.abandon(&active.token);
+            self.needs_human("worker returned the wrong role");
+            bail!("worker result role mismatch")
         }
-        let native_result = adapter
-            .extract_result(&control, &completion.artifacts)
-            .context("worker result does not satisfy its adapter contract");
-        let native = post_turn_result(
-            &mut self.store,
-            &claim,
-            native_result,
-            "result_validation",
-            "worker result failed its adapter contract",
-        )?;
-        if native.role() != claim.ready.role {
-            return post_turn_result(
-                &mut self.store,
-                &claim,
-                Err(anyhow!("worker native result role mismatch")),
-                "result_validation",
-                "worker result role did not match the durable turn",
-            );
-        }
-        let result_json_result = match &native {
-            NativeResult::Developer { result, .. } => result.canonical_json(),
-            NativeResult::Reviewer { result, .. } => result.canonical_json(),
+        self.bind_native_session(active.task_index, active.role, native.native_session_id())?;
+        let result_json = match &native {
+            NativeResult::Developer { result, .. } => result.canonical_json()?,
+            NativeResult::Reviewer { result, .. } => result.canonical_json()?,
         };
-        let result_json = post_turn_result(
-            &mut self.store,
-            &claim,
-            result_json_result,
-            "result_validation",
-            "worker result could not be canonicalized",
-        )?;
         let result_hash = sha256_hex(&result_json);
-        let result_receipt_result = completion.artifact_attempt.write_result_json(&result_json);
-        let result_receipt = post_turn_result(
-            &mut self.store,
-            &claim,
-            result_receipt_result,
-            "result_artifact",
-            "validated worker result could not be persisted",
-        )?;
-        if result_receipt.sha256 != result_hash {
-            return post_turn_result(
-                &mut self.store,
-                &claim,
-                Err(anyhow!(
-                    "artifact result hash differs from the durable result"
-                )),
-                "result_artifact",
-                "validated result artifact hash mismatch",
-            );
-        }
-        let completed_at_result = now_epoch_seconds();
-        let completed_at = post_turn_result(
-            &mut self.store,
-            &claim,
-            completed_at_result,
-            "manifest_finalize",
-            "worker completion timestamp could not be recorded",
-        )?;
-        let manifest_result = completion
+        let result_receipt = completion
             .artifact_attempt
-            .finalize_manifest(ManifestMetadata {
-                native_session_id: native.native_session_id().to_owned(),
-                task_version: control.task_version,
-                review_round: control.review_round,
-                base_revision: control.base_revision.clone(),
-                head_revision: control.head_revision.clone(),
-                review_snapshot_digest: workspace_before,
-                daemon_epoch: self.epoch.clone(),
-                environment_hash,
-                adapter_contract_hash: claim.ready.profile.capability.contract_hash.clone(),
-                result_hash: result_hash.clone(),
-                created_at: completed_at,
-                completed_at,
-            });
-        let manifest = post_turn_result(
-            &mut self.store,
-            &claim,
-            manifest_result,
-            "manifest_finalize",
-            "worker artifact manifest could not be finalized",
-        )?;
-        let ready_result = self.store.record_result_ready(
-            &claim,
-            identity.pid,
-            &identity.process_birth,
-            native.native_session_id(),
-            std::str::from_utf8(&result_json).expect("canonical JSON is UTF-8"),
-            &result_hash,
-            manifest.activity_truncated,
-        );
-        post_turn_result(
-            &mut self.store,
-            &claim,
-            ready_result,
-            "result_ready",
-            "worker result could not enter durable result_ready state",
-        )?;
-        if self.fail_after_result_ready_once {
-            self.fail_after_result_ready_once = false;
-            return Ok(SchedulerStep::InjectedStop);
+            .write_result_json(&result_json)?;
+        if result_receipt.sha256 != result_hash {
+            self.completion_gate.abandon(&active.token);
+            self.needs_human("validated result artifact hash mismatched");
+            bail!("validated result artifact hash mismatch")
         }
-        Ok(SchedulerStep::Progress)
+        let completed_at = now_epoch_seconds()?;
+        let head_revision = match &native {
+            NativeResult::Developer { result, .. } => result.head_revision.clone(),
+            NativeResult::Reviewer { .. } => active.control.head_revision.clone(),
+        };
+        let review_workspace_digest = if active.role == WorkerRole::Reviewer {
+            Some(sha256_hex(&serde_json::to_vec(&(
+                "hcom-session-review-workspace-v1",
+                &self.startup.repo_root,
+                active
+                    .control
+                    .head_revision
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("reviewer turn lost its exact HEAD"))?,
+            ))?))
+        } else {
+            None
+        };
+        let _manifest: TurnManifest =
+            completion
+                .artifact_attempt
+                .finalize_manifest(ManifestMetadata {
+                    native_session_id: native.native_session_id().to_owned(),
+                    task_version: active.control.task_version,
+                    review_round: active.control.review_round,
+                    base_revision: active.control.base_revision.clone(),
+                    head_revision,
+                    review_workspace_digest,
+                    supervisor_epoch: self.epoch.clone(),
+                    environment_hash: active.environment.descriptor().environment_hash.clone(),
+                    adapter_contract_hash: active.profile.capability.contract_hash.clone(),
+                    result_hash,
+                    created_at: active.created_at,
+                    completed_at,
+                })?;
+        if !self.completion_gate.accept(&active.token) {
+            bail!("duplicate or late worker completion was rejected");
+        }
+        self.apply_native_result(&active, native)
     }
 
-    fn verify_persisted_manifest(&self, ready: &ReadyTurn) -> Result<()> {
-        let scope = ArtifactScope {
-            project_id: ready.project_id.clone(),
-            task_id: ready.task_id.clone(),
-            role: ready.role,
-            logical_session_id: ready.session_id.clone(),
-            turn_sequence: ready.sequence,
-            attempt: ready.attempt,
-        };
-        let expected_prefix = format!(
-            "{}/{}/{}/{}/turn-{}",
-            ready.project_id,
-            ready.task_id,
-            role_name(ready.role),
-            ready.session_id,
-            ready.sequence
-        );
-        if ready.artifact_dir != expected_prefix {
-            bail!("durable artifact prefix does not match the turn scope");
-        }
-        let manifest = self.artifacts.load_turn_manifest(&scope)?;
-        if ready.result_hash.as_deref() != Some(&manifest.result_hash) {
-            bail!("durable result hash does not match the persisted manifest");
-        }
-        if ready.native_session_id.as_deref() != Some(&manifest.native_session_id) {
-            bail!("durable native session does not match the persisted manifest");
-        }
-        if ready.profile.capability.contract_hash != manifest.adapter_contract_hash {
-            bail!("durable adapter contract does not match the persisted manifest");
-        }
-        if ready.task_version != manifest.task_version
-            || ready.review_round != manifest.review_round
-            || ready.base_revision != manifest.base_revision
-            || ready.head_revision != manifest.head_revision
-            || ready.review_snapshot_digest != manifest.review_snapshot_digest
-        {
-            bail!("durable turn control does not match the persisted manifest");
-        }
-        match ready.role {
-            WorkerRole::Developer if manifest.review_snapshot_digest.is_some() => {
-                bail!("developer manifest unexpectedly binds a review snapshot");
-            }
-            WorkerRole::Reviewer => {
-                let expected = manifest
-                    .review_snapshot_digest
+    fn apply_native_result(&mut self, active: &ActiveTurn, native: NativeResult) -> Result<()> {
+        match native {
+            NativeResult::Developer { result, .. } => {
+                if result.decision != DeveloperDecision::Completed {
+                    self.tasks[active.task_index].outcome_detail =
+                        Some(developer_outcome_detail(&result));
+                    self.needs_human("developer needs human input or reported a blocker");
+                    return Ok(());
+                }
+                require_checks_passed(
+                    "developer",
+                    &self.tasks[active.task_index].spec.required_checks,
+                    &result.checks,
+                )?;
+                self.tasks[active.task_index].outcome_detail =
+                    Some(developer_outcome_detail(&result));
+                let base = self.tasks[active.task_index]
+                    .base_revision
                     .as_deref()
-                    .ok_or_else(|| anyhow!("reviewer manifest lost its snapshot digest"))?;
-                let adapter = self.adapters.resolve(&ready.profile.adapter)?;
-                ready.profile.validate_for(adapter.as_ref())?;
-                let control = TurnControl {
-                    project_id: ready.project_id.clone(),
-                    task_id: ready.task_id.clone(),
-                    role: ready.role,
-                    logical_session_id: ready.session_id.clone(),
-                    native_session_id: ready.native_session_id.clone(),
-                    turn_sequence: ready.sequence,
-                    attempt: ready.attempt,
-                    task_version: ready.task_version,
-                    review_round: ready.review_round,
-                    base_revision: ready.base_revision.clone(),
-                    head_revision: ready.head_revision.clone(),
-                    artifact_dir: ArtifactScope {
-                        project_id: ready.project_id.clone(),
-                        task_id: ready.task_id.clone(),
-                        role: ready.role,
-                        logical_session_id: ready.session_id.clone(),
-                        turn_sequence: ready.sequence,
-                        attempt: ready.attempt,
+                    .ok_or_else(|| anyhow!("developer task base disappeared"))?;
+                let turn_start_head = self.tasks[active.task_index]
+                    .head_revision
+                    .as_deref()
+                    .unwrap_or(base);
+                require_changed_paths_in_scope(
+                    &result.changed_paths,
+                    &self.tasks[active.task_index].spec.allowed_paths,
+                )?;
+                let head = self.repository.validate_developer_completion(
+                    &self.startup.start_branch,
+                    base,
+                    turn_start_head,
+                    &result,
+                )?;
+                let task = &mut self.tasks[active.task_index];
+                task.developer.turn_sequence = active.turn_sequence;
+                task.head_revision = Some(head);
+                task.state = TaskState::Reviewing;
+                self.retry = None;
+                self.bump_version()
+            }
+            NativeResult::Reviewer { result, .. } => {
+                if result.decision == ReviewDecision::Lgtm {
+                    require_checks_passed(
+                        "reviewer",
+                        &self.tasks[active.task_index].spec.required_checks,
+                        &result.checks,
+                    )?;
+                }
+                self.tasks[active.task_index].outcome_detail =
+                    Some(reviewer_outcome_detail(&result));
+                let expected_head = self.tasks[active.task_index]
+                    .head_revision
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("reviewer task head disappeared"))?;
+                self.repository
+                    .require_exact(&self.startup.start_branch, expected_head)?;
+                let task = &mut self.tasks[active.task_index];
+                task.reviewer.turn_sequence = active.turn_sequence;
+                task.last_review = Some(result.clone());
+                self.retry = None;
+                match result.decision {
+                    ReviewDecision::Lgtm => {
+                        task.state = TaskState::Lgtm;
+                        self.advance_after_reviewed_task(active.task_index)
                     }
-                    .relative_path(),
-                };
-                let command = match ready.kind {
-                    TurnKind::Create => adapter.build_create(&control)?,
-                    TurnKind::Resume => adapter.build_resume(
-                        ready
-                            .native_session_id
-                            .as_deref()
-                            .ok_or_else(|| anyhow!("reviewer resume lost its native session"))?,
-                        &control,
-                    )?,
-                };
-                command.validate()?;
-                if snapshot_digest(&command.workspace_cwd)? != expected {
-                    bail!("review snapshot no longer matches its persisted turn binding");
+                    ReviewDecision::RequestChanges
+                        if task.review_round >= u32::from(task.spec.max_review_rounds) =>
+                    {
+                        task.state = TaskState::ReviewExhausted;
+                        self.advance_after_reviewed_task(active.task_index)
+                    }
+                    ReviewDecision::RequestChanges => {
+                        task.state = TaskState::Developing;
+                        self.bump_version()
+                    }
                 }
             }
-            WorkerRole::Developer => {}
         }
-        let lease_owner = ready
-            .lease_owner
-            .as_deref()
-            .ok_or_else(|| anyhow!("result_ready turn lost its lease owner"))?;
-        if !lease_owner.starts_with(&format!("{}/", manifest.daemon_epoch)) {
-            bail!("durable turn lease does not match the persisted daemon epoch");
+    }
+
+    fn advance_after_reviewed_task(&mut self, completed_index: usize) -> Result<()> {
+        let reviewed_head = self.tasks[completed_index]
+            .head_revision
+            .clone()
+            .ok_or_else(|| anyhow!("reviewed task has no exact head"))?;
+        self.current_head = reviewed_head.clone();
+        let next = completed_index + 1;
+        if next < self.tasks.len() {
+            let task = &mut self.tasks[next];
+            task.base_revision = Some(reviewed_head);
+            task.state = TaskState::Developing;
+            self.current_task = Some(next);
+        } else {
+            self.current_task = None;
+            self.state = SessionState::Completed;
+            self.terminal_detail =
+                Some("all explicitly approved tasks reached a terminal outcome".into());
         }
-        if !self.store.manifest_environment_matches(
-            &ready.project_id,
-            &manifest.daemon_epoch,
-            &manifest.environment_hash,
-        )? {
-            bail!("persisted manifest environment is not durably bound to the project");
+        self.bump_version()
+    }
+
+    fn ensure_task_adapter(&mut self, task_index: usize, role: WorkerRole) -> Result<()> {
+        if self.tasks[task_index].session(role).adapter.is_some() {
+            return Ok(());
+        }
+        let draft = self
+            .draft
+            .as_ref()
+            .ok_or_else(|| anyhow!("task adapter requested without a plan"))?;
+        let name = match role {
+            WorkerRole::Developer => draft.developer_adapter.as_str(),
+            WorkerRole::Reviewer => draft.reviewer_adapter.as_str(),
+        };
+        let adapter = match self.adapters.resolve(name) {
+            Ok(adapter) => adapter,
+            Err(_) => self.create_production_adapter(task_index, role, name)?,
+        };
+        let descriptor = adapter.descriptor();
+        descriptor.validate()?;
+        if !descriptor.capabilities.roles.contains(&role) {
+            bail!("selected adapter does not support its assigned role");
+        }
+        let profile = WorkerProfile {
+            role,
+            adapter: descriptor.name.clone(),
+            model: descriptor.model.clone(),
+            reasoning: descriptor.reasoning.clone(),
+            policy: descriptor.policy.clone(),
+            executable: adapter.executable_contract().clone(),
+            cli_version: descriptor.cli_version.clone(),
+            adapter_contract_version: descriptor.contract_version,
+            native_session_mode: descriptor.capabilities.native_session_mode,
+            capability: crate::control_api::CapabilitySnapshot {
+                contract_hash: descriptor.capability_contract_hash.clone(),
+                features: descriptor.capabilities.features.clone(),
+            },
+        };
+        profile.validate_for(adapter.as_ref())?;
+        let task = &mut self.tasks[task_index];
+        let session = task.session_mut(role);
+        if profile.native_session_mode == NativeSessionMode::Preassigned {
+            let native = Uuid::new_v4().to_string();
+            if self
+                .used_native_sessions
+                .insert(native.clone(), (task_index, role))
+                .is_some()
+            {
+                bail!("generated native session id collided");
+            }
+            session.native_session_id = Some(native);
+        }
+        session.profile = Some(profile);
+        session.adapter = Some(adapter);
+        Ok(())
+    }
+
+    fn create_production_adapter(
+        &self,
+        task_index: usize,
+        role: WorkerRole,
+        name: &str,
+    ) -> Result<Arc<dyn WorkerAdapter>> {
+        let task = &self.tasks[task_index];
+        let workers_root = self.run_root.join("workers");
+        let task_root = workers_root.join(format!("{}-{}", task_index, task.spec.task_key));
+        let role_root = self
+            .run_root
+            .join("workers")
+            .join(format!("{}-{}", task_index, task.spec.task_key))
+            .join(role_name(role));
+        let home = role_root.join("home");
+        let native = match name {
+            "claude-reviewer-2.1.220" => home.join(".claude"),
+            _ => home.join(".codex"),
+        };
+        let temp = role_root.join("tmp");
+        let private_run = role_root.join("run");
+        let cargo_home = home.join(".cargo");
+        for directory in [
+            &workers_root,
+            &task_root,
+            &role_root,
+            &home,
+            &native,
+            &temp,
+            &private_run,
+            &cargo_home,
+        ] {
+            ensure_private_directory(directory)?;
+        }
+        let adapter: Arc<dyn WorkerAdapter> = match (role, name) {
+            (WorkerRole::Developer, "codex-developer-0.145.0") => {
+                prepare_auth_mount_target(&native.join("auth.json"))?;
+                Arc::new(CodexDeveloperAdapter::discover(CodexDeveloperConfig {
+                    run_id: self.startup.run_id.clone(),
+                    workspace_cwd: self.startup.repo_root.clone(),
+                    artifact_root: self.artifact_root_path.clone(),
+                    isolated_home: home,
+                    codex_home: native,
+                    temp_dir: temp,
+                    runtime_dir: private_run,
+                    host_runtime_dir: self.sources.host_runtime_dir.clone(),
+                    auth_source: self
+                        .sources
+                        .codex_auth_source
+                        .clone()
+                        .ok_or_else(|| anyhow!("Codex auth source is unavailable"))?,
+                    cargo_bin_source: self.sources.cargo_bin_source.clone(),
+                    rustup_home_source: self.sources.rustup_home_source.clone(),
+                })?)
+            }
+            (WorkerRole::Reviewer, "codex-reviewer-0.145.0") => {
+                prepare_auth_mount_target(&native.join("auth.json"))?;
+                Arc::new(CodexReviewerAdapter::discover(CodexReviewerConfig {
+                    run_id: self.startup.run_id.clone(),
+                    workspace_cwd: self.startup.repo_root.clone(),
+                    artifact_root: self.artifact_root_path.clone(),
+                    isolated_home: home,
+                    codex_home: native,
+                    temp_dir: temp,
+                    runtime_dir: private_run,
+                    host_runtime_dir: self.sources.host_runtime_dir.clone(),
+                    auth_source: self
+                        .sources
+                        .codex_auth_source
+                        .clone()
+                        .ok_or_else(|| anyhow!("Codex auth source is unavailable"))?,
+                    cargo_bin_source: self.sources.cargo_bin_source.clone(),
+                    rustup_home_source: self.sources.rustup_home_source.clone(),
+                })?)
+            }
+            (WorkerRole::Reviewer, "claude-reviewer-2.1.220") => {
+                prepare_auth_mount_target(&native.join(".credentials.json"))?;
+                let xdg_config = home.join(".config");
+                let xdg_state = home.join(".state");
+                let xdg_cache = home.join(".cache");
+                let xdg_data = home.join(".data");
+                for directory in [&xdg_config, &xdg_state, &xdg_cache, &xdg_data] {
+                    ensure_private_directory(directory)?;
+                }
+                Arc::new(ClaudeReviewerAdapter::discover(ClaudeReviewerConfig {
+                    run_id: self.startup.run_id.clone(),
+                    workspace_cwd: self.startup.repo_root.clone(),
+                    artifact_root: self.artifact_root_path.clone(),
+                    isolated_home: home,
+                    claude_config_dir: native,
+                    xdg_config_home: xdg_config,
+                    xdg_state_home: xdg_state,
+                    xdg_cache_home: xdg_cache,
+                    xdg_data_home: xdg_data,
+                    temp_dir: temp,
+                    runtime_dir: private_run,
+                    host_runtime_dir: self.sources.host_runtime_dir.clone(),
+                    auth_source: self
+                        .sources
+                        .claude_auth_source
+                        .clone()
+                        .ok_or_else(|| anyhow!("Claude auth source is unavailable"))?,
+                    cargo_bin_source: self.sources.cargo_bin_source.clone(),
+                    rustup_home_source: self.sources.rustup_home_source.clone(),
+                })?)
+            }
+            _ => bail!("unknown or disabled exact session worker adapter"),
+        };
+        Ok(adapter)
+    }
+
+    fn build_turn_prompt(
+        &self,
+        task_index: usize,
+        role: WorkerRole,
+        review_round: u32,
+    ) -> Result<Vec<u8>> {
+        #[derive(Serialize)]
+        struct Prompt<'a> {
+            contract: &'static str,
+            role: &'static str,
+            task_ordinal: usize,
+            task: &'a TaskDraft,
+            base_revision: &'a str,
+            head_revision: Option<&'a str>,
+            review_round: u32,
+            max_review_rounds: u8,
+            prior_review: Option<&'a ReviewerResult>,
+            requirements: &'static [&'static str],
+        }
+        let task = &self.tasks[task_index];
+        let prompt = Prompt {
+            contract: "hcom-session-worker-turn-v1",
+            role: role_name(role),
+            task_ordinal: task_index,
+            task: &task.spec,
+            base_revision: task
+                .base_revision
+                .as_deref()
+                .ok_or_else(|| anyhow!("task prompt lost base revision"))?,
+            head_revision: task.head_revision.as_deref(),
+            review_round,
+            max_review_rounds: task.spec.max_review_rounds,
+            prior_review: (role == WorkerRole::Developer)
+                .then_some(task.last_review.as_ref())
+                .flatten(),
+            requirements: match role {
+                WorkerRole::Developer => &[
+                    "Work only on this explicitly approved task.",
+                    "Commit all completed changes in the canonical checkout.",
+                    "Return a clean committed HEAD that fast-forwards the exact task base.",
+                    "Do not push, install, reset, rebase, merge, or expand scope.",
+                ],
+                WorkerRole::Reviewer => &[
+                    "Review only the exact bound HEAD and task.",
+                    "Do not modify the checkout.",
+                    "Return request_changes only with at least one major finding.",
+                    "Return lgtm only when no major finding remains.",
+                ],
+            },
+        };
+        let bytes = serde_json::to_vec(&prompt)?;
+        if bytes.len() > crate::worker::contract::MAX_PROMPT_BYTES {
+            bail!("session worker prompt exceeds its bound");
+        }
+        Ok(bytes)
+    }
+
+    fn bind_native_session(
+        &mut self,
+        task_index: usize,
+        role: WorkerRole,
+        native_session_id: &str,
+    ) -> Result<()> {
+        crate::worker::contract::validate_native_session_id(native_session_id)?;
+        let session = self.tasks[task_index].session_mut(role);
+        match session.native_session_id.as_deref() {
+            Some(expected) if expected == native_session_id => Ok(()),
+            Some(_) => bail!("worker result changed the exact native session"),
+            None => {
+                if self.used_native_sessions.contains_key(native_session_id) {
+                    bail!("native session id was reused across task or role");
+                }
+                session.native_session_id = Some(native_session_id.to_owned());
+                self.used_native_sessions
+                    .insert(native_session_id.to_owned(), (task_index, role));
+                Ok(())
+            }
+        }
+    }
+
+    fn schedule_spawn_retry(
+        &mut self,
+        task_index: usize,
+        role: WorkerRole,
+        turn_sequence: u32,
+        attempt: u32,
+        review_round: u32,
+        must_resume: bool,
+    ) {
+        if attempt < MAX_WORKER_ATTEMPTS {
+            self.retry = Some(RetryTurn {
+                task_index,
+                role,
+                turn_sequence,
+                next_attempt: attempt + 1,
+                review_round,
+                must_resume,
+            });
+            self.metrics.worker_retries = self.metrics.worker_retries.saturating_add(1);
+        } else {
+            self.needs_human("worker spawn retries were exhausted");
+        }
+    }
+
+    fn schedule_runtime_retry(
+        &mut self,
+        active: &ActiveTurn,
+        observed_native_session: Option<&str>,
+    ) -> Result<()> {
+        if let Some(native) = observed_native_session {
+            self.bind_native_session(active.task_index, active.role, native)?;
+        }
+        let has_exact_native = self.tasks[active.task_index]
+            .session(active.role)
+            .native_session_id
+            .is_some();
+        if active.attempt < MAX_WORKER_ATTEMPTS && has_exact_native {
+            self.retry = Some(RetryTurn {
+                task_index: active.task_index,
+                role: active.role,
+                turn_sequence: active.turn_sequence,
+                next_attempt: active.attempt + 1,
+                review_round: active.review_round,
+                must_resume: true,
+            });
+            self.metrics.worker_retries = self.metrics.worker_retries.saturating_add(1);
+            Ok(())
+        } else {
+            self.needs_human(if has_exact_native {
+                "worker crash retries were exhausted"
+            } else {
+                "worker crashed before an exact native session could be proven"
+            });
+            Ok(())
+        }
+    }
+
+    fn require_version(&self, expected: u64) -> Result<()> {
+        if self.version != expected {
+            bail!("session version is stale");
         }
         Ok(())
     }
 
-    fn start_metric(&mut self, role: WorkerRole) {
+    fn bump_version(&mut self) -> Result<()> {
+        self.version = self
+            .version
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("session version overflow"))?;
+        Ok(())
+    }
+
+    fn needs_human(&mut self, detail: &str) {
+        if let Some(index) = self.current_task
+            && let Some(task) = self.tasks.get_mut(index)
+            && !matches!(
+                task.state,
+                TaskState::Lgtm | TaskState::ReviewExhausted | TaskState::Canceled
+            )
+        {
+            task.state = TaskState::NeedsHuman;
+        }
+        self.retry = None;
+        self.state = SessionState::NeedsHuman;
+        self.terminal_detail = Some(detail.to_owned());
+        let _ = self.bump_version();
+    }
+
+    fn start_worker_metric(&mut self, role: WorkerRole) {
+        self.metrics.current_workers = self.metrics.current_workers.saturating_add(1);
+        self.metrics.max_live_workers = self
+            .metrics
+            .max_live_workers
+            .max(self.metrics.current_workers);
         match role {
             WorkerRole::Developer => {
-                self.metrics.current_developers += 1;
-                self.metrics.developer_spawns += 1;
-                self.metrics.max_live_developers = self
-                    .metrics
-                    .max_live_developers
-                    .max(self.metrics.current_developers);
+                self.metrics.developer_spawns = self.metrics.developer_spawns.saturating_add(1)
             }
             WorkerRole::Reviewer => {
-                self.metrics.current_reviewers += 1;
-                self.metrics.reviewer_spawns += 1;
-                self.metrics.max_live_reviewers = self
-                    .metrics
-                    .max_live_reviewers
-                    .max(self.metrics.current_reviewers);
+                self.metrics.reviewer_spawns = self.metrics.reviewer_spawns.saturating_add(1)
             }
         }
     }
 
-    fn finish_metric(&mut self, role: WorkerRole) {
-        match role {
-            WorkerRole::Developer => self.metrics.current_developers -= 1,
-            WorkerRole::Reviewer => self.metrics.current_reviewers -= 1,
-        }
-    }
-
-    pub(crate) fn metrics(&self) -> &SchedulerMetrics {
-        &self.metrics
-    }
-
-    pub(crate) fn spawn_audit(&self) -> &[SpawnAudit] {
-        &self.spawn_audit
-    }
-
-    pub(crate) fn snapshot(&self, project_id: &str) -> Result<SchedulerSnapshot> {
-        self.store.project_snapshot(project_id)
-    }
-
-    pub(crate) fn set_fail_after_result_ready_once(&mut self) {
-        self.fail_after_result_ready_once = true;
-    }
-
-    #[cfg(test)]
-    fn cancel_worker_on_next_heartbeat(&mut self) {
-        self.cancel_on_next_heartbeat = true;
-    }
-
-    #[cfg(test)]
-    fn pause_worker_on_next_heartbeat(&mut self) {
-        self.pause_on_next_heartbeat = true;
-    }
-
-    pub(crate) fn simulate_crash_on_drop(&mut self) {
-        self.retire_epoch_on_drop = false;
-    }
-
-    #[cfg(test)]
-    fn seed_fake_project(&mut self, seed: &crate::project_store::FakeProjectSeed) -> Result<()> {
-        self.store.seed_fake_project(seed)
+    fn finish_worker_metric(&mut self) {
+        self.metrics.current_workers = self.metrics.current_workers.saturating_sub(1);
     }
 }
 
-impl Drop for DurableScheduler {
+impl Drop for SessionSupervisor {
     fn drop(&mut self) {
-        if self.retire_epoch_on_drop {
-            let _ = self.store.retire_daemon_epoch(&self.epoch);
+        let _ = self.shutdown();
+    }
+}
+
+fn observe_native_session(
+    adapter: &dyn WorkerAdapter,
+    completion: &ProcessCompletion,
+) -> Option<String> {
+    let mut records = Vec::new();
+    records.push(completion.artifacts.stdout());
+    records.extend(
+        completion
+            .artifacts
+            .stdout()
+            .split_inclusive(|byte| *byte == b'\n')
+            .filter(|record| !record.iter().all(u8::is_ascii_whitespace)),
+    );
+    let mut observed = BTreeSet::new();
+    for record in records {
+        if let Ok(observations) = adapter.observe_native_record(record) {
+            for observation in observations {
+                if let NativeObservation::SessionStarted { native_session_id } = observation {
+                    observed.insert(native_session_id);
+                }
+            }
         }
     }
+    (observed.len() == 1).then(|| observed.into_iter().next().expect("one observed session"))
 }
 
-fn pre_spawn_result<T>(
-    store: &mut DaemonStore,
-    claim: &ClaimedTurn,
-    result: Result<T>,
-    error_kind: &str,
-    durable_message: &str,
-) -> Result<T> {
-    match result {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            store
-                .mark_spawn_failed(claim, error_kind, durable_message)
-                .context("failed to commit pre-spawn failure state")?;
-            Err(error)
+struct CanonicalRepository {
+    root: PathBuf,
+    git: ExecutableIdentity,
+    root_identity: DirectoryIdentity,
+    git_dir: DirectoryIdentity,
+    common_dir: DirectoryIdentity,
+    object_dir: DirectoryIdentity,
+}
+
+impl CanonicalRepository {
+    fn open(root: &Path) -> Result<Self> {
+        if !root.is_absolute() {
+            bail!("session repository must be absolute");
         }
-    }
-}
-
-fn post_turn_result<T>(
-    store: &mut DaemonStore,
-    claim: &ClaimedTurn,
-    result: Result<T>,
-    error_kind: &str,
-    durable_message: &str,
-) -> Result<T> {
-    match result {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            store
-                .mark_turn_indeterminate(claim, error_kind, durable_message)
-                .context("failed to commit indeterminate worker state")?;
-            Err(error)
+        let root = fs::canonicalize(root).context("failed to canonicalize session repository")?;
+        let root_identity =
+            DirectoryIdentity::capture(&root, false).context("unsafe canonical checkout root")?;
+        let git = capture_exact_git()?;
+        let runner = GitRunner {
+            git: &git,
+            root: &root,
+        };
+        let top = canonical_git_path(&runner.one_line(&["rev-parse", "--show-toplevel"])?)?;
+        if top != root {
+            bail!("--repo must name the exact canonical Git top level");
         }
+        let git_dir = canonical_git_path(&runner.one_line(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+        ])?)?;
+        let common_dir = canonical_git_path(&runner.one_line(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ])?)?;
+        let object_dir = canonical_git_path(&runner.one_line(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ])?)?;
+        if !git_dir.starts_with(&root)
+            || !common_dir.starts_with(&root)
+            || !object_dir.starts_with(&root)
+        {
+            bail!("canonical checkout Git administration must remain inside the checkout");
+        }
+        let repository = Self {
+            root,
+            git,
+            root_identity,
+            git_dir: DirectoryIdentity::capture(&git_dir, false)
+                .context("unsafe canonical checkout Git directory")?,
+            common_dir: DirectoryIdentity::capture(&common_dir, false)
+                .context("unsafe canonical checkout common Git directory")?,
+            object_dir: DirectoryIdentity::capture(&object_dir, false)
+                .context("unsafe canonical checkout object directory")?,
+        };
+        repository.reject_indirections()?;
+        repository.require_clean()?;
+        Ok(repository)
+    }
+
+    fn revalidate_identity(&self) -> Result<()> {
+        self.git.revalidate()?;
+        if DirectoryIdentity::capture(&self.root, false)? != self.root_identity
+            || DirectoryIdentity::capture(self.git_dir.path(), false)? != self.git_dir
+            || DirectoryIdentity::capture(self.common_dir.path(), false)? != self.common_dir
+            || DirectoryIdentity::capture(self.object_dir.path(), false)? != self.object_dir
+        {
+            bail!("canonical repository identity drifted");
+        }
+        self.reject_indirections()
+    }
+
+    fn branch(&self) -> Result<String> {
+        GitRunner {
+            git: &self.git,
+            root: &self.root,
+        }
+        .one_line(&["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .context("canonical checkout must have an attached branch")
+    }
+
+    fn head(&self) -> Result<String> {
+        let head = GitRunner {
+            git: &self.git,
+            root: &self.root,
+        }
+        .one_line(&["rev-parse", "--verify", "HEAD^{commit}"])?;
+        validate_git_oid("canonical checkout HEAD", &head)?;
+        Ok(head)
+    }
+
+    fn require_clean(&self) -> Result<()> {
+        let runner = GitRunner {
+            git: &self.git,
+            root: &self.root,
+        };
+        if !runner
+            .success(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?
+            .is_empty()
+        {
+            bail!("canonical checkout must be completely clean");
+        }
+        if !runner
+            .success(&["for-each-ref", "--format=%(refname)", "refs/replace/"])?
+            .is_empty()
+        {
+            bail!("canonical checkout contains replacement refs");
+        }
+        Ok(())
+    }
+
+    fn require_exact(&self, branch: &str, head: &str) -> Result<()> {
+        self.revalidate_identity()?;
+        self.require_clean()?;
+        if self.branch()? != branch || self.head()? != head {
+            bail!("canonical checkout branch or HEAD drifted");
+        }
+        self.revalidate_identity()?;
+        self.require_clean()
+    }
+
+    fn validate_developer_completion(
+        &self,
+        branch: &str,
+        base: &str,
+        turn_start_head: &str,
+        result: &DeveloperResult,
+    ) -> Result<String> {
+        self.revalidate_identity()?;
+        self.require_clean()?;
+        if self.branch()? != branch {
+            bail!("developer changed the canonical checkout branch");
+        }
+        let head = self.head()?;
+        if head == base || result.head_revision.as_deref() != Some(head.as_str()) {
+            bail!("developer result must name a new exact committed HEAD");
+        }
+        let runner = GitRunner {
+            git: &self.git,
+            root: &self.root,
+        };
+        let ancestor = runner.run(&["merge-base", "--is-ancestor", base, &head])?;
+        if ancestor.status.code() != Some(0) || !ancestor.stderr.is_empty() {
+            bail!("developer HEAD is not a fast-forward from the task base");
+        }
+        let turn_ancestor = runner.run(&["merge-base", "--is-ancestor", turn_start_head, &head])?;
+        if turn_ancestor.status.code() != Some(0) || !turn_ancestor.stderr.is_empty() {
+            bail!("developer HEAD rewrote the exact same-task turn-start HEAD");
+        }
+        let range = format!("{base}..{head}");
+        let commits = parse_git_commits(&runner.success(&[
+            "log",
+            "-z",
+            "--reverse",
+            "--topo-order",
+            "--max-count=257",
+            "--no-show-signature",
+            "--format=%H%x00%s",
+            &range,
+            "--",
+        ])?)?;
+        if commits != result.commits {
+            bail!("developer commit report differs from the exact Git range");
+        }
+        let mut changed = parse_nul_paths(&runner.success(&[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-ext-diff",
+            "--no-textconv",
+            &range,
+            "--",
+        ])?)?;
+        let mut reported = result.changed_paths.clone();
+        changed.sort();
+        reported.sort();
+        if changed != reported {
+            bail!("developer changed-path report differs from the exact Git range");
+        }
+        self.require_exact(branch, &head)?;
+        Ok(head)
+    }
+
+    fn reject_indirections(&self) -> Result<()> {
+        for path in [
+            self.common_dir.path().join("info/grafts"),
+            self.object_dir.path().join("info/alternates"),
+            self.object_dir.path().join("info/http-alternates"),
+        ] {
+            match fs::symlink_metadata(&path) {
+                Ok(_) => bail!("canonical checkout uses forbidden Git object indirection"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 }
 
-fn artifact_scope(claim: &ClaimedTurn) -> ArtifactScope {
-    ArtifactScope {
-        project_id: claim.ready.project_id.clone(),
-        task_id: claim.ready.task_id.clone(),
-        role: claim.ready.role,
-        logical_session_id: claim.ready.session_id.clone(),
-        turn_sequence: claim.ready.sequence,
-        attempt: claim.attempt,
+struct RepositoryLock {
+    _file: File,
+}
+
+impl RepositoryLock {
+    fn acquire(repository: &CanonicalRepository, root: &Path) -> Result<Self> {
+        ensure_private_directory(root)?;
+        let metadata = fs::metadata(&repository.root)?;
+        let key = sha256_hex(serde_json::to_vec(&(metadata.dev(), metadata.ino()))?.as_slice());
+        let path = root.join(format!("{key}.lock"));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)?;
+        let file_metadata = file.metadata()?;
+        // SAFETY: geteuid has no preconditions.
+        if file_metadata.uid() != unsafe { libc::geteuid() }
+            || file_metadata.permissions().mode() & 0o777 != 0o600
+            || file_metadata.nlink() != 1
+        {
+            bail!("repository lock file has an unsafe identity");
+        }
+        // SAFETY: flock operates on this live file descriptor.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                bail!("another architect session already owns this canonical checkout");
+            }
+            return Err(error.into());
+        }
+        Ok(Self { _file: file })
     }
 }
 
-fn build_turn_prompt(claim: &ClaimedTurn) -> Result<Vec<u8>> {
-    let task_spec: serde_json::Value =
-        serde_json::from_str(&claim.ready.spec_json).context("stored TaskSpec is malformed")?;
-    let previous_result: Option<serde_json::Value> = claim
-        .ready
-        .previous_result_json
-        .as_deref()
-        .map(serde_json::from_str)
-        .transpose()
-        .context("stored previous result is malformed")?;
-    let value = serde_json::json!({
-        "contract": "hcom-durable-worker-turn-v1",
-        "project_id": claim.ready.project_id,
-        "task_id": claim.ready.task_id,
-        "role": role_name(claim.ready.role),
-        "turn": match claim.ready.kind {
-            TurnKind::Create => "create",
-            TurnKind::Resume => "resume",
+#[derive(Clone, PartialEq, Eq)]
+struct DirectoryIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    uid: u32,
+    mode: u32,
+}
+
+impl DirectoryIdentity {
+    fn capture(path: &Path, private: bool) -> Result<Self> {
+        let link = fs::symlink_metadata(path)?;
+        if link.file_type().is_symlink() || !link.is_dir() {
+            bail!("directory identity requires a real directory");
+        }
+        let canonical = fs::canonicalize(path)?;
+        if canonical != path {
+            bail!("directory identity path must already be canonical");
+        }
+        let metadata = fs::metadata(path)?;
+        let identity = Self {
+            path: canonical,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+            mode: metadata.permissions().mode() & 0o777,
+        };
+        // SAFETY: geteuid has no preconditions.
+        if identity.uid != unsafe { libc::geteuid() } {
+            bail!("directory identity is not owned by the current user");
+        }
+        if private && identity.mode != 0o700 {
+            bail!("private directory must be mode 0700");
+        }
+        Ok(identity)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+struct GitRunner<'a> {
+    git: &'a ExecutableIdentity,
+    root: &'a Path,
+}
+
+struct BoundedOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl GitRunner<'_> {
+    fn run(&self, args: &[&str]) -> Result<BoundedOutput> {
+        let mut command = Command::new(&self.git.canonical_path);
+        command
+            .arg("--no-replace-objects")
+            .args(["-c", "core.fsmonitor=false"])
+            .args(["-c", "core.untrackedCache=false"])
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .args(args)
+            .current_dir(self.root)
+            .env_clear()
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_PAGER", "/bin/cat")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("HOME", "/nonexistent")
+            .env("LC_ALL", "C");
+        let output = run_bounded_command(command, MAX_GIT_OUTPUT_BYTES, GIT_TIMEOUT)?;
+        Ok(output)
+    }
+
+    fn success(&self, args: &[&str]) -> Result<Vec<u8>> {
+        let output = self.run(args)?;
+        if !output.status.success() || !output.stderr.is_empty() {
+            bail!("bounded Git evidence command failed");
+        }
+        Ok(output.stdout)
+    }
+
+    fn one_line(&self, args: &[&str]) -> Result<String> {
+        let bytes = self.success(args)?;
+        let text = std::str::from_utf8(&bytes)?
+            .strip_suffix('\n')
+            .unwrap_or(std::str::from_utf8(&bytes)?);
+        if text.is_empty() || text.contains('\n') || text.contains('\r') {
+            bail!("Git evidence did not contain one bounded line");
+        }
+        Ok(text.to_owned())
+    }
+}
+
+fn capture_exact_git() -> Result<ExecutableIdentity> {
+    let git = ExecutableIdentity::capture(Path::new(GIT_EXECUTABLE))?;
+    let output = run_bounded_command(
+        {
+            let mut command = Command::new(GIT_EXECUTABLE);
+            command.arg("--version").env_clear();
+            command
         },
-        "turn_sequence": claim.ready.sequence,
-        "review_round": claim.ready.review_round,
-        "base_revision": claim.ready.base_revision,
-        "head_revision": claim.ready.head_revision,
-        "task_spec": task_spec,
-        "previous_result": previous_result,
-    });
-    serde_json::to_vec(&value).context("failed to encode bounded worker turn prompt")
+        4096,
+        Duration::from_secs(5),
+    )?;
+    if !output.status.success()
+        || !output.stderr.is_empty()
+        || std::str::from_utf8(&output.stdout)?.trim_end() != GIT_VERSION
+    {
+        bail!("Git executable does not match the exact enabled version");
+    }
+    git.revalidate()?;
+    Ok(git)
+}
+
+fn run_bounded_command(
+    mut command: Command,
+    cap: usize,
+    timeout: Duration,
+) -> Result<BoundedOutput> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("missing stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("missing stderr"))?;
+    let overflow = Arc::new(AtomicBool::new(false));
+    let stdout_overflow = Arc::clone(&overflow);
+    let stderr_overflow = Arc::clone(&overflow);
+    let stdout_thread = std::thread::spawn(move || read_bounded(stdout, cap, stdout_overflow));
+    let stderr_thread = std::thread::spawn(move || read_bounded(stderr, cap, stderr_overflow));
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if overflow.load(Ordering::Acquire) || started.elapsed() >= timeout {
+            terminate_child(&mut child);
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            bail!("bounded Git command exceeded its output or time limit");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| anyhow!("stdout reader panicked"))??;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| anyhow!("stderr reader panicked"))??;
+    if overflow.load(Ordering::Acquire) {
+        bail!("bounded Git output exceeded its cap");
+    }
+    Ok(BoundedOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_bounded(mut reader: impl Read, cap: usize, overflow: Arc<AtomicBool>) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        if output.len().saturating_add(count) > cap {
+            overflow.store(true, Ordering::Release);
+            break;
+        }
+        output.extend_from_slice(&buffer[..count]);
+    }
+    Ok(output)
+}
+
+fn terminate_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn parse_git_commits(bytes: &[u8]) -> Result<Vec<crate::worker::result::CommitSummary>> {
+    let mut fields: Vec<_> = bytes.split(|byte| *byte == 0).collect();
+    if fields.last().is_some_and(|field| field.is_empty()) {
+        fields.pop();
+    }
+    if fields.len() % 2 != 0 || fields.len() / 2 > 256 {
+        bail!("Git commit evidence has an invalid shape");
+    }
+    let mut commits = Vec::new();
+    for pair in fields.chunks_exact(2) {
+        let sha = std::str::from_utf8(pair[0])?.to_owned();
+        let subject = std::str::from_utf8(pair[1])?.to_owned();
+        validate_git_oid("Git commit", &sha)?;
+        validate_text("Git commit subject", &subject, 512)?;
+        commits.push(crate::worker::result::CommitSummary { sha, subject });
+    }
+    Ok(commits)
+}
+
+fn parse_nul_paths(bytes: &[u8]) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for component in bytes.split(|byte| *byte == 0) {
+        if component.is_empty() {
+            continue;
+        }
+        let path = std::str::from_utf8(component)?;
+        crate::worker::validation::validate_relative_path("Git changed path", path)?;
+        paths.push(path.to_owned());
+        if paths.len() > 256 {
+            bail!("Git changed paths exceed their bound");
+        }
+    }
+    Ok(paths)
+}
+
+fn canonical_git_path(value: &str) -> Result<PathBuf> {
+    if value.len() > 4096 {
+        bail!("Git path exceeds its bound");
+    }
+    let path = PathBuf::from(value);
+    if !path.is_absolute() || fs::canonicalize(&path)? != path {
+        bail!("Git path must be absolute and canonical");
+    }
+    Ok(path)
+}
+
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).with_context(|| {
+                format!("failed to create private directory {}", path.display())
+            })?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let _ = canonical_private_directory(path, "private session directory")?;
+    Ok(())
+}
+
+fn canonical_private_directory(path: &Path, label: &str) -> Result<PathBuf> {
+    let canonical = fs::canonicalize(path).with_context(|| format!("failed to resolve {label}"))?;
+    let metadata = fs::symlink_metadata(path)?;
+    // SAFETY: geteuid has no preconditions.
+    if canonical != path
+        || metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        bail!("{label} must be canonical, current-user owned, and mode 0700");
+    }
+    Ok(canonical)
+}
+
+fn canonical_readable_directory(path: &Path, label: &str) -> Result<PathBuf> {
+    let canonical = fs::canonicalize(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    // SAFETY: geteuid has no preconditions.
+    if canonical != path
+        || metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o002 != 0
+    {
+        bail!("{label} has an unsafe identity");
+    }
+    Ok(canonical)
+}
+
+fn canonical_private_file(path: &Path, label: &str) -> Result<PathBuf> {
+    let canonical = fs::canonicalize(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    // SAFETY: geteuid has no preconditions.
+    if canonical != path
+        || metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.permissions().mode() & 0o600 != 0o600
+        || metadata.nlink() != 1
+    {
+        bail!("{label} has an unsafe identity");
+    }
+    Ok(canonical)
+}
+
+fn prepare_auth_mount_target(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if !metadata.file_type().is_symlink()
+                && metadata.is_file()
+                && metadata.permissions().mode() & 0o777 == 0o600
+                && metadata.nlink() == 1 =>
+        {
+            return Ok(());
+        }
+        Ok(_) => bail!("worker auth mount target has an unsafe identity"),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        Err(_) => {}
+    }
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn validate_id(label: &str, value: &str) -> Result<()> {
+    crate::worker::validation::validate_opaque_id(label, value)
+}
+
+fn validate_git_oid(label: &str, value: &str) -> Result<()> {
+    crate::worker::validation::validate_git_oid(label, value)
+}
+
+fn validate_text(label: &str, value: &str, max: usize) -> Result<()> {
+    crate::worker::validation::validate_text(label, value, max, false)
+}
+
+fn now_epoch_seconds() -> Result<i64> {
+    i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+        .context("system time exceeds i64")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 fn role_name(role: WorkerRole) -> &'static str {
@@ -991,1271 +2060,754 @@ fn role_name(role: WorkerRole) -> &'static str {
     }
 }
 
-fn snapshot_digest(root: &Path) -> Result<String> {
-    let canonical = fs::canonicalize(root)?;
-    if canonical != root || !canonical.is_dir() {
-        bail!("review snapshot root is not canonical");
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(b"hcom-review-snapshot-v2\0");
-    let mut entry_count = 0;
-    let mut total_bytes = 0;
-    hash_snapshot_entries(
-        &canonical,
-        &canonical,
-        &mut hasher,
-        &mut entry_count,
-        &mut total_bytes,
-        0,
-    )?;
-    Ok(hex_bytes(&hasher.finalize()))
-}
-
-fn reviewer_exposes_developer_path(
-    reviewer_cwd: &Path,
-    argv: &[String],
-    prompt: &[u8],
-    developer_worktree: &str,
-) -> Result<bool> {
-    let developer = Path::new(developer_worktree);
-    Ok(reviewer_cwd.starts_with(developer)
-        || developer.starts_with(reviewer_cwd)
-        || argv.windows(3).any(|arguments| {
-            matches!(
-                arguments[0].as_str(),
-                "--bind" | "--bind-try" | "--dev-bind" | "--dev-bind-try"
-            ) && (paths_overlap(Path::new(&arguments[1]), developer)
-                || paths_overlap(Path::new(&arguments[2]), developer))
-        })
-        || argv
-            .iter()
-            .any(|argument| argument.contains(developer_worktree))
-        || String::from_utf8_lossy(prompt).contains(developer_worktree)
-        || snapshot_contains_bytes(
-            reviewer_cwd,
-            reviewer_cwd,
-            developer_worktree.as_bytes(),
-            &mut 0,
-            &mut 0,
-            0,
-        )?)
-}
-
-fn paths_overlap(left: &Path, right: &Path) -> bool {
-    left.starts_with(right) || right.starts_with(left)
-}
-
-fn snapshot_contains_bytes(
-    root: &Path,
-    directory: &Path,
-    needle: &[u8],
-    entries: &mut usize,
-    total_bytes: &mut u64,
-    depth: usize,
-) -> Result<bool> {
-    if needle.is_empty() {
-        bail!("review snapshot exposure needle must not be empty");
-    }
-    if depth > 32 || *entries > MAX_REVIEW_SNAPSHOT_ENTRIES {
-        bail!("review snapshot exceeds its bounded exposure-check shape");
-    }
-    let mut children = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
-    children.sort_by_key(|entry| entry.file_name());
-    for child in children {
-        *entries += 1;
-        if *entries > MAX_REVIEW_SNAPSHOT_ENTRIES {
-            bail!("review snapshot exceeds its bounded exposure-check shape");
-        }
-        let path = child.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() {
-            bail!("review snapshot contains a symlink");
-        }
-        let relative = path.strip_prefix(root)?;
-        let relative = relative
-            .to_str()
-            .ok_or_else(|| anyhow!("review snapshot path is not UTF-8"))?;
-        crate::worker::validation::validate_text("review snapshot path", relative, 4096, false)?;
-        if relative
-            .as_bytes()
-            .windows(needle.len())
-            .any(|part| part == needle)
-        {
-            return Ok(true);
-        }
-        if metadata.is_dir() {
-            if snapshot_contains_bytes(root, &path, needle, entries, total_bytes, depth + 1)? {
-                return Ok(true);
-            }
-        } else if metadata.is_file() {
-            if metadata.nlink() != 1 {
-                bail!("review snapshot contains a hard-linked file");
-            }
-            if metadata.len() > MAX_REVIEW_SNAPSHOT_FILE_BYTES {
-                bail!("review snapshot file exceeds its exposure-check bound");
-            }
-            *total_bytes = total_bytes
-                .checked_add(metadata.len())
-                .ok_or_else(|| anyhow!("review snapshot exposure-check size overflow"))?;
-            if *total_bytes > MAX_REVIEW_SNAPSHOT_TOTAL_BYTES {
-                bail!("review snapshot exceeds its aggregate exposure-check bound");
-            }
-            if file_contains_bytes(&path, metadata.len(), needle)? {
-                return Ok(true);
-            }
-        } else {
-            bail!("review snapshot contains an unsupported file type");
-        }
-    }
-    Ok(false)
-}
-
-fn hash_snapshot_entries(
-    root: &Path,
-    directory: &Path,
-    hasher: &mut Sha256,
-    entry_count: &mut usize,
-    total_bytes: &mut u64,
-    depth: usize,
-) -> Result<()> {
-    if depth > 32 || *entry_count > MAX_REVIEW_SNAPSHOT_ENTRIES {
-        bail!("review snapshot exceeds its bounded manifest shape");
-    }
-    let mut children = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
-    children.sort_by_key(|entry| entry.file_name());
-    for child in children {
-        *entry_count += 1;
-        if *entry_count > MAX_REVIEW_SNAPSHOT_ENTRIES {
-            bail!("review snapshot exceeds its bounded manifest shape");
-        }
-        let path = child.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() {
-            bail!("review snapshot contains a symlink");
-        }
-        let relative = path.strip_prefix(root)?;
-        let relative = relative
-            .to_str()
-            .ok_or_else(|| anyhow!("review snapshot path is not UTF-8"))?;
-        crate::worker::validation::validate_text("review snapshot path", relative, 4096, false)?;
-        if metadata.is_dir() {
-            hash_snapshot_entry(
-                hasher,
-                format!("d\0{relative}\0{:o}", metadata.permissions().mode()).as_bytes(),
-            );
-            hash_snapshot_entries(root, &path, hasher, entry_count, total_bytes, depth + 1)?;
-        } else if metadata.is_file() {
-            if metadata.nlink() != 1 {
-                bail!("review snapshot contains a hard-linked file");
-            }
-            if metadata.len() > MAX_REVIEW_SNAPSHOT_FILE_BYTES {
-                bail!("review snapshot file exceeds its bound");
-            }
-            *total_bytes = total_bytes
-                .checked_add(metadata.len())
-                .ok_or_else(|| anyhow!("review snapshot size overflow"))?;
-            if *total_bytes > MAX_REVIEW_SNAPSHOT_TOTAL_BYTES {
-                bail!("review snapshot exceeds its aggregate byte bound");
-            }
-            let content_hash = hash_snapshot_file(&path, metadata.len())?;
-            hash_snapshot_entry(
-                hasher,
-                format!(
-                    "f\0{relative}\0{}\0{:o}\0{content_hash}",
-                    metadata.len(),
-                    metadata.permissions().mode(),
-                )
-                .as_bytes(),
-            );
-        } else {
-            bail!("review snapshot contains an unsupported file type");
+fn require_changed_paths_in_scope(changed: &[String], allowed: &[String]) -> Result<()> {
+    for changed_path in changed {
+        let changed_path = Path::new(changed_path);
+        if !allowed.iter().any(|allowed_path| {
+            let allowed_path = Path::new(allowed_path);
+            changed_path == allowed_path || changed_path.starts_with(allowed_path)
+        }) {
+            bail!("developer changed a path outside the explicitly approved task scope");
         }
     }
     Ok(())
 }
 
-fn hash_snapshot_entry(hasher: &mut Sha256, entry: &[u8]) {
-    hasher.update((entry.len() as u64).to_be_bytes());
-    hasher.update(entry);
+fn require_checks_passed(role: &str, required: &[String], reported: &[CheckResult]) -> Result<()> {
+    let statuses: BTreeMap<_, _> = reported
+        .iter()
+        .map(|check| (check.command.as_str(), check.status))
+        .collect();
+    if required
+        .iter()
+        .any(|command| statuses.get(command.as_str()).copied() != Some(CheckStatus::Passed))
+    {
+        bail!("{role} did not pass every explicitly approved required check");
+    }
+    Ok(())
 }
 
-fn hash_snapshot_file(path: &Path, expected_len: u64) -> Result<String> {
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut observed = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        observed = observed
-            .checked_add(u64::try_from(count)?)
-            .ok_or_else(|| anyhow!("review snapshot file size overflow"))?;
-        if observed > expected_len {
-            bail!("review snapshot file grew while it was hashed");
-        }
-        hasher.update(&buffer[..count]);
+fn developer_outcome_detail(result: &DeveloperResult) -> String {
+    let decision = match result.decision {
+        DeveloperDecision::Completed => "completed",
+        DeveloperDecision::NeedsInput => "needs_input",
+        DeveloperDecision::Blocked => "blocked",
+    };
+    let mut detail = format!("developer {decision}: {}", result.summary);
+    if !result.questions.is_empty() {
+        detail.push_str("; questions: ");
+        detail.push_str(&result.questions.join(" | "));
     }
-    if observed != expected_len {
-        bail!("review snapshot file changed while it was hashed");
+    if !result.risks.is_empty() {
+        detail.push_str("; risks: ");
+        detail.push_str(&result.risks.join(" | "));
     }
-    Ok(hex_bytes(&hasher.finalize()))
+    truncate_status_detail(detail)
 }
 
-fn file_contains_bytes(path: &Path, expected_len: u64, needle: &[u8]) -> Result<bool> {
-    let mut file = File::open(path)?;
-    let mut observed = 0u64;
-    let mut tail = Vec::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        observed = observed
-            .checked_add(u64::try_from(count)?)
-            .ok_or_else(|| anyhow!("review snapshot exposure-check size overflow"))?;
-        if observed > expected_len {
-            bail!("review snapshot file grew during its exposure check");
-        }
-        let mut searchable = Vec::with_capacity(tail.len() + count);
-        searchable.extend_from_slice(&tail);
-        searchable.extend_from_slice(&buffer[..count]);
-        if searchable.windows(needle.len()).any(|part| part == needle) {
-            return Ok(true);
-        }
-        let retained = needle.len().saturating_sub(1).min(searchable.len());
-        tail.clear();
-        tail.extend_from_slice(&searchable[searchable.len() - retained..]);
+fn reviewer_outcome_detail(result: &ReviewerResult) -> String {
+    let decision = match result.decision {
+        ReviewDecision::Lgtm => "lgtm",
+        ReviewDecision::RequestChanges => "request_changes",
+    };
+    let mut detail = format!("reviewer {decision}: {}", result.summary);
+    if !result.findings.is_empty() {
+        detail.push_str("; findings: ");
+        detail.push_str(
+            &result
+                .findings
+                .iter()
+                .map(|finding| finding.title.as_str())
+                .collect::<Vec<_>>()
+                .join(" | "),
+        );
     }
-    if observed != expected_len {
-        bail!("review snapshot file changed during its exposure check");
-    }
-    Ok(false)
+    truncate_status_detail(detail)
 }
 
-fn hex_bytes(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+fn truncate_status_detail(mut detail: String) -> String {
+    if detail.len() <= MAX_STATUS_OUTCOME_BYTES {
+        return detail;
     }
-    output
+    const MARKER: &str = "…";
+    let mut boundary = MAX_STATUS_OUTCOME_BYTES - MARKER.len();
+    while !detail.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    detail.truncate(boundary);
+    detail.push_str(MARKER);
+    detail
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project_store::{FakeProjectSeed, FakeTaskSeed};
-    use crate::worker::ExecutableIdentity;
-    use crate::worker::environment::{EnvironmentPolicy, ExecutionEnvironmentLease};
     use crate::worker::fake::FakeWorkerAdapter;
-    use std::io::{Seek, SeekFrom, Write};
     use std::os::unix::fs::PermissionsExt;
 
-    struct Fixture {
-        _temp: tempfile::TempDir,
-        layout: ProjectControlLayout,
-        artifact_root: PathBuf,
-        developer: PathBuf,
-        reviewer: PathBuf,
-        executable: ExecutableIdentity,
-    }
+    const FAKE_WORKER: &str = r#"#!/usr/bin/python3
+import json
+import os
+import subprocess
+import sys
+import time
 
-    impl Fixture {
-        fn new() -> Self {
-            Self::new_with_script(fake_worker_script())
-        }
+if any(os.isatty(fd) for fd in (0, 1, 2)):
+    raise SystemExit(90)
 
-        fn new_with_script(script_contents: Vec<u8>) -> Self {
-            let temp = tempfile::tempdir().unwrap();
-            let state = temp.path().join("state/hcom-project-control");
-            let runtime = temp.path().join("run/hcom-project-control");
-            let config = temp.path().join("config/hcom-project-control/config.toml");
-            let artifact_root = state.join("control-v1/artifacts");
-            fs::create_dir_all(&artifact_root).unwrap();
-            fs::set_permissions(&artifact_root, fs::Permissions::from_mode(0o700)).unwrap();
-            let developer = temp.path().join("developer");
-            let reviewer = temp.path().join("reviewer");
-            fs::create_dir(&developer).unwrap();
-            fs::create_dir(&reviewer).unwrap();
-            fs::write(developer.join("tracked.txt"), b"developer worktree").unwrap();
-            fs::write(reviewer.join("tracked.txt"), b"read-only snapshot").unwrap();
-            fs::set_permissions(&reviewer, fs::Permissions::from_mode(0o500)).unwrap();
-            fs::set_permissions(
-                reviewer.join("tracked.txt"),
-                fs::Permissions::from_mode(0o400),
-            )
-            .unwrap();
-            let script = temp.path().join("fake-worker");
-            fs::write(&script, script_contents).unwrap();
-            fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-            let executable =
-                ExecutableIdentity::capture(fs::canonicalize(&script).unwrap()).unwrap();
-            Self {
-                _temp: temp,
-                layout: ProjectControlLayout::from_app_roots(state, runtime, config),
-                artifact_root: fs::canonicalize(artifact_root).unwrap(),
-                developer: fs::canonicalize(developer).unwrap(),
-                reviewer: fs::canonicalize(reviewer).unwrap(),
-                executable,
-            }
-        }
+prompt_bytes = sys.stdin.buffer.read()
+if not prompt_bytes:
+    raise SystemExit(91)
+prompt = json.loads(prompt_bytes)
+role = os.environ["HCOM_WORKER_ROLE"]
+task = os.environ["HCOM_TASK_ID"]
+if os.environ.get("HCOM_RUN_ID") != "run-test":
+    raise SystemExit(92)
 
-        fn scheduler(&self) -> DurableScheduler {
-            let adapter = Arc::new(
-                FakeWorkerAdapter::isolated_preassigned(
-                    self.executable.clone(),
-                    self.developer.clone(),
-                    self.reviewer.clone(),
-                )
-                .unwrap(),
-            );
-            let mut registry = WorkerAdapterRegistry::default();
-            registry.register(adapter).unwrap();
-            DurableScheduler::open(
-                &self.layout,
-                &self.artifact_root,
-                registry,
-                ProcessRunner::new(Duration::from_millis(10), Duration::from_millis(50)).unwrap(),
-            )
-            .unwrap()
-        }
+arguments = sys.argv[1:]
+if "--session-id" in arguments:
+    session_id = arguments[arguments.index("--session-id") + 1]
+    invocation = "create"
+elif "--resume" in arguments:
+    session_id = arguments[arguments.index("--resume") + 1]
+    invocation = "resume"
+else:
+    raise SystemExit(93)
 
-        fn seed(&self, scheduler: &mut DurableScheduler, project_id: &str) {
-            let adapter = FakeWorkerAdapter::isolated_preassigned(
-                self.executable.clone(),
-                self.developer.clone(),
-                self.reviewer.clone(),
-            )
-            .unwrap();
-            scheduler
-                .seed_fake_project(&FakeProjectSeed {
-                    project_id: project_id.into(),
-                    source_repo_root: self.developer.to_string_lossy().into_owned(),
-                    developer_worktree: self.developer.to_string_lossy().into_owned(),
-                    base_revision: "0".repeat(40),
-                    developer_profile: adapter.profile(WorkerRole::Developer),
-                    reviewer_profile: adapter.profile(WorkerRole::Reviewer),
-                    approved_tasks: vec![
-                        task("task-1", "approved-one", 0, vec![]),
-                        task("task-2", "approved-two", 1, vec!["task-1".into()]),
-                    ],
-                    unapproved_task: Some(task("task-3", "unapproved-three", 0, vec![])),
-                })
-                .unwrap();
-        }
-    }
+root = os.path.dirname(os.path.realpath(sys.argv[0]))
+try:
+    with open(os.path.join(root, "behavior"), encoding="utf-8") as source:
+        behavior = source.read().strip()
+except FileNotFoundError:
+    behavior = "normal"
+count_path = os.path.join(root, f"{task}-{role}.count")
+try:
+    with open(count_path, encoding="utf-8") as source:
+        count = int(source.read()) + 1
+except FileNotFoundError:
+    count = 1
+with open(count_path, "w", encoding="utf-8") as output:
+    output.write(str(count))
+with open(os.path.join(root, "audit.ndjson"), "a", encoding="utf-8") as output:
+    output.write(json.dumps({
+        "task": task,
+        "role": role,
+        "session_id": session_id,
+        "invocation": invocation,
+        "count": count,
+        "stdin_is_tty": os.isatty(0),
+    }, separators=(",", ":")) + "\n")
 
-    #[test]
-    fn fake_two_task_run_is_fresh_serial_snapshot_isolated_and_approval_bound() {
-        let fixture = Fixture::new();
-        let mut scheduler = fixture.scheduler();
-        fixture.seed(&mut scheduler, "project-e2e");
-        let environment = environment("lease-e2e", scheduler.daemon_epoch());
-        scheduler
-            .request_run(
-                "project-e2e",
-                0,
-                1,
-                &sha256_hex(b"project-e2e:approved-plan"),
-                environment,
-            )
-            .unwrap();
-        scheduler.run_until_blocked("project-e2e", 64).unwrap();
-        let snapshot = scheduler.snapshot("project-e2e").unwrap();
-        assert_eq!(snapshot.project_state, "completed");
-        assert_eq!(snapshot.checkpoint_sha, "c".repeat(40));
-        assert_eq!(snapshot.developer_native_sessions.len(), 2);
-        assert_eq!(snapshot.reviewer_native_sessions.len(), 2);
-        assert_ne!(
-            snapshot.developer_native_sessions[0],
-            snapshot.developer_native_sessions[1]
-        );
-        assert_ne!(
-            snapshot.reviewer_native_sessions[0],
-            snapshot.reviewer_native_sessions[1]
-        );
-        assert!(
-            snapshot
-                .developer_native_sessions
-                .iter()
-                .chain(&snapshot.reviewer_native_sessions)
-                .all(|session| Uuid::parse_str(session)
-                    .is_ok_and(|parsed| parsed.hyphenated().to_string() == *session))
-        );
-        assert_eq!(snapshot.turn_count, 6);
-        assert_eq!(snapshot.applied_turn_count, 6);
-        assert_eq!(snapshot.result_ready_turn_count, 0);
-        assert!(snapshot.transition_count >= 16);
-        assert!(
-            snapshot
-                .task_states
-                .contains(&("unapproved-three".into(), "draft".into()))
-        );
-        let metrics = scheduler.metrics();
-        assert_eq!(metrics.max_live_developers, 1);
-        assert_eq!(metrics.max_live_reviewers, 1);
-        assert_eq!(metrics.developer_spawns, 3);
-        assert_eq!(metrics.reviewer_spawns, 3);
-        assert!(metrics.heartbeats >= 6);
-        assert_eq!(metrics.current_developers, 0);
-        assert_eq!(metrics.current_reviewers, 0);
-        assert!(scheduler.spawn_audit().iter().all(|audit| {
-            !audit.prompt_in_argv
-                && !audit.developer_path_exposed
-                && match audit.role {
-                    WorkerRole::Developer => audit.workspace_cwd == fixture.developer,
-                    WorkerRole::Reviewer => {
-                        audit.workspace_cwd == fixture.reviewer
-                            && audit.workspace_cwd != fixture.developer
-                    }
-                }
-        }));
-        assert_eq!(
-            scheduler
-                .spawn_audit()
-                .iter()
-                .filter(|audit| audit.task_id == "task-3")
-                .count(),
-            0
-        );
-    }
+if behavior == "crash-once" and task == "one" and role == "developer" and count == 1:
+    raise SystemExit(42)
 
-    #[test]
-    fn reviewer_snapshot_containing_developer_worktree_path_fails_before_spawn() {
-        let fixture = Fixture::new_with_script(
-            String::from_utf8(fake_worker_script())
-                .unwrap()
-                .replace("    sleep 0.04\n", "")
-                .into_bytes(),
-        );
-        let tracked = fixture.reviewer.join("tracked.txt");
-        fs::set_permissions(&tracked, fs::Permissions::from_mode(0o600)).unwrap();
-        fs::write(
-            &tracked,
-            format!("leaked path: {}\n", fixture.developer.display()),
+if role == "developer":
+    if behavior == "rewrite-on-resume" and task == "one" and count == 2:
+        subprocess.run(
+            ["/usr/bin/git", "reset", "--hard", prompt["base_revision"]],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        .unwrap();
-        fs::set_permissions(&tracked, fs::Permissions::from_mode(0o400)).unwrap();
-
-        let mut scheduler = fixture.scheduler();
-        fixture.seed(&mut scheduler, "project-reviewer-path-leak");
-        scheduler
-            .request_run(
-                "project-reviewer-path-leak",
-                0,
-                1,
-                &sha256_hex(b"project-reviewer-path-leak:approved-plan"),
-                environment("lease-reviewer-path-leak", scheduler.daemon_epoch()),
-            )
-            .unwrap();
-        assert!(
-            scheduler
-                .run_until_blocked("project-reviewer-path-leak", 64)
-                .is_err()
-        );
-        let snapshot = scheduler.snapshot("project-reviewer-path-leak").unwrap();
-        assert_eq!(scheduler.metrics().reviewer_spawns, 0);
-        let turn_evidence = scheduler
-            .store
-            .connection()
-            .prepare(
-                "SELECT s.role, wt.status, wt.error_kind
-                 FROM worker_turns wt
-                 JOIN worker_sessions s ON s.id = wt.session_id
-                 ORDER BY wt.created_at, wt.id",
-            )
-            .unwrap()
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(
-            snapshot.project_state, "failed",
-            "unexpected turn evidence: {turn_evidence:?}"
-        );
+    path = f"{task}.txt"
+    with open(path, "a", encoding="utf-8") as output:
+        output.write(f"{invocation}-{count}\n")
+    subprocess.run(
+        ["/usr/bin/git", "add", "--", path],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        [
+            "/usr/bin/git",
+            "-c", "user.name=Phase 8 Fake",
+            "-c", "user.email=phase8-fake@example.invalid",
+            "commit", "-m", f"{task} developer turn {count}",
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    head = subprocess.check_output(
+        ["/usr/bin/git", "rev-parse", "HEAD"], text=True
+    ).strip()
+    base = prompt["base_revision"]
+    log = subprocess.check_output(
+        [
+            "/usr/bin/git", "log", "--reverse",
+            "--format=%H%x1f%s", f"{base}..{head}", "--",
+        ],
+        text=True,
+    )
+    commits = []
+    for line in log.splitlines():
+        sha, subject = line.split("\x1f", 1)
+        commits.append({"sha": sha, "subject": subject})
+    changed = subprocess.check_output(
+        ["/usr/bin/git", "diff", "--name-only", f"{base}..{head}", "--"],
+        text=True,
+    ).splitlines()
+    result = {
+        "decision": "completed",
+        "summary": f"completed {task} turn {count}",
+        "head_revision": head,
+        "commits": commits,
+        "checks": [{
+            "command": "fake deterministic check",
+            "status": "passed",
+            "summary": "the deterministic fake worker completed its approved check",
+        }],
+        "questions": [],
+        "risks": [],
+        "changed_paths": sorted(changed),
     }
-
-    #[test]
-    fn reviewer_writable_mount_parent_of_developer_worktree_is_exposure() {
-        let temp = tempfile::tempdir().unwrap();
-        let reviewer = temp.path().join("reviewer");
-        let writable = temp.path().join("writable");
-        let developer = writable.join("developer");
-        fs::create_dir(&reviewer).unwrap();
-        fs::create_dir(&writable).unwrap();
-        fs::create_dir(&developer).unwrap();
-        let reviewer = fs::canonicalize(reviewer).unwrap();
-        let writable = fs::canonicalize(writable).unwrap();
-        let developer = fs::canonicalize(developer).unwrap();
-        let argv = vec![
-            "--bind".into(),
-            writable.to_string_lossy().into_owned(),
-            writable.to_string_lossy().into_owned(),
-        ];
-        assert!(
-            reviewer_exposes_developer_path(
-                &reviewer,
-                &argv,
-                b"bounded reviewer prompt",
-                developer.to_str().unwrap(),
-            )
-            .unwrap()
-        );
-    }
-
-    #[test]
-    fn reviewer_snapshot_mutation_makes_the_turn_indeterminate_without_apply() {
-        let script = String::from_utf8(fake_worker_script())
-            .unwrap()
-            .replace(
-                "if touch reviewer-write-probe 2>/dev/null; then\n        exit 73\n    fi",
-                "chmod u+w . tracked.txt\n    printf '%s\\n' 'mutated by reviewer' >>tracked.txt",
-            )
-            .into_bytes();
-        let fixture = Fixture::new_with_script(script);
-        let mut scheduler = fixture.scheduler();
-        fixture.seed(&mut scheduler, "project-reviewer-mutation");
-        scheduler
-            .request_run(
-                "project-reviewer-mutation",
-                0,
-                1,
-                &sha256_hex(b"project-reviewer-mutation:approved-plan"),
-                environment("lease-reviewer-mutation", scheduler.daemon_epoch()),
-            )
-            .unwrap();
-        scheduler
-            .run_until_blocked("project-reviewer-mutation", 64)
-            .unwrap();
-
-        let snapshot = scheduler.snapshot("project-reviewer-mutation").unwrap();
-        assert_eq!(snapshot.project_state, "needs_recovery");
-        assert!(
-            snapshot
-                .task_states
-                .contains(&("approved-one".into(), "indeterminate".into()))
-        );
-        assert_eq!(snapshot.applied_turn_count, 1);
-        assert_eq!(scheduler.metrics().reviewer_spawns, 1);
-    }
-
-    #[test]
-    fn review_snapshot_digest_streams_large_files_and_detects_tail_changes() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(temp.path()).unwrap();
-        let large = root.join("large-pack");
-        File::create(&large)
-            .unwrap()
-            .set_len(17 * 1024 * 1024)
-            .unwrap();
-        let before = snapshot_digest(&root).unwrap();
-        let mut file = fs::OpenOptions::new().write(true).open(&large).unwrap();
-        file.seek(SeekFrom::End(-1)).unwrap();
-        file.write_all(b"x").unwrap();
-        file.sync_all().unwrap();
-        let after = snapshot_digest(&root).unwrap();
-        assert_ne!(before, after);
-    }
-
-    #[test]
-    fn review_snapshot_rejects_symlink_hardlink_and_control_path_escape() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(temp.path()).unwrap();
-        let tracked = root.join("tracked");
-        fs::write(&tracked, b"exact snapshot\n").unwrap();
-
-        let hardlink = root.join("hardlink");
-        fs::hard_link(&tracked, &hardlink).unwrap();
-        assert!(snapshot_digest(&root).is_err());
-        fs::remove_file(&hardlink).unwrap();
-
-        let symlink = root.join("symlink");
-        std::os::unix::fs::symlink(&tracked, &symlink).unwrap();
-        assert!(snapshot_digest(&root).is_err());
-        fs::remove_file(&symlink).unwrap();
-
-        fs::write(root.join("control\npath"), b"forbidden path\n").unwrap();
-        assert!(snapshot_digest(&root).is_err());
-    }
-
-    #[test]
-    fn daemon_restart_applies_result_ready_without_repeating_worker_turn() {
-        let fixture = Fixture::new();
-        let mut first = fixture.scheduler();
-        fixture.seed(&mut first, "project-recovery");
-        first
-            .request_run(
-                "project-recovery",
-                0,
-                1,
-                &sha256_hex(b"project-recovery:approved-plan"),
-                environment("lease-before", first.daemon_epoch()),
-            )
-            .unwrap();
-        first.set_fail_after_result_ready_once();
-        first.run_until_blocked("project-recovery", 8).unwrap();
-        assert_eq!(first.metrics().developer_spawns, 1);
-        let before = first.snapshot("project-recovery").unwrap();
-        assert_eq!(before.result_ready_turn_count, 1);
-        first.simulate_crash_on_drop();
-        drop(first);
-
-        let mut recovered = fixture.scheduler();
-        let recovered_state = recovered.snapshot("project-recovery").unwrap();
-        assert_eq!(recovered_state.project_state, "needs_recovery");
-        assert_eq!(recovered_state.result_ready_turn_count, 1);
-        let lease_states: (i64, i64) = recovered
-            .store
-            .connection()
-            .query_row(
-                "SELECT
-                     sum(CASE WHEN state = 'lost' THEN 1 ELSE 0 END),
-                     sum(CASE WHEN state = 'active' THEN 1 ELSE 0 END)
-                 FROM execution_environment_leases
-                 WHERE project_id = 'project-recovery'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(lease_states, (1, 0));
-        recovered.run_until_blocked("project-recovery", 8).unwrap();
-        let applied = recovered.snapshot("project-recovery").unwrap();
-        assert_eq!(applied.result_ready_turn_count, 0);
-        assert_eq!(recovered.metrics().developer_spawns, 0);
-        recovered
-            .resume(
-                "project-recovery",
-                applied.project_version,
-                environment("lease-after", recovered.daemon_epoch()),
-            )
-            .unwrap();
-        recovered.run_until_blocked("project-recovery", 64).unwrap();
-        let final_state = recovered.snapshot("project-recovery").unwrap();
-        assert_eq!(final_state.project_state, "completed");
-        assert_eq!(final_state.turn_count, 6);
-        assert_eq!(recovered.metrics().developer_spawns, 2);
-        assert_eq!(recovered.metrics().reviewer_spawns, 3);
-    }
-
-    #[test]
-    fn canceling_result_ready_prevents_late_apply_or_worker_restart() {
-        let fixture = Fixture::new();
-        let mut scheduler = fixture.scheduler();
-        fixture.seed(&mut scheduler, "project-result-cancel");
-        scheduler
-            .request_run(
-                "project-result-cancel",
-                0,
-                1,
-                &sha256_hex(b"project-result-cancel:approved-plan"),
-                environment("lease-result-cancel", scheduler.daemon_epoch()),
-            )
-            .unwrap();
-        scheduler.set_fail_after_result_ready_once();
-        scheduler
-            .run_until_blocked("project-result-cancel", 8)
-            .unwrap();
-        let ready = scheduler.snapshot("project-result-cancel").unwrap();
-        assert_eq!(ready.result_ready_turn_count, 1);
-        scheduler
-            .cancel(
-                "project-result-cancel",
-                ready.project_version,
-                "cancel_after_result",
-            )
-            .unwrap();
-        scheduler
-            .run_until_blocked("project-result-cancel", 8)
-            .unwrap();
-        let canceled = scheduler.snapshot("project-result-cancel").unwrap();
-        assert_eq!(canceled.project_state, "canceled");
-        assert_eq!(canceled.result_ready_turn_count, 0);
-        assert_eq!(canceled.applied_turn_count, 0);
-        assert_eq!(scheduler.metrics().developer_spawns, 1);
-        assert_eq!(scheduler.metrics().reviewer_spawns, 0);
-    }
-
-    #[test]
-    fn tampered_result_ready_manifest_is_staled_and_recovery_gated() {
-        let fixture = Fixture::new();
-        let mut scheduler = fixture.scheduler();
-        fixture.seed(&mut scheduler, "project-manifest-tamper");
-        scheduler
-            .request_run(
-                "project-manifest-tamper",
-                0,
-                1,
-                &sha256_hex(b"project-manifest-tamper:approved-plan"),
-                environment("lease-manifest-tamper", scheduler.daemon_epoch()),
-            )
-            .unwrap();
-        scheduler.set_fail_after_result_ready_once();
-        scheduler
-            .run_until_blocked("project-manifest-tamper", 8)
-            .unwrap();
-        let artifact_dir: String = scheduler
-            .store
-            .connection()
-            .query_row(
-                "SELECT artifact_dir FROM worker_turns WHERE status = 'result_ready'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let manifest_path = fixture
-            .artifact_root
-            .join(artifact_dir)
-            .join("attempt-1/manifest.json");
-        let mut manifest: serde_json::Value =
-            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-        manifest["adapter_contract_hash"] = serde_json::Value::String("f".repeat(64));
-        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-
-        assert!(
-            scheduler
-                .run_until_blocked("project-manifest-tamper", 8)
-                .is_err()
-        );
-        let snapshot = scheduler.snapshot("project-manifest-tamper").unwrap();
-        assert_eq!(snapshot.project_state, "needs_recovery");
-        assert_eq!(snapshot.result_ready_turn_count, 0);
-        assert_eq!(snapshot.applied_turn_count, 0);
-        assert!(
-            snapshot
-                .task_states
-                .contains(&("approved-one".into(), "indeterminate".into()))
-        );
-        assert_eq!(scheduler.metrics().developer_spawns, 1);
-    }
-
-    #[test]
-    fn superseded_reviewer_snapshot_cannot_apply_a_persisted_verdict() {
-        let fixture = Fixture::new();
-        let mut scheduler = fixture.scheduler();
-        fixture.seed(&mut scheduler, "project-review-superseded");
-        scheduler
-            .request_run(
-                "project-review-superseded",
-                0,
-                1,
-                &sha256_hex(b"project-review-superseded:approved-plan"),
-                environment("lease-review-superseded", scheduler.daemon_epoch()),
-            )
-            .unwrap();
-
-        assert!(
-            scheduler
-                .run_until_blocked("project-review-superseded", 4)
-                .is_err()
-        );
-        let ready_role: String = scheduler
-            .store
-            .connection()
-            .query_row(
-                "SELECT s.role
-                 FROM worker_turns wt
-                 JOIN worker_sessions s ON s.id = wt.session_id
-                 WHERE wt.status = 'result_ready'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(ready_role, "reviewer");
-
-        let tracked = fixture.reviewer.join("tracked.txt");
-        fs::set_permissions(&tracked, fs::Permissions::from_mode(0o600)).unwrap();
-        fs::write(&tracked, b"superseded review snapshot\n").unwrap();
-        fs::set_permissions(&tracked, fs::Permissions::from_mode(0o400)).unwrap();
-        assert!(
-            scheduler
-                .run_until_blocked("project-review-superseded", 8)
-                .is_err()
-        );
-
-        let snapshot = scheduler.snapshot("project-review-superseded").unwrap();
-        assert_eq!(snapshot.project_state, "needs_recovery");
-        assert_eq!(snapshot.applied_turn_count, 1);
-        assert_eq!(snapshot.result_ready_turn_count, 0);
-        assert!(
-            snapshot
-                .task_states
-                .contains(&("approved-one".into(), "indeterminate".into()))
-        );
-    }
-
-    #[test]
-    fn persisted_reviewer_verdict_binds_task_round_revisions_and_snapshot_digest() {
-        let fixture = Fixture::new();
-        let mut scheduler = fixture.scheduler();
-        fixture.seed(&mut scheduler, "project-review-binding");
-        scheduler
-            .request_run(
-                "project-review-binding",
-                0,
-                1,
-                &sha256_hex(b"project-review-binding:approved-plan"),
-                environment("lease-review-binding", scheduler.daemon_epoch()),
-            )
-            .unwrap();
-        assert!(
-            scheduler
-                .run_until_blocked("project-review-binding", 4)
-                .is_err()
-        );
-        let ready = scheduler
-            .store
-            .next_result_ready_turn("project-review-binding")
-            .unwrap()
-            .unwrap();
-        assert_eq!(ready.role, WorkerRole::Reviewer);
-        assert!(ready.review_snapshot_digest.is_some());
-
-        let manifest_path = fixture
-            .artifact_root
-            .join(&ready.artifact_dir)
-            .join(format!("attempt-{}/manifest.json", ready.attempt));
-        let original = fs::read(&manifest_path).unwrap();
-        let original_value: serde_json::Value = serde_json::from_slice(&original).unwrap();
-        for (field, replacement) in [
-            (
-                "task_version",
-                serde_json::Value::from(ready.task_version + 1),
-            ),
-            (
-                "review_round",
-                serde_json::Value::from(ready.review_round + 1),
-            ),
-            ("base_revision", serde_json::Value::String("e".repeat(40))),
-            ("head_revision", serde_json::Value::String("d".repeat(40))),
-            (
-                "review_snapshot_digest",
-                serde_json::Value::String("f".repeat(64)),
-            ),
-        ] {
-            let mut tampered = original_value.clone();
-            tampered[field] = replacement;
-            fs::write(&manifest_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
-            assert!(scheduler.verify_persisted_manifest(&ready).is_err());
+else:
+    if behavior == "slow-review":
+        time.sleep(1.0)
+    request_changes = task == "one" and (behavior == "exhaust" or count == 1)
+    if request_changes:
+        result = {
+            "decision": "request_changes",
+            "summary": "one bounded major finding remains",
+            "findings": [{
+                "severity": "major",
+                "title": "bounded fake finding",
+                "body": "exercise exact same-task resume",
+                "file": f"{task}.txt",
+                "line": 1,
+            }],
+            "checks": [],
         }
-        fs::write(&manifest_path, &original).unwrap();
-        scheduler.verify_persisted_manifest(&ready).unwrap();
-
-        assert!(
-            scheduler
-                .store
-                .connection()
-                .execute(
-                    "UPDATE worker_turns
-                     SET review_snapshot_digest = ?1
-                     WHERE id = ?2",
-                    rusqlite::params!["0".repeat(64), ready.turn_id],
-                )
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn duplicate_result_ready_apply_cannot_advance_twice() {
-        let fixture = Fixture::new();
-        let mut scheduler = fixture.scheduler();
-        fixture.seed(&mut scheduler, "project-duplicate-apply");
-        scheduler
-            .request_run(
-                "project-duplicate-apply",
-                0,
-                1,
-                &sha256_hex(b"project-duplicate-apply:approved-plan"),
-                environment("lease-duplicate-apply", scheduler.daemon_epoch()),
-            )
-            .unwrap();
-        scheduler.set_fail_after_result_ready_once();
-        scheduler
-            .run_until_blocked("project-duplicate-apply", 8)
-            .unwrap();
-        let ready = scheduler
-            .store
-            .next_result_ready_turn("project-duplicate-apply")
-            .unwrap()
-            .unwrap();
-        scheduler.verify_persisted_manifest(&ready).unwrap();
-        scheduler.store.apply_result_ready(&ready).unwrap();
-        assert!(scheduler.store.apply_result_ready(&ready).is_err());
-        let snapshot = scheduler.snapshot("project-duplicate-apply").unwrap();
-        assert_eq!(snapshot.applied_turn_count, 1);
-        assert_eq!(snapshot.result_ready_turn_count, 0);
-        assert_eq!(snapshot.turn_count, 2);
-    }
-
-    #[test]
-    fn pause_and_cancel_commit_durable_state_before_any_worker_exists() {
-        let fixture = Fixture::new();
-        let mut scheduler = fixture.scheduler();
-        fixture.seed(&mut scheduler, "project-control");
-        scheduler
-            .request_run(
-                "project-control",
-                0,
-                1,
-                &sha256_hex(b"project-control:approved-plan"),
-                environment("lease-control-1", scheduler.daemon_epoch()),
-            )
-            .unwrap();
-        let running = scheduler.snapshot("project-control").unwrap();
-        assert_eq!(running.project_state, "running");
-        scheduler
-            .pause("project-control", running.project_version, "human_pause")
-            .unwrap();
-        let paused = scheduler.snapshot("project-control").unwrap();
-        assert_eq!(paused.project_state, "paused");
-        assert_eq!(scheduler.metrics().developer_spawns, 0);
-        scheduler
-            .resume(
-                "project-control",
-                paused.project_version,
-                environment("lease-control-2", scheduler.daemon_epoch()),
-            )
-            .unwrap();
-        let resumed = scheduler.snapshot("project-control").unwrap();
-        scheduler
-            .cancel("project-control", resumed.project_version, "human_cancel")
-            .unwrap();
-        let canceled = scheduler.snapshot("project-control").unwrap();
-        assert_eq!(canceled.project_state, "canceled");
-        scheduler.run_until_blocked("project-control", 4).unwrap();
-        assert_eq!(scheduler.metrics().developer_spawns, 0);
-    }
-
-    #[test]
-    fn claimed_attempt_crossing_daemon_epoch_is_indeterminate_not_respawned() {
-        let fixture = Fixture::new();
-        let mut first = fixture.scheduler();
-        fixture.seed(&mut first, "project-claimed");
-        first
-            .request_run(
-                "project-claimed",
-                0,
-                1,
-                &sha256_hex(b"project-claimed:approved-plan"),
-                environment("lease-claimed", first.daemon_epoch()),
-            )
-            .unwrap();
-        assert!(
-            first
-                .store
-                .enqueue_next_ready_task("project-claimed")
-                .unwrap()
-        );
-        let ready = first
-            .store
-            .next_queued_turn("project-claimed")
-            .unwrap()
-            .unwrap();
-        let epoch = first.daemon_epoch().to_owned();
-        first
-            .store
-            .claim_turn(&ready.turn_id, &epoch, TURN_LEASE_DURATION)
-            .unwrap();
-        assert_eq!(first.metrics().developer_spawns, 0);
-        first.simulate_crash_on_drop();
-        drop(first);
-
-        let recovered = fixture.scheduler();
-        let snapshot = recovered.snapshot("project-claimed").unwrap();
-        assert_eq!(snapshot.project_state, "needs_recovery");
-        assert!(
-            snapshot
-                .task_states
-                .contains(&("approved-one".into(), "indeterminate".into()))
-        );
-        assert_eq!(recovered.metrics().developer_spawns, 0);
-        assert_eq!(snapshot.turn_count, 1);
-    }
-
-    #[test]
-    fn paused_claim_crossing_daemon_epoch_is_recovery_gated() {
-        let fixture = Fixture::new();
-        let mut first = fixture.scheduler();
-        fixture.seed(&mut first, "project-paused-claim");
-        first
-            .request_run(
-                "project-paused-claim",
-                0,
-                1,
-                &sha256_hex(b"project-paused-claim:approved-plan"),
-                environment("lease-paused-claim", first.daemon_epoch()),
-            )
-            .unwrap();
-        assert!(
-            first
-                .store
-                .enqueue_next_ready_task("project-paused-claim")
-                .unwrap()
-        );
-        let ready = first
-            .store
-            .next_queued_turn("project-paused-claim")
-            .unwrap()
-            .unwrap();
-        let epoch = first.daemon_epoch().to_owned();
-        first
-            .store
-            .claim_turn(&ready.turn_id, &epoch, TURN_LEASE_DURATION)
-            .unwrap();
-        let snapshot = first.snapshot("project-paused-claim").unwrap();
-        first
-            .pause(
-                "project-paused-claim",
-                snapshot.project_version,
-                "pause_before_spawn",
-            )
-            .unwrap();
-        first.simulate_crash_on_drop();
-        drop(first);
-
-        let recovered = fixture.scheduler();
-        let snapshot = recovered.snapshot("project-paused-claim").unwrap();
-        assert_eq!(snapshot.project_state, "needs_recovery");
-        assert!(
-            snapshot
-                .task_states
-                .contains(&("approved-one".into(), "indeterminate".into()))
-        );
-        assert_eq!(recovered.metrics().developer_spawns, 0);
-    }
-
-    #[test]
-    fn systemd_unit_is_no_tty_restartable_and_cgroup_scoped() {
-        let unit = include_str!("../../contrib/systemd/hcomd.service");
-        for required in [
-            "ExecStart=%h/.local/libexec/hcomd",
-            "Restart=on-failure",
-            "KillMode=control-group",
-            "StandardInput=null",
-            "StandardOutput=journal",
-            "StandardError=journal",
-            "UMask=0077",
-            "RuntimeDirectoryMode=0700",
-        ] {
-            assert!(
-                unit.contains(required),
-                "missing systemd contract: {required}"
-            );
+    else:
+        result = {
+            "decision": "lgtm",
+            "summary": "no major finding remains",
+            "findings": [],
+            "checks": [{
+                "command": "fake deterministic check",
+                "status": "passed",
+                "summary": "the deterministic fake reviewer completed its approved check",
+            }],
         }
-        assert!(!unit.contains("chain"));
-        assert!(!unit.contains("handoff"));
-        assert!(!unit.contains("TTYPath"));
-    }
 
-    #[test]
-    fn running_cancel_commits_store_state_before_validated_group_signal() {
-        let fixture = Fixture::new();
-        let mut scheduler = fixture.scheduler();
-        fixture.seed(&mut scheduler, "project-running-cancel");
-        scheduler
-            .request_run(
-                "project-running-cancel",
-                0,
-                1,
-                &sha256_hex(b"project-running-cancel:approved-plan"),
-                environment("lease-running-cancel", scheduler.daemon_epoch()),
-            )
-            .unwrap();
-        scheduler.cancel_worker_on_next_heartbeat();
-        scheduler
-            .run_until_blocked("project-running-cancel", 8)
-            .unwrap();
-        let snapshot = scheduler.snapshot("project-running-cancel").unwrap();
-        assert_eq!(snapshot.project_state, "canceled");
-        assert!(
-            snapshot
-                .task_states
-                .contains(&("approved-one".into(), "canceled".into()))
-        );
-        assert_eq!(scheduler.metrics().developer_spawns, 1);
-        assert_eq!(scheduler.metrics().controlled_cancellations, 1);
-        assert_eq!(scheduler.metrics().current_developers, 0);
-    }
+sys.stdout.write(json.dumps({
+    "session_id": session_id,
+    "role": role,
+    "result": result,
+}, separators=(",", ":")))
+"#;
 
-    #[test]
-    fn running_pause_commits_state_then_stops_as_indeterminate() {
-        let fixture = Fixture::new();
-        let mut scheduler = fixture.scheduler();
-        fixture.seed(&mut scheduler, "project-running-pause");
-        scheduler
-            .request_run(
-                "project-running-pause",
-                0,
-                1,
-                &sha256_hex(b"project-running-pause:approved-plan"),
-                environment("lease-running-pause", scheduler.daemon_epoch()),
-            )
-            .unwrap();
-        scheduler.pause_worker_on_next_heartbeat();
-        scheduler
-            .run_until_blocked("project-running-pause", 8)
-            .unwrap();
-        let snapshot = scheduler.snapshot("project-running-pause").unwrap();
-        assert_eq!(snapshot.project_state, "needs_recovery");
-        assert!(
-            snapshot
-                .task_states
-                .contains(&("approved-one".into(), "indeterminate".into()))
-        );
-        assert_eq!(scheduler.metrics().developer_spawns, 1);
-        assert_eq!(scheduler.metrics().controlled_pauses, 1);
-        assert_eq!(scheduler.metrics().current_developers, 0);
-    }
-
-    #[test]
-    fn pre_spawn_profile_drift_reaches_explicit_terminal_state() {
-        let fixture = Fixture::new();
-        let mut scheduler = fixture.scheduler();
-        fixture.seed(&mut scheduler, "project-profile-drift");
-        scheduler
-            .request_run(
-                "project-profile-drift",
-                0,
-                1,
-                &sha256_hex(b"project-profile-drift:approved-plan"),
-                environment("lease-profile-drift", scheduler.daemon_epoch()),
-            )
-            .unwrap();
-        fs::set_permissions(
-            &fixture.executable.canonical_path,
-            fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
-
-        assert!(
-            scheduler
-                .run_until_blocked("project-profile-drift", 8)
-                .is_err()
-        );
-        let snapshot = scheduler.snapshot("project-profile-drift").unwrap();
-        assert_eq!(snapshot.project_state, "failed");
-        assert!(
-            snapshot
-                .task_states
-                .contains(&("approved-one".into(), "failed".into()))
-        );
-        assert_eq!(scheduler.metrics().developer_spawns, 0);
-    }
-
-    #[test]
-    fn invalid_post_turn_result_is_indeterminate_not_stuck_running() {
-        let fixture = Fixture::new_with_script(
-            br#"#!/bin/sh
-set -eu
-[ ! -t 0 ] && [ ! -t 1 ] && [ ! -t 2 ]
-sed -n '1,$p' >/dev/null
-printf '%s' '{"not":"a worker result"}'
-"#
-            .to_vec(),
-        );
-        let mut scheduler = fixture.scheduler();
-        fixture.seed(&mut scheduler, "project-invalid-result");
-        scheduler
-            .request_run(
-                "project-invalid-result",
-                0,
-                1,
-                &sha256_hex(b"project-invalid-result:approved-plan"),
-                environment("lease-invalid-result", scheduler.daemon_epoch()),
-            )
-            .unwrap();
-
-        assert!(
-            scheduler
-                .run_until_blocked("project-invalid-result", 8)
-                .is_err()
-        );
-        let snapshot = scheduler.snapshot("project-invalid-result").unwrap();
-        assert_eq!(snapshot.project_state, "needs_recovery");
-        assert!(
-            snapshot
-                .task_states
-                .contains(&("approved-one".into(), "indeterminate".into()))
-        );
-        assert_eq!(scheduler.metrics().developer_spawns, 1);
-        assert_eq!(scheduler.metrics().current_developers, 0);
-    }
-
-    fn task(id: &str, key: &str, ordinal: u32, dependencies: Vec<String>) -> FakeTaskSeed {
-        FakeTaskSeed {
-            id: id.into(),
+    fn task(key: &str, max_review_rounds: u8) -> TaskDraft {
+        TaskDraft {
             task_key: key.into(),
-            ordinal,
-            spec_json: serde_json::json!({
-                "task_key": key,
-                "objective": format!("complete {key}"),
-                "allowed_paths": ["tracked.txt"]
-            })
-            .to_string(),
-            max_review_rounds: 2,
-            dependencies,
+            title: format!("Task {key}"),
+            objective: format!("Implement the bounded {key} task"),
+            acceptance_criteria: vec![format!("{key} is committed and reviewed")],
+            required_checks: vec!["fake deterministic check".into()],
+            allowed_paths: vec![format!("{key}.txt")],
+            forbidden_actions: vec!["push, install, reset, rebase, or merge".into()],
+            max_review_rounds,
         }
     }
 
-    fn environment(id: &str, epoch: &str) -> ExecutionEnvironmentLease {
-        ExecutionEnvironmentLease::capture(
-            id,
-            epoch,
-            &EnvironmentPolicy::baseline(),
-            vec![("PATH".into(), "/usr/bin:/bin".into())],
+    fn git(repo: &Path, args: &[&str]) -> Vec<u8> {
+        let output = Command::new("/usr/bin/git")
+            .args(args)
+            .current_dir(repo)
+            .env_clear()
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("HOME", "/nonexistent")
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn initialize_repository(root: &Path) -> PathBuf {
+        let repository = root.join("repo");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", "master"]);
+        fs::write(repository.join("seed.txt"), "seed\n").unwrap();
+        git(&repository, &["add", "--", "seed.txt"]);
+        git(
+            &repository,
+            &[
+                "-c",
+                "user.name=Phase 8 Fixture",
+                "-c",
+                "user.email=phase8-fixture@example.invalid",
+                "commit",
+                "-m",
+                "Initial fixture",
+            ],
+        );
+        fs::canonicalize(repository).unwrap()
+    }
+
+    fn write_fake_worker(root: &Path, behavior: &str) -> ExecutableIdentity {
+        let worker = root.join("fake-worker");
+        fs::write(&worker, FAKE_WORKER).unwrap();
+        fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(root.join("behavior"), behavior).unwrap();
+        ExecutableIdentity::capture(fs::canonicalize(worker).unwrap()).unwrap()
+    }
+
+    fn private_directory(path: &Path) -> PathBuf {
+        fs::create_dir(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::canonicalize(path).unwrap()
+    }
+
+    fn open_supervisor(
+        root: &Path,
+        repository: &Path,
+        behavior: &str,
+        run_name: &str,
+        lock_root: &Path,
+    ) -> SessionSupervisor {
+        let executable = write_fake_worker(root, behavior);
+        let adapter =
+            Arc::new(FakeWorkerAdapter::preassigned(executable, repository.to_owned()).unwrap());
+        let mut adapters = WorkerAdapterRegistry::default();
+        adapters.register(adapter).unwrap();
+        let run_root = private_directory(&root.join(run_name));
+        let toolchain = private_directory(&root.join(format!("{run_name}-toolchain")));
+        SessionSupervisor::open_with(
+            "run-test".into(),
+            repository.to_owned(),
+            run_root,
+            lock_root.to_owned(),
+            SessionRuntimeSources::fake(&toolchain),
+            adapters,
+            ProcessRunner::new(Duration::from_millis(10), Duration::from_millis(100)).unwrap(),
         )
         .unwrap()
     }
 
-    fn fake_worker_script() -> Vec<u8> {
-        br#"#!/bin/sh
-set -eu
-[ ! -t 0 ] && [ ! -t 1 ] && [ ! -t 2 ]
-mode="$2"
-session=""
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --session-id|--resume)
-            shift
-            session="$1"
-            ;;
-    esac
-    shift
-done
-[ -n "$session" ]
-prompt=$(sed -n '1,$p')
-[ -n "$prompt" ]
-role="$HCOM_WORKER_ROLE"
-task="$HCOM_TASK_ID"
-if [ "$role" = "reviewer" ]; then
-    if touch reviewer-write-probe 2>/dev/null; then
-        exit 73
-    fi
-fi
-if [ "$role" = "developer" ]; then
-    sleep 0.04
-    if [ "$task" = "task-1" ] && [ "$mode" = "create" ]; then
-        head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-    elif [ "$task" = "task-1" ]; then
-        head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-    else
-        head=cccccccccccccccccccccccccccccccccccccccc
-    fi
-    printf '{"session_id":"%s","role":"developer","result":{"decision":"completed","summary":"fake completed","head_revision":"%s","commits":[{"sha":"%s","subject":"fake commit"}],"checks":[{"command":"fake-check","status":"passed","summary":"passed"}],"questions":[],"risks":[],"changed_paths":["tracked.txt"]}}' "$session" "$head" "$head"
-elif [ "$task" = "task-1" ] && [ "$mode" = "create" ]; then
-    printf '{"session_id":"%s","role":"reviewer","result":{"decision":"request_changes","summary":"one fake major","findings":[{"severity":"major","title":"fix required","body":"bounded fake finding","file":"tracked.txt","line":1}],"checks":[]}}' "$session"
-else
-    printf '{"session_id":"%s","role":"reviewer","result":{"decision":"lgtm","summary":"fake lgtm","findings":[],"checks":[]}}' "$session"
-fi
-"#
-        .to_vec()
+    fn approve(supervisor: &mut SessionSupervisor, tasks: Vec<TaskDraft>) {
+        let (plan_version, plan_hash) = supervisor
+            .replace_plan(0, "fake-envelope", "fake-envelope", tasks)
+            .unwrap();
+        assert_eq!(supervisor.snapshot().state, SessionState::AwaitingApproval);
+        supervisor
+            .approve_and_start(1, plan_version, &plan_hash, true)
+            .unwrap();
+    }
+
+    fn poll_until(
+        supervisor: &mut SessionSupervisor,
+        predicate: impl Fn(&SessionSupervisor) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !predicate(supervisor) {
+            let result = supervisor.poll_once();
+            if let Err(error) = &result
+                && supervisor.snapshot().state != SessionState::NeedsHuman
+            {
+                panic!("unexpected non-terminal poll error: {error:#}");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "session supervisor timed out: {:?}; active={:?}; retry={:?}",
+                supervisor.snapshot(),
+                supervisor.active.as_ref().map(|active| (
+                    active.task_index,
+                    active.role,
+                    active.turn_sequence,
+                    active.attempt,
+                )),
+                supervisor.retry.as_ref().map(|retry| (
+                    retry.task_index,
+                    retry.role,
+                    retry.turn_sequence,
+                    retry.next_attempt,
+                ))
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn two_task_e2e_uses_fresh_cross_task_sessions_and_exact_same_task_resume() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let repository = initialize_repository(&root);
+        let locks = private_directory(&root.join("locks"));
+        let mut supervisor = open_supervisor(&root, &repository, "normal", "run", &locks);
+        approve(&mut supervisor, vec![task("one", 2), task("two", 2)]);
+        poll_until(&mut supervisor, |supervisor| {
+            supervisor.snapshot().state.is_terminal()
+        });
+
+        let snapshot = supervisor.snapshot();
+        assert_eq!(
+            snapshot.state,
+            SessionState::Completed,
+            "unexpected session snapshot: {snapshot:?}"
+        );
+        assert_eq!(snapshot.tasks[0].state, TaskState::Lgtm);
+        assert_eq!(snapshot.tasks[0].review_round, 2);
+        assert_eq!(snapshot.tasks[1].state, TaskState::Lgtm);
+        assert_eq!(snapshot.tasks[1].review_round, 1);
+        assert_eq!(supervisor.metrics().max_live_workers, 1);
+        assert_eq!(supervisor.metrics().current_workers, 0);
+        assert!(
+            supervisor
+                .spawn_audit()
+                .iter()
+                .all(|spawn| !spawn.prompt_in_argv && spawn.workspace_cwd == repository)
+        );
+        assert!(
+            supervisor
+                .spawn_audit()
+                .iter()
+                .all(|spawn| matches!(spawn.task_key.as_str(), "one" | "two")),
+            "a task outside the exact approved two-task plan was spawned"
+        );
+
+        for role in [WorkerRole::Developer, WorkerRole::Reviewer] {
+            let one: Vec<_> = supervisor
+                .spawn_audit()
+                .iter()
+                .filter(|spawn| spawn.task_key == "one" && spawn.role == role)
+                .collect();
+            let two: Vec<_> = supervisor
+                .spawn_audit()
+                .iter()
+                .filter(|spawn| spawn.task_key == "two" && spawn.role == role)
+                .collect();
+            assert_eq!(one.len(), 2);
+            assert_eq!(two.len(), 1);
+            assert_eq!(one[0].logical_session_id, one[1].logical_session_id);
+            assert_eq!(one[0].native_session_id, one[1].native_session_id);
+            assert!(!one[0].resume);
+            assert!(one[1].resume);
+            assert_ne!(one[0].logical_session_id, two[0].logical_session_id);
+            assert_ne!(one[0].native_session_id, two[0].native_session_id);
+        }
+        assert_eq!(
+            String::from_utf8(git(&repository, &["status", "--porcelain=v1"])).unwrap(),
+            ""
+        );
+        drop(supervisor);
+        drop(temp);
+    }
+
+    #[test]
+    fn review_exhausted_is_not_lgtm_and_still_advances_to_the_next_task() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let repository = initialize_repository(&root);
+        let locks = private_directory(&root.join("locks"));
+        let mut supervisor = open_supervisor(&root, &repository, "exhaust", "run", &locks);
+        approve(&mut supervisor, vec![task("one", 1), task("two", 1)]);
+        poll_until(&mut supervisor, |supervisor| {
+            supervisor.snapshot().state.is_terminal()
+        });
+
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, SessionState::Completed);
+        assert_eq!(snapshot.tasks[0].state, TaskState::ReviewExhausted);
+        assert_ne!(snapshot.tasks[0].state, TaskState::Lgtm);
+        assert!(
+            snapshot.tasks[0]
+                .outcome_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("request_changes"))
+        );
+        assert_eq!(snapshot.tasks[1].state, TaskState::Lgtm);
+        assert!(
+            supervisor
+                .spawn_audit()
+                .iter()
+                .any(|spawn| spawn.task_key == "two" && spawn.role == WorkerRole::Developer)
+        );
+        drop(supervisor);
+        drop(temp);
+    }
+
+    #[test]
+    fn crash_retry_resumes_the_exact_native_session_with_a_bounded_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let repository = initialize_repository(&root);
+        let locks = private_directory(&root.join("locks"));
+        let mut supervisor = open_supervisor(&root, &repository, "crash-once", "run", &locks);
+        approve(&mut supervisor, vec![task("one", 2)]);
+        poll_until(&mut supervisor, |supervisor| {
+            supervisor.snapshot().state.is_terminal()
+        });
+
+        assert_eq!(supervisor.snapshot().state, SessionState::Completed);
+        assert_eq!(supervisor.metrics().worker_retries, 1);
+        let developer: Vec<_> = supervisor
+            .spawn_audit()
+            .iter()
+            .filter(|spawn| spawn.role == WorkerRole::Developer)
+            .collect();
+        assert!(developer.len() >= 2);
+        assert_eq!(developer[0].turn_sequence, 1);
+        assert_eq!(developer[1].turn_sequence, 1);
+        assert_eq!(developer[0].attempt, 1);
+        assert_eq!(developer[1].attempt, 2);
+        assert!(!developer[0].resume);
+        assert!(developer[1].resume);
+        assert_eq!(
+            developer[0].logical_session_id,
+            developer[1].logical_session_id
+        );
+        assert_eq!(
+            developer[0].native_session_id,
+            developer[1].native_session_id
+        );
+        drop(supervisor);
+        drop(temp);
+    }
+
+    #[test]
+    fn reviewer_head_drift_stops_the_run_and_rejects_the_old_verdict() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let repository = initialize_repository(&root);
+        let locks = private_directory(&root.join("locks"));
+        let mut supervisor = open_supervisor(&root, &repository, "slow-review", "run", &locks);
+        approve(&mut supervisor, vec![task("one", 2)]);
+        poll_until(&mut supervisor, |supervisor| {
+            supervisor
+                .active
+                .as_ref()
+                .is_some_and(|active| active.role == WorkerRole::Reviewer)
+        });
+
+        fs::write(repository.join("external.txt"), "external drift\n").unwrap();
+        git(&repository, &["add", "--", "external.txt"]);
+        git(
+            &repository,
+            &[
+                "-c",
+                "user.name=External Fixture",
+                "-c",
+                "user.email=external-fixture@example.invalid",
+                "commit",
+                "-m",
+                "External drift",
+            ],
+        );
+        poll_until(&mut supervisor, |supervisor| {
+            supervisor.snapshot().state == SessionState::NeedsHuman
+        });
+        assert_eq!(supervisor.snapshot().tasks[0].state, TaskState::NeedsHuman);
+        assert_ne!(supervisor.snapshot().tasks[0].state, TaskState::Lgtm);
+        drop(supervisor);
+        drop(temp);
+    }
+
+    #[test]
+    fn same_task_developer_resume_cannot_rewrite_the_previous_review_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let repository = initialize_repository(&root);
+        let locks = private_directory(&root.join("locks"));
+        let mut supervisor =
+            open_supervisor(&root, &repository, "rewrite-on-resume", "run", &locks);
+        approve(&mut supervisor, vec![task("one", 2)]);
+        poll_until(&mut supervisor, |supervisor| {
+            supervisor.snapshot().state == SessionState::NeedsHuman
+        });
+
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.tasks[0].state, TaskState::NeedsHuman);
+        assert_ne!(snapshot.tasks[0].state, TaskState::Lgtm);
+        assert_eq!(
+            snapshot.tasks[0].review_round,
+            1,
+            "unexpected early stop: {snapshot:?}; audit={:?}",
+            supervisor.spawn_audit()
+        );
+        drop(supervisor);
+        drop(temp);
+    }
+
+    #[test]
+    fn dirty_start_and_second_same_repository_session_fail_closed() {
+        let dirty_temp = tempfile::tempdir().unwrap();
+        let dirty_root = fs::canonicalize(dirty_temp.path()).unwrap();
+        let dirty_repository = initialize_repository(&dirty_root);
+        fs::write(dirty_repository.join("dirty.txt"), "dirty\n").unwrap();
+        let dirty_run = private_directory(&dirty_root.join("run"));
+        let dirty_locks = private_directory(&dirty_root.join("locks"));
+        let dirty_toolchain = private_directory(&dirty_root.join("toolchain"));
+        assert!(
+            SessionSupervisor::open(
+                "run-dirty".into(),
+                dirty_repository,
+                dirty_run,
+                dirty_locks,
+                SessionRuntimeSources::fake(&dirty_toolchain),
+            )
+            .is_err()
+        );
+
+        let lock_temp = tempfile::tempdir().unwrap();
+        let lock_root = fs::canonicalize(lock_temp.path()).unwrap();
+        let repository = initialize_repository(&lock_root);
+        let locks = private_directory(&lock_root.join("locks"));
+        let first_run = private_directory(&lock_root.join("run-one"));
+        let second_run = private_directory(&lock_root.join("run-two"));
+        let toolchain = private_directory(&lock_root.join("toolchain"));
+        let first = SessionSupervisor::open(
+            "run-one".into(),
+            repository.clone(),
+            first_run,
+            locks.clone(),
+            SessionRuntimeSources::fake(&toolchain),
+        )
+        .unwrap();
+        assert!(
+            SessionSupervisor::open(
+                "run-two".into(),
+                repository,
+                second_run,
+                locks,
+                SessionRuntimeSources::fake(&toolchain),
+            )
+            .is_err()
+        );
+        let renamed_repository = lock_root.join("renamed-repository");
+        fs::rename(first.startup().repo_root.as_path(), &renamed_repository).unwrap();
+        let renamed_repository = fs::canonicalize(renamed_repository).unwrap();
+        let renamed_run = private_directory(&lock_root.join("run-renamed"));
+        assert!(
+            SessionSupervisor::open(
+                "run-renamed".into(),
+                renamed_repository,
+                renamed_run,
+                lock_root.join("locks"),
+                SessionRuntimeSources::fake(&toolchain),
+            )
+            .is_err(),
+            "renaming the same checkout inode must not bypass its live runtime lock"
+        );
+        drop(first);
+    }
+
+    #[test]
+    fn duplicate_and_late_completion_tokens_apply_at_most_once() {
+        let mut gate = CompletionGate::default();
+        gate.begin("turn-one").unwrap();
+        let mut advances = 0;
+        if gate.accept("turn-one") {
+            advances += 1;
+        }
+        if gate.accept("turn-one") {
+            advances += 1;
+        }
+        assert_eq!(advances, 1);
+        assert!(gate.begin("turn-one").is_err());
+
+        gate.begin("turn-two").unwrap();
+        assert!(!gate.accept("turn-one"));
+        assert!(gate.accept("turn-two"));
+    }
+
+    #[test]
+    fn changed_path_scope_is_an_exact_or_descendant_allowlist() {
+        assert!(
+            require_changed_paths_in_scope(&["src/orchestrator/mod.rs".into()], &["src".into()])
+                .is_ok()
+        );
+        assert!(
+            require_changed_paths_in_scope(&["tests/outside.rs".into()], &["src".into()]).is_err()
+        );
+    }
+
+    #[test]
+    fn explicitly_required_checks_cannot_be_omitted_or_left_incomplete() {
+        let required: Vec<String> = vec!["cargo test --all-targets".into()];
+        let passed = CheckResult {
+            command: required[0].clone(),
+            status: CheckStatus::Passed,
+            summary: "passed".into(),
+        };
+        assert!(require_checks_passed("developer", &required, &[passed]).is_ok());
+        assert!(require_checks_passed("developer", &required, &[]).is_err());
+        let failed = CheckResult {
+            command: required[0].clone(),
+            status: CheckStatus::Failed,
+            summary: "failed".into(),
+        };
+        assert!(require_checks_passed("reviewer", &required, &[failed]).is_err());
+    }
+
+    #[test]
+    fn session_worker_source_preserves_every_present_proxy_name_and_value() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let mut sources = SessionRuntimeSources::fake(&root);
+        for (name, value) in [
+            ("HTTPS_PROXY", "http://upper.invalid"),
+            ("https_proxy", "http://lower.invalid"),
+            ("HTTP_PROXY", "http://upper-http.invalid"),
+            ("http_proxy", "http://lower-http.invalid"),
+            ("ALL_PROXY", "socks5://upper.invalid"),
+            ("all_proxy", "socks5://lower.invalid"),
+            ("NO_PROXY", "UPPER.internal"),
+            ("no_proxy", "lower.internal"),
+        ] {
+            sources.parent_values.insert(name.into(), value.into());
+        }
+        let lease = sources
+            .environment_for("fake-envelope", "epoch-proxy", "run-proxy", "task-proxy")
+            .unwrap();
+        let materialized = lease
+            .materialize(
+                "epoch-proxy",
+                &WorkerEnvironmentIdentity {
+                    role: WorkerRole::Developer,
+                    run_id: "run-proxy".into(),
+                    task_id: "task-proxy".into(),
+                },
+            )
+            .unwrap();
+        let values: BTreeMap<_, _> = materialized.iter().collect();
+        for (name, value) in [
+            ("HTTPS_PROXY", "http://upper.invalid"),
+            ("https_proxy", "http://lower.invalid"),
+            ("HTTP_PROXY", "http://upper-http.invalid"),
+            ("http_proxy", "http://lower-http.invalid"),
+            ("ALL_PROXY", "socks5://upper.invalid"),
+            ("all_proxy", "socks5://lower.invalid"),
+            ("NO_PROXY", "UPPER.internal"),
+            ("no_proxy", "lower.internal"),
+        ] {
+            assert_eq!(values.get(name), Some(&value));
+        }
+    }
+
+    #[test]
+    fn worker_outcome_status_is_human_readable_and_strictly_bounded() {
+        let result = DeveloperResult {
+            decision: DeveloperDecision::NeedsInput,
+            summary: "scope is ambiguous".into(),
+            head_revision: None,
+            commits: vec![],
+            checks: vec![],
+            questions: vec!["which approved behavior should be used?".repeat(256)],
+            risks: vec![],
+            changed_paths: vec![],
+        };
+        let detail = developer_outcome_detail(&result);
+        assert!(detail.contains("needs_input"));
+        assert!(detail.contains("questions:"));
+        assert!(detail.len() <= MAX_STATUS_OUTCOME_BYTES);
+        assert!(detail.ends_with('…'));
     }
 }

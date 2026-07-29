@@ -9,8 +9,12 @@ use super::contract::{
 };
 use super::environment::{EnvironmentPolicy, ExactEnvironmentRequirement};
 use super::result::{CheckStatus, MAX_RESULT_BYTES, ReviewerResult};
+use super::sandbox::{
+    EmptyRootContract, EmptyRootMounts, INSIDE_ARTIFACTS, INSIDE_CARGO_HOME, INSIDE_CLAUDE,
+    INSIDE_CODEX, INSIDE_HOME, INSIDE_NATIVE_CONFIG, INSIDE_PATH, INSIDE_RUNTIME,
+    INSIDE_RUSTUP_HOME, INSIDE_TEMP, INSIDE_WORKSPACE,
+};
 use super::validation::{MAX_PATH_BYTES, validate_git_oid, validate_text};
-use crate::control_api::daemon::ControlPaths;
 use crate::control_api::{CapabilitySnapshot, NativeSessionMode, WorkerRole};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -44,11 +48,11 @@ const GIT_EXECUTABLE: &str = "/usr/bin/git";
 const GIT_VERSION: &str = "git version 2.43.0";
 const CODEX_ADAPTER_NAME: &str = "codex-reviewer-0.145.0";
 const CLAUDE_ADAPTER_NAME: &str = "claude-reviewer-2.1.220";
-const ADAPTER_CONTRACT_VERSION: u32 = 1;
+const ADAPTER_CONTRACT_VERSION: u32 = 2;
 const CODEX_EFFECTIVE_POLICY: &str =
-    "native=danger-full-access;outer=bubblewrap-0.9.0-reviewer-ro-v1;approval=never";
+    "native=danger-full-access;outer=bubblewrap-0.9.0-empty-root-reviewer-ro-v2;approval=never";
 const CLAUDE_EFFECTIVE_POLICY: &str =
-    "native=bypassPermissions;outer=bubblewrap-0.9.0-reviewer-ro-v1";
+    "native=bypassPermissions;outer=bubblewrap-0.9.0-empty-root-reviewer-ro-v2";
 const CODEX_RESULT_SCHEMA_FILE: &str = "codex-reviewer-result-schema.json";
 const CODEX_FINAL_FILE: &str = "native-final.partial";
 const JSON_SCHEMA_DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
@@ -66,7 +70,8 @@ const CLAUDE_EXACT_ENVIRONMENT: &[(&str, &str)] = &[
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct CodexReviewerConfig {
-    pub snapshot_cwd: PathBuf,
+    pub run_id: String,
+    pub workspace_cwd: PathBuf,
     pub artifact_root: PathBuf,
     pub isolated_home: PathBuf,
     pub codex_home: PathBuf,
@@ -74,6 +79,8 @@ pub struct CodexReviewerConfig {
     pub runtime_dir: PathBuf,
     pub host_runtime_dir: PathBuf,
     pub auth_source: PathBuf,
+    pub cargo_bin_source: PathBuf,
+    pub rustup_home_source: PathBuf,
 }
 
 pub struct CodexReviewerAdapter {
@@ -86,7 +93,7 @@ pub struct CodexReviewerAdapter {
 
 impl CodexReviewerAdapter {
     pub fn discover(config: CodexReviewerConfig) -> Result<Self> {
-        validate_production_runtime_contract(&config.host_runtime_dir)?;
+        validate_production_runtime_contract(&config.host_runtime_dir, &config.run_id)?;
         Self::discover_with_paths(
             config,
             Path::new(CODEX_REVIEWER_EXECUTABLE),
@@ -96,7 +103,15 @@ impl CodexReviewerAdapter {
     }
 
     pub fn environment_policy() -> Result<EnvironmentPolicy> {
-        policy_with_required(&["CODEX_HOME", "HOME", "TMPDIR", "XDG_RUNTIME_DIR"])
+        policy_with_required(&[
+            "CARGO_HOME",
+            "CODEX_HOME",
+            "HOME",
+            "PATH",
+            "RUSTUP_HOME",
+            "TMPDIR",
+            "XDG_RUNTIME_DIR",
+        ])
     }
 
     pub fn profile(&self) -> WorkerProfile {
@@ -114,7 +129,8 @@ impl CodexReviewerAdapter {
         let git_executable = capture_exact_tool(git_path, GIT_VERSION)?;
         let sandbox = ReviewerSandbox::capture(
             ReviewerSandboxConfig {
-                snapshot_cwd: config.snapshot_cwd,
+                run_id: config.run_id,
+                workspace_cwd: config.workspace_cwd,
                 artifact_root: config.artifact_root,
                 isolated_home: config.isolated_home,
                 native_config_dir: config.codex_home,
@@ -123,21 +139,15 @@ impl CodexReviewerAdapter {
                 host_runtime_dir: config.host_runtime_dir,
                 auth_source: config.auth_source,
                 auth_target_name: CODEX_AUTH_FILE.into(),
+                cargo_bin_source: config.cargo_bin_source,
+                rustup_home_source: config.rustup_home_source,
                 extra_private_dirs: vec![],
             },
             &executable,
             &outer_executable,
             &git_executable,
         )?;
-        let descriptor = AdapterDescriptor::new(
-            CODEX_ADAPTER_NAME,
-            ADAPTER_CONTRACT_VERSION,
-            CODEX_REVIEWER_CLI_VERSION,
-            CODEX_REVIEWER_MODEL,
-            CODEX_REVIEWER_REASONING,
-            CODEX_EFFECTIVE_POLICY,
-            reviewer_capabilities(NativeSessionMode::Discovered, ResultTransport::FinalFile),
-        )?;
+        let descriptor = codex_reviewer_descriptor()?;
         Ok(Self {
             descriptor,
             executable,
@@ -187,16 +197,14 @@ impl CodexReviewerAdapter {
             fixed_argv.extend(["--disable".into(), (*feature).into()]);
         }
         if resume_session_id.is_none() {
-            fixed_argv.extend([
-                "--cd".into(),
-                path_text("Codex reviewer snapshot", self.sandbox.snapshot.path())?.into(),
-            ]);
+            fixed_argv.extend(["--cd".into(), INSIDE_WORKSPACE.into()]);
         }
         let expected_artifact_dir = self
             .sandbox
             .artifact_root
             .path()
             .join(&control.artifact_dir);
+        let production_outer = self.outer_executable.canonical_path == Path::new(BWRAP_EXECUTABLE);
         Ok(CommandSpec {
             executable: self.executable.clone(),
             fixed_argv,
@@ -220,31 +228,38 @@ impl CodexReviewerAdapter {
                 },
             ],
             stdin_prompt_argument: Some("-".into()),
-            workspace_cwd: self.sandbox.snapshot.path().to_owned(),
+            workspace_cwd: self.sandbox.workspace.path().to_owned(),
             outer_launch: Some(OuterLaunchEnvelope {
                 executable: self.outer_executable.clone(),
-                fixed_argv: self
-                    .sandbox
-                    .outer_argv(&expected_artifact_dir, &self.executable)?,
+                fixed_argv: self.sandbox.outer_argv(
+                    &expected_artifact_dir,
+                    &self.executable,
+                    INSIDE_CODEX,
+                    "/hcom/native/auth.json",
+                )?,
                 expected_artifact_dir,
+                inside_executable: if production_outer {
+                    INSIDE_CODEX.into()
+                } else {
+                    self.executable.canonical_path.clone()
+                },
+                inside_artifact_dir: if production_outer {
+                    INSIDE_ARTIFACTS.into()
+                } else {
+                    self.sandbox
+                        .artifact_root
+                        .path()
+                        .join(&control.artifact_dir)
+                },
             }),
             exact_environment: vec![
-                ExactEnvironmentRequirement::new(
-                    "CODEX_HOME",
-                    path_text("isolated CODEX_HOME", self.sandbox.native_config.path())?,
-                )?,
-                ExactEnvironmentRequirement::new(
-                    "HOME",
-                    path_text("isolated HOME", self.sandbox.isolated_home.path())?,
-                )?,
-                ExactEnvironmentRequirement::new(
-                    "TMPDIR",
-                    path_text("isolated temp", self.sandbox.temp_dir.path())?,
-                )?,
-                ExactEnvironmentRequirement::new(
-                    "XDG_RUNTIME_DIR",
-                    path_text("private runtime", self.sandbox.runtime_dir.path())?,
-                )?,
+                ExactEnvironmentRequirement::new("CARGO_HOME", INSIDE_CARGO_HOME)?,
+                ExactEnvironmentRequirement::new("CODEX_HOME", INSIDE_NATIVE_CONFIG)?,
+                ExactEnvironmentRequirement::new("HOME", INSIDE_HOME)?,
+                ExactEnvironmentRequirement::new("PATH", INSIDE_PATH)?,
+                ExactEnvironmentRequirement::new("RUSTUP_HOME", INSIDE_RUSTUP_HOME)?,
+                ExactEnvironmentRequirement::new("TMPDIR", INSIDE_TEMP)?,
+                ExactEnvironmentRequirement::new("XDG_RUNTIME_DIR", INSIDE_RUNTIME)?,
             ],
         })
     }
@@ -268,7 +283,7 @@ impl WorkerAdapter for CodexReviewerAdapter {
 
     fn build_resume(&self, native_session_id: &str, control: &TurnControl) -> Result<CommandSpec> {
         if control.native_session_id.as_deref() != Some(native_session_id) {
-            bail!("Codex reviewer resume must use the exact durable native session");
+            bail!("Codex reviewer resume must use the exact session-bound native session");
         }
         self.command(control, Some(native_session_id))
     }
@@ -308,7 +323,8 @@ impl WorkerAdapter for CodexReviewerAdapter {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ClaudeReviewerConfig {
-    pub snapshot_cwd: PathBuf,
+    pub run_id: String,
+    pub workspace_cwd: PathBuf,
     pub artifact_root: PathBuf,
     pub isolated_home: PathBuf,
     pub claude_config_dir: PathBuf,
@@ -320,6 +336,8 @@ pub struct ClaudeReviewerConfig {
     pub runtime_dir: PathBuf,
     pub host_runtime_dir: PathBuf,
     pub auth_source: PathBuf,
+    pub cargo_bin_source: PathBuf,
+    pub rustup_home_source: PathBuf,
 }
 
 pub struct ClaudeReviewerAdapter {
@@ -336,7 +354,7 @@ pub struct ClaudeReviewerAdapter {
 
 impl ClaudeReviewerAdapter {
     pub fn discover(config: ClaudeReviewerConfig) -> Result<Self> {
-        validate_production_runtime_contract(&config.host_runtime_dir)?;
+        validate_production_runtime_contract(&config.host_runtime_dir, &config.run_id)?;
         Self::discover_with_paths(
             config,
             Path::new(CLAUDE_REVIEWER_EXECUTABLE),
@@ -347,12 +365,15 @@ impl ClaudeReviewerAdapter {
 
     pub fn environment_policy() -> Result<EnvironmentPolicy> {
         policy_with_required(&[
+            "CARGO_HOME",
             "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS",
             "CLAUDE_CODE_DISABLE_FAST_MODE",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
             "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION",
             "CLAUDE_CONFIG_DIR",
             "HOME",
+            "PATH",
+            "RUSTUP_HOME",
             "TMPDIR",
             "XDG_CACHE_HOME",
             "XDG_CONFIG_HOME",
@@ -381,7 +402,8 @@ impl ClaudeReviewerAdapter {
         let xdg_data_home = DirectoryIdentity::capture(&config.xdg_data_home, true)?;
         let sandbox = ReviewerSandbox::capture(
             ReviewerSandboxConfig {
-                snapshot_cwd: config.snapshot_cwd,
+                run_id: config.run_id,
+                workspace_cwd: config.workspace_cwd,
                 artifact_root: config.artifact_root,
                 isolated_home: config.isolated_home,
                 native_config_dir: config.claude_config_dir,
@@ -390,6 +412,8 @@ impl ClaudeReviewerAdapter {
                 host_runtime_dir: config.host_runtime_dir,
                 auth_source: config.auth_source,
                 auth_target_name: CLAUDE_AUTH_FILE.into(),
+                cargo_bin_source: config.cargo_bin_source,
+                rustup_home_source: config.rustup_home_source,
                 extra_private_dirs: vec![
                     xdg_config_home.clone(),
                     xdg_state_home.clone(),
@@ -401,15 +425,7 @@ impl ClaudeReviewerAdapter {
             &outer_executable,
             &git_executable,
         )?;
-        let descriptor = AdapterDescriptor::new(
-            CLAUDE_ADAPTER_NAME,
-            ADAPTER_CONTRACT_VERSION,
-            CLAUDE_REVIEWER_CLI_VERSION,
-            CLAUDE_REVIEWER_MODEL,
-            CLAUDE_REVIEWER_REASONING,
-            CLAUDE_EFFECTIVE_POLICY,
-            reviewer_capabilities(NativeSessionMode::Preassigned, ResultTransport::Envelope),
-        )?;
+        let descriptor = claude_reviewer_descriptor()?;
         Ok(Self {
             descriptor,
             executable,
@@ -435,7 +451,7 @@ impl ClaudeReviewerAdapter {
             .ok_or_else(|| anyhow!("Claude reviewer requires a preassigned native session"))?;
         validate_claude_session_id(exact_session)?;
         if resume_session_id.is_some_and(|session| session != exact_session) {
-            bail!("Claude reviewer resume must use the exact durable native session");
+            bail!("Claude reviewer resume must use the exact session-bound native session");
         }
         revalidate_exact_tool(&self.executable, CLAUDE_REVIEWER_CLI_VERSION)?;
         revalidate_exact_tool(&self.outer_executable, BWRAP_VERSION)?;
@@ -464,7 +480,7 @@ impl ClaudeReviewerAdapter {
         }
         fixed_argv.extend([
             "--name".into(),
-            "hcom-durable-reviewer".into(),
+            "hcom-session-reviewer".into(),
             "--model".into(),
             CLAUDE_REVIEWER_MODEL.into(),
             "--effort".into(),
@@ -488,6 +504,7 @@ impl ClaudeReviewerAdapter {
             .artifact_root
             .path()
             .join(&control.artifact_dir);
+        let production_outer = self.outer_executable.canonical_path == Path::new(BWRAP_EXECUTABLE);
         Ok(CommandSpec {
             executable: self.executable.clone(),
             fixed_argv,
@@ -503,13 +520,29 @@ impl ClaudeReviewerAdapter {
                 output_argument: None,
             }],
             stdin_prompt_argument: None,
-            workspace_cwd: self.sandbox.snapshot.path().to_owned(),
+            workspace_cwd: self.sandbox.workspace.path().to_owned(),
             outer_launch: Some(OuterLaunchEnvelope {
                 executable: self.outer_executable.clone(),
-                fixed_argv: self
-                    .sandbox
-                    .outer_argv(&expected_artifact_dir, &self.executable)?,
+                fixed_argv: self.sandbox.outer_argv(
+                    &expected_artifact_dir,
+                    &self.executable,
+                    INSIDE_CLAUDE,
+                    "/hcom/native/.credentials.json",
+                )?,
                 expected_artifact_dir,
+                inside_executable: if production_outer {
+                    INSIDE_CLAUDE.into()
+                } else {
+                    self.executable.canonical_path.clone()
+                },
+                inside_artifact_dir: if production_outer {
+                    INSIDE_ARTIFACTS.into()
+                } else {
+                    self.sandbox
+                        .artifact_root
+                        .path()
+                        .join(&control.artifact_dir)
+                },
             }),
             exact_environment: self.exact_environment()?,
         })
@@ -521,41 +554,17 @@ impl ClaudeReviewerAdapter {
             .map(|(name, value)| ExactEnvironmentRequirement::new(*name, *value))
             .collect::<Result<Vec<_>>>()?;
         exact.extend([
-            ExactEnvironmentRequirement::new(
-                "CLAUDE_CONFIG_DIR",
-                path_text(
-                    "isolated CLAUDE_CONFIG_DIR",
-                    self.sandbox.native_config.path(),
-                )?,
-            )?,
-            ExactEnvironmentRequirement::new(
-                "HOME",
-                path_text("isolated HOME", self.sandbox.isolated_home.path())?,
-            )?,
-            ExactEnvironmentRequirement::new(
-                "TMPDIR",
-                path_text("isolated temp", self.sandbox.temp_dir.path())?,
-            )?,
-            ExactEnvironmentRequirement::new(
-                "XDG_CACHE_HOME",
-                path_text("isolated XDG cache", self.xdg_cache_home.path())?,
-            )?,
-            ExactEnvironmentRequirement::new(
-                "XDG_CONFIG_HOME",
-                path_text("isolated XDG config", self.xdg_config_home.path())?,
-            )?,
-            ExactEnvironmentRequirement::new(
-                "XDG_DATA_HOME",
-                path_text("isolated XDG data", self.xdg_data_home.path())?,
-            )?,
-            ExactEnvironmentRequirement::new(
-                "XDG_RUNTIME_DIR",
-                path_text("private runtime", self.sandbox.runtime_dir.path())?,
-            )?,
-            ExactEnvironmentRequirement::new(
-                "XDG_STATE_HOME",
-                path_text("isolated XDG state", self.xdg_state_home.path())?,
-            )?,
+            ExactEnvironmentRequirement::new("CARGO_HOME", INSIDE_CARGO_HOME)?,
+            ExactEnvironmentRequirement::new("CLAUDE_CONFIG_DIR", INSIDE_NATIVE_CONFIG)?,
+            ExactEnvironmentRequirement::new("HOME", INSIDE_HOME)?,
+            ExactEnvironmentRequirement::new("PATH", INSIDE_PATH)?,
+            ExactEnvironmentRequirement::new("RUSTUP_HOME", INSIDE_RUSTUP_HOME)?,
+            ExactEnvironmentRequirement::new("TMPDIR", INSIDE_TEMP)?,
+            ExactEnvironmentRequirement::new("XDG_CACHE_HOME", "/hcom/home/.cache")?,
+            ExactEnvironmentRequirement::new("XDG_CONFIG_HOME", "/hcom/home/.config")?,
+            ExactEnvironmentRequirement::new("XDG_DATA_HOME", "/hcom/home/.data")?,
+            ExactEnvironmentRequirement::new("XDG_RUNTIME_DIR", INSIDE_RUNTIME)?,
+            ExactEnvironmentRequirement::new("XDG_STATE_HOME", "/hcom/home/.state")?,
         ]);
         exact.sort_by(|left, right| left.name().cmp(right.name()));
         Ok(exact)
@@ -647,11 +656,35 @@ fn reviewer_capabilities(
         result_transport,
         features: vec![
             "exact-resume".into(),
-            "outer-bwrap-reviewer-ro-v1".into(),
-            "snapshot-attestation".into(),
+            "outer-bwrap-empty-root-reviewer-ro-v2".into(),
+            "workspace-attestation".into(),
             "structured-major-minor".into(),
         ],
     }
+}
+
+fn codex_reviewer_descriptor() -> Result<AdapterDescriptor> {
+    AdapterDescriptor::new(
+        CODEX_ADAPTER_NAME,
+        ADAPTER_CONTRACT_VERSION,
+        CODEX_REVIEWER_CLI_VERSION,
+        CODEX_REVIEWER_MODEL,
+        CODEX_REVIEWER_REASONING,
+        CODEX_EFFECTIVE_POLICY,
+        reviewer_capabilities(NativeSessionMode::Discovered, ResultTransport::FinalFile),
+    )
+}
+
+fn claude_reviewer_descriptor() -> Result<AdapterDescriptor> {
+    AdapterDescriptor::new(
+        CLAUDE_ADAPTER_NAME,
+        ADAPTER_CONTRACT_VERSION,
+        CLAUDE_REVIEWER_CLI_VERSION,
+        CLAUDE_REVIEWER_MODEL,
+        CLAUDE_REVIEWER_REASONING,
+        CLAUDE_EFFECTIVE_POLICY,
+        reviewer_capabilities(NativeSessionMode::Preassigned, ResultTransport::Envelope),
+    )
 }
 
 fn policy_with_required(extra: &[&str]) -> Result<EnvironmentPolicy> {
@@ -811,7 +844,8 @@ fn validate_claude_session_id(value: &str) -> Result<()> {
 }
 
 struct ReviewerSandboxConfig {
-    snapshot_cwd: PathBuf,
+    run_id: String,
+    workspace_cwd: PathBuf,
     artifact_root: PathBuf,
     isolated_home: PathBuf,
     native_config_dir: PathBuf,
@@ -820,22 +854,25 @@ struct ReviewerSandboxConfig {
     host_runtime_dir: PathBuf,
     auth_source: PathBuf,
     auth_target_name: String,
+    cargo_bin_source: PathBuf,
+    rustup_home_source: PathBuf,
     extra_private_dirs: Vec<DirectoryIdentity>,
 }
 
 struct ReviewerSandbox {
-    snapshot: DirectoryIdentity,
+    run_id: String,
+    workspace: DirectoryIdentity,
     artifact_root: DirectoryIdentity,
     isolated_home: DirectoryIdentity,
     native_config: DirectoryIdentity,
     temp_dir: DirectoryIdentity,
     runtime_dir: DirectoryIdentity,
     host_runtime_dir: DirectoryIdentity,
-    control_socket_path: PathBuf,
     auth_source: FileIdentity,
     auth_target: FileIdentity,
     extra_private_dirs: Vec<DirectoryIdentity>,
-    git_snapshot: GitSnapshotIdentity,
+    git_workspace: GitWorkspaceIdentity,
+    empty_root: EmptyRootContract,
 }
 
 impl ReviewerSandbox {
@@ -854,8 +891,8 @@ impl ReviewerSandbox {
         if Path::new(&config.auth_target_name).components().count() != 1 {
             bail!("reviewer auth target filename must be one normal component");
         }
-        let snapshot = DirectoryIdentity::capture(&config.snapshot_cwd, false)
-            .context("invalid reviewer snapshot root")?;
+        let workspace = DirectoryIdentity::capture(&config.workspace_cwd, false)
+            .context("invalid reviewer checkout root")?;
         let artifact_root = DirectoryIdentity::capture(&config.artifact_root, true)
             .context("invalid reviewer artifact root")?;
         let isolated_home = DirectoryIdentity::capture(&config.isolated_home, true)
@@ -883,7 +920,7 @@ impl ReviewerSandbox {
             }
         }
         let mut disjoint = vec![
-            ("snapshot", snapshot.path()),
+            ("workspace", workspace.path()),
             ("artifact root", artifact_root.path()),
             ("isolated HOME", isolated_home.path()),
             ("isolated temp", temp_dir.path()),
@@ -915,7 +952,7 @@ impl ReviewerSandbox {
             bwrap.canonical_path.as_path(),
             git.canonical_path.as_path(),
             auth_source.path(),
-            snapshot.path(),
+            workspace.path(),
         ] {
             if protected.starts_with(host_runtime_dir.path()) {
                 bail!("host runtime mask hides a required reviewer sandbox path");
@@ -927,23 +964,23 @@ impl ReviewerSandbox {
                 bail!("reviewer writable roots contain a protected host path");
             }
         }
-        let control_socket_path = host_runtime_dir
-            .path()
-            .join("hcom-project-control/control.sock");
-        let git_snapshot = GitSnapshotIdentity::capture(snapshot.path(), git)?;
+        let git_workspace = GitWorkspaceIdentity::capture(workspace.path(), git)?;
+        let empty_root =
+            EmptyRootContract::capture(&config.cargo_bin_source, &config.rustup_home_source)?;
         Ok(Self {
-            snapshot,
+            run_id: config.run_id,
+            workspace,
             artifact_root,
             isolated_home,
             native_config,
             temp_dir,
             runtime_dir,
             host_runtime_dir,
-            control_socket_path,
             auth_source,
             auth_target,
             extra_private_dirs: config.extra_private_dirs,
-            git_snapshot,
+            git_workspace,
+            empty_root,
         })
     }
 
@@ -956,7 +993,7 @@ impl ReviewerSandbox {
         native.revalidate()?;
         bwrap.revalidate()?;
         git.revalidate()?;
-        self.snapshot.revalidate(false)?;
+        self.workspace.revalidate(false)?;
         self.artifact_root.revalidate(true)?;
         self.isolated_home.revalidate(true)?;
         self.native_config.revalidate(true)?;
@@ -966,78 +1003,39 @@ impl ReviewerSandbox {
         for directory in &self.extra_private_dirs {
             directory.revalidate(true)?;
         }
-        if self.control_socket_path
-            != self
-                .host_runtime_dir
-                .path()
-                .join("hcom-project-control/control.sock")
-        {
-            bail!("reviewer durable control socket mask contract drifted");
-        }
+        super::validation::validate_opaque_id("reviewer run id", &self.run_id)?;
         self.auth_source.revalidate()?;
         self.auth_target.revalidate()?;
-        self.git_snapshot.revalidate(self.snapshot.path(), git)
+        self.empty_root.revalidate()?;
+        self.git_workspace.revalidate(self.workspace.path(), git)
     }
 
-    fn outer_argv(&self, artifact_dir: &Path, native: &ExecutableIdentity) -> Result<Vec<String>> {
+    fn outer_argv(
+        &self,
+        artifact_dir: &Path,
+        native: &ExecutableIdentity,
+        inside_native: &'static str,
+        auth_target: &'static str,
+    ) -> Result<Vec<String>> {
         if !artifact_dir.starts_with(self.artifact_root.path()) {
             bail!("reviewer artifact attempt escaped its pinned artifact root");
         }
-        let mut argv: Vec<String> = vec![
-            "--die-with-parent".into(),
-            "--unshare-pid".into(),
-            "--unshare-ipc".into(),
-            "--unshare-uts".into(),
-            "--ro-bind".into(),
-            "/".into(),
-            "/".into(),
-            "--proc".into(),
-            "/proc".into(),
-            "--dev".into(),
-            "/dev".into(),
-            "--tmpfs".into(),
-            path_text("host XDG runtime mask", self.host_runtime_dir.path())?.into(),
-        ];
-        for path in [
-            self.isolated_home.path(),
-            self.temp_dir.path(),
+        let argv = self.empty_root.outer_argv(EmptyRootMounts {
+            native,
+            inside_native,
+            isolated_home: self.isolated_home.path(),
+            native_config: self.native_config.path(),
+            workspace: self.workspace.path(),
+            workspace_writable: false,
             artifact_dir,
-        ] {
-            let path = path_text("reviewer writable sandbox mount", path)?;
-            argv.extend(["--bind".into(), path.into(), path.into()]);
-        }
-        argv.extend([
-            "--tmpfs".into(),
-            path_text("reviewer private runtime mount", self.runtime_dir.path())?.into(),
-            "--ro-bind".into(),
-            path_text("review snapshot", self.snapshot.path())?.into(),
-            path_text("review snapshot", self.snapshot.path())?.into(),
-            "--ro-bind".into(),
-            path_text("reviewer auth source", self.auth_source.path())?.into(),
-            path_text("reviewer auth target", self.auth_target.path())?.into(),
-            "--chdir".into(),
-            path_text("review snapshot", self.snapshot.path())?.into(),
-        ]);
-        let host_runtime = path_text("host XDG runtime mask", self.host_runtime_dir.path())?;
-        let private_runtime = path_text("reviewer private runtime mount", self.runtime_dir.path())?;
-        let tmpfs_targets: std::collections::BTreeSet<_> = argv
-            .windows(2)
-            .filter(|pair| pair[0] == "--tmpfs")
-            .map(|pair| pair[1].as_str())
-            .collect();
-        if !self
-            .control_socket_path
-            .starts_with(self.host_runtime_dir.path())
-            || !tmpfs_targets.contains(host_runtime)
-            || !tmpfs_targets.contains(private_runtime)
-        {
-            bail!("reviewer outer sandbox does not mask durable runtime endpoints");
-        }
+            auth_source: self.auth_source.path(),
+            auth_target,
+        })?;
         if argv.iter().any(|argument| {
             argument == "--"
-                || argument == &native.canonical_path.to_string_lossy()
-                || argument.contains("hcom-project-control/control.sock")
+                || argument.contains("control.sock")
                 || argument == "--new-session"
+                || argument == "/"
         }) {
             bail!("reviewer outer sandbox manifest contains forbidden launch authority");
         }
@@ -1047,48 +1045,41 @@ impl ReviewerSandbox {
     fn validate_revision(&self, control: &TurnControl, git: &ExecutableIdentity) -> Result<()> {
         validate_reviewer_control(control)?;
         revalidate_exact_tool(git, GIT_VERSION)?;
-        self.git_snapshot.revalidate(self.snapshot.path(), git)?;
+        self.git_workspace.revalidate(self.workspace.path(), git)?;
         let runner = GitRunner {
             executable: git,
-            workspace: self.snapshot.path(),
+            workspace: self.workspace.path(),
         };
         if !runner
             .success(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?
             .is_empty()
         {
-            bail!("review snapshot is not clean");
+            bail!("review checkout is not clean");
         }
         if !runner
             .success(&["for-each-ref", "--format=%(refname)", "refs/replace/"])?
             .is_empty()
         {
-            bail!("review snapshot contains replacement refs");
-        }
-        let symbolic = runner.run(&["symbolic-ref", "-q", "HEAD"])?;
-        if symbolic.status.code() != Some(1)
-            || !symbolic.stdout.is_empty()
-            || !symbolic.stderr.is_empty()
-        {
-            bail!("review snapshot HEAD must be detached");
+            bail!("review checkout contains replacement refs");
         }
         let head = runner.one_line(&["rev-parse", "--verify", "HEAD^{commit}"])?;
-        validate_git_oid("actual review snapshot HEAD", &head)?;
+        validate_git_oid("actual review checkout HEAD", &head)?;
         if control.head_revision.as_deref() != Some(head.as_str()) {
-            bail!("review snapshot HEAD differs from the exact reviewer turn");
+            bail!("review checkout HEAD differs from the exact reviewer turn");
         }
         let ancestor =
             runner.run(&["merge-base", "--is-ancestor", &control.base_revision, &head])?;
         if ancestor.status.code() != Some(0) || !ancestor.stderr.is_empty() {
-            bail!("review base revision is not an ancestor of the exact snapshot HEAD");
+            bail!("review base revision is not an ancestor of the exact workspace HEAD");
         }
         revalidate_exact_tool(git, GIT_VERSION)?;
-        self.git_snapshot.revalidate(self.snapshot.path(), git)?;
+        self.git_workspace.revalidate(self.workspace.path(), git)?;
         if !runner
             .success(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?
             .is_empty()
             || runner.one_line(&["rev-parse", "--verify", "HEAD^{commit}"])? != head
         {
-            bail!("review snapshot drifted during its revision gate");
+            bail!("review checkout drifted during its revision gate");
         }
         Ok(())
     }
@@ -1140,8 +1131,8 @@ impl DirectoryIdentity {
     fn validate_metadata(&self, private: bool) -> Result<()> {
         // SAFETY: geteuid has no preconditions.
         let uid = unsafe { libc::geteuid() };
-        if self.uid != uid || self.mode & 0o022 != 0 {
-            bail!("reviewer sandbox directory has unsafe ownership or permissions");
+        if self.uid != uid {
+            bail!("reviewer sandbox directory is not owned by the current user");
         }
         if private && (self.mode & 0o077 != 0 || self.mode & 0o700 != 0o700) {
             bail!("reviewer private directory must be mode 0700");
@@ -1215,22 +1206,22 @@ impl FileIdentity {
     }
 }
 
-struct GitSnapshotIdentity {
+struct GitWorkspaceIdentity {
     top_level: PathBuf,
     git_dir: DirectoryIdentity,
     common_dir: DirectoryIdentity,
     object_dir: DirectoryIdentity,
 }
 
-impl GitSnapshotIdentity {
-    fn capture(snapshot: &Path, git: &ExecutableIdentity) -> Result<Self> {
+impl GitWorkspaceIdentity {
+    fn capture(workspace: &Path, git: &ExecutableIdentity) -> Result<Self> {
         let runner = GitRunner {
             executable: git,
-            workspace: snapshot,
+            workspace,
         };
         let top_level = canonical_git_path(&runner.one_line(&["rev-parse", "--show-toplevel"])?)?;
-        if top_level != snapshot {
-            bail!("review snapshot is not its exact Git top level");
+        if top_level != workspace {
+            bail!("review checkout is not its exact Git top level");
         }
         let git_dir = canonical_git_path(&runner.one_line(&[
             "rev-parse",
@@ -1248,33 +1239,33 @@ impl GitSnapshotIdentity {
             "--git-path",
             "objects",
         ])?)?;
-        if !git_dir.starts_with(snapshot)
-            || !common_dir.starts_with(snapshot)
-            || !object_dir.starts_with(snapshot)
+        if !git_dir.starts_with(workspace)
+            || !common_dir.starts_with(workspace)
+            || !object_dir.starts_with(workspace)
         {
-            bail!("review snapshot Git administration must stay inside the read-only snapshot");
+            bail!("review checkout Git administration must stay inside the read-only workspace");
         }
         let identity = Self {
             top_level,
             git_dir: DirectoryIdentity::capture(&git_dir, false)
-                .context("invalid review snapshot Git directory")?,
+                .context("invalid review checkout Git directory")?,
             common_dir: DirectoryIdentity::capture(&common_dir, false)
-                .context("invalid review snapshot common Git directory")?,
+                .context("invalid review checkout common Git directory")?,
             object_dir: DirectoryIdentity::capture(&object_dir, false)
-                .context("invalid review snapshot object directory")?,
+                .context("invalid review checkout object directory")?,
         };
         identity.reject_admin_indirections()?;
         Ok(identity)
     }
 
-    fn revalidate(&self, snapshot: &Path, git: &ExecutableIdentity) -> Result<()> {
-        let current = Self::capture(snapshot, git)?;
+    fn revalidate(&self, workspace: &Path, git: &ExecutableIdentity) -> Result<()> {
+        let current = Self::capture(workspace, git)?;
         if current.top_level != self.top_level
             || current.git_dir != self.git_dir
             || current.common_dir != self.common_dir
             || current.object_dir != self.object_dir
         {
-            bail!("review snapshot Git identity drifted");
+            bail!("review checkout Git identity drifted");
         }
         Ok(())
     }
@@ -1286,10 +1277,10 @@ impl GitSnapshotIdentity {
             self.object_dir.path().join("info/http-alternates"),
         ] {
             match fs::symlink_metadata(&path) {
-                Ok(_) => bail!("review snapshot uses forbidden Git object indirection"),
+                Ok(_) => bail!("review checkout uses forbidden Git object indirection"),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    return Err(error).context("failed to inspect review snapshot indirection");
+                    return Err(error).context("failed to inspect review checkout indirection");
                 }
             }
         }
@@ -1477,7 +1468,8 @@ fn canonical_git_path(value: &str) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn validate_production_runtime_contract(host_runtime_dir: &Path) -> Result<()> {
+fn validate_production_runtime_contract(host_runtime_dir: &Path, run_id: &str) -> Result<()> {
+    super::validation::validate_opaque_id("reviewer run id", run_id)?;
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("XDG_RUNTIME_DIR is required for the reviewer sandbox"))?;
@@ -1485,20 +1477,7 @@ fn validate_production_runtime_contract(host_runtime_dir: &Path) -> Result<()> {
     if runtime != canonical || host_runtime_dir != canonical {
         bail!("reviewer host runtime mask does not match canonical XDG_RUNTIME_DIR");
     }
-    if ControlPaths::discover()?.socket_path()
-        != canonical.join("hcom-project-control/control.sock")
-    {
-        bail!("reviewer could not resolve the durable control socket under its mask");
-    }
     Ok(())
-}
-
-fn path_text<'a>(label: &str, path: &'a Path) -> Result<&'a str> {
-    let text = path
-        .to_str()
-        .ok_or_else(|| anyhow!("{label} must be valid UTF-8"))?;
-    validate_text(label, text, MAX_PATH_BYTES, false)?;
-    Ok(text)
 }
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
@@ -1521,7 +1500,7 @@ mod tests {
 
     struct Fixture {
         _temp: tempfile::TempDir,
-        snapshot: PathBuf,
+        workspace: PathBuf,
         artifact_root: PathBuf,
         isolated_home: PathBuf,
         codex_home: PathBuf,
@@ -1535,6 +1514,8 @@ mod tests {
         host_runtime_dir: PathBuf,
         codex_auth_source: PathBuf,
         claude_auth_source: PathBuf,
+        cargo_bin_source: PathBuf,
+        rustup_home_source: PathBuf,
         codex: PathBuf,
         claude: PathBuf,
         bwrap: PathBuf,
@@ -1549,7 +1530,7 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let temp = tempfile::tempdir().unwrap();
-            let snapshot = temp.path().join("review-snapshot");
+            let workspace = temp.path().join("review-workspace");
             let artifact_root = temp.path().join("artifacts");
             let isolated_home = temp.path().join("isolated-home");
             let codex_home = isolated_home.join("codex");
@@ -1562,9 +1543,11 @@ mod tests {
             let runtime_dir = temp.path().join("isolated-runtime");
             let host_runtime_dir = temp.path().join("host-runtime");
             let developer_worktree = temp.path().join("developer-worktree");
+            let cargo_bin_source = temp.path().join("cargo-bin");
+            let rustup_home_source = temp.path().join("rustup-home");
             let tools = temp.path().join("tools");
             for directory in [
-                &snapshot,
+                &workspace,
                 &artifact_root,
                 &isolated_home,
                 &codex_home,
@@ -1577,6 +1560,8 @@ mod tests {
                 &runtime_dir,
                 &host_runtime_dir,
                 &developer_worktree,
+                &cargo_bin_source,
+                &rustup_home_source,
                 &tools,
             ] {
                 fs::create_dir(directory).unwrap();
@@ -1605,52 +1590,56 @@ mod tests {
 
             git_ok(
                 &git,
-                &snapshot,
+                &workspace,
                 &["init", "--quiet", "--initial-branch=master"],
             );
-            git_ok(&git, &snapshot, &["config", "user.name", "Phase Six"]);
+            git_ok(&git, &workspace, &["config", "user.name", "Phase Six"]);
             git_ok(
                 &git,
-                &snapshot,
+                &workspace,
                 &["config", "user.email", "phase6@example.invalid"],
             );
-            fs::write(snapshot.join("base.txt"), b"base\n").unwrap();
-            git_ok(&git, &snapshot, &["add", "base.txt"]);
-            git_ok(&git, &snapshot, &["commit", "--quiet", "-m", "Base commit"]);
-            let base_revision = git_line(&git, &snapshot, &["rev-parse", "HEAD"]);
-
-            fs::write(snapshot.join("tracked.txt"), b"revision one\n").unwrap();
-            git_ok(&git, &snapshot, &["add", "tracked.txt"]);
+            fs::write(workspace.join("base.txt"), b"base\n").unwrap();
+            git_ok(&git, &workspace, &["add", "base.txt"]);
             git_ok(
                 &git,
-                &snapshot,
+                &workspace,
+                &["commit", "--quiet", "-m", "Base commit"],
+            );
+            let base_revision = git_line(&git, &workspace, &["rev-parse", "HEAD"]);
+
+            fs::write(workspace.join("tracked.txt"), b"revision one\n").unwrap();
+            git_ok(&git, &workspace, &["add", "tracked.txt"]);
+            git_ok(
+                &git,
+                &workspace,
                 &["commit", "--quiet", "-m", "First review head"],
             );
-            let first_head = git_line(&git, &snapshot, &["rev-parse", "HEAD"]);
+            let first_head = git_line(&git, &workspace, &["rev-parse", "HEAD"]);
 
-            fs::write(snapshot.join("tracked.txt"), b"revision two\n").unwrap();
-            git_ok(&git, &snapshot, &["add", "tracked.txt"]);
+            fs::write(workspace.join("tracked.txt"), b"revision two\n").unwrap();
+            git_ok(&git, &workspace, &["add", "tracked.txt"]);
             git_ok(
                 &git,
-                &snapshot,
+                &workspace,
                 &["commit", "--quiet", "-m", "Second review head"],
             );
-            let second_head = git_line(&git, &snapshot, &["rev-parse", "HEAD"]);
+            let second_head = git_line(&git, &workspace, &["rev-parse", "HEAD"]);
             git_ok(
                 &git,
-                &snapshot,
+                &workspace,
                 &["checkout", "--quiet", "--detach", &first_head],
             );
-            fs::set_permissions(snapshot.join(".git"), fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(workspace.join(".git"), fs::Permissions::from_mode(0o700)).unwrap();
             fs::set_permissions(
-                snapshot.join(".git/objects"),
+                workspace.join(".git/objects"),
                 fs::Permissions::from_mode(0o700),
             )
             .unwrap();
 
             Self {
                 _temp: temp,
-                snapshot: fs::canonicalize(snapshot).unwrap(),
+                workspace: fs::canonicalize(workspace).unwrap(),
                 artifact_root: fs::canonicalize(artifact_root).unwrap(),
                 isolated_home: fs::canonicalize(isolated_home).unwrap(),
                 codex_home: fs::canonicalize(codex_home).unwrap(),
@@ -1664,6 +1653,8 @@ mod tests {
                 host_runtime_dir: fs::canonicalize(host_runtime_dir).unwrap(),
                 codex_auth_source: fs::canonicalize(codex_auth_source).unwrap(),
                 claude_auth_source: fs::canonicalize(claude_auth_source).unwrap(),
+                cargo_bin_source: fs::canonicalize(cargo_bin_source).unwrap(),
+                rustup_home_source: fs::canonicalize(rustup_home_source).unwrap(),
                 codex: fs::canonicalize(codex).unwrap(),
                 claude: fs::canonicalize(claude).unwrap(),
                 bwrap: fs::canonicalize(bwrap).unwrap(),
@@ -1678,7 +1669,8 @@ mod tests {
 
         fn codex_config(&self) -> CodexReviewerConfig {
             CodexReviewerConfig {
-                snapshot_cwd: self.snapshot.clone(),
+                run_id: "run-reviewer-fixture".into(),
+                workspace_cwd: self.workspace.clone(),
                 artifact_root: self.artifact_root.clone(),
                 isolated_home: self.isolated_home.clone(),
                 codex_home: self.codex_home.clone(),
@@ -1686,12 +1678,15 @@ mod tests {
                 runtime_dir: self.runtime_dir.clone(),
                 host_runtime_dir: self.host_runtime_dir.clone(),
                 auth_source: self.codex_auth_source.clone(),
+                cargo_bin_source: self.cargo_bin_source.clone(),
+                rustup_home_source: self.rustup_home_source.clone(),
             }
         }
 
         fn claude_config(&self) -> ClaudeReviewerConfig {
             ClaudeReviewerConfig {
-                snapshot_cwd: self.snapshot.clone(),
+                run_id: "run-reviewer-fixture".into(),
+                workspace_cwd: self.workspace.clone(),
                 artifact_root: self.artifact_root.clone(),
                 isolated_home: self.isolated_home.clone(),
                 claude_config_dir: self.claude_config_dir.clone(),
@@ -1703,6 +1698,8 @@ mod tests {
                 runtime_dir: self.runtime_dir.clone(),
                 host_runtime_dir: self.host_runtime_dir.clone(),
                 auth_source: self.claude_auth_source.clone(),
+                cargo_bin_source: self.cargo_bin_source.clone(),
+                rustup_home_source: self.rustup_home_source.clone(),
             }
         }
 
@@ -1729,7 +1726,7 @@ mod tests {
         fn refresh(&self, head: &str) {
             git_ok(
                 &self.git,
-                &self.snapshot,
+                &self.workspace,
                 &["checkout", "--quiet", "--force", "--detach", head],
             );
         }
@@ -1744,7 +1741,7 @@ mod tests {
             head: &str,
         ) -> TurnControl {
             TurnControl {
-                project_id: "project-reviewers".into(),
+                run_id: "run-reviewers".into(),
                 task_id: task_id.into(),
                 role: WorkerRole::Reviewer,
                 logical_session_id: logical_session_id.into(),
@@ -1756,7 +1753,7 @@ mod tests {
                 base_revision: self.base_revision.clone(),
                 head_revision: Some(head.into()),
                 artifact_dir: format!(
-                    "project-reviewers/{task_id}/reviewer/{logical_session_id}/turn-{sequence}/attempt-1"
+                    "run-reviewers/{task_id}/reviewer/{logical_session_id}/turn-{sequence}/attempt-1"
                 ),
             }
         }
@@ -1767,23 +1764,13 @@ mod tests {
                 "epoch-reviewers",
                 &CodexReviewerAdapter::environment_policy().unwrap(),
                 vec![
-                    (
-                        "CODEX_HOME".into(),
-                        self.codex_home.to_string_lossy().into_owned(),
-                    ),
-                    (
-                        "HOME".into(),
-                        self.isolated_home.to_string_lossy().into_owned(),
-                    ),
-                    ("PATH".into(), "/usr/bin:/bin".into()),
-                    (
-                        "TMPDIR".into(),
-                        self.temp_dir.to_string_lossy().into_owned(),
-                    ),
-                    (
-                        "XDG_RUNTIME_DIR".into(),
-                        self.runtime_dir.to_string_lossy().into_owned(),
-                    ),
+                    ("CARGO_HOME".into(), INSIDE_CARGO_HOME.into()),
+                    ("CODEX_HOME".into(), INSIDE_NATIVE_CONFIG.into()),
+                    ("HOME".into(), INSIDE_HOME.into()),
+                    ("PATH".into(), INSIDE_PATH.into()),
+                    ("RUSTUP_HOME".into(), INSIDE_RUSTUP_HOME.into()),
+                    ("TMPDIR".into(), INSIDE_TEMP.into()),
+                    ("XDG_RUNTIME_DIR".into(), INSIDE_RUNTIME.into()),
                 ],
             )
             .unwrap()
@@ -1791,39 +1778,17 @@ mod tests {
 
         fn claude_lease(&self, id: &str) -> ExecutionEnvironmentLease {
             let mut values = vec![
-                (
-                    "CLAUDE_CONFIG_DIR".into(),
-                    self.claude_config_dir.to_string_lossy().into_owned(),
-                ),
-                (
-                    "HOME".into(),
-                    self.isolated_home.to_string_lossy().into_owned(),
-                ),
-                ("PATH".into(), "/usr/bin:/bin".into()),
-                (
-                    "TMPDIR".into(),
-                    self.temp_dir.to_string_lossy().into_owned(),
-                ),
-                (
-                    "XDG_CACHE_HOME".into(),
-                    self.xdg_cache_home.to_string_lossy().into_owned(),
-                ),
-                (
-                    "XDG_CONFIG_HOME".into(),
-                    self.xdg_config_home.to_string_lossy().into_owned(),
-                ),
-                (
-                    "XDG_DATA_HOME".into(),
-                    self.xdg_data_home.to_string_lossy().into_owned(),
-                ),
-                (
-                    "XDG_RUNTIME_DIR".into(),
-                    self.runtime_dir.to_string_lossy().into_owned(),
-                ),
-                (
-                    "XDG_STATE_HOME".into(),
-                    self.xdg_state_home.to_string_lossy().into_owned(),
-                ),
+                ("CARGO_HOME".into(), INSIDE_CARGO_HOME.into()),
+                ("CLAUDE_CONFIG_DIR".into(), INSIDE_NATIVE_CONFIG.into()),
+                ("HOME".into(), INSIDE_HOME.into()),
+                ("PATH".into(), INSIDE_PATH.into()),
+                ("RUSTUP_HOME".into(), INSIDE_RUSTUP_HOME.into()),
+                ("TMPDIR".into(), INSIDE_TEMP.into()),
+                ("XDG_CACHE_HOME".into(), "/hcom/home/.cache".into()),
+                ("XDG_CONFIG_HOME".into(), "/hcom/home/.config".into()),
+                ("XDG_DATA_HOME".into(), "/hcom/home/.data".into()),
+                ("XDG_RUNTIME_DIR".into(), INSIDE_RUNTIME.into()),
+                ("XDG_STATE_HOME".into(), "/hcom/home/.state".into()),
             ];
             values.extend(
                 CLAUDE_EXACT_ENVIRONMENT
@@ -1858,7 +1823,7 @@ mod tests {
             let attempt = ArtifactAttempt::create(
                 &root,
                 ArtifactScope {
-                    project_id: control.project_id.clone(),
+                    run_id: control.run_id.clone(),
                     task_id: control.task_id.clone(),
                     role: WorkerRole::Reviewer,
                     logical_session_id: control.logical_session_id.clone(),
@@ -1874,7 +1839,7 @@ mod tests {
                     "epoch-reviewers",
                     &WorkerEnvironmentIdentity {
                         role: WorkerRole::Reviewer,
-                        project_id: control.project_id.clone(),
+                        run_id: control.run_id.clone(),
                         task_id: control.task_id.clone(),
                     },
                 )
@@ -1956,7 +1921,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_profiles_fake_create_and_same_task_snapshot_refresh_resume_are_closed() {
+    fn exact_profiles_fake_create_and_same_task_workspace_refresh_resume_are_closed() {
         let fixture = Fixture::new();
         let prompt = b"review only the exact approved base and head";
 
@@ -2208,7 +2173,7 @@ mod tests {
         wrong_base.base_revision = "f".repeat(40);
         assert!(prepare_create_turn(&adapter, &profile, &wrong_base, prompt.to_vec()).is_err());
 
-        fs::write(fixture.snapshot.join("tracked.txt"), b"dirty\n").unwrap();
+        fs::write(fixture.workspace.join("tracked.txt"), b"dirty\n").unwrap();
         let clean_control = fixture.control(
             "task-dirty",
             "logical-dirty",
@@ -2222,17 +2187,17 @@ mod tests {
 
         git_ok(
             &fixture.git,
-            &fixture.snapshot,
+            &fixture.workspace,
             &["replace", &fixture.first_head, &fixture.base_revision],
         );
         assert!(prepare_create_turn(&adapter, &profile, &clean_control, prompt.to_vec()).is_err());
         git_ok(
             &fixture.git,
-            &fixture.snapshot,
+            &fixture.workspace,
             &["replace", "-d", &fixture.first_head],
         );
 
-        let alternates = fixture.snapshot.join(".git/objects/info/alternates");
+        let alternates = fixture.workspace.join(".git/objects/info/alternates");
         fs::write(&alternates, b"/forbidden/object/store\n").unwrap();
         assert!(prepare_create_turn(&adapter, &profile, &clean_control, prompt.to_vec()).is_err());
         fs::remove_file(alternates).unwrap();
@@ -2242,6 +2207,7 @@ mod tests {
             "epoch-reviewers",
             &ClaudeReviewerAdapter::environment_policy().unwrap(),
             vec![
+                ("CARGO_HOME".into(), INSIDE_CARGO_HOME.into()),
                 ("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS".into(), "1".into()),
                 ("CLAUDE_CODE_DISABLE_FAST_MODE".into(), "0".into()),
                 (
@@ -2252,39 +2218,16 @@ mod tests {
                     "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION".into(),
                     "false".into(),
                 ),
-                (
-                    "CLAUDE_CONFIG_DIR".into(),
-                    fixture.claude_config_dir.to_string_lossy().into_owned(),
-                ),
-                (
-                    "HOME".into(),
-                    fixture.isolated_home.to_string_lossy().into_owned(),
-                ),
-                ("PATH".into(), "/usr/bin:/bin".into()),
-                (
-                    "TMPDIR".into(),
-                    fixture.temp_dir.to_string_lossy().into_owned(),
-                ),
-                (
-                    "XDG_CACHE_HOME".into(),
-                    fixture.xdg_cache_home.to_string_lossy().into_owned(),
-                ),
-                (
-                    "XDG_CONFIG_HOME".into(),
-                    fixture.xdg_config_home.to_string_lossy().into_owned(),
-                ),
-                (
-                    "XDG_DATA_HOME".into(),
-                    fixture.xdg_data_home.to_string_lossy().into_owned(),
-                ),
-                (
-                    "XDG_RUNTIME_DIR".into(),
-                    fixture.runtime_dir.to_string_lossy().into_owned(),
-                ),
-                (
-                    "XDG_STATE_HOME".into(),
-                    fixture.xdg_state_home.to_string_lossy().into_owned(),
-                ),
+                ("CLAUDE_CONFIG_DIR".into(), INSIDE_NATIVE_CONFIG.into()),
+                ("HOME".into(), INSIDE_HOME.into()),
+                ("PATH".into(), INSIDE_PATH.into()),
+                ("RUSTUP_HOME".into(), INSIDE_RUSTUP_HOME.into()),
+                ("TMPDIR".into(), INSIDE_TEMP.into()),
+                ("XDG_CACHE_HOME".into(), "/hcom/home/.cache".into()),
+                ("XDG_CONFIG_HOME".into(), "/hcom/home/.config".into()),
+                ("XDG_DATA_HOME".into(), "/hcom/home/.data".into()),
+                ("XDG_RUNTIME_DIR".into(), INSIDE_RUNTIME.into()),
+                ("XDG_STATE_HOME".into(), "/hcom/home/.state".into()),
             ],
         )
         .unwrap();
@@ -2304,7 +2247,7 @@ mod tests {
         let attempt = ArtifactAttempt::create(
             &root,
             ArtifactScope {
-                project_id: claude_control.project_id.clone(),
+                run_id: claude_control.run_id.clone(),
                 task_id: claude_control.task_id.clone(),
                 role: WorkerRole::Reviewer,
                 logical_session_id: claude_control.logical_session_id.clone(),
@@ -2320,7 +2263,7 @@ mod tests {
                 "epoch-reviewers",
                 &WorkerEnvironmentIdentity {
                     role: WorkerRole::Reviewer,
-                    project_id: claude_control.project_id.clone(),
+                    run_id: claude_control.run_id.clone(),
                     task_id: claude_control.task_id.clone(),
                 },
             )
@@ -2473,7 +2416,7 @@ mod tests {
     #[test]
     fn real_bwrap_enforces_erofs_and_masks_live_host_control_socket() {
         let fixture = Fixture::new();
-        let control_root = fixture.host_runtime_dir.join("hcom-project-control");
+        let control_root = fixture.host_runtime_dir.join("hcom-architect-session");
         fs::create_dir(&control_root).unwrap();
         fs::set_permissions(&control_root, fs::Permissions::from_mode(0o700)).unwrap();
         let socket_path = control_root.join("control.sock");
@@ -2516,8 +2459,27 @@ mod tests {
         adapter
             .extract_result(&control, &completion.artifacts)
             .unwrap();
-        assert!(!fixture.snapshot.join("reviewer-write-probe").exists());
+        assert!(!fixture.workspace.join("reviewer-write-probe").exists());
         drop(listener);
+    }
+
+    #[test]
+    fn claude_auth_mount_target_must_exist_with_exact_private_permissions() {
+        let fixture = Fixture::new();
+        let target = fixture.claude_config_dir.join(CLAUDE_AUTH_FILE);
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o664)).unwrap();
+        let error = ClaudeReviewerAdapter::discover_with_paths(
+            fixture.claude_config(),
+            &fixture.claude,
+            &fixture.bwrap,
+            &fixture.git,
+        )
+        .err()
+        .expect("group-readable Claude auth target must fail before spawn");
+        assert!(
+            format!("{error:#}").contains("unsafe ownership, links, or permissions"),
+            "unexpected error: {error:#}"
+        );
     }
 
     fn assert_closed_codex_argv(argv: &[String], fixture: &Fixture, prompt: &[u8]) {
@@ -2535,7 +2497,7 @@ mod tests {
         assert!(!argv.iter().any(|argument| argument == "--new-session"));
         assert!(!argv.iter().any(|argument| argument == "--last"));
         assert!(!argv.iter().any(|argument| argument == "--ephemeral"));
-        assert_ro_snapshot_and_no_authority(argv, fixture, prompt);
+        assert_ro_workspace_and_no_authority(argv, fixture, prompt);
     }
 
     fn assert_closed_claude_argv(
@@ -2576,32 +2538,30 @@ mod tests {
         );
         assert!(!argv.iter().any(|argument| argument == "--new-session"));
         assert!(!argv.iter().any(|argument| argument == "--last"));
-        assert_ro_snapshot_and_no_authority(argv, fixture, prompt);
+        assert_ro_workspace_and_no_authority(argv, fixture, prompt);
     }
 
-    fn assert_ro_snapshot_and_no_authority(argv: &[String], fixture: &Fixture, prompt: &[u8]) {
-        let snapshot = fixture.snapshot.to_str().unwrap();
+    fn assert_ro_workspace_and_no_authority(argv: &[String], fixture: &Fixture, prompt: &[u8]) {
+        let workspace = fixture.workspace.to_str().unwrap();
         assert!(
             argv.windows(3)
-                .any(|part| part == ["--ro-bind", snapshot, snapshot])
+                .any(|part| part == ["--ro-bind", workspace, INSIDE_WORKSPACE])
         );
         assert!(
             !argv
                 .windows(3)
-                .any(|part| part == ["--bind", snapshot, snapshot])
+                .any(|part| part == ["--bind", workspace, INSIDE_WORKSPACE])
         );
         assert!(
             argv.windows(2)
-                .any(|pair| pair == ["--tmpfs", fixture.runtime_dir.to_str().unwrap()])
+                .any(|pair| pair == ["--tmpfs", INSIDE_RUNTIME])
         );
-        assert!(
-            argv.windows(2)
-                .any(|pair| pair == ["--tmpfs", fixture.host_runtime_dir.to_str().unwrap()])
-        );
+        assert!(argv.windows(2).any(|pair| pair == ["--tmpfs", INSIDE_TEMP]));
+        assert!(!argv.windows(3).any(|part| part == ["--ro-bind", "/", "/"]));
         let joined = argv.join("\0");
         assert!(!joined.contains(&String::from_utf8_lossy(prompt).to_string()));
         assert!(!joined.contains(fixture.developer_worktree.to_str().unwrap()));
-        assert!(!joined.contains("hcom-project-control/control.sock"));
+        assert!(!joined.contains("hcom-architect-session/control.sock"));
         assert!(!joined.contains("HCOM_AGENT"));
         assert!(!joined.contains("CHAIN"));
         assert!(!joined.contains("HANDOFF"));
@@ -2665,10 +2625,13 @@ fi
 # SANDBOX_PROBE
 [ ! -t 0 ] && [ ! -t 1 ] && [ ! -t 2 ]
 [ "${HCOM_WORKER_ROLE-}" = reviewer ]
-[ -n "${HCOM_PROJECT_ID-}" ] && [ -n "${HCOM_TASK_ID-}" ]
+[ -n "${HCOM_RUN_ID-}" ] && [ -n "${HCOM_TASK_ID-}" ]
 [ -z "${HCOM_AGENT-}" ] && [ -z "${TERM-}" ] && [ -z "${STY-}" ]
 [ -n "${HOME-}" ] && [ -n "${CODEX_HOME-}" ] && [ -n "${TMPDIR-}" ]
-[ -n "${XDG_RUNTIME_DIR-}" ] && [ -f "$CODEX_HOME/auth.json" ]
+[ "${HOME-}" = /hcom/home ] && [ "${CODEX_HOME-}" = /hcom/native ]
+[ "${TMPDIR-}" = /tmp ] && [ "${XDG_RUNTIME_DIR-}" = /hcom/run ]
+[ "${CARGO_HOME-}" = /hcom/home/.cargo ]
+[ "${RUSTUP_HOME-}" = /hcom/toolchains/rust/rustup ]
 [ "$1" = exec ]
 shift
 session=native-codex-reviewer-1
@@ -2718,10 +2681,13 @@ if [ "${1-}" = "--version" ]; then
 fi
 [ ! -t 0 ] && [ ! -t 1 ] && [ ! -t 2 ]
 [ "${HCOM_WORKER_ROLE-}" = reviewer ]
-[ -n "${HCOM_PROJECT_ID-}" ] && [ -n "${HCOM_TASK_ID-}" ]
+[ -n "${HCOM_RUN_ID-}" ] && [ -n "${HCOM_TASK_ID-}" ]
 [ -z "${HCOM_AGENT-}" ] && [ -z "${TERM-}" ] && [ -z "${STY-}" ]
 [ -n "${HOME-}" ] && [ -n "${CLAUDE_CONFIG_DIR-}" ] && [ -n "${TMPDIR-}" ]
-[ -n "${XDG_RUNTIME_DIR-}" ] && [ -f "$CLAUDE_CONFIG_DIR/.credentials.json" ]
+[ "${HOME-}" = /hcom/home ] && [ "${CLAUDE_CONFIG_DIR-}" = /hcom/native ]
+[ "${TMPDIR-}" = /tmp ] && [ "${XDG_RUNTIME_DIR-}" = /hcom/run ]
+[ "${CARGO_HOME-}" = /hcom/home/.cargo ]
+[ "${RUSTUP_HOME-}" = /hcom/toolchains/rust/rustup ]
 [ "${CLAUDE_CODE_DISABLE_BACKGROUND_TASKS-}" = 1 ]
 [ "${CLAUDE_CODE_DISABLE_FAST_MODE-}" = 1 ]
 [ "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC-}" = 1 ]
@@ -2754,9 +2720,15 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s",
     }
 
     fn fake_codex_script_with_sandbox_probe(probe_path: &Path) -> String {
-        let probe_path = probe_path.to_str().unwrap();
-        assert!(!probe_path.contains('\''));
-        fake_codex_script().replace("# SANDBOX_PROBE", probe_path)
+        let source = fs::read_to_string(probe_path).unwrap();
+        let body = source
+            .strip_prefix("#!/usr/bin/python3\n")
+            .expect("sandbox probe must use the exact Python interpreter");
+        assert!(!body.lines().any(|line| line == "HCOM_PROBE_EOF"));
+        fake_codex_script().replace(
+            "# SANDBOX_PROBE",
+            &format!("/usr/bin/python3 - <<'HCOM_PROBE_EOF'\n{body}\nHCOM_PROBE_EOF"),
+        )
     }
 
     fn sandbox_probe_script(socket_path: &Path) -> String {

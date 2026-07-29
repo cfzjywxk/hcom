@@ -962,7 +962,7 @@ Launch:\n\
   hcom kill <name(s)|tag:T|all>         Kill + close terminal pane\n\
 \n\
 Commands:\n\
-  architect    Launch a blank durable project architect\n\
+  architect    Launch a blank in-memory session-task architect\n\
   send         Send message to your buddies\n\
   review       Review/fix/re-review until LGTM or a round limit\n\
   listen       Block until message or event arrives\n\

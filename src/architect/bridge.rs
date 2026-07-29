@@ -3,7 +3,6 @@ use crate::control_api::client::ControlClient;
 use crate::control_api::codec::{
     read_request_frame, read_response_frame, write_request_frame, write_response_frame,
 };
-use crate::control_api::daemon::ControlPaths;
 use crate::control_api::peer::{
     peer_credentials, process_birth_identity, process_executable_path, process_has_ancestor,
     process_is_live_identity,
@@ -12,13 +11,14 @@ use crate::control_api::protocol::PROTOCOL_VERSION;
 use crate::control_api::registration::{
     RegistrationAction, RegistrationCaller, RegistrationClient, RegistrationRequest,
 };
+use crate::control_api::supervisor::ControlPaths;
 use crate::control_api::{CallerAuth, ControlRequest, ControlResponse};
-use crate::project_store::sha256_hex;
 use crate::worker::ExecutableIdentity;
 use crate::worker::contract::validate_native_session_id;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{FromRawFd, RawFd};
@@ -40,7 +40,8 @@ pub(super) struct BridgeConfiguration {
     pub launch_nonce: String,
     pub capability: String,
     pub repo_root: PathBuf,
-    pub project_id: Option<String>,
+    pub run_root: PathBuf,
+    pub lock_root: PathBuf,
     pub relay_socket_path: PathBuf,
     pub registration_socket_path: PathBuf,
     pub control_socket_path: PathBuf,
@@ -191,14 +192,21 @@ pub(super) fn relay_runtime_scope_hash(directory: &Path) -> Result<String> {
     Ok(sha256_hex(&value))
 }
 
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
+}
+
 fn validate_bridge_configuration(configuration: &BridgeConfiguration) -> Result<()> {
     validate_native_session_id(&configuration.binding_id)?;
     validate_secret(&configuration.launch_nonce)?;
     validate_secret(&configuration.capability)?;
     validate_canonical_directory("architect repository", &configuration.repo_root, None)?;
-    if let Some(project_id) = &configuration.project_id {
-        validate_native_session_id(project_id)?;
-    }
     let relay_parent = configuration
         .relay_socket_path
         .parent()
@@ -216,11 +224,11 @@ fn validate_bridge_configuration(configuration: &BridgeConfiguration) -> Result<
         Some(0o700),
     )?;
     configuration.relay_executable.revalidate()?;
-    let paths = ControlPaths::discover()?;
+    let paths = ControlPaths::new(&configuration.run_root, &configuration.lock_root)?;
     if paths.socket_path() != configuration.control_socket_path
         || paths.registration_socket_path() != configuration.registration_socket_path
     {
-        bail!("architect bridge durable socket paths drifted");
+        bail!("architect bridge session socket paths drifted");
     }
     Ok(())
 }
@@ -312,7 +320,7 @@ fn serve_bridge(
         },
     )?;
     if !close.ok || close.binding_version != binding_version.checked_add(1) {
-        bail!("architect binding close was not durably acknowledged");
+        bail!("architect binding close was not acknowledged");
     }
     Ok(())
 }
@@ -379,7 +387,7 @@ fn serve_mcp_connection(
                     "result":{
                         "protocolVersion":MCP_PROTOCOL_VERSION,
                         "capabilities":{"tools":{"listChanged":false}},
-                        "serverInfo":{"name":"hcom-project-control","version":"1"}
+                        "serverInfo":{"name":"hcom-session-task-control","version":"1"}
                     }
                 })
             }),
@@ -833,19 +841,6 @@ struct CodexSessionPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control_api::ActionName;
-    use crate::control_api::daemon::{
-        ArchitectBindingRegistration, ArchitectProcessRegistration, DaemonEndpoint,
-    };
-    use std::os::fd::AsRawFd;
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
-    use std::time::Instant;
-
-    const BRIDGE_HELPER_FD: &str = "HCOM_PHASE7_BRIDGE_HELPER_FD";
-    const RELAY_HELPER_SOCKET: &str = "HCOM_PHASE7_RELAY_HELPER_SOCKET";
-    const RELAY_HELPER_PARENT: &str = "HCOM_PHASE7_RELAY_HELPER_PARENT";
-    const RELAY_HELPER_EXPECT_ACK: &str = "HCOM_PHASE7_RELAY_HELPER_EXPECT_ACK";
 
     #[test]
     fn native_session_requires_one_exact_machine_record() {
@@ -889,464 +884,41 @@ mod tests {
     }
 
     #[test]
-    fn bridge_helper_process() {
-        let Some(fd) = std::env::var_os(BRIDGE_HELPER_FD) else {
-            return;
-        };
-        let fd = fd.to_string_lossy().parse::<RawFd>().unwrap();
-        run_bridge(fd).unwrap();
-    }
-
-    #[test]
-    fn bridge_bootstrap_socket_and_exit_revoke_are_process_bound() {
-        let temp = tempfile::Builder::new()
-            .prefix("hcom-phase7-bridge.")
-            .tempdir()
-            .unwrap();
-        let root = fs::canonicalize(temp.path()).unwrap();
-        let state_home = root.join("state");
-        let runtime_home = root.join("run");
-        let config_home = root.join("config");
-        for path in [&state_home, &runtime_home, &config_home] {
-            fs::create_dir(path).unwrap();
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let paths = crate::control_api::daemon::ControlPaths::new(
-            state_home.join("hcom-project-control"),
-            runtime_home.join("hcom-project-control"),
-            config_home.join("hcom-project-control/config.toml"),
-        );
-        let mut endpoint = DaemonEndpoint::bind(paths.clone()).unwrap();
-        let repository = root.join("repo");
-        let codex_home = root.join("codex-home");
-        let relay_root = paths.architect_runtime_root_path().join("launch");
-        for path in [&repository, &codex_home, &relay_root] {
-            fs::create_dir_all(path).unwrap();
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let relay_socket = relay_root.join(RELAY_SOCKET_NAME);
-        let relay_scope_hash = relay_runtime_scope_hash(&relay_root).unwrap();
-        let relay_executable = ExecutableIdentity::capture(
-            fs::canonicalize(std::env::current_exe().unwrap()).unwrap(),
-        )
-        .unwrap();
-
-        let mut architect = Command::new("/usr/bin/sleep")
-            .arg("30")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let architect_pid = architect.id();
-        let architect_birth = process_birth_identity(architect_pid).unwrap();
-
-        let (mut bootstrap, child_bootstrap) = UnixStream::pair().unwrap();
-        bootstrap
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        bootstrap
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let inherited_fd = child_bootstrap.as_raw_fd();
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .args([
-                "--exact",
-                "architect::bridge::tests::bridge_helper_process",
-                "--nocapture",
-            ])
-            .env(BRIDGE_HELPER_FD, inherited_fd.to_string())
-            .env("XDG_STATE_HOME", &state_home)
-            .env("XDG_RUNTIME_DIR", &runtime_home)
-            .env("XDG_CONFIG_HOME", &config_home)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        // SAFETY: inherited_fd is a live socketpair descriptor. Clearing
-        // CLOEXEC preserves only that exact test bootstrap channel.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::fcntl(inherited_fd, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut bridge = command.spawn().unwrap();
-        drop(child_bootstrap);
-        let bridge_pid = bridge.id();
-        let bridge_birth = process_birth_identity(bridge_pid).unwrap();
-
-        endpoint
-            .control_mut()
-            .register_architect_binding(&ArchitectBindingRegistration {
-                binding_id: "binding-bridge-lifecycle".into(),
-                repo_root: repository.clone(),
-                architect_name: "architect-bridge-lifecycle".into(),
-                architect_adapter: "codex-0.145.0".into(),
-                launch_nonce: "launch-nonce-bridge-lifecycle".into(),
-                capability: "capability-bridge-lifecycle".into(),
-                actions: ActionName::ALL.into_iter().collect(),
-            })
-            .unwrap();
-        endpoint
-            .control_mut()
-            .bind_architect_process(
-                "binding-bridge-lifecycle",
-                0,
-                &ArchitectProcessRegistration {
-                    architect_pid,
-                    architect_process_birth: architect_birth.clone(),
-                    bridge_pid,
-                    bridge_process_birth: bridge_birth.clone(),
-                    relay_executable_contract_hash: sha256_hex(
-                        &serde_json::to_vec(&relay_executable).unwrap(),
-                    ),
-                    relay_runtime_scope_hash: relay_scope_hash.clone(),
-                },
-            )
-            .unwrap();
-        let configuration = BridgeConfiguration {
-            binding_id: "binding-bridge-lifecycle".into(),
-            launch_nonce: "launch-nonce-bridge-lifecycle".into(),
-            capability: "capability-bridge-lifecycle".into(),
-            repo_root: repository,
-            project_id: None,
-            relay_socket_path: relay_socket.clone(),
-            registration_socket_path: paths.registration_socket_path(),
-            control_socket_path: paths.socket_path(),
-            codex_home,
-            relay_executable,
-            relay_runtime_scope_hash: relay_scope_hash,
-        };
-        configure_bridge(&mut bootstrap, configuration).unwrap();
-        let metadata = fs::symlink_metadata(&relay_socket).unwrap();
-        assert!(metadata.file_type().is_socket());
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-        activate_bridge(
-            &mut bootstrap,
-            BridgeActivation {
-                architect_pid,
-                architect_process_birth: architect_birth,
-                bridge_pid,
-                bridge_process_birth: bridge_birth,
-                binding_version: 1,
-            },
-        )
-        .unwrap();
-        drop(bootstrap);
-
-        endpoint.set_nonblocking(true).unwrap();
-        let server = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut endpoint = endpoint;
-            loop {
-                if endpoint.try_serve_registration_one().unwrap() {
-                    return endpoint;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "bridge did not close its registration before the deadline"
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        });
-        architect.kill().unwrap();
-        architect.wait().unwrap();
-        let status = bridge.wait().unwrap();
-        assert!(status.success(), "bridge helper failed: {status}");
-        let mut endpoint = server.join().unwrap();
-        let stored = endpoint
-            .control_mut()
-            .architect_binding_state_version("binding-bridge-lifecycle")
-            .unwrap();
-        assert_eq!(stored, ("closed".into(), 2));
-        assert!(!relay_socket.exists());
-    }
-
-    #[test]
-    fn relay_client_helper_process() {
-        let Some(socket) = std::env::var_os(RELAY_HELPER_SOCKET) else {
-            return;
-        };
-        if std::env::var_os(RELAY_HELPER_PARENT).is_some() {
-            let status = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "architect::bridge::tests::relay_client_helper_process",
-                    "--nocapture",
-                ])
-                .env(RELAY_HELPER_SOCKET, socket)
-                .env_remove(RELAY_HELPER_PARENT)
-                .env(RELAY_HELPER_EXPECT_ACK, "1")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .unwrap();
-            assert!(status.success());
-            return;
-        }
-        let mut stream = UnixStream::connect(PathBuf::from(socket)).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream.write_all(&[0xff]).unwrap();
-        let mut ack = [0u8; 1];
-        if std::env::var_os(RELAY_HELPER_EXPECT_ACK).is_some() {
-            let count = stream.read(&mut ack).unwrap();
-            assert_eq!((count, ack[0]), (1, 0x7f));
-        } else {
-            match stream.read(&mut ack) {
-                Ok(0) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
-                outcome => panic!("unauthorized relay received an unexpected outcome: {outcome:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn relay_peer_requires_exact_executable_and_architect_ancestry_before_frames() {
-        let temp = tempfile::Builder::new()
-            .prefix("hcom-phase7-relay-auth.")
-            .tempdir()
-            .unwrap();
+    fn bridge_configuration_binds_runtime_only_socket_paths() {
+        let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        let relay_path = root.join(RELAY_SOCKET_NAME);
-        let listener = UnixListener::bind(&relay_path).unwrap();
-        fs::set_permissions(&relay_path, fs::Permissions::from_mode(0o600)).unwrap();
-        let executable = ExecutableIdentity::capture(
-            fs::canonicalize(std::env::current_exe().unwrap()).unwrap(),
-        )
-        .unwrap();
-        let bridge_birth = process_birth_identity(std::process::id()).unwrap();
-        let configuration = BridgeConfiguration {
-            binding_id: "binding-relay-auth".into(),
-            launch_nonce: "launch-nonce-relay-auth".into(),
-            capability: "capability-relay-auth".into(),
-            repo_root: root.clone(),
-            project_id: None,
-            relay_socket_path: relay_path.clone(),
-            registration_socket_path: root.join("registration.sock"),
-            control_socket_path: root.join("control.sock"),
-            codex_home: root.clone(),
-            relay_executable: executable,
-            relay_runtime_scope_hash: relay_runtime_scope_hash(&root).unwrap(),
-        };
-
-        let mut architect = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "architect::bridge::tests::relay_client_helper_process",
-                "--nocapture",
-            ])
-            .env(RELAY_HELPER_SOCKET, &relay_path)
-            .env(RELAY_HELPER_PARENT, "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let activation = BridgeActivation {
-            architect_pid: architect.id(),
-            architect_process_birth: process_birth_identity(architect.id()).unwrap(),
-            bridge_pid: std::process::id(),
-            bridge_process_birth: bridge_birth.clone(),
-            binding_version: 1,
-        };
-        let (mut authorized, _) = listener.accept().unwrap();
-        authorize_relay_peer(&authorized, &configuration, &activation).unwrap();
-        let mut invalid_frame = [0u8; 1];
-        authorized.read_exact(&mut invalid_frame).unwrap();
-        assert_eq!(invalid_frame, [0xff]);
-        authorized.write_all(&[0x7f]).unwrap();
-        drop(authorized);
-        assert!(architect.wait().unwrap().success());
-
-        let mut wrong_ancestry = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "architect::bridge::tests::relay_client_helper_process",
-                "--nocapture",
-            ])
-            .env(RELAY_HELPER_SOCKET, &relay_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let (unauthorized, _) = listener.accept().unwrap();
-        assert!(authorize_relay_peer(&unauthorized, &configuration, &activation).is_err());
-        drop(unauthorized);
-        assert!(wrong_ancestry.wait().unwrap().success());
-
-        let script = "import socket,sys\ns=socket.socket(socket.AF_UNIX)\ns.connect(sys.argv[1])\ns.sendall(b'x')\ntry:\n    result=s.recv(1)\nexcept ConnectionResetError:\n    result=b''\nraise SystemExit(0 if result == b'' else 1)";
-        let mut wrong_executable = Command::new("/usr/bin/python3")
-            .args(["-c", script, relay_path.to_str().unwrap()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let (unauthorized, _) = listener.accept().unwrap();
-        let parent_activation = BridgeActivation {
-            architect_pid: std::process::id(),
-            architect_process_birth: bridge_birth.clone(),
-            bridge_pid: std::process::id(),
-            bridge_process_birth: bridge_birth,
-            binding_version: 1,
-        };
-        assert!(authorize_relay_peer(&unauthorized, &configuration, &parent_activation).is_err());
-        drop(unauthorized);
-        assert!(wrong_executable.wait().unwrap().success());
-    }
-
-    #[test]
-    fn first_typed_tool_call_binds_one_exact_native_session_then_only_uses_control() {
-        let temp = tempfile::Builder::new()
-            .prefix("hcom-phase7-tool-call.")
-            .tempdir()
-            .unwrap();
-        let root = fs::canonicalize(temp.path()).unwrap();
-        let state_home = root.join("state");
-        let runtime_home = root.join("run");
-        let config_home = root.join("config");
-        let repository = root.join("repo");
-        let codex_home = root.join("codex-home");
-        for path in [
-            &state_home,
-            &runtime_home,
-            &config_home,
-            &repository,
-            &codex_home,
-        ] {
+        let run_root = root.join("run");
+        let lock_root = root.join("locks");
+        let repo_root = root.join("repo");
+        let codex_home = root.join("codex");
+        let relay_root = root.join("relay");
+        for path in [&run_root, &lock_root, &repo_root, &codex_home, &relay_root] {
             fs::create_dir(path).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let paths = crate::control_api::daemon::ControlPaths::new(
-            state_home.join("hcom-project-control"),
-            runtime_home.join("hcom-project-control"),
-            config_home.join("hcom-project-control/config.toml"),
-        );
-        let mut endpoint = DaemonEndpoint::bind(paths.clone()).unwrap();
-        let birth = process_birth_identity(std::process::id()).unwrap();
-        endpoint
-            .control_mut()
-            .register_architect_binding(&ArchitectBindingRegistration {
-                binding_id: "binding-tool-call".into(),
-                repo_root: repository.clone(),
-                architect_name: "architect-tool-call".into(),
-                architect_adapter: "codex-0.145.0".into(),
-                launch_nonce: "launch-nonce-tool-call".into(),
-                capability: "capability-tool-call".into(),
-                actions: ActionName::ALL.into_iter().collect(),
-            })
-            .unwrap();
-        endpoint
-            .control_mut()
-            .bind_architect_process(
-                "binding-tool-call",
-                0,
-                &ArchitectProcessRegistration {
-                    architect_pid: std::process::id(),
-                    architect_process_birth: birth.clone(),
-                    bridge_pid: std::process::id(),
-                    bridge_process_birth: birth,
-                    relay_executable_contract_hash: std::iter::repeat_n('e', 64).collect(),
-                    relay_runtime_scope_hash: std::iter::repeat_n('f', 64).collect(),
-                },
-            )
-            .unwrap();
-        let session_id = "019fa976-e270-7a92-b5f0-6d3d8a0ad3f4";
-        let sessions = codex_home.join("sessions/2026/07/29");
-        fs::create_dir_all(&sessions).unwrap();
-        fs::write(
-            sessions.join(format!("rollout-2026-07-29T00-00-00-{session_id}.jsonl")),
-            format!(
-                "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"cwd\":{},\"cli_version\":\"0.145.0\",\"originator\":\"codex_cli_rs\"}}}}\n",
-                serde_json::to_string(&repository).unwrap()
-            ),
-        )
-        .unwrap();
-        endpoint.set_nonblocking(true).unwrap();
-        let server = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut endpoint = endpoint;
-            let mut registrations = 0;
-            let mut controls = 0;
-            while registrations < 1 || controls < 2 {
-                if endpoint.try_serve_registration_one().unwrap() {
-                    registrations += 1;
-                }
-                if endpoint.try_serve_one().unwrap() {
-                    controls += 1;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "typed tool calls did not reach the daemon before the deadline"
-                );
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            endpoint
-        });
         let executable = ExecutableIdentity::capture(
             fs::canonicalize(std::env::current_exe().unwrap()).unwrap(),
         )
         .unwrap();
         let configuration = BridgeConfiguration {
-            binding_id: "binding-tool-call".into(),
-            launch_nonce: "launch-nonce-tool-call".into(),
-            capability: "capability-tool-call".into(),
-            repo_root: repository.clone(),
-            project_id: None,
-            relay_socket_path: root.join("relay.sock"),
-            registration_socket_path: paths.registration_socket_path(),
-            control_socket_path: paths.socket_path(),
+            binding_id: "binding-session-test".into(),
+            launch_nonce: "launch-nonce-session-test".into(),
+            capability: "capability-session-test".into(),
+            repo_root,
+            run_root: run_root.clone(),
+            lock_root: lock_root.clone(),
+            relay_socket_path: relay_root.join(RELAY_SOCKET_NAME),
+            registration_socket_path: run_root.join("registration.sock"),
+            control_socket_path: run_root.join("control.sock"),
             codex_home,
             relay_executable: executable,
-            relay_runtime_scope_hash: std::iter::repeat_n('f', 64).collect(),
+            relay_runtime_scope_hash: relay_runtime_scope_hash(&relay_root).unwrap(),
         };
-        let params = || {
-            Some(json!({
-                "name":"project_create",
-                "arguments":{
-                    "repo_root":repository,
-                    "target_ref":"refs/heads/master"
-                }
-            }))
-        };
-        let mut binding_version = 1;
-        let mut native_session = None;
-        for id in [1, 2] {
-            let response = handle_tool_call(
-                json!(id),
-                params(),
-                &configuration,
-                &mut binding_version,
-                &mut native_session,
-            );
-            assert_eq!(response["result"]["isError"], true);
-            assert_eq!(
-                response["result"]["structuredContent"]["error"]["code"],
-                "not_implemented"
-            );
-        }
-        assert_eq!(binding_version, 2);
-        assert_eq!(native_session.as_deref(), Some(session_id));
-        let mut endpoint = server.join().unwrap();
-        assert_eq!(
-            endpoint
-                .control_mut()
-                .architect_binding_state_version("binding-tool-call")
-                .unwrap(),
-            ("bound".into(), 2)
-        );
-        assert_eq!(
-            endpoint.control_mut().phase7_business_counts().unwrap(),
-            (2, 0),
-            "Phase 7 may write only the request ledger, not project business rows"
-        );
+        validate_bridge_configuration(&configuration).unwrap();
+
+        let mut drifted = configuration.clone();
+        drifted.control_socket_path = root.join("other.sock");
+        assert!(validate_bridge_configuration(&drifted).is_err());
     }
 }

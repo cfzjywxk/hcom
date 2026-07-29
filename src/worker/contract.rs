@@ -265,6 +265,7 @@ impl WorkerProfile {
         validate_text("worker reasoning", &self.reasoning, 64, false)?;
         validate_text("worker policy", &self.policy, 2048, false)?;
         validate_text("worker CLI version", &self.cli_version, 128, false)?;
+        self.capability.validate()?;
         self.executable.revalidate()
     }
 
@@ -277,7 +278,7 @@ impl WorkerProfile {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TurnControl {
-    pub project_id: String,
+    pub run_id: String,
     pub task_id: String,
     pub role: WorkerRole,
     pub logical_session_id: String,
@@ -293,7 +294,7 @@ pub struct TurnControl {
 
 impl TurnControl {
     pub fn validate(&self) -> Result<()> {
-        validate_opaque_id("project_id", &self.project_id)?;
+        validate_opaque_id("run_id", &self.run_id)?;
         validate_opaque_id("task_id", &self.task_id)?;
         validate_opaque_id("logical_session_id", &self.logical_session_id)?;
         if let Some(native_session_id) = &self.native_session_id {
@@ -350,6 +351,8 @@ pub struct OuterLaunchEnvelope {
     pub executable: ExecutableIdentity,
     pub fixed_argv: Vec<String>,
     pub expected_artifact_dir: PathBuf,
+    pub inside_executable: PathBuf,
+    pub inside_artifact_dir: PathBuf,
 }
 
 impl OuterLaunchEnvelope {
@@ -362,7 +365,23 @@ impl OuterLaunchEnvelope {
         validate_absolute_lexical_path(
             "outer launch expected artifact directory",
             &self.expected_artifact_dir,
-        )
+        )?;
+        validate_absolute_lexical_path(
+            "outer launch inside native executable",
+            &self.inside_executable,
+        )?;
+        validate_absolute_lexical_path(
+            "outer launch inside artifact directory",
+            &self.inside_artifact_dir,
+        )?;
+        if self.inside_executable == self.inside_artifact_dir
+            || self
+                .inside_executable
+                .starts_with(&self.inside_artifact_dir)
+        {
+            bail!("outer launch native executable cannot be inside its artifact directory");
+        }
+        Ok(())
     }
 }
 
@@ -453,23 +472,23 @@ impl CommandSpec {
     }
 
     pub fn materialized_control_argv(&self) -> Vec<String> {
-        let native = self.materialized_native_control_argv();
         let Some(outer) = &self.outer_launch else {
-            return native;
+            return self.materialized_native_control_argv();
         };
+        let native =
+            self.materialized_native_control_argv_at(Some(outer.inside_artifact_dir.as_path()));
         let mut argv = outer.fixed_argv.clone();
         argv.push("--".into());
-        argv.push(
-            self.executable
-                .canonical_path
-                .to_string_lossy()
-                .into_owned(),
-        );
+        argv.push(outer.inside_executable.to_string_lossy().into_owned());
         argv.extend(native);
         argv
     }
 
     pub(crate) fn materialized_native_control_argv(&self) -> Vec<String> {
+        self.materialized_native_control_argv_at(None)
+    }
+
+    fn materialized_native_control_argv_at(&self, artifact_dir: Option<&Path>) -> Vec<String> {
         let mut argv = self.fixed_argv.clone();
         match &self.schema_transport {
             SchemaTransport::None => {}
@@ -483,13 +502,25 @@ impl CommandSpec {
                 ..
             } => {
                 argv.push(argument.clone());
-                argv.push(relative_path.clone());
+                argv.push(
+                    artifact_dir
+                        .map(|root| root.join(relative_path).to_string_lossy().into_owned())
+                        .unwrap_or_else(|| relative_path.clone()),
+                );
             }
         }
         for output in &self.expected_outputs {
             if let Some(argument) = &output.output_argument {
                 argv.push(argument.clone());
-                argv.push(output.relative_path.clone());
+                argv.push(
+                    artifact_dir
+                        .map(|root| {
+                            root.join(&output.relative_path)
+                                .to_string_lossy()
+                                .into_owned()
+                        })
+                        .unwrap_or_else(|| output.relative_path.clone()),
+                );
             }
         }
         if let Some(argument) = &self.stdin_prompt_argument {
@@ -906,7 +937,7 @@ mod tests {
 
     fn control(_temp: &tempfile::TempDir, role: WorkerRole) -> TurnControl {
         TurnControl {
-            project_id: "project-1".into(),
+            run_id: "run-1".into(),
             task_id: "task-1".into(),
             role,
             logical_session_id: "logical-1".into(),
@@ -917,7 +948,7 @@ mod tests {
             review_round: 0,
             base_revision: std::iter::repeat_n('a', 40).collect(),
             head_revision: None,
-            artifact_dir: "project-1/task-1/developer/session-1/turn-1/attempt-1".into(),
+            artifact_dir: "run-1/task-1/developer/session-1/turn-1/attempt-1".into(),
         }
     }
 

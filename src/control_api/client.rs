@@ -1,5 +1,5 @@
 use super::codec::{read_response_frame, write_request_frame};
-use super::protocol::{ControlAction, ControlRequest, ControlResponse};
+use super::protocol::{ControlRequest, ControlResponse};
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(5);
-const FOLLOW_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone)]
 pub struct ControlClient {
@@ -37,15 +36,15 @@ impl ControlClient {
         stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT))?;
         stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT))?;
         write_request_frame(&mut stream, &payload)?;
-        stream.set_read_timeout(Some(response_timeout(&request.action)))?;
+        stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT))?;
         let response_frame = read_response_frame(&mut stream)?;
         let response: ControlResponse = serde_json::from_slice(&response_frame)
-            .context("control daemon returned malformed JSON")?;
+            .context("session supervisor returned malformed control JSON")?;
         response
             .validate()
-            .context("control daemon returned an invalid response")?;
+            .context("session supervisor returned an invalid control response")?;
         if response.request_id != request.request_id {
-            bail!("control daemon returned an invalid response envelope");
+            bail!("session supervisor returned an invalid control response envelope");
         }
         Ok(response)
     }
@@ -81,30 +80,5 @@ impl ControlClient {
             bail!("control socket parent is not private");
         }
         Ok(())
-    }
-}
-
-fn response_timeout(action: &ControlAction) -> Duration {
-    match action {
-        ControlAction::ProjectWait { max_wait_ms, .. } => {
-            Duration::from_millis(u64::from(*max_wait_ms)) + SOCKET_IO_TIMEOUT
-        }
-        ControlAction::ProjectLogs { follow: true, .. } => FOLLOW_RESPONSE_TIMEOUT,
-        _ => SOCKET_IO_TIMEOUT,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wait_timeout_includes_the_declared_observer_window() {
-        let action = ControlAction::ProjectWait {
-            project_id: "project-1".into(),
-            after_project_version: 1,
-            max_wait_ms: 30_000,
-        };
-        assert_eq!(response_timeout(&action), Duration::from_secs(35));
     }
 }

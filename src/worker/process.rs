@@ -1,4 +1,4 @@
-//! Linux no-TTY process lifecycle for one durable worker turn.
+//! Linux no-TTY process lifecycle for one foreground-session worker turn.
 
 use super::contract::NativeOutputKind;
 use super::{MaterializedWorkerEnvironment, NativeArtifacts, PreparedTurn, SchemaTransport};
@@ -102,6 +102,10 @@ impl ProcessRunner {
         let (command_spec, prompt) = prepared.into_parts();
         command_spec.validate()?;
         environment.require_exact(&command_spec.exact_environment)?;
+        let inside_artifact_dir = command_spec
+            .outer_launch
+            .as_ref()
+            .map(|outer| outer.inside_artifact_dir.as_path());
         let mut native_argv = command_spec.fixed_argv.clone();
         match &command_spec.schema_transport {
             SchemaTransport::None => {}
@@ -114,7 +118,10 @@ impl ProcessRunner {
                 relative_path,
                 contents,
             } => {
-                let path = attempt.write_control_file(relative_path, contents)?;
+                let host_path = attempt.write_control_file(relative_path, contents)?;
+                let path = inside_artifact_dir
+                    .map(|root| root.join(relative_path))
+                    .unwrap_or(host_path);
                 let path = path
                     .to_str()
                     .ok_or_else(|| anyhow!("adapter control path is not valid UTF-8"))?;
@@ -146,7 +153,9 @@ impl ProcessRunner {
                 )
             });
         if let Some((relative_path, argument, _)) = &final_output {
-            let output_path = attempt.directory_path().join(relative_path);
+            let output_path = inside_artifact_dir
+                .map(|root| root.join(relative_path))
+                .unwrap_or_else(|| attempt.directory_path().join(relative_path));
             let output_path = output_path
                 .to_str()
                 .ok_or_else(|| anyhow!("native final output path is not valid UTF-8"))?;
@@ -167,9 +176,8 @@ impl ProcessRunner {
                 let mut argv = outer.fixed_argv.clone();
                 argv.push("--".into());
                 argv.push(
-                    command_spec
-                        .executable
-                        .canonical_path
+                    outer
+                        .inside_executable
                         .to_str()
                         .ok_or_else(|| anyhow!("native executable path is not valid UTF-8"))?
                         .to_owned(),
@@ -185,7 +193,7 @@ impl ProcessRunner {
         let stderr_writer =
             attempt.start_native_stream(ArtifactKind::NativeStderr, MAX_NATIVE_ARTIFACT_BYTES)?;
         let mut activity = attempt.start_activity_log(MAX_ACTIVITY_ARTIFACT_BYTES)?;
-        activity.record("lifecycle", b"worker spawn starting after durable claim")?;
+        activity.record("lifecycle", b"worker spawn starting after in-memory claim")?;
 
         let expected_parent = std::process::id();
         let mut command = Command::new(&launch_executable.canonical_path);
@@ -206,7 +214,7 @@ impl ProcessRunner {
         }
         let mut child = command.spawn().with_context(|| {
             format!(
-                "failed to spawn durable worker {}",
+                "failed to spawn session worker {}",
                 launch_executable.canonical_path.display()
             )
         })?;
@@ -286,7 +294,18 @@ impl RunningWorker {
         &self.identity
     }
 
-    pub fn wait<F>(mut self, mut heartbeat: F) -> Result<ProcessCompletion>
+    pub fn wait<F>(self, mut heartbeat: F) -> Result<ProcessCompletion>
+    where
+        F: FnMut(&ProcessIdentity) -> Result<HeartbeatControl>,
+    {
+        self.wait_with_cancel(Arc::new(AtomicBool::new(false)), &mut heartbeat)
+    }
+
+    pub fn wait_with_cancel<F>(
+        mut self,
+        cancel: Arc<AtomicBool>,
+        mut heartbeat: F,
+    ) -> Result<ProcessCompletion>
     where
         F: FnMut(&ProcessIdentity) -> Result<HeartbeatControl>,
     {
@@ -346,6 +365,11 @@ impl RunningWorker {
                 }
                 let status = self.child.wait()?;
                 break status;
+            }
+            if cancel.load(Ordering::Acquire) && termination == WorkerTermination::Exited {
+                signal_owned_group(&self.identity, libc::SIGTERM)?;
+                termination = WorkerTermination::Canceled;
+                termination_started = Some(Instant::now());
             }
             if transport_failure.load(Ordering::Acquire) && termination == WorkerTermination::Exited
             {
@@ -776,7 +800,7 @@ mod tests {
         };
         let profile = adapter.profile(WorkerRole::Developer);
         let control = TurnControl {
-            project_id: "project-1".into(),
+            run_id: "run-1".into(),
             task_id: "task-1".into(),
             role: WorkerRole::Developer,
             logical_session_id: "session-1".into(),
@@ -787,7 +811,7 @@ mod tests {
             review_round: 0,
             base_revision: "a".repeat(40),
             head_revision: None,
-            artifact_dir: "project-1/task-1/developer/session-1/turn-1".into(),
+            artifact_dir: "run-1/task-1/developer/session-1/turn-1".into(),
         };
         let prepared = prepare_create_turn(&adapter, &profile, &control, prompt.clone()).unwrap();
         let artifact_root_path = temp.path().join("artifacts");
@@ -798,7 +822,7 @@ mod tests {
         let attempt = ArtifactAttempt::create(
             &root,
             ArtifactScope {
-                project_id: "project-1".into(),
+                run_id: "run-1".into(),
                 task_id: "task-1".into(),
                 role: WorkerRole::Developer,
                 logical_session_id: "session-1".into(),
@@ -814,7 +838,7 @@ mod tests {
                 "epoch-1",
                 &WorkerEnvironmentIdentity {
                     role: WorkerRole::Developer,
-                    project_id: "project-1".into(),
+                    run_id: "run-1".into(),
                     task_id: "task-1".into(),
                 },
             )
@@ -917,7 +941,7 @@ sleep 5
 "#,
         );
         let identity = worker.identity().clone();
-        let result = worker.wait(|_| Err(anyhow!("injected durable heartbeat failure")));
+        let result = worker.wait(|_| Err(anyhow!("injected session heartbeat failure")));
         assert!(result.is_err());
         assert!(
             process_birth_identity(identity.pid)
@@ -928,7 +952,7 @@ sleep 5
     }
 
     #[test]
-    fn final_file_path_is_daemon_materialized_and_securely_ingested() {
+    fn final_file_path_is_parent_materialized_and_securely_ingested() {
         let (_temp, worker, adapter, _prompt) = spawn_discovered_fake(
             r#"
 output=
@@ -986,7 +1010,7 @@ ln -s "$PWD/victim" "$output"
 
     fn developer_control(discovered: bool) -> TurnControl {
         TurnControl {
-            project_id: "project-1".into(),
+            run_id: "run-1".into(),
             task_id: "task-1".into(),
             role: WorkerRole::Developer,
             logical_session_id: "session-1".into(),
@@ -997,7 +1021,7 @@ ln -s "$PWD/victim" "$output"
             review_round: 0,
             base_revision: "a".repeat(40),
             head_revision: None,
-            artifact_dir: "project-1/task-1/developer/session-1/turn-1/attempt-1".into(),
+            artifact_dir: "run-1/task-1/developer/session-1/turn-1/attempt-1".into(),
         }
     }
 
@@ -1072,7 +1096,7 @@ done
     }
 
     #[test]
-    fn worker_dies_when_its_daemon_parent_exits() {
+    fn worker_dies_when_its_session_parent_exits() {
         const FLAG: &str = "HCOM_PDEATHSIG_PARENT_TEST";
         if std::env::var_os(FLAG).is_some() {
             let (_temp, worker, _adapter, _prompt) = spawn_fake(
@@ -1098,7 +1122,7 @@ sleep 30
         let report = isolated_tmp.path().join("worker-identity");
         let output = Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
-            .arg("worker::process::tests::worker_dies_when_its_daemon_parent_exits")
+            .arg("worker::process::tests::worker_dies_when_its_session_parent_exits")
             .env(FLAG, "1")
             .env("HCOM_PDEATHSIG_REPORT", &report)
             .env("TMPDIR", isolated_tmp.path())
@@ -1123,7 +1147,7 @@ sleep 30
             process_birth_identity(pid)
                 .map(|current| current != birth)
                 .unwrap_or(true),
-            "PDEATHSIG must terminate the worker after its daemon parent exits"
+            "PDEATHSIG must terminate the worker after its session parent exits"
         );
     }
 

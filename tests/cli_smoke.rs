@@ -89,7 +89,7 @@ fn top_level_help_preserves_retained_commands_and_omits_stale_commands() {
             "missing retained command {retained}: stdout={stdout}"
         );
     }
-    for stale in ["handoff", "chain"] {
+    for stale in ["handoff", "chain", "project"] {
         assert!(
             !commands.contains(&stale),
             "stale top-level command {stale} remains: stdout={stdout}"
@@ -103,7 +103,7 @@ fn stale_top_level_commands_are_unknown_without_opening_v24_state() {
     let db_path = h.path().join("hcom.db");
     assert!(!db_path.exists());
 
-    for stale in ["handoff", "chain"] {
+    for stale in ["handoff", "chain", "project"] {
         let (code, stdout, stderr) = h.run([stale, "--help"]);
         assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
         assert!(stdout.is_empty(), "stdout={stdout}");
@@ -129,10 +129,12 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     assert!(stdout.contains("hcom architect codex"), "stdout={stdout}");
     assert!(stdout.contains("--repo"), "stdout={stdout}");
-    assert!(stdout.contains("--project"), "stdout={stdout}");
+    assert!(!stdout.contains("--project"), "stdout={stdout}");
+    assert!(stdout.contains("in-memory session-task"), "stdout={stdout}");
+    assert!(stdout.contains("canonical checkout"), "stdout={stdout}");
     assert!(
         !db_path.exists(),
-        "durable architect help must not initialize retained v24 state"
+        "session architect help must not initialize retained v24 state"
     );
 }
 
@@ -150,7 +152,7 @@ fn architect_help_does_not_read_or_repair_malformed_v24_state() {
     assert_eq!(
         std::fs::read(&db_path).unwrap(),
         malformed,
-        "durable architect help must not read, migrate, or repair retained v24 state"
+        "session architect help must not read, migrate, or repair retained v24 state"
     );
 }
 
@@ -222,43 +224,6 @@ fn status_json_in_fresh_dir() {
         serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("status json: {e}\n{stdout}"));
     assert_eq!(v["hcom_dir"].as_str(), Some(h.path().to_str().unwrap()));
     assert_eq!(v["instances"]["total"], 0);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn malformed_store_v1_does_not_block_or_redirect_retained_v24_commands() {
-    use hcom::control_api::daemon::{ControlPaths, DaemonEndpoint};
-    use std::os::unix::fs::PermissionsExt;
-
-    let h = Hcom::new();
-    let durable = tempfile::tempdir().unwrap();
-    let state_root = durable.path().join("state/hcom-project-control");
-    let control_root = state_root.join("control-v1");
-    let runtime_root = durable.path().join("run/hcom-project-control");
-    std::fs::create_dir_all(&control_root).unwrap();
-    std::fs::create_dir_all(&runtime_root).unwrap();
-    for path in [&state_root, &control_root, &runtime_root] {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    let malformed_store = control_root.join("store.sqlite3");
-    let malformed_bytes = b"not-a-project-control-store";
-    std::fs::write(&malformed_store, malformed_bytes).unwrap();
-    std::fs::set_permissions(&malformed_store, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let paths = ControlPaths::new(
-        &state_root,
-        &runtime_root,
-        durable
-            .path()
-            .join("config/hcom-project-control/config.toml"),
-    );
-    assert!(DaemonEndpoint::bind(paths).is_err());
-
-    let (code, stdout, stderr) = h.run(["status", "--json"]);
-    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(status["hcom_dir"].as_str(), h.path().to_str());
-    assert!(h.path().join("hcom.db").exists());
-    assert_eq!(std::fs::read(&malformed_store).unwrap(), malformed_bytes);
 }
 
 #[test]

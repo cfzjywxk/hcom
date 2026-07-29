@@ -512,7 +512,7 @@ pub fn dispatch() -> anyhow::Result<()> {
 
     // Skip dev_root re-exec for `config dev_root` so a stale pointer can't
     // trap the user — the invoked binary owns its own dev_root setting. The
-    // durable architect lane is also independent of retained v24 state.
+    // The session-task architect lane is also independent of retained v24 state.
     if !is_config_dev_root_invocation(argv) && !matches!(&action, Action::Architect { .. }) {
         maybe_reexec_dev_root();
     }
