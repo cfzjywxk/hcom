@@ -51,6 +51,7 @@ const CLAUDE_EFFECTIVE_POLICY: &str =
     "native=bypassPermissions;outer=bubblewrap-0.9.0-reviewer-ro-v1";
 const CODEX_RESULT_SCHEMA_FILE: &str = "codex-reviewer-result-schema.json";
 const CODEX_FINAL_FILE: &str = "native-final.partial";
+const JSON_SCHEMA_DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
 const CODEX_AUTH_FILE: &str = "auth.json";
 const CLAUDE_AUTH_FILE: &str = ".credentials.json";
 const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -202,7 +203,7 @@ impl CodexReviewerAdapter {
             schema_transport: SchemaTransport::File {
                 argument: "--output-schema".into(),
                 relative_path: CODEX_RESULT_SCHEMA_FILE.into(),
-                contents: reviewer_result_schema(),
+                contents: codex_reviewer_result_schema(),
             },
             expected_outputs: vec![
                 OutputDeclaration {
@@ -492,7 +493,7 @@ impl ClaudeReviewerAdapter {
             fixed_argv,
             schema_transport: SchemaTransport::InlineArgument {
                 flag: "--json-schema".into(),
-                json: String::from_utf8(reviewer_result_schema())
+                json: String::from_utf8(claude_reviewer_result_schema())
                     .expect("static reviewer schema is UTF-8"),
             },
             expected_outputs: vec![OutputDeclaration {
@@ -700,9 +701,8 @@ fn validate_reported_checks(
     Ok(())
 }
 
-fn reviewer_result_schema() -> Vec<u8> {
-    serde_json::to_vec(&serde_json::json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
+fn reviewer_result_schema_shape() -> serde_json::Value {
+    serde_json::json!({
         "type": "object",
         "additionalProperties": false,
         "required": ["decision", "summary", "findings", "checks"],
@@ -738,8 +738,27 @@ fn reviewer_result_schema() -> Vec<u8> {
                 }
             }
         }
-    }))
-    .expect("static reviewer result schema is valid JSON")
+    })
+}
+
+fn codex_reviewer_result_schema() -> Vec<u8> {
+    let mut schema = reviewer_result_schema_shape();
+    schema
+        .as_object_mut()
+        .expect("static reviewer schema is an object")
+        .insert(
+            "$schema".into(),
+            serde_json::Value::String(JSON_SCHEMA_DRAFT_2020_12.into()),
+        );
+    serialize_reviewer_result_schema(&schema)
+}
+
+fn claude_reviewer_result_schema() -> Vec<u8> {
+    serialize_reviewer_result_schema(&reviewer_result_schema_shape())
+}
+
+fn serialize_reviewer_result_schema(schema: &serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(schema).expect("static reviewer result schema is valid JSON")
 }
 
 #[derive(Deserialize)]
@@ -1870,6 +1889,73 @@ mod tests {
     }
 
     #[test]
+    fn adapter_schema_declarations_share_one_strict_result_shape() {
+        let mut codex: serde_json::Value =
+            serde_json::from_slice(&codex_reviewer_result_schema()).unwrap();
+        let claude: serde_json::Value =
+            serde_json::from_slice(&claude_reviewer_result_schema()).unwrap();
+
+        assert_eq!(
+            codex.get("$schema"),
+            Some(&serde_json::Value::String(JSON_SCHEMA_DRAFT_2020_12.into()))
+        );
+        assert!(claude.get("$schema").is_none());
+        codex.as_object_mut().unwrap().remove("$schema");
+        assert_eq!(codex, claude);
+
+        assert_eq!(
+            claude.get("required"),
+            Some(&serde_json::json!([
+                "decision", "summary", "findings", "checks"
+            ]))
+        );
+        assert_eq!(
+            claude.get("additionalProperties"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        assert_eq!(
+            claude.pointer("/properties/findings/items/additionalProperties"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        assert_eq!(
+            claude.pointer("/properties/checks/items/additionalProperties"),
+            Some(&serde_json::Value::Bool(false))
+        );
+
+        let valid = serde_json::json!({
+            "decision": "lgtm",
+            "summary": "no blocking issue",
+            "findings": [],
+            "checks": []
+        });
+        assert!(ReviewerResult::parse(&serde_json::to_vec(&valid).unwrap()).is_ok());
+
+        let mut unknown = valid.clone();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".into(), true.into());
+        assert!(ReviewerResult::parse(&serde_json::to_vec(&unknown).unwrap()).is_err());
+
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove("checks");
+        assert!(ReviewerResult::parse(&serde_json::to_vec(&missing).unwrap()).is_err());
+
+        let nested_unknown = serde_json::json!({
+            "decision": "lgtm",
+            "summary": "no blocking issue",
+            "findings": [],
+            "checks": [{
+                "command": "git diff --check",
+                "status": "passed",
+                "summary": "clean",
+                "unexpected": true
+            }]
+        });
+        assert!(ReviewerResult::parse(&serde_json::to_vec(&nested_unknown).unwrap()).is_err());
+    }
+
+    #[test]
     fn exact_profiles_fake_create_and_same_task_snapshot_refresh_resume_are_closed() {
         let fixture = Fixture::new();
         let prompt = b"review only the exact approved base and head";
@@ -2612,6 +2698,7 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 [ -n "$output" ] && [ -s "$schema" ]
+grep -q '"\$schema":"https://json-schema.org/draft/2020-12/schema"' "$schema"
 prompt=$(sed -n '1,$p')
 [ -n "$prompt" ]
 printf '{"type":"thread.started","thread_id":"%s"}\n' "$session"
@@ -2640,16 +2727,26 @@ fi
 [ "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC-}" = 1 ]
 [ "${CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION-}" = false ]
 session=
+schema=
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --session-id|--resume)
             shift
             session="$1"
             ;;
+        --json-schema)
+            shift
+            schema="$1"
+            ;;
     esac
     shift
 done
-[ -n "$session" ]
+[ -n "$session" ] && [ -n "$schema" ]
+if printf '%s' "$schema" | grep -q '"\$schema"'; then
+    exit 91
+fi
+printf '%s' "$schema" | grep -q '"additionalProperties":false'
+printf '%s' "$schema" | grep -q '"required":\["decision","summary","findings","checks"\]'
 prompt=$(sed -n '1,$p')
 [ -n "$prompt" ]
 printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","structured_output":{"decision":"lgtm","summary":"fake exact Claude review passed","findings":[],"checks":[]},"modelUsage":{"claude-opus-5":{}}}\n' "$session"
