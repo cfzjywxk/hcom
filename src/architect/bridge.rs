@@ -15,6 +15,7 @@ use crate::control_api::supervisor::ControlPaths;
 use crate::control_api::{CallerAuth, ControlRequest, ControlResponse};
 use crate::worker::ExecutableIdentity;
 use crate::worker::contract::validate_native_session_id;
+use crate::worker::sandbox::INSIDE_WORKSPACE;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -461,8 +462,7 @@ fn handle_tool_call(
         )
         .context("invalid typed tool call")?;
         let action = control_action(&params.name, params.arguments)?;
-        let observed =
-            discover_codex_native_session(&configuration.codex_home, &configuration.repo_root)?;
+        let observed = discover_codex_native_session(&configuration.codex_home)?;
         match native_session_id {
             Some(expected) if expected != &observed => {
                 bail!("architect native session changed inside one live binding")
@@ -537,7 +537,7 @@ fn handle_tool_call(
     }
 }
 
-fn discover_codex_native_session(codex_home: &Path, repo_root: &Path) -> Result<String> {
+fn discover_codex_native_session(codex_home: &Path) -> Result<String> {
     let sessions = codex_home.join("sessions");
     let mut files = Vec::new();
     let mut entries = 0;
@@ -574,11 +574,14 @@ fn discover_codex_native_session(codex_home: &Path, repo_root: &Path) -> Result<
     }
     let metadata: CodexSessionMetadata =
         serde_json::from_slice(trim_line(&first_line)).context("invalid Codex session metadata")?;
+    // Codex runs inside the empty-root mount namespace. Its machine record must
+    // therefore bind the exact namespace-local workspace path, not the host
+    // repository path mounted there by the already-validated sandbox contract.
     if metadata.kind != "session_meta"
-        || metadata.payload.cwd != repo_root
+        || metadata.payload.cwd != Path::new(INSIDE_WORKSPACE)
         || metadata.payload.cli_version != "0.145.0"
     {
-        bail!("architect native session metadata does not match the bound repository");
+        bail!("architect native session metadata does not match the exact workspace");
     }
     let id = Uuid::parse_str(&metadata.payload.id)
         .context("architect native session id is not a canonical UUID")?
@@ -1030,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn native_session_requires_one_exact_machine_record() {
+    fn native_session_requires_one_exact_namespace_local_machine_record() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
         let codex = temp.path().join("codex");
@@ -1043,18 +1046,36 @@ mod tests {
             &path,
             format!(
                 "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{},\"cli_version\":\"0.145.0\",\"originator\":\"codex_cli_rs\"}}}}\n",
+                serde_json::to_string(INSIDE_WORKSPACE).unwrap()
+            ),
+        )
+        .unwrap();
+        assert_eq!(discover_codex_native_session(&codex).unwrap(), id);
+
+        fs::write(
+            &path,
+            format!(
+                "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{},\"cli_version\":\"0.145.0\",\"originator\":\"codex_cli_rs\"}}}}\n",
                 serde_json::to_string(&repo).unwrap()
             ),
         )
         .unwrap();
-        assert_eq!(discover_codex_native_session(&codex, &repo).unwrap(), id);
+        assert!(discover_codex_native_session(&codex).is_err());
+        fs::write(
+            &path,
+            format!(
+                "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{},\"cli_version\":\"0.145.0\",\"originator\":\"codex_cli_rs\"}}}}\n",
+                serde_json::to_string(INSIDE_WORKSPACE).unwrap()
+            ),
+        )
+        .unwrap();
 
         fs::write(
             sessions.join("rollout-other-019fa976-e270-7a92-b5f0-6d3d8a0ad3f5.jsonl"),
             "{}\n",
         )
         .unwrap();
-        assert!(discover_codex_native_session(&codex, &repo).is_err());
+        assert!(discover_codex_native_session(&codex).is_err());
     }
 
     #[test]
