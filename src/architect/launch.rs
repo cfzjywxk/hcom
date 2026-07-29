@@ -70,6 +70,14 @@ struct ArchitectArgs {
     approval: String,
 }
 
+fn create_private_session_runtime() -> Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix("hcom-architect-session.")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in("/tmp")
+        .context("failed to create private architect-session runtime")
+}
+
 pub(super) fn run_cli(argv: &[String]) -> Result<i32> {
     let args = ArchitectArgs::try_parse_from(
         std::iter::once("hcom architect".to_owned()).chain(argv.iter().skip(1).cloned()),
@@ -79,10 +87,7 @@ pub(super) fn run_cli(argv: &[String]) -> Result<i32> {
 
     let repository = canonical_repository(&args.repo)?;
     let native_environment = ArchitectEnvironment::capture()?;
-    let session_root = tempfile::Builder::new()
-        .prefix("hcom-architect-session.")
-        .tempdir_in("/tmp")
-        .context("failed to create private architect-session runtime")?;
+    let session_root = create_private_session_runtime()?;
     let run_root = fs::canonicalize(session_root.path())?;
     let lock_root = native_environment
         .runtime_home
@@ -1522,6 +1527,47 @@ mod tests {
     use std::os::unix::process::CommandExt;
 
     const BLANK_HELPER_ROOT: &str = "HCOM_PHASE7_BLANK_HELPER_ROOT";
+    const RUNTIME_MODE_HELPER: &str = "HCOM_PHASE9_RUNTIME_MODE_HELPER";
+
+    #[test]
+    fn session_runtime_helper_process() {
+        if std::env::var_os(RUNTIME_MODE_HELPER).is_none() {
+            return;
+        }
+        // SAFETY: this exact-filtered helper runs in its own disposable process,
+        // so changing its process-global umask cannot race another test.
+        unsafe {
+            libc::umask(0o002);
+        }
+        let runtime = create_private_session_runtime().unwrap();
+        assert_eq!(
+            fs::symlink_metadata(runtime.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn session_runtime_is_private_under_a_permissive_parent_umask() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "architect::launch::tests::session_runtime_helper_process",
+                "--nocapture",
+            ])
+            .env(RUNTIME_MODE_HELPER, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "runtime mode helper failed: {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn kernel_nonce_is_csprng_shaped_and_not_reused() {
