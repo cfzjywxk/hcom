@@ -11,6 +11,13 @@ pub(crate) struct PeerCredentials {
     pub(crate) gid: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcessExecutableIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) size: u64,
+}
+
 pub(crate) fn peer_credentials(stream: &UnixStream) -> Result<PeerCredentials> {
     let mut credentials = libc::ucred {
         pid: 0,
@@ -97,17 +104,25 @@ pub(crate) fn process_has_ancestor(pid: u32, roots: &[(u32, String)]) -> Result<
     bail!("process ancestry exceeds its bounded depth")
 }
 
-pub(crate) fn process_executable_path(pid: u32) -> Result<std::path::PathBuf> {
+pub(crate) fn process_executable_identity(pid: u32) -> Result<ProcessExecutableIdentity> {
     let before = process_birth_identity(pid)?;
-    let link = fs::read_link(format!("/proc/{pid}/exe"))
-        .with_context(|| format!("failed to resolve executable for PID {pid}"))?;
-    let canonical = fs::canonicalize(&link)
-        .with_context(|| format!("failed to canonicalize executable for PID {pid}"))?;
+    // Inspect the procfs magic link itself. Its textual target is expressed in
+    // the peer's mount namespace and therefore cannot safely be canonicalized
+    // in this process's mount namespace.
+    let metadata = fs::metadata(format!("/proc/{pid}/exe"))
+        .with_context(|| format!("failed to inspect executable for PID {pid}"))?;
+    if !metadata.is_file() {
+        bail!("process executable is not a regular file");
+    }
     let after = process_birth_identity(pid)?;
     if before != after {
-        bail!("process identity changed while resolving its executable");
+        bail!("process identity changed while inspecting its executable");
     }
-    Ok(canonical)
+    Ok(ProcessExecutableIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.len(),
+    })
 }
 
 pub(crate) fn process_is_live_identity(pid: u32, expected_birth: &str) -> Result<bool> {

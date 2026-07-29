@@ -4,8 +4,8 @@ use crate::control_api::codec::{
     read_request_frame, read_response_frame, write_request_frame, write_response_frame,
 };
 use crate::control_api::peer::{
-    peer_credentials, process_birth_identity, process_executable_path, process_has_ancestor,
-    process_is_live_identity,
+    ProcessExecutableIdentity, peer_credentials, process_birth_identity,
+    process_executable_identity, process_has_ancestor, process_is_live_identity,
 };
 use crate::control_api::protocol::PROTOCOL_VERSION;
 use crate::control_api::registration::{
@@ -345,17 +345,33 @@ fn authorize_relay_peer(
     )? {
         bail!("architect relay peer is outside the registered architect tree");
     }
-    if process_executable_path(peer.pid)? != configuration.relay_executable.canonical_path {
-        bail!("architect relay executable path mismatch");
+    configuration.relay_executable.revalidate()?;
+    let peer_executable = process_executable_identity(peer.pid)?;
+    if !relay_executable_matches(&peer_executable, &configuration.relay_executable) {
+        bail!("architect relay executable identity mismatch");
     }
     if process_birth_identity(peer.pid)? != peer_birth
         || process_birth_identity(activation.architect_pid)? != activation.architect_process_birth
         || process_birth_identity(activation.bridge_pid)? != activation.bridge_process_birth
-        || process_executable_path(peer.pid)? != configuration.relay_executable.canonical_path
     {
         bail!("architect relay process identity changed during authorization");
     }
+    let final_peer_executable = process_executable_identity(peer.pid)?;
+    if final_peer_executable != peer_executable
+        || !relay_executable_matches(&final_peer_executable, &configuration.relay_executable)
+    {
+        bail!("architect relay executable identity changed during authorization");
+    }
     configuration.relay_executable.revalidate()
+}
+
+fn relay_executable_matches(
+    observed: &ProcessExecutableIdentity,
+    expected: &ExecutableIdentity,
+) -> bool {
+    observed.device == expected.device
+        && observed.inode == expected.inode
+        && observed.size == expected.size
 }
 
 fn serve_mcp_connection(
@@ -841,6 +857,150 @@ struct CodexSessionPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    const RELAY_NAMESPACE_HELPER: &str = "HCOM_PHASE9_RELAY_NAMESPACE_HELPER";
+
+    #[test]
+    fn relay_mount_namespace_helper_process() {
+        let Some(socket) = std::env::var_os(RELAY_NAMESPACE_HELPER) else {
+            return;
+        };
+        let mut stream = UnixStream::connect(PathBuf::from(socket)).unwrap();
+        let mut release = [0u8; 1];
+        stream.read_exact(&mut release).unwrap();
+        assert_eq!(release, [1]);
+    }
+
+    #[test]
+    fn relay_authorization_accepts_exact_executable_from_private_mount_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_path = root.join("relay-test.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let executable_path = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let executable = ExecutableIdentity::capture(&executable_path).unwrap();
+        let process_birth = process_birth_identity(std::process::id()).unwrap();
+        let configuration = BridgeConfiguration {
+            binding_id: "binding-namespace-test".into(),
+            launch_nonce: "launch-nonce-namespace-test".into(),
+            capability: "capability-namespace-test".into(),
+            repo_root: root.clone(),
+            run_root: root.clone(),
+            lock_root: root.clone(),
+            relay_socket_path: socket_path.clone(),
+            registration_socket_path: root.join("registration.sock"),
+            control_socket_path: root.join("control.sock"),
+            codex_home: root.clone(),
+            relay_executable: executable,
+            relay_runtime_scope_hash: "unused-by-authorization".into(),
+        };
+        let activation = BridgeActivation {
+            architect_pid: std::process::id(),
+            architect_process_birth: process_birth.clone(),
+            bridge_pid: std::process::id(),
+            bridge_process_birth: process_birth,
+            binding_version: 1,
+        };
+
+        let inside_control = Path::new("/tmp/hcom-phase9-relay-control");
+        let inside_socket = inside_control.join("relay-test.sock");
+        let inside_executable = Path::new("/tmp/hcom-phase9-relay-executable");
+        assert!(
+            !inside_executable.exists(),
+            "namespace-only executable alias unexpectedly exists on the host"
+        );
+        let mut child = Command::new(crate::worker::codex::BWRAP_EXECUTABLE);
+        child
+            .args([
+                "--die-with-parent",
+                "--ro-bind",
+                "/",
+                "/",
+                "--tmpfs",
+                "/tmp",
+            ])
+            .arg("--ro-bind")
+            .arg(&root)
+            .arg(inside_control)
+            .arg("--ro-bind")
+            .arg(&executable_path)
+            .arg(inside_executable)
+            .args(["--clearenv", "--setenv"])
+            .arg(RELAY_NAMESPACE_HELPER)
+            .arg(&inside_socket)
+            .arg("--")
+            .arg(inside_executable)
+            .args([
+                "--exact",
+                "architect::bridge::tests::relay_mount_namespace_helper_process",
+                "--nocapture",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = child.spawn().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        let output = child.wait_with_output().unwrap();
+                        panic!(
+                            "mount-namespace relay helper exited before connect: {status}\n{}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    if Instant::now() >= deadline {
+                        child.kill().unwrap();
+                        let output = child.wait_with_output().unwrap();
+                        panic!(
+                            "mount-namespace relay helper timed out before connect\n{}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "failed to accept mount-namespace relay helper: {error}\n{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+        };
+
+        let observation = (|| -> Result<PathBuf> {
+            let peer = peer_credentials(&stream)?;
+            let namespace_path = fs::read_link(format!("/proc/{}/exe", peer.pid))?;
+            authorize_relay_peer(&stream, &configuration, &activation)?;
+            Ok(namespace_path)
+        })();
+
+        let release = (&stream).write_all(&[1]);
+        drop(stream);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "mount-namespace relay helper failed: {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        release.unwrap();
+        let namespace_path = observation.unwrap();
+        assert_eq!(namespace_path, inside_executable);
+        assert!(
+            fs::canonicalize(&namespace_path).is_err(),
+            "namespace-only executable path unexpectedly resolves on the host"
+        );
+    }
 
     #[test]
     fn native_session_requires_one_exact_machine_record() {
