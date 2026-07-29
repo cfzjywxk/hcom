@@ -154,10 +154,13 @@ impl FakeWorkerAdapter {
             fixed_argv,
             schema_transport,
             expected_outputs: vec![output],
+            stdin_prompt_argument: None,
             workspace_cwd: match role {
                 WorkerRole::Developer => self.developer_workspace.clone(),
                 WorkerRole::Reviewer => self.reviewer_workspace.clone(),
             },
+            outer_launch: None,
+            exact_environment: vec![],
         }
     }
 }
@@ -206,7 +209,15 @@ impl WorkerAdapter for FakeWorkerAdapter {
         })
     }
 
-    fn extract_result(&self, artifacts: &NativeArtifacts) -> Result<NativeResult> {
+    fn extract_result(
+        &self,
+        control: &TurnControl,
+        artifacts: &NativeArtifacts,
+    ) -> Result<NativeResult> {
+        control.validate()?;
+        if control.role != artifacts.role() {
+            bail!("fake result artifacts do not match the exact turn role");
+        }
         let bytes = match self.descriptor.capabilities.result_transport {
             ResultTransport::Envelope => artifacts.stdout(),
             ResultTransport::FinalFile => artifacts
@@ -304,7 +315,12 @@ mod tests {
             None,
         )
         .unwrap();
-        let result = preassigned.extract_result(&artifacts).unwrap();
+        let result = preassigned
+            .extract_result(
+                &control(WorkerRole::Developer, Some("native-preassigned")),
+                &artifacts,
+            )
+            .unwrap();
         assert_eq!(result.native_session_id(), "native-preassigned");
 
         let discovered = FakeWorkerAdapter::discovered(executable(&temp), cwd).unwrap();
@@ -325,7 +341,9 @@ mod tests {
             Some(serde_json::to_vec(&reviewer).unwrap()),
         )
         .unwrap();
-        let result = discovered.extract_result(&artifacts).unwrap();
+        let result = discovered
+            .extract_result(&control(WorkerRole::Reviewer, None), &artifacts)
+            .unwrap();
         assert_eq!(result.native_session_id(), "native-discovered");
     }
 
@@ -351,11 +369,22 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(envelope.extract_result(&artifacts).is_err());
+        assert!(
+            envelope
+                .extract_result(
+                    &control(WorkerRole::Developer, Some("native-preassigned")),
+                    &artifacts
+                )
+                .is_err()
+        );
 
         let final_file = FakeWorkerAdapter::discovered(executable(&temp), cwd).unwrap();
         let missing = NativeArtifacts::new(WorkerRole::Reviewer, vec![], vec![], None).unwrap();
-        assert!(final_file.extract_result(&missing).is_err());
+        assert!(
+            final_file
+                .extract_result(&control(WorkerRole::Reviewer, None), &missing)
+                .is_err()
+        );
 
         let unknown = br#"{"type":"session_started","session_id":"native-1","extra":true}"#;
         assert!(final_file.observe_native_record(unknown).is_err());
@@ -387,7 +416,14 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(envelope.extract_result(&duplicate).is_err());
+        assert!(
+            envelope
+                .extract_result(
+                    &control(WorkerRole::Developer, Some("native-preassigned")),
+                    &duplicate
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -485,6 +521,23 @@ mod tests {
                 )
                 .is_err()
             );
+        }
+    }
+
+    fn control(role: WorkerRole, native_session_id: Option<&str>) -> TurnControl {
+        TurnControl {
+            project_id: "project-1".into(),
+            task_id: "task-1".into(),
+            role,
+            logical_session_id: "logical-1".into(),
+            native_session_id: native_session_id.map(str::to_owned),
+            turn_sequence: 1,
+            attempt: 1,
+            task_version: 1,
+            review_round: if role == WorkerRole::Reviewer { 1 } else { 0 },
+            base_revision: "a".repeat(40),
+            head_revision: (role == WorkerRole::Reviewer).then(|| "b".repeat(40)),
+            artifact_dir: "project-1/task-1/developer/logical-1/turn-1/attempt-1".into(),
         }
     }
 }

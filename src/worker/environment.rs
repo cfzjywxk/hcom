@@ -224,6 +224,51 @@ impl MaterializedWorkerEnvironment {
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str()))
     }
+
+    pub(crate) fn require_exact(&self, requirements: &[ExactEnvironmentRequirement]) -> Result<()> {
+        let mut previous = None;
+        for requirement in requirements {
+            requirement.validate()?;
+            if previous.is_some_and(|name| name >= requirement.name.as_str()) {
+                bail!("exact environment requirements must use unique canonical order");
+            }
+            previous = Some(requirement.name.as_str());
+            if self.values.get(&requirement.name) != Some(&requirement.value) {
+                bail!("materialized worker environment does not match its exact path contract");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExactEnvironmentRequirement {
+    name: String,
+    value: String,
+}
+
+impl ExactEnvironmentRequirement {
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Result<Self> {
+        let requirement = Self {
+            name: name.into(),
+            value: value.into(),
+        };
+        requirement.validate()?;
+        Ok(requirement)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_environment_name(&self.name)?;
+        validate_environment_value(&self.name, &self.value)
+    }
 }
 
 pub(crate) struct SecretRedactor {
@@ -564,6 +609,57 @@ mod tests {
         assert_eq!(values["HCOM_TASK_ID"], "task-2");
         assert!(!values.contains_key("HCOM_AGENT"));
         assert!(!values.contains_key("TERM_PROGRAM"));
+    }
+
+    #[test]
+    fn exact_environment_requirements_reject_missing_drift_and_ambiguous_order() {
+        let names = vec![
+            "CODEX_HOME".into(),
+            "HOME".into(),
+            "PATH".into(),
+            "TMPDIR".into(),
+            "XDG_RUNTIME_DIR".into(),
+        ];
+        let lease = ExecutionEnvironmentLease::capture(
+            "lease-1",
+            "epoch-1",
+            &EnvironmentPolicy::new(names.clone(), names).unwrap(),
+            vec![
+                ("CODEX_HOME".into(), "/isolated/codex".into()),
+                ("HOME".into(), "/isolated/home".into()),
+                ("PATH".into(), "/usr/bin".into()),
+                ("TMPDIR".into(), "/isolated/tmp".into()),
+                ("XDG_RUNTIME_DIR".into(), "/run/user/1000".into()),
+            ],
+        )
+        .unwrap();
+        let materialized = lease
+            .materialize(
+                "epoch-1",
+                &WorkerEnvironmentIdentity {
+                    role: WorkerRole::Developer,
+                    project_id: "project-1".into(),
+                    task_id: "task-1".into(),
+                },
+            )
+            .unwrap();
+        let exact = vec![
+            ExactEnvironmentRequirement::new("CODEX_HOME", "/isolated/codex").unwrap(),
+            ExactEnvironmentRequirement::new("HOME", "/isolated/home").unwrap(),
+            ExactEnvironmentRequirement::new("TMPDIR", "/isolated/tmp").unwrap(),
+            ExactEnvironmentRequirement::new("XDG_RUNTIME_DIR", "/run/user/1000").unwrap(),
+        ];
+        materialized.require_exact(&exact).unwrap();
+
+        let drifted = vec![ExactEnvironmentRequirement::new("HOME", "/different/home").unwrap()];
+        assert!(materialized.require_exact(&drifted).is_err());
+        let missing = vec![ExactEnvironmentRequirement::new("LC_ALL", "C.UTF-8").unwrap()];
+        assert!(materialized.require_exact(&missing).is_err());
+        let unordered = vec![
+            ExactEnvironmentRequirement::new("HOME", "/isolated/home").unwrap(),
+            ExactEnvironmentRequirement::new("CODEX_HOME", "/isolated/codex").unwrap(),
+        ];
+        assert!(materialized.require_exact(&unordered).is_err());
     }
 
     #[test]

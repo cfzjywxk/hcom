@@ -2,6 +2,8 @@
 
 pub(crate) mod validation;
 
+#[cfg(target_os = "linux")]
+pub mod codex;
 pub mod contract;
 pub mod environment;
 pub mod fake;
@@ -11,13 +13,13 @@ pub mod result;
 
 pub use contract::{
     AdapterCapabilities, AdapterDescriptor, CommandSpec, ExecutableIdentity, NativeArtifacts,
-    NativeObservation, NativeResult, NativeSessionBinding, OutputDeclaration, PreparedTurn,
-    ResultTransport, SchemaTransport, TurnControl, WorkerAdapter, WorkerAdapterRegistry,
-    WorkerProfile, prepare_create_turn, prepare_resume_turn,
+    NativeObservation, NativeResult, NativeSessionBinding, OuterLaunchEnvelope, OutputDeclaration,
+    PreparedTurn, ResultTransport, SchemaTransport, TurnControl, WorkerAdapter,
+    WorkerAdapterRegistry, WorkerProfile, prepare_create_turn, prepare_resume_turn,
 };
 pub use environment::{
-    EnvironmentLeaseDescriptor, EnvironmentPolicy, ExecutionEnvironmentLease,
-    MaterializedWorkerEnvironment, WorkerEnvironmentIdentity,
+    EnvironmentLeaseDescriptor, EnvironmentPolicy, ExactEnvironmentRequirement,
+    ExecutionEnvironmentLease, MaterializedWorkerEnvironment, WorkerEnvironmentIdentity,
 };
 #[cfg(target_os = "linux")]
 pub use process::{

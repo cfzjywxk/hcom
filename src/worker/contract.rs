@@ -1,3 +1,4 @@
+use super::environment::ExactEnvironmentRequirement;
 use super::result::{DeveloperResult, ReviewerResult};
 use super::validation::{
     MAX_PATH_BYTES, validate_git_oid, validate_list, validate_opaque_id, validate_relative_path,
@@ -345,28 +346,42 @@ pub struct OutputDeclaration {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+pub struct OuterLaunchEnvelope {
+    pub executable: ExecutableIdentity,
+    pub fixed_argv: Vec<String>,
+    pub expected_artifact_dir: PathBuf,
+}
+
+impl OuterLaunchEnvelope {
+    fn validate(&self) -> Result<()> {
+        self.executable.revalidate()?;
+        validate_argv("outer launch argv", &self.fixed_argv)?;
+        if self.fixed_argv.iter().any(|argument| argument == "--") {
+            bail!("outer launch argv cannot contain the native command separator");
+        }
+        validate_absolute_lexical_path(
+            "outer launch expected artifact directory",
+            &self.expected_artifact_dir,
+        )
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct CommandSpec {
     pub executable: ExecutableIdentity,
     pub fixed_argv: Vec<String>,
     pub schema_transport: SchemaTransport,
     pub expected_outputs: Vec<OutputDeclaration>,
+    pub stdin_prompt_argument: Option<String>,
     pub workspace_cwd: PathBuf,
+    pub outer_launch: Option<OuterLaunchEnvelope>,
+    pub exact_environment: Vec<ExactEnvironmentRequirement>,
 }
 
 impl CommandSpec {
     pub fn validate(&self) -> Result<()> {
         self.executable.revalidate()?;
-        validate_list("fixed argv", &self.fixed_argv)?;
-        let mut total_argv = 0usize;
-        for argument in &self.fixed_argv {
-            validate_text("fixed argument", argument, MAX_ARG_BYTES, false)?;
-            total_argv = total_argv
-                .checked_add(argument.len())
-                .ok_or_else(|| anyhow::anyhow!("fixed argv length overflow"))?;
-        }
-        if total_argv > MAX_ARGV_BYTES {
-            bail!("fixed argv exceeds its aggregate bound");
-        }
+        validate_argv("fixed argv", &self.fixed_argv)?;
         match &self.schema_transport {
             SchemaTransport::None => {}
             SchemaTransport::InlineArgument { flag, json } => {
@@ -407,6 +422,9 @@ impl CommandSpec {
                 bail!("expected output kinds and paths must be unique");
             }
         }
+        if let Some(argument) = &self.stdin_prompt_argument {
+            validate_text("stdin prompt argument", argument, 128, false)?;
+        }
         let cwd = self
             .workspace_cwd
             .to_str()
@@ -418,10 +436,40 @@ impl CommandSpec {
         {
             bail!("worker cwd must be an existing canonical directory");
         }
+        if let Some(outer) = &self.outer_launch {
+            outer.validate()?;
+            if outer.executable == self.executable {
+                bail!("outer launch executable must be distinct from the native executable");
+            }
+        }
+        let mut previous = None;
+        for requirement in &self.exact_environment {
+            if previous.is_some_and(|name| name >= requirement.name()) {
+                bail!("exact environment requirements must use unique canonical order");
+            }
+            previous = Some(requirement.name());
+        }
         Ok(())
     }
 
     pub fn materialized_control_argv(&self) -> Vec<String> {
+        let native = self.materialized_native_control_argv();
+        let Some(outer) = &self.outer_launch else {
+            return native;
+        };
+        let mut argv = outer.fixed_argv.clone();
+        argv.push("--".into());
+        argv.push(
+            self.executable
+                .canonical_path
+                .to_string_lossy()
+                .into_owned(),
+        );
+        argv.extend(native);
+        argv
+    }
+
+    pub(crate) fn materialized_native_control_argv(&self) -> Vec<String> {
         let mut argv = self.fixed_argv.clone();
         match &self.schema_transport {
             SchemaTransport::None => {}
@@ -443,6 +491,9 @@ impl CommandSpec {
                 argv.push(argument.clone());
                 argv.push(output.relative_path.clone());
             }
+        }
+        if let Some(argument) = &self.stdin_prompt_argument {
+            argv.push(argument.clone());
         }
         argv
     }
@@ -667,7 +718,11 @@ pub trait WorkerAdapter: Send + Sync {
     fn build_create(&self, control: &TurnControl) -> Result<CommandSpec>;
     fn build_resume(&self, native_session_id: &str, control: &TurnControl) -> Result<CommandSpec>;
     fn observe_native_record(&self, record: &[u8]) -> Result<Vec<NativeObservation>>;
-    fn extract_result(&self, artifacts: &NativeArtifacts) -> Result<NativeResult>;
+    fn extract_result(
+        &self,
+        control: &TurnControl,
+        artifacts: &NativeArtifacts,
+    ) -> Result<NativeResult>;
 }
 
 #[derive(Default)]
@@ -773,6 +828,35 @@ fn validate_json_schema(bytes: &[u8]) -> Result<()> {
         serde_json::from_slice(bytes).context("adapter schema is not valid JSON")?;
     if !value.is_object() {
         bail!("adapter schema must be a JSON object");
+    }
+    Ok(())
+}
+
+fn validate_argv(label: &str, argv: &[String]) -> Result<()> {
+    validate_list(label, argv)?;
+    let mut total = 0usize;
+    for argument in argv {
+        validate_text(label, argument, MAX_ARG_BYTES, false)?;
+        total = total
+            .checked_add(argument.len())
+            .ok_or_else(|| anyhow::anyhow!("{label} length overflow"))?;
+    }
+    if total > MAX_ARGV_BYTES {
+        bail!("{label} exceeds its aggregate bound");
+    }
+    Ok(())
+}
+
+fn validate_absolute_lexical_path(label: &str, path: &Path) -> Result<()> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("{label} must be valid UTF-8"))?;
+    validate_text(label, text, MAX_PATH_BYTES, false)?;
+    let mut components = path.components();
+    if !matches!(components.next(), Some(std::path::Component::RootDir))
+        || !components.all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("{label} must be an absolute normalized path");
     }
     Ok(())
 }

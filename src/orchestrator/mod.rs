@@ -571,7 +571,7 @@ impl DurableScheduler {
             }
         }
         let native_result = adapter
-            .extract_result(&completion.artifacts)
+            .extract_result(&control, &completion.artifacts)
             .context("worker result does not satisfy its adapter contract");
         let native = post_turn_result(
             &mut self.store,

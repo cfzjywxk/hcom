@@ -100,12 +100,14 @@ impl ProcessRunner {
             bail!("worker role does not match its artifact attempt");
         }
         let (command_spec, prompt) = prepared.into_parts();
-        let mut argv = command_spec.fixed_argv.clone();
+        command_spec.validate()?;
+        environment.require_exact(&command_spec.exact_environment)?;
+        let mut native_argv = command_spec.fixed_argv.clone();
         match &command_spec.schema_transport {
             SchemaTransport::None => {}
             SchemaTransport::InlineArgument { flag, json } => {
-                argv.push(flag.clone());
-                argv.push(json.clone());
+                native_argv.push(flag.clone());
+                native_argv.push(json.clone());
             }
             SchemaTransport::File {
                 argument,
@@ -116,8 +118,8 @@ impl ProcessRunner {
                 let path = path
                     .to_str()
                     .ok_or_else(|| anyhow!("adapter control path is not valid UTF-8"))?;
-                argv.push(argument.clone());
-                argv.push(path.to_owned());
+                native_argv.push(argument.clone());
+                native_argv.push(path.to_owned());
             }
         }
         let stdout_cap = command_spec
@@ -148,9 +150,35 @@ impl ProcessRunner {
             let output_path = output_path
                 .to_str()
                 .ok_or_else(|| anyhow!("native final output path is not valid UTF-8"))?;
-            argv.push(argument.clone());
-            argv.push(output_path.to_owned());
+            native_argv.push(argument.clone());
+            native_argv.push(output_path.to_owned());
         }
+        if let Some(argument) = &command_spec.stdin_prompt_argument {
+            native_argv.push(argument.clone());
+        }
+        let (launch_executable, argv) = match &command_spec.outer_launch {
+            Some(outer) => {
+                if outer.expected_artifact_dir != attempt.directory_path()
+                    || fs::canonicalize(&outer.expected_artifact_dir)?
+                        != outer.expected_artifact_dir
+                {
+                    bail!("outer launch artifact mount does not match the exact attempt");
+                }
+                let mut argv = outer.fixed_argv.clone();
+                argv.push("--".into());
+                argv.push(
+                    command_spec
+                        .executable
+                        .canonical_path
+                        .to_str()
+                        .ok_or_else(|| anyhow!("native executable path is not valid UTF-8"))?
+                        .to_owned(),
+                );
+                argv.extend(native_argv);
+                (&outer.executable, argv)
+            }
+            None => (&command_spec.executable, native_argv),
+        };
 
         let stdout_writer =
             attempt.start_native_stream(ArtifactKind::NativeStdout, stdout_cap as u64)?;
@@ -160,7 +188,7 @@ impl ProcessRunner {
         activity.record("lifecycle", b"worker spawn starting after durable claim")?;
 
         let expected_parent = std::process::id();
-        let mut command = Command::new(&command_spec.executable.canonical_path);
+        let mut command = Command::new(&launch_executable.canonical_path);
         command
             .args(&argv)
             .current_dir(&command_spec.workspace_cwd)
@@ -179,7 +207,7 @@ impl ProcessRunner {
         let mut child = command.spawn().with_context(|| {
             format!(
                 "failed to spawn durable worker {}",
-                command_spec.executable.canonical_path.display()
+                launch_executable.canonical_path.display()
             )
         })?;
         let spawned_pid = child.id();
@@ -816,7 +844,9 @@ printf '%s' '{"session_id":"native-1","role":"developer","result":{"decision":"b
         assert_eq!(completion.exit.termination, WorkerTermination::Exited);
         assert!(completion.exit.code == Some(0));
         assert_eq!(completion.artifacts.stderr(), prompt);
-        adapter.extract_result(&completion.artifacts).unwrap();
+        adapter
+            .extract_result(&developer_control(false), &completion.artifacts)
+            .unwrap();
     }
 
     #[test]
@@ -915,7 +945,9 @@ printf '%s' '{"session_id":"native-discovered-1","role":"developer","result":{"d
 "#,
         );
         let completion = worker.wait(|_| Ok(HeartbeatControl::Continue)).unwrap();
-        let native = adapter.extract_result(&completion.artifacts).unwrap();
+        let native = adapter
+            .extract_result(&developer_control(true), &completion.artifacts)
+            .unwrap();
         assert_eq!(native.native_session_id(), "native-discovered-1");
         let final_path = completion
             .artifact_attempt
@@ -950,6 +982,23 @@ ln -s "$PWD/victim" "$output"
             fs::read(temp.path().join("victim")).unwrap(),
             b"do-not-ingest"
         );
+    }
+
+    fn developer_control(discovered: bool) -> TurnControl {
+        TurnControl {
+            project_id: "project-1".into(),
+            task_id: "task-1".into(),
+            role: WorkerRole::Developer,
+            logical_session_id: "session-1".into(),
+            native_session_id: (!discovered).then(|| "native-1".into()),
+            turn_sequence: 1,
+            attempt: 1,
+            task_version: 1,
+            review_round: 0,
+            base_revision: "a".repeat(40),
+            head_revision: None,
+            artifact_dir: "project-1/task-1/developer/session-1/turn-1/attempt-1".into(),
+        }
     }
 
     #[test]
