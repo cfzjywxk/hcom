@@ -54,6 +54,7 @@ fn action_allows_update_notice(action: &Action) -> bool {
     match action {
         Action::Command { cmd, .. } => cmd != "update",
         Action::Launch { .. } | Action::Version | Action::Help => true,
+        Action::Architect { .. } => false,
         _ => false,
     }
 }
@@ -128,6 +129,8 @@ pub enum Action {
     Command { cmd: String, args: Vec<String> },
     /// Launch tool (e.g. `hcom 3 claude --model haiku`)
     Launch { args: Vec<String> },
+    /// Launch the additive blank interactive architect.
+    Architect { args: Vec<String> },
     /// Run PTY wrapper mode
     Pty { args: Vec<String> },
     /// Run TUI (no arguments)
@@ -310,6 +313,12 @@ pub fn resolve_action(argv: &[String]) -> Action {
 
     // Find the first non-flag token in stripped args
     let cmd_token = stripped.first().map(|s| s.as_str()).unwrap_or("");
+
+    if cmd_token == "architect" {
+        return Action::Architect {
+            args: argv.to_vec(),
+        };
+    }
 
     // Hook detection: argv[1] matches a known hook name
     if is_hook(cmd_token) {
@@ -499,14 +508,14 @@ fn is_same_file(a: &Path, b: &Path) -> bool {
 pub fn dispatch() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
     let argv = &args[1..]; // strip binary name
+    let action = resolve_action(argv);
 
     // Skip dev_root re-exec for `config dev_root` so a stale pointer can't
-    // trap the user — the invoked binary owns its own dev_root setting.
-    if !is_config_dev_root_invocation(argv) {
+    // trap the user — the invoked binary owns its own dev_root setting. The
+    // durable architect lane is also independent of retained v24 state.
+    if !is_config_dev_root_invocation(argv) && !matches!(&action, Action::Architect { .. }) {
         maybe_reexec_dev_root();
     }
-
-    let action = resolve_action(argv);
 
     // Check for updates on ordinary CLI commands (not hooks/pty/relay-worker —
     // those need to be fast, silent, and free of unowned background children).
@@ -566,6 +575,20 @@ pub fn dispatch() -> anyhow::Result<()> {
                 "f" | "fork" => crate::commands::fork::run(args, &flags)?,
                 _ => crate::commands::launch::run(args, &flags)?,
             };
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        }
+        Action::Architect { ref args } => {
+            let (stripped, flags, help) = extract_global_flags_full(args);
+            if help {
+                println!("{}", hcom::architect::help_text());
+                return Ok(());
+            }
+            if flags.name.is_some() || flags.go {
+                anyhow::bail!("hcom architect does not accept retained interactive global flags");
+            }
+            let exit_code = hcom::architect::run_cli(&stripped)?;
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }

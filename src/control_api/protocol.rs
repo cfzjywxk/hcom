@@ -239,6 +239,16 @@ impl ControlAction {
         }
     }
 
+    pub(crate) fn is_human_only_mutation(&self) -> bool {
+        !matches!(
+            self,
+            Self::ProjectGet { .. }
+                | Self::ProjectWait { .. }
+                | Self::ProjectStatus { .. }
+                | Self::ProjectLogs { .. }
+        )
+    }
+
     fn validate(&self) -> Result<(), ProtocolValidationError> {
         match self {
             Self::ProjectCreate {

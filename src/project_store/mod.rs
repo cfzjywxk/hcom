@@ -76,8 +76,20 @@ impl ProjectControlLayout {
         self.runtime_root.join("control.sock")
     }
 
+    pub(crate) fn registration_socket_path(&self) -> PathBuf {
+        self.runtime_root.join("registration.sock")
+    }
+
     pub(crate) fn artifact_root_path(&self) -> PathBuf {
         self.control_root().join("artifacts")
+    }
+
+    pub(crate) fn architect_state_root_path(&self) -> PathBuf {
+        self.control_root().join("architect")
+    }
+
+    pub(crate) fn architect_runtime_root_path(&self) -> PathBuf {
+        self.runtime_root.join("architect")
     }
 
     fn validate(&self) -> Result<()> {
@@ -154,6 +166,12 @@ pub(crate) struct ArchitectAuthorization {
     pub(crate) architect_native_session_id: Option<String>,
     pub(crate) action_set_json: String,
     pub(crate) action_set_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedProcessRoot {
+    pub(crate) pid: u32,
+    pub(crate) process_birth: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -401,7 +419,12 @@ impl DaemonStore {
             "UPDATE architect_bindings
              SET project_id = ?1, version = version + 1, updated_at = ?2
              WHERE id = ?3 AND version = ?4 AND binding_state = 'bound'
-               AND project_id IS NULL",
+               AND project_id IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM project_runs p
+                   WHERE p.id = ?1
+                     AND p.source_repo_root = architect_bindings.repo_root
+               )",
             params![
                 project_id,
                 now_epoch_seconds()?,
@@ -413,6 +436,54 @@ impl DaemonStore {
             bail!("architect project CAS failed");
         }
         Ok(())
+    }
+
+    pub(crate) fn close_architect_binding(
+        &mut self,
+        binding_id: &str,
+        expected_version: i64,
+    ) -> Result<()> {
+        let changed = self.connection.execute(
+            "UPDATE architect_bindings
+             SET binding_state = 'closed', version = version + 1, updated_at = ?1
+             WHERE id = ?2 AND version = ?3
+               AND binding_state IN ('pending', 'bound')",
+            params![now_epoch_seconds()?, binding_id, expected_version],
+        )?;
+        if changed != 1 {
+            bail!("architect close CAS failed");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn managed_process_roots(&self) -> Result<Vec<ManagedProcessRoot>> {
+        let mut statement = self.connection.prepare(
+            "SELECT architect_pid, architect_process_birth
+             FROM architect_bindings
+             WHERE binding_state = 'bound'
+             UNION ALL
+             SELECT bridge_pid, bridge_process_birth
+             FROM architect_bindings
+             WHERE binding_state = 'bound'
+             UNION ALL
+             SELECT worker_pid, process_birth
+             FROM worker_turns
+             WHERE status IN ('claimed', 'running')
+               AND worker_pid IS NOT NULL
+               AND process_birth IS NOT NULL
+             ORDER BY 1, 2",
+        )?;
+        statement
+            .query_map([], |row| {
+                let pid = row.get::<_, i64>(0)?;
+                Ok(ManagedProcessRoot {
+                    pid: u32::try_from(pid)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, pid))?,
+                    process_birth: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to read registered managed process roots")
     }
 
     pub(crate) fn architect_authorization(
@@ -1163,6 +1234,44 @@ mod tests {
         assert!(
             error.contains("metadata mismatch") || error.contains("application ID mismatch"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn pending_architect_binding_can_be_revoked_without_becoming_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = DaemonStore::open(&layout(&temp)).unwrap();
+        let actions = r#"["project_get"]"#;
+        store
+            .insert_pending_architect_binding(&PendingArchitectBinding {
+                id: "binding-pending-revoke",
+                repo_root: Path::new("/repo"),
+                architect_name: "architect-pending-revoke",
+                architect_adapter: "codex-0.145.0",
+                launch_nonce_hash: &digest('6'),
+                control_capability_hash: &digest('7'),
+                action_set_json: actions,
+                action_set_hash: &sha256_hex(actions.as_bytes()),
+            })
+            .unwrap();
+
+        store
+            .close_architect_binding("binding-pending-revoke", 0)
+            .unwrap();
+        let state: (String, i64) = store
+            .connection()
+            .query_row(
+                "SELECT binding_state, version
+                 FROM architect_bindings WHERE id = 'binding-pending-revoke'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("closed".into(), 1));
+        assert!(
+            store
+                .close_architect_binding("binding-pending-revoke", 0)
+                .is_err()
         );
     }
 

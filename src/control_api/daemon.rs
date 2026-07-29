@@ -1,8 +1,15 @@
 use super::codec::{read_request_frame, write_response_frame};
-use super::peer::{PeerCredentials, peer_credentials, process_birth_identity};
+use super::peer::{
+    PeerCredentials, peer_credentials, process_birth_identity, process_has_ancestor,
+    process_owns_foreground_tty,
+};
 use super::protocol::{
     ActionName, CallerAuth, ControlErrorCode, ControlRequest, ControlResponse,
     canonical_action_set, parse_canonical_action_set,
+};
+use super::registration::{
+    RegistrationAction, RegistrationCaller, RegistrationRequest, RegistrationResponse,
+    validate_request_envelope,
 };
 use crate::orchestrator::DurableScheduler;
 use crate::project_store::{
@@ -47,12 +54,26 @@ impl ControlPaths {
     pub fn socket_path(&self) -> PathBuf {
         self.layout.control_socket_path()
     }
+
+    pub fn registration_socket_path(&self) -> PathBuf {
+        self.layout.registration_socket_path()
+    }
+
+    pub fn architect_state_root_path(&self) -> PathBuf {
+        self.layout.architect_state_root_path()
+    }
+
+    pub fn architect_runtime_root_path(&self) -> PathBuf {
+        self.layout.architect_runtime_root_path()
+    }
 }
 
 pub struct DaemonEndpoint {
     control: DaemonControl,
     listener: UnixListener,
     socket_guard: SocketGuard,
+    registration_listener: UnixListener,
+    registration_socket_guard: SocketGuard,
 }
 
 impl DaemonEndpoint {
@@ -60,15 +81,23 @@ impl DaemonEndpoint {
         let control = DaemonControl::open(&paths)?;
         let socket_guard = SocketGuard::bind(&paths.socket_path())?;
         let listener = socket_guard.listener.try_clone()?;
+        let registration_socket_guard = SocketGuard::bind(&paths.registration_socket_path())?;
+        let registration_listener = registration_socket_guard.listener.try_clone()?;
         Ok(Self {
             control,
             listener,
             socket_guard,
+            registration_listener,
+            registration_socket_guard,
         })
     }
 
     pub fn socket_path(&self) -> &Path {
         &self.socket_guard.path
+    }
+
+    pub fn registration_socket_path(&self) -> &Path {
+        &self.registration_socket_guard.path
     }
 
     pub fn control_mut(&mut self) -> &mut DaemonControl {
@@ -85,8 +114,19 @@ impl DaemonEndpoint {
         self.control.serve_stream(&mut stream)
     }
 
+    pub fn serve_registration_one(&mut self) -> Result<()> {
+        let (mut stream, _) = self
+            .registration_listener
+            .accept()
+            .context("failed to accept architect registration connection")?;
+        stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT))?;
+        self.control.serve_registration_stream(&mut stream)
+    }
+
     pub fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
         self.listener.set_nonblocking(nonblocking)?;
+        self.registration_listener.set_nonblocking(nonblocking)?;
         Ok(())
     }
 
@@ -103,6 +143,22 @@ impl DaemonEndpoint {
             // this accepted connection. It must not tear down the durable
             // daemon, its scheduler, or an unrelated worker.
             eprintln!("hcomd: rejected control connection: {error:#}");
+        }
+        Ok(true)
+    }
+
+    pub fn try_serve_registration_one(&mut self) -> Result<bool> {
+        let (mut stream, _) = match self.registration_listener.accept() {
+            Ok(connection) => connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => {
+                return Err(error).context("failed to accept architect registration connection");
+            }
+        };
+        stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT))?;
+        if let Err(error) = self.control.serve_registration_stream(&mut stream) {
+            eprintln!("hcomd: rejected architect registration connection: {error:#}");
         }
         Ok(true)
     }
@@ -135,7 +191,7 @@ impl DaemonControl {
     pub fn register_architect_binding(
         &mut self,
         registration: &ArchitectBindingRegistration,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         validate_binding_registration(registration)?;
         let (action_set_json, _) = canonical_action_set(registration.actions.iter().copied())?;
         let action_set_hash = sha256_hex(action_set_json.as_bytes());
@@ -158,7 +214,8 @@ impl DaemonControl {
                 control_capability_hash: &capability_hash,
                 action_set_json: &action_set_json,
                 action_set_hash: &action_set_hash,
-            })
+            })?;
+        Ok(0)
     }
 
     pub fn bind_architect_process(
@@ -166,7 +223,7 @@ impl DaemonControl {
         binding_id: &str,
         expected_version: u64,
         registration: &ArchitectProcessRegistration,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         validate_opaque_id(binding_id)?;
         validate_process_registration(registration)?;
         self.scheduler.store_mut().bind_architect_process(
@@ -180,7 +237,10 @@ impl DaemonControl {
                 relay_executable_contract_hash: &registration.relay_executable_contract_hash,
                 relay_runtime_scope_hash: &registration.relay_runtime_scope_hash,
             },
-        )
+        )?;
+        expected_version
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("architect binding version overflow"))
     }
 
     pub fn bind_architect_native_session(
@@ -188,14 +248,17 @@ impl DaemonControl {
         binding_id: &str,
         expected_version: u64,
         native_session_id: &str,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         validate_opaque_id(binding_id)?;
         validate_single_line(native_session_id, 256)?;
         self.scheduler.store_mut().bind_architect_native_session(
             binding_id,
             i64::try_from(expected_version).context("binding version is too large")?,
             native_session_id,
-        )
+        )?;
+        expected_version
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("architect binding version overflow"))
     }
 
     pub fn bind_architect_project(
@@ -203,14 +266,181 @@ impl DaemonControl {
         binding_id: &str,
         expected_version: u64,
         project_id: &str,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         validate_opaque_id(binding_id)?;
         validate_opaque_id(project_id)?;
         self.scheduler.store_mut().bind_architect_project(
             binding_id,
             i64::try_from(expected_version).context("binding version is too large")?,
             project_id,
-        )
+        )?;
+        expected_version
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("architect binding version overflow"))
+    }
+
+    pub fn close_architect_binding(
+        &mut self,
+        binding_id: &str,
+        expected_version: u64,
+    ) -> Result<u64> {
+        validate_opaque_id(binding_id)?;
+        self.scheduler.store_mut().close_architect_binding(
+            binding_id,
+            i64::try_from(expected_version).context("binding version is too large")?,
+        )?;
+        expected_version
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("architect binding version overflow"))
+    }
+
+    fn serve_registration_stream(&mut self, stream: &mut UnixStream) -> Result<()> {
+        let peer = peer_credentials(stream)?;
+        if peer.uid != self.expected_uid {
+            bail!("registration peer uid mismatch");
+        }
+        let frame = read_request_frame(stream)?;
+        let request: RegistrationRequest = match serde_json::from_slice(&frame) {
+            Ok(request) => request,
+            Err(_) => {
+                return write_registration_response(
+                    stream,
+                    &RegistrationResponse::error("", "malformed registration request"),
+                );
+            }
+        };
+        let response = match validate_request_envelope(&request)
+            .and_then(|()| self.handle_registration_request(peer, &request))
+        {
+            Ok(version) => RegistrationResponse::success(&request.request_id, version),
+            Err(_) => RegistrationResponse::error(
+                &request.request_id,
+                "architect registration request was refused",
+            ),
+        };
+        write_registration_response(stream, &response)
+    }
+
+    fn handle_registration_request(
+        &mut self,
+        peer: PeerCredentials,
+        request: &RegistrationRequest,
+    ) -> Result<u64> {
+        match (&request.caller, &request.action) {
+            (
+                RegistrationCaller::Human { process_birth },
+                RegistrationAction::CreateBinding {
+                    binding_id,
+                    repo_root,
+                    architect_name,
+                    architect_adapter,
+                    launch_nonce,
+                    capability,
+                    actions,
+                },
+            ) => {
+                self.authorize_human_peer(peer, process_birth, true)?;
+                self.register_architect_binding(&ArchitectBindingRegistration {
+                    binding_id: binding_id.clone(),
+                    repo_root: PathBuf::from(repo_root),
+                    architect_name: architect_name.clone(),
+                    architect_adapter: architect_adapter.clone(),
+                    launch_nonce: launch_nonce.clone(),
+                    capability: capability.clone(),
+                    actions: actions.clone(),
+                })
+            }
+            (
+                RegistrationCaller::Human { process_birth },
+                RegistrationAction::BindProcess {
+                    binding_id,
+                    expected_version,
+                    architect_pid,
+                    architect_process_birth,
+                    bridge_pid,
+                    bridge_process_birth,
+                    relay_executable_contract_hash,
+                    relay_runtime_scope_hash,
+                },
+            ) => {
+                self.authorize_human_peer(peer, process_birth, true)?;
+                self.bind_architect_process(
+                    binding_id,
+                    *expected_version,
+                    &ArchitectProcessRegistration {
+                        architect_pid: *architect_pid,
+                        architect_process_birth: architect_process_birth.clone(),
+                        bridge_pid: *bridge_pid,
+                        bridge_process_birth: bridge_process_birth.clone(),
+                        relay_executable_contract_hash: relay_executable_contract_hash.clone(),
+                        relay_runtime_scope_hash: relay_runtime_scope_hash.clone(),
+                    },
+                )
+            }
+            (
+                RegistrationCaller::Human { process_birth },
+                RegistrationAction::BindProject {
+                    binding_id,
+                    expected_version,
+                    project_id,
+                },
+            ) => {
+                self.authorize_human_peer(peer, process_birth, true)?;
+                self.bind_architect_project(binding_id, *expected_version, project_id)
+            }
+            (
+                RegistrationCaller::Bridge {
+                    binding_id,
+                    launch_nonce,
+                    capability,
+                },
+                RegistrationAction::ObserveNativeSession {
+                    binding_id: action_binding,
+                    expected_version,
+                    native_session_id,
+                },
+            ) if binding_id == action_binding => {
+                self.authorize_bridge_registration(
+                    peer,
+                    binding_id,
+                    launch_nonce,
+                    capability,
+                    true,
+                )?;
+                self.bind_architect_native_session(binding_id, *expected_version, native_session_id)
+            }
+            (
+                RegistrationCaller::Bridge {
+                    binding_id,
+                    launch_nonce,
+                    capability,
+                },
+                RegistrationAction::CloseBinding {
+                    binding_id: action_binding,
+                    expected_version,
+                },
+            ) if binding_id == action_binding => {
+                self.authorize_bridge_registration(
+                    peer,
+                    binding_id,
+                    launch_nonce,
+                    capability,
+                    false,
+                )?;
+                self.close_architect_binding(binding_id, *expected_version)
+            }
+            (
+                RegistrationCaller::Human { process_birth },
+                RegistrationAction::CloseBinding {
+                    binding_id,
+                    expected_version,
+                },
+            ) => {
+                self.authorize_human_peer(peer, process_birth, true)?;
+                self.close_architect_binding(binding_id, *expected_version)
+            }
+            _ => bail!("registration caller is not authorized for this operation"),
+        }
     }
 
     fn serve_stream(&mut self, stream: &mut UnixStream) -> Result<()> {
@@ -310,12 +540,12 @@ impl DaemonControl {
             }
         }
 
-        // Phase 2 intentionally stops at a validated, authorized protocol shape.
-        // Business transitions and all process spawning belong to later phases.
+        // Phase 7 enables the bound architect transport while deliberately
+        // leaving every project business transition to Phase 8.
         let response = ControlResponse::error(
             &request.request_id,
             ControlErrorCode::NotImplemented,
-            "typed action is not implemented in Phase 2",
+            "typed action is not implemented before Phase 8",
         );
         let response_json = match serde_json::to_string(&response) {
             Ok(json) => json,
@@ -354,9 +584,11 @@ impl DaemonControl {
         let live_birth = process_birth_identity(peer.pid)?;
         match &request.caller {
             CallerAuth::Human { process_birth } => {
-                if !constant_time_equal(live_birth.as_bytes(), process_birth.as_bytes()) {
-                    bail!("human process birth mismatch");
-                }
+                self.authorize_human_peer(
+                    peer,
+                    process_birth,
+                    request.action.is_human_only_mutation(),
+                )?;
                 Ok(domain_hash(
                     b"hcom-project-control/human-caller/v1",
                     &[
@@ -433,6 +665,76 @@ impl DaemonControl {
         }
     }
 
+    fn authorize_human_peer(
+        &self,
+        peer: PeerCredentials,
+        process_birth: &str,
+        require_foreground_tty: bool,
+    ) -> Result<()> {
+        let live_birth = process_birth_identity(peer.pid)?;
+        if !constant_time_equal(live_birth.as_bytes(), process_birth.as_bytes()) {
+            bail!("human process birth mismatch");
+        }
+        let roots: Vec<_> = self
+            .scheduler
+            .store()
+            .managed_process_roots()?
+            .into_iter()
+            .map(|root| (root.pid, root.process_birth))
+            .collect();
+        if process_has_ancestor(peer.pid, &roots)? {
+            bail!("registered agent process tree cannot claim human authority");
+        }
+        if require_foreground_tty && !process_owns_foreground_tty(peer.pid, process_birth)? {
+            bail!("human mutation requires a real foreground terminal");
+        }
+        Ok(())
+    }
+
+    fn authorize_bridge_registration(
+        &self,
+        peer: PeerCredentials,
+        binding_id: &str,
+        launch_nonce: &str,
+        capability: &str,
+        require_architect_live: bool,
+    ) -> Result<()> {
+        let binding = self
+            .scheduler
+            .store()
+            .architect_authorization(binding_id)?
+            .ok_or_else(|| anyhow::anyhow!("architect binding is unavailable"))?;
+        let live_bridge_birth = process_birth_identity(peer.pid)?;
+        if peer.pid != binding.bridge_pid
+            || !constant_time_equal(
+                live_bridge_birth.as_bytes(),
+                binding.bridge_process_birth.as_bytes(),
+            )
+        {
+            bail!("bridge process binding mismatch");
+        }
+        if require_architect_live {
+            let architect_birth = process_birth_identity(binding.architect_pid)?;
+            if !constant_time_equal(
+                architect_birth.as_bytes(),
+                binding.architect_process_birth.as_bytes(),
+            ) {
+                bail!("architect process binding mismatch");
+            }
+        }
+        let nonce_hash = secret_hash(b"hcom-project-control/launch-nonce/v1", launch_nonce);
+        let capability_hash = secret_hash(b"hcom-project-control/capability/v1", capability);
+        if !constant_time_equal(nonce_hash.as_bytes(), binding.launch_nonce_hash.as_bytes())
+            || !constant_time_equal(
+                capability_hash.as_bytes(),
+                binding.control_capability_hash.as_bytes(),
+            )
+        {
+            bail!("architect registration secret mismatch");
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn set_expected_uid(&mut self, uid: u32) {
         self.expected_uid = uid;
@@ -441,6 +743,37 @@ impl DaemonControl {
     #[cfg(test)]
     fn simulate_crash_on_drop(&mut self) {
         self.scheduler.simulate_crash_on_drop();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn architect_binding_state_version(
+        &self,
+        binding_id: &str,
+    ) -> Result<(String, i64)> {
+        self.scheduler
+            .store()
+            .connection()
+            .query_row(
+                "SELECT binding_state, version FROM architect_bindings WHERE id = ?1",
+                [binding_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .context("failed to read architect binding test state")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn phase7_business_counts(&self) -> Result<(i64, i64)> {
+        let requests = self.scheduler.store().connection().query_row(
+            "SELECT count(*) FROM control_requests",
+            [],
+            |row| row.get(0),
+        )?;
+        let projects = self.scheduler.store().connection().query_row(
+            "SELECT count(*) FROM project_runs",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((requests, projects))
     }
 }
 
@@ -553,6 +886,15 @@ impl Drop for SocketGuard {
 
 fn write_response(stream: &mut UnixStream, response: &ControlResponse) -> Result<()> {
     let payload = serde_json::to_vec(response).context("failed to encode control response")?;
+    write_response_frame(stream, &payload)?;
+    Ok(())
+}
+
+fn write_registration_response(
+    stream: &mut UnixStream,
+    response: &RegistrationResponse,
+) -> Result<()> {
+    let payload = serde_json::to_vec(response).context("failed to encode registration response")?;
     write_response_frame(stream, &payload)?;
     Ok(())
 }
@@ -674,7 +1016,10 @@ mod tests {
     use crate::control_api::codec::{read_response_frame, write_request_frame};
     use crate::control_api::protocol::{MAX_REQUEST_BYTES, PROTOCOL_VERSION};
     use std::io::Write;
+    use std::os::fd::{AsRawFd, OwnedFd};
     use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command};
     use std::thread;
 
     fn paths(temp: &tempfile::TempDir) -> ControlPaths {
@@ -708,6 +1053,52 @@ mod tests {
         })
     }
 
+    struct ForegroundTtyChild {
+        child: Child,
+        _master: OwnedFd,
+    }
+
+    impl Drop for ForegroundTtyChild {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn foreground_tty_child() -> ForegroundTtyChild {
+        let pty = nix::pty::openpty(None, None).unwrap();
+        let slave_fd = pty.slave.as_raw_fd();
+        let master_fd = pty.master.as_raw_fd();
+        let mut command = Command::new("/usr/bin/sleep");
+        command.arg("30");
+        // SAFETY: these are async-signal-safe session, terminal, and
+        // descriptor operations in the child before exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setsid() == -1
+                    || libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1
+                    || libc::tcsetpgrp(slave_fd, libc::getpid()) == -1
+                    || libc::dup2(slave_fd, libc::STDIN_FILENO) == -1
+                    || libc::dup2(slave_fd, libc::STDOUT_FILENO) == -1
+                    || libc::dup2(slave_fd, libc::STDERR_FILENO) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if slave_fd > libc::STDERR_FILENO {
+                    libc::close(slave_fd);
+                }
+                libc::close(master_fd);
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        drop(pty.slave);
+        ForegroundTtyChild {
+            child,
+            _master: pty.master,
+        }
+    }
+
     #[test]
     fn real_socket_validates_peer_and_replays_exact_request() {
         let temp = tempfile::tempdir().unwrap();
@@ -725,6 +1116,250 @@ mod tests {
         let endpoint = server.join().unwrap().unwrap();
         drop(endpoint);
         assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn registered_agent_tree_is_denied_before_mutation_ledger() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir(&repo_root).unwrap();
+        let mut endpoint = DaemonEndpoint::bind(paths(&temp)).unwrap();
+        let managed = foreground_tty_child();
+        let managed_pid = managed.child.id();
+        let managed_birth = process_birth_identity(managed_pid).unwrap();
+        assert!(process_owns_foreground_tty(managed_pid, &managed_birth).unwrap());
+        let peer = PeerCredentials {
+            pid: managed_pid,
+            // SAFETY: geteuid/getegid have no preconditions.
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+        };
+        let action = super::super::ControlAction::ProjectCreate {
+            repo_root: repo_root.to_string_lossy().into_owned(),
+            target_ref: "refs/heads/master".into(),
+        };
+        let eligible = endpoint.control_mut().handle_request(
+            peer,
+            &ControlRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: "human-eligible".into(),
+                caller: CallerAuth::Human {
+                    process_birth: managed_birth.clone(),
+                },
+                action: action.clone(),
+            },
+        );
+        assert_eq!(
+            eligible.error.unwrap().code,
+            ControlErrorCode::NotImplemented
+        );
+        assert_eq!(
+            endpoint
+                .control
+                .scheduler
+                .store()
+                .connection()
+                .query_row("SELECT count(*) FROM control_requests", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            endpoint
+                .control
+                .scheduler
+                .store()
+                .connection()
+                .query_row("SELECT count(*) FROM project_runs", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0,
+            "Phase 7 must not enable project business transitions"
+        );
+
+        let bridge_birth = process_birth_identity(std::process::id()).unwrap();
+        endpoint
+            .control_mut()
+            .register_architect_binding(&ArchitectBindingRegistration {
+                binding_id: "binding-managed".into(),
+                repo_root,
+                architect_name: "architect-managed".into(),
+                architect_adapter: "codex-0.145.0".into(),
+                launch_nonce: "launch-nonce-managed".into(),
+                capability: "capability-secret-managed".into(),
+                actions: [ActionName::ProjectCreate].into_iter().collect(),
+            })
+            .unwrap();
+        endpoint
+            .control_mut()
+            .bind_architect_process(
+                "binding-managed",
+                0,
+                &ArchitectProcessRegistration {
+                    architect_pid: managed_pid,
+                    architect_process_birth: managed_birth.clone(),
+                    bridge_pid: std::process::id(),
+                    bridge_process_birth: bridge_birth,
+                    relay_executable_contract_hash: std::iter::repeat_n('a', 64).collect(),
+                    relay_runtime_scope_hash: std::iter::repeat_n('b', 64).collect(),
+                },
+            )
+            .unwrap();
+        let denied = endpoint.control_mut().handle_request(
+            peer,
+            &ControlRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: "managed-denied".into(),
+                caller: CallerAuth::Human {
+                    process_birth: managed_birth,
+                },
+                action,
+            },
+        );
+        assert_eq!(denied.error.unwrap().code, ControlErrorCode::Unauthorized);
+        let denied_read = endpoint.control_mut().handle_request(
+            peer,
+            &ControlRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: "managed-read-denied".into(),
+                caller: CallerAuth::Human {
+                    process_birth: process_birth_identity(managed_pid).unwrap(),
+                },
+                action: super::super::ControlAction::ProjectGet {
+                    project_id: "project-1".into(),
+                },
+            },
+        );
+        assert_eq!(
+            denied_read.error.unwrap().code,
+            ControlErrorCode::Unauthorized
+        );
+        assert_eq!(
+            endpoint
+                .control
+                .scheduler
+                .store()
+                .connection()
+                .query_row("SELECT count(*) FROM control_requests", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1,
+            "registered agent authority must be rejected before the request ledger"
+        );
+        assert_eq!(
+            endpoint
+                .control
+                .scheduler
+                .store()
+                .connection()
+                .query_row("SELECT count(*) FROM project_runs", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn private_registration_socket_applies_one_shot_session_and_close_cas() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        fs::create_dir(&repo_root).unwrap();
+        let mut endpoint = DaemonEndpoint::bind(paths(&temp)).unwrap();
+        let birth = process_birth_identity(std::process::id()).unwrap();
+        endpoint
+            .control_mut()
+            .register_architect_binding(&ArchitectBindingRegistration {
+                binding_id: "binding-registration".into(),
+                repo_root,
+                architect_name: "architect-registration".into(),
+                architect_adapter: "codex-0.145.0".into(),
+                launch_nonce: "launch-nonce-registration".into(),
+                capability: "capability-registration".into(),
+                actions: [ActionName::ProjectCreate].into_iter().collect(),
+            })
+            .unwrap();
+        assert!(
+            endpoint
+                .control
+                .scheduler
+                .store()
+                .architect_authorization("binding-registration")
+                .unwrap()
+                .is_none(),
+            "a pending crash window must not authorize architect control"
+        );
+        endpoint
+            .control_mut()
+            .bind_architect_process(
+                "binding-registration",
+                0,
+                &ArchitectProcessRegistration {
+                    architect_pid: std::process::id(),
+                    architect_process_birth: birth.clone(),
+                    bridge_pid: std::process::id(),
+                    bridge_process_birth: birth,
+                    relay_executable_contract_hash: std::iter::repeat_n('c', 64).collect(),
+                    relay_runtime_scope_hash: std::iter::repeat_n('d', 64).collect(),
+                },
+            )
+            .unwrap();
+        let socket_path = endpoint.registration_socket_path().to_path_buf();
+        let metadata = fs::symlink_metadata(&socket_path).unwrap();
+        assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let server = thread::spawn(move || {
+            let mut endpoint = endpoint;
+            endpoint.serve_registration_one().unwrap();
+            endpoint.serve_registration_one().unwrap();
+            endpoint
+        });
+        let client = super::super::registration::RegistrationClient::new(&socket_path);
+        let caller = RegistrationCaller::Bridge {
+            binding_id: "binding-registration".into(),
+            launch_nonce: "launch-nonce-registration".into(),
+            capability: "capability-registration".into(),
+        };
+        let observed = client
+            .request(&RegistrationRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: "registration-observe".into(),
+                caller: caller.clone(),
+                action: RegistrationAction::ObserveNativeSession {
+                    binding_id: "binding-registration".into(),
+                    expected_version: 1,
+                    native_session_id: "native-session-registration".into(),
+                },
+            })
+            .unwrap();
+        assert!(observed.ok);
+        assert_eq!(observed.binding_version, Some(2));
+        let closed = client
+            .request(&RegistrationRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: "registration-close".into(),
+                caller,
+                action: RegistrationAction::CloseBinding {
+                    binding_id: "binding-registration".into(),
+                    expected_version: 2,
+                },
+            })
+            .unwrap();
+        assert!(closed.ok);
+        assert_eq!(closed.binding_version, Some(3));
+        let endpoint = server.join().unwrap();
+        assert!(
+            endpoint
+                .control
+                .scheduler
+                .store()
+                .architect_authorization("binding-registration")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -907,6 +1542,108 @@ mod tests {
                 .unwrap(),
             1,
             "unauthorized requests must be rejected before dispatch/ledger mutation"
+        );
+    }
+
+    #[test]
+    fn project_bound_architect_is_limited_to_one_existing_same_repo_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktree");
+        fs::create_dir(&repo_root).unwrap();
+        fs::create_dir(&worktree_root).unwrap();
+        let repo_root_text = repo_root.to_string_lossy().into_owned();
+        let worktree_root_text = worktree_root.to_string_lossy().into_owned();
+        let mut endpoint = DaemonEndpoint::bind(paths(&temp)).unwrap();
+        let sha = std::iter::repeat_n('1', 40).collect::<String>();
+        endpoint
+            .control
+            .scheduler
+            .store_mut()
+            .connection_mut()
+            .execute(
+                "INSERT INTO project_runs (
+                     id, state, version, pause_reason, source_repo_root,
+                     source_git_dir_identity, target_ref, target_expected_sha,
+                     worktree_root, worktree_branch, checkpoint_sha,
+                     applied_target_sha, approved_plan_version, approved_plan_hash,
+                     run_requested_at, active_daemon_epoch, created_at, updated_at
+                 ) VALUES (
+                     'project-bound', 'draft', 0, NULL, ?1, 'git-dir',
+                     'refs/heads/master', ?2, ?3,
+                     'refs/heads/hcom-project/project-bound', ?2,
+                     NULL, NULL, NULL, NULL, NULL, 1, 1
+                 )",
+                rusqlite::params![repo_root_text, sha, worktree_root_text],
+            )
+            .unwrap();
+        let birth = process_birth_identity(std::process::id()).unwrap();
+        endpoint
+            .control_mut()
+            .register_architect_binding(&ArchitectBindingRegistration {
+                binding_id: "binding-project-bound".into(),
+                repo_root,
+                architect_name: "architect-project-bound".into(),
+                architect_adapter: "codex-0.145.0".into(),
+                launch_nonce: "launch-nonce-project-bound".into(),
+                capability: "capability-project-bound".into(),
+                actions: [ActionName::ProjectGet].into_iter().collect(),
+            })
+            .unwrap();
+        endpoint
+            .control_mut()
+            .bind_architect_process(
+                "binding-project-bound",
+                0,
+                &ArchitectProcessRegistration {
+                    architect_pid: std::process::id(),
+                    architect_process_birth: birth.clone(),
+                    bridge_pid: std::process::id(),
+                    bridge_process_birth: birth,
+                    relay_executable_contract_hash: std::iter::repeat_n('a', 64).collect(),
+                    relay_runtime_scope_hash: std::iter::repeat_n('b', 64).collect(),
+                },
+            )
+            .unwrap();
+        endpoint
+            .control_mut()
+            .bind_architect_project("binding-project-bound", 1, "project-bound")
+            .unwrap();
+        let peer = PeerCredentials {
+            pid: std::process::id(),
+            // SAFETY: geteuid/getegid have no preconditions.
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+        };
+        let request = |request_id: &str, project_id: &str| ControlRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: request_id.into(),
+            caller: CallerAuth::Architect {
+                binding_id: "binding-project-bound".into(),
+                launch_nonce: "launch-nonce-project-bound".into(),
+                capability: "capability-project-bound".into(),
+                native_session_id: None,
+            },
+            action: super::super::ControlAction::ProjectGet {
+                project_id: project_id.into(),
+            },
+        };
+
+        let allowed = endpoint
+            .control_mut()
+            .handle_request(peer, &request("project-bound-ok", "project-bound"));
+        assert_eq!(
+            allowed.error.unwrap().code,
+            ControlErrorCode::NotImplemented
+        );
+        let denied = endpoint
+            .control_mut()
+            .handle_request(peer, &request("project-bound-wrong", "project-other"));
+        assert_eq!(denied.error.unwrap().code, ControlErrorCode::Unauthorized);
+        assert_eq!(
+            endpoint.control_mut().phase7_business_counts().unwrap(),
+            (1, 1),
+            "only the authorized request ledger may change in Phase 7"
         );
     }
 

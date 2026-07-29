@@ -51,7 +51,7 @@ const CODEX_RESULT_SCHEMA_FILE: &str = "codex-developer-result-schema.json";
 const CODEX_FINAL_FILE: &str = "native-final.partial";
 const CODEX_AUTH_FILE: &str = "auth.json";
 
-pub(super) const DISABLED_CODEX_FEATURES: &[&str] = &[
+pub(crate) const DISABLED_CODEX_FEATURES: &[&str] = &[
     "apps",
     "auth_elicitation",
     "browser_use",
@@ -1865,20 +1865,36 @@ mod tests {
     }
 
     #[test]
-    fn real_bwrap_masks_a_live_host_control_socket() {
+    fn real_bwrap_masks_all_live_host_control_and_architect_sockets() {
         let fixture = Fixture::new();
         let control_root = fixture.config.host_runtime_dir.join("hcom-project-control");
+        let architect_root = control_root.join("architect");
+        let launch_root = architect_root.join("launch-mask-proof");
         fs::create_dir(&control_root).unwrap();
-        fs::set_permissions(&control_root, fs::Permissions::from_mode(0o700)).unwrap();
-        let socket_path = control_root.join("control.sock");
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).unwrap();
-        let outside = UnixStream::connect(&socket_path).unwrap();
-        drop(outside);
+        fs::create_dir(&architect_root).unwrap();
+        fs::create_dir(&launch_root).unwrap();
+        for directory in [&control_root, &architect_root, &launch_root] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let socket_paths = vec![
+            control_root.join("control.sock"),
+            control_root.join("registration.sock"),
+            launch_root.join("relay.sock"),
+        ];
+        let listeners: Vec<_> = socket_paths
+            .iter()
+            .map(|socket_path| {
+                let listener = UnixListener::bind(socket_path).unwrap();
+                fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600)).unwrap();
+                let outside = UnixStream::connect(socket_path).unwrap();
+                drop(outside);
+                listener
+            })
+            .collect();
 
         write_executable(
             &fixture.codex,
-            &fake_codex_script_with_socket_probe(&socket_path),
+            &fake_codex_script_with_socket_probes(&socket_paths),
         );
         let real_bwrap = fs::canonicalize(BWRAP_EXECUTABLE).unwrap();
         let adapter = CodexDeveloperAdapter::discover_with_paths(
@@ -1895,7 +1911,7 @@ mod tests {
         adapter
             .extract_result(&control, &completion.artifacts)
             .unwrap();
-        drop(listener);
+        drop(listeners);
     }
 
     #[test]
@@ -2465,12 +2481,18 @@ printf '%s\n' '{"type":"turn.completed"}'
 "#
     }
 
-    fn fake_codex_script_with_socket_probe(socket_path: &Path) -> String {
-        let socket_path = socket_path.to_str().unwrap();
-        assert!(!socket_path.contains('\''));
-        let socket_path = serde_json::to_string(socket_path).unwrap();
+    fn fake_codex_script_with_socket_probes(socket_paths: &[PathBuf]) -> String {
+        let socket_paths: Vec<_> = socket_paths
+            .iter()
+            .map(|path| {
+                let path = path.to_str().unwrap();
+                assert!(!path.contains('\''));
+                path
+            })
+            .collect();
+        let socket_paths = serde_json::to_string(&socket_paths).unwrap();
         let probe = format!(
-            "/usr/bin/python3 -c 'import os,socket\np={socket_path}\nif os.path.exists(p):\n    raise SystemExit(41)\nclient=socket.socket(socket.AF_UNIX)\ntry:\n    client.connect(p)\nexcept FileNotFoundError:\n    pass\nelse:\n    raise SystemExit(42)'"
+            "/usr/bin/python3 -c 'import os,socket\nfor p in {socket_paths}:\n    if os.path.exists(p):\n        raise SystemExit(41)\n    client=socket.socket(socket.AF_UNIX)\n    try:\n        client.connect(p)\n    except FileNotFoundError:\n        pass\n    else:\n        raise SystemExit(42)\n    finally:\n        client.close()'"
         );
         fake_codex_script().replace("# SOCKET_REACHABILITY_PROBE", &probe)
     }

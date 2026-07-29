@@ -118,6 +118,66 @@ fn stale_top_level_commands_are_unknown_without_opening_v24_state() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn architect_help_is_additive_and_does_not_open_v24_state() {
+    let h = Hcom::new();
+    let db_path = h.path().join("hcom.db");
+    assert!(!db_path.exists());
+
+    let (code, stdout, stderr) = h.run(["architect", "--help"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("hcom architect codex"), "stdout={stdout}");
+    assert!(stdout.contains("--repo"), "stdout={stdout}");
+    assert!(stdout.contains("--project"), "stdout={stdout}");
+    assert!(
+        !db_path.exists(),
+        "durable architect help must not initialize retained v24 state"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn architect_help_does_not_read_or_repair_malformed_v24_state() {
+    let h = Hcom::new();
+    let db_path = h.path().join("hcom.db");
+    let malformed = b"not-a-retained-sqlite-database";
+    std::fs::write(&db_path, malformed).unwrap();
+
+    let (code, stdout, stderr) = h.run(["architect", "--help"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("hcom architect codex"), "stdout={stdout}");
+    assert_eq!(
+        std::fs::read(&db_path).unwrap(),
+        malformed,
+        "durable architect help must not read, migrate, or repair retained v24 state"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn architect_refuses_pipe_stdio_before_opening_either_state_lane() {
+    let h = Hcom::new();
+    let (code, stdout, stderr) = h.run([
+        "architect",
+        "codex",
+        "--repo",
+        h.workspace.to_str().unwrap(),
+    ]);
+    assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.is_empty(), "stdout={stdout}");
+    assert!(
+        stderr.contains("requires stdin/stdout/stderr on a real terminal"),
+        "stderr={stderr}"
+    );
+    assert!(!h.path().join("hcom.db").exists());
+    assert!(
+        !h.root_path()
+            .join("xdg/state/hcom-project-control")
+            .exists()
+    );
+}
+
 #[test]
 fn bundle_and_send_help_expose_repository_snapshot_contract() {
     let h = Hcom::new();

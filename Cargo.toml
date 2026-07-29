@@ -17,6 +17,10 @@ path = "src/main.rs"
 name = "hcomd"
 path = "src/bin/hcomd.rs"
 
+[[bin]]
+name = "hcom-architect-mcp"
+path = "src/bin/hcom-architect-mcp.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 vt100 = "0.16"

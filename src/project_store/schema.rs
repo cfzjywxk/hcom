@@ -434,7 +434,7 @@ CREATE TABLE architect_bindings (
     CHECK (length(CAST(action_set_json AS BLOB)) BETWEEN 2 AND 4096),
     CHECK (length(action_set_hash) = 64
            AND action_set_hash NOT GLOB '*[^0-9a-f]*'),
-    CHECK ((binding_state = 'pending'
+    CHECK ((binding_state IN ('pending', 'closed')
             AND architect_pid IS NULL AND architect_process_birth IS NULL
             AND bridge_pid IS NULL AND bridge_process_birth IS NULL
             AND relay_executable_contract_hash IS NULL
@@ -966,6 +966,13 @@ WHEN NOT (
      AND NEW.relay_executable_contract_hash IS NOT NULL
      AND OLD.relay_runtime_scope_hash IS NULL
      AND NEW.relay_runtime_scope_hash IS NOT NULL)
+    OR (OLD.binding_state = 'pending' AND NEW.binding_state = 'closed'
+        AND NEW.architect_pid IS OLD.architect_pid
+        AND NEW.architect_process_birth IS OLD.architect_process_birth
+        AND NEW.bridge_pid IS OLD.bridge_pid
+        AND NEW.bridge_process_birth IS OLD.bridge_process_birth
+        AND NEW.relay_executable_contract_hash IS OLD.relay_executable_contract_hash
+        AND NEW.relay_runtime_scope_hash IS OLD.relay_runtime_scope_hash)
     OR (OLD.binding_state = 'bound' AND NEW.binding_state = 'closed'
         AND NEW.architect_pid IS OLD.architect_pid
         AND NEW.architect_process_birth IS OLD.architect_process_birth

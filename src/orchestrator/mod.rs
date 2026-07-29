@@ -50,7 +50,9 @@ pub fn run_hcomd_service() -> Result<()> {
         signal_hook::flag::register(signal, stopping.clone())?;
     }
     while !stopping.load(Ordering::Acquire) {
-        if !endpoint.try_serve_one()? {
+        let served_control = endpoint.try_serve_one()?;
+        let served_registration = endpoint.try_serve_registration_one()?;
+        if !served_control && !served_registration {
             std::thread::sleep(Duration::from_millis(25));
         }
     }
