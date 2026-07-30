@@ -125,7 +125,9 @@ All fields in a profile table are required. Supported values are:
 - Codex `reasoning_effort`: `none`, `minimal`, `low`, `medium`, `high`,
   `xhigh`, or `max`.
 - Claude `effort`: `low`, `medium`, `high`, `xhigh`, or `max`.
-- Codex `sandbox`: `read-only`, `workspace-write`, or `danger-full-access`.
+- Codex `sandbox`: `read-only`, `workspace-write`, or `danger-full-access`;
+  a Codex developer must use `workspace-write` or `danger-full-access` because
+  a successful developer turn must write and commit.
 - Codex `ask_for_approval`: `untrusted`, `on-request`, or `never`.
 - Developer `adapter`: `claude` or `codex`.
 - Reviewer `adapter`: `claude` or `codex`.
@@ -185,9 +187,11 @@ Profile configuration changes native CLI policy, not the outer containment:
   every task worker;
 - absolute host paths are preserved; no role sees a synthetic
   `/hcom/workspace`;
-- the interactive Architect keeps a read-only host filesystem view so it can
-  follow project documentation to source repositories outside the project
-  directory; hcom control runtime paths remain masked;
+- the interactive Architect keeps a whole-host read-only filesystem view so it
+  can follow project documentation to source repositories outside the project
+  directory; `/tmp`, the host XDG runtime, all current/sibling architect
+  session roots, and hcom control sockets are masked, while the exact project
+  and this Architect's private state are rebound as needed;
 - the developer receives only its task repository read-write at that
   repository's real absolute path;
 - every reviewer sees the exact task repository HEAD read-only at its real
@@ -199,8 +203,19 @@ Profile configuration changes native CLI policy, not the outer containment:
   runtime contents, or push credential;
 - Codex delegation, hooks, plugins, apps, and arbitrary MCP servers remain
   disabled for session workers;
+- when a task repository differs from the project directory, hcom declares it
+  to native Codex/Claude with `--add-dir`; Codex `workspace-write` therefore
+  applies to both the project workspace and the task repository, while the
+  outer mount still keeps the project read-only;
 - one task gets fresh developer/reviewer sessions, while request-changes
   resumes only the exact sessions already bound to that task.
+
+Whole-host read-only means files outside those masks, including same-user
+configuration such as `$HCOM_DIR` or `~/.ssh`, can be read by the interactive
+Architect. This matches the authority needed to follow arbitrary absolute
+source paths, but it is broader than the task-worker view. Do not start an
+Architect on untrusted project instructions if that read authority is
+unacceptable.
 
 Consequently, configuring the Architect or reviewer with
 `danger-full-access`/`dangerously_skip_permissions = true` does not make the

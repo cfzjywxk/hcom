@@ -50,10 +50,10 @@ pub(crate) fn control_action(
 fn tool_description(action: ActionName) -> &'static str {
     match action {
         ActionName::SessionPlanReplace => {
-            "Draft or replace the bounded ordered task plan. Read the current project documentation first and set each task's repository_root to that task's real absolute canonical Git top level; it need not equal or live under the project directory. This never starts a worker. Present the returned exact plan version and hash to the human before requesting approval."
+            "Draft or replace the bounded ordered task plan. Read the current project documentation first and set each task's repository_root to that task's real absolute canonical Git top level; it need not equal or live under the project directory. This never starts a worker. Before requesting approval, enumerate every returned task binding to the human with ordinal, task_key, repository_root, branch, and start HEAD (base_revision), then present the exact plan version and exact plan hash. Do not abbreviate or omit a writable repository binding."
         }
         ActionName::SessionApproveAndStart => {
-            "Start the exact draft only after the human explicitly approved its returned plan version and hash in this architect conversation. Never infer approval."
+            "Start the exact draft only after the human explicitly approved, in this architect conversation, the complete displayed task binding list (ordinal, task_key, repository_root, branch, and start HEAD/base_revision) together with its returned plan version and plan hash. Never infer approval."
         }
         ActionName::SessionStatus => {
             "Read the sanitized in-memory status of this foreground architect run."
@@ -370,5 +370,51 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn approval_contract_requires_every_writable_repository_binding_to_be_displayed() {
+        let tools = tool_definitions("codex-developer-0.145.0", "claude-reviewer-2.1.220");
+        let plan = tools
+            .iter()
+            .find(|tool| tool["name"] == "session_plan_replace")
+            .unwrap()["description"]
+            .as_str()
+            .unwrap();
+        for required in [
+            "ordinal",
+            "task_key",
+            "repository_root",
+            "branch",
+            "base_revision",
+            "plan version",
+            "plan hash",
+        ] {
+            assert!(
+                plan.contains(required),
+                "plan description omitted {required}"
+            );
+        }
+        assert!(plan.contains("Do not abbreviate or omit"));
+
+        let approve = tools
+            .iter()
+            .find(|tool| tool["name"] == "session_approve_and_start")
+            .unwrap()["description"]
+            .as_str()
+            .unwrap();
+        for required in [
+            "task binding list",
+            "repository_root",
+            "branch",
+            "base_revision",
+            "plan version",
+            "plan hash",
+        ] {
+            assert!(
+                approve.contains(required),
+                "approval description omitted {required}"
+            );
+        }
     }
 }

@@ -7,7 +7,7 @@ use super::contract::{
     validate_native_session_id,
 };
 use super::environment::{EnvironmentPolicy, ExactEnvironmentRequirement};
-use super::profile::{CodexInvocationProfile, validate_cli_help_contract};
+use super::profile::{CodexInvocationProfile, CodexSandbox, validate_cli_help_contract};
 use super::result::{
     CheckStatus, CommitSummary, DeveloperDecision, DeveloperResult, MAX_RESULT_BYTES,
 };
@@ -42,7 +42,7 @@ pub const GIT_EXECUTABLE: &str = "/usr/bin/git";
 pub const GIT_VERSION: &str = "git version 2.43.0";
 
 const ADAPTER_NAME: &str = "codex-developer-0.145.0";
-const ADAPTER_CONTRACT_VERSION: u32 = 3;
+const ADAPTER_CONTRACT_VERSION: u32 = 4;
 const OUTER_POLICY: &str = "bubblewrap-0.9.0-host-path-developer-repo-rw-v1";
 const MAX_CODEX_EVENTS: usize = 4096;
 const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -172,7 +172,7 @@ impl CodexDeveloperAdapter {
         bwrap_path: &Path,
         git_path: &Path,
     ) -> Result<Self> {
-        config.invocation.validate("Codex developer")?;
+        validate_codex_developer_invocation(&config.invocation)?;
         let invocation = config.invocation.clone();
         let executable = capture_exact_tool(codex_path, CODEX_DEVELOPER_CLI_VERSION)?;
         let outer_executable = capture_exact_tool(bwrap_path, BWRAP_VERSION)?;
@@ -207,13 +207,24 @@ impl CodexDeveloperAdapter {
             &self.outer_executable,
             &self.git_executable,
         )?;
-        self.invocation.validate("Codex developer")?;
+        validate_codex_developer_invocation(&self.invocation)?;
 
         let mut fixed_argv = vec![
             "exec".into(),
             "--sandbox".into(),
             self.invocation.sandbox.as_str().into(),
         ];
+        if self.invocation.sandbox == CodexSandbox::WorkspaceWrite
+            && self.sandbox.workspace.path() != self.sandbox.launch_cwd.path()
+        {
+            fixed_argv.extend([
+                "--add-dir".into(),
+                path_string(
+                    "Codex developer task repository",
+                    self.sandbox.workspace.path(),
+                )?,
+            ]);
+        }
         if let Some(session_id) = resume_session_id {
             validate_native_session_id(session_id)?;
             fixed_argv.extend(["resume".into(), session_id.into()]);
@@ -289,6 +300,16 @@ impl CodexDeveloperAdapter {
     }
 }
 
+fn validate_codex_developer_invocation(invocation: &CodexInvocationProfile) -> Result<()> {
+    invocation.validate("Codex developer")?;
+    if invocation.sandbox == CodexSandbox::ReadOnly {
+        bail!(
+            "Codex developer sandbox must be workspace-write or danger-full-access because a completed developer turn must commit"
+        );
+    }
+    Ok(())
+}
+
 fn validate_codex_exec_cli(path: &Path) -> Result<()> {
     let mut command = Command::new(path);
     command.args(["exec", "--help"]).env_clear();
@@ -307,6 +328,7 @@ fn validate_codex_exec_cli(path: &Path) -> Result<()> {
             "--model",
             "--sandbox",
             "--cd",
+            "--add-dir",
             "--ignore-user-config",
             "--ignore-rules",
             "--output-schema",
@@ -432,6 +454,7 @@ fn developer_descriptor(invocation: &CodexInvocationProfile) -> Result<AdapterDe
             features: vec![
                 "exact-resume".into(),
                 "host-git-evidence".into(),
+                "native-add-dir-task-repository".into(),
                 "outer-bwrap-host-path-developer-repo-rw-v1".into(),
                 "structured-result".into(),
             ],
@@ -2040,6 +2063,7 @@ mod tests {
         let project = fs::canonicalize(project).unwrap();
         let mut config = fixture.config.clone();
         config.launch_cwd = project.clone();
+        config.invocation.sandbox = CodexSandbox::WorkspaceWrite;
         let adapter = CodexDeveloperAdapter::discover_with_paths(
             config,
             &fixture.codex,
@@ -2057,6 +2081,11 @@ mod tests {
         .unwrap();
         let command = prepared.command();
         assert_eq!(command.workspace_cwd, project);
+        assert!(
+            command.fixed_argv.windows(2).any(|pair| {
+                pair == ["--add-dir", fixture.config.workspace_cwd.to_str().unwrap()]
+            })
+        );
         assert!(
             command
                 .fixed_argv
@@ -2078,6 +2107,46 @@ mod tests {
         }));
         assert!(!outer.windows(3).any(|part| part == ["--ro-bind", "/", "/"]));
         assert!(!outer.iter().any(|argument| argument == "/hcom/workspace"));
+
+        let resume_control = fixture.control(Some("native-codex-workspace-write"));
+        let resumed = prepare_resume_turn(
+            &adapter,
+            &adapter.profile(),
+            &resume_control,
+            "native-codex-workspace-write",
+            b"resume in the same external task repository".to_vec(),
+        )
+        .unwrap();
+        let resumed_argv = &resumed.command().fixed_argv;
+        let add_dir = resumed_argv
+            .iter()
+            .position(|argument| argument == "--add-dir")
+            .unwrap();
+        let resume = resumed_argv
+            .iter()
+            .position(|argument| argument == "resume")
+            .unwrap();
+        assert!(add_dir < resume);
+        assert_eq!(
+            resumed_argv[add_dir + 1],
+            fixture.config.workspace_cwd.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn read_only_native_sandbox_is_rejected_for_a_developer() {
+        let fixture = Fixture::new();
+        let mut config = fixture.config.clone();
+        config.invocation.sandbox = CodexSandbox::ReadOnly;
+        assert!(
+            CodexDeveloperAdapter::discover_with_paths(
+                config,
+                &fixture.codex,
+                &fixture.bwrap,
+                &fixture.git,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2176,6 +2245,74 @@ mod tests {
                 .join("repository-write-probe")
                 .exists()
         );
+    }
+
+    #[test]
+    fn real_bwrap_keeps_nested_task_repository_writable_under_read_only_project() {
+        let fixture = Fixture::new();
+        let project = fixture._temp.path().join("nested-project-context");
+        let repository = project.join("src/task-repository");
+        fs::create_dir_all(&repository).unwrap();
+        fs::set_permissions(&project, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(
+            repository.parent().unwrap(),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::set_permissions(&repository, fs::Permissions::from_mode(0o700)).unwrap();
+        git_ok(
+            &fixture.git,
+            &repository,
+            &["init", "--quiet", "--initial-branch=master"],
+        );
+        git_ok(
+            &fixture.git,
+            &repository,
+            &["config", "user.name", "Nested Layout"],
+        );
+        git_ok(
+            &fixture.git,
+            &repository,
+            &["config", "user.email", "nested@example.invalid"],
+        );
+        fs::write(repository.join("base.txt"), b"nested base\n").unwrap();
+        git_ok(&fixture.git, &repository, &["add", "base.txt"]);
+        git_ok(
+            &fixture.git,
+            &repository,
+            &["commit", "--quiet", "-m", "Nested base"],
+        );
+        fs::set_permissions(repository.join(".git"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(
+            repository.join(".git/objects"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let project = fs::canonicalize(project).unwrap();
+        let repository = fs::canonicalize(repository).unwrap();
+        write_executable(
+            &fixture.codex,
+            &fake_codex_script_with_path_probe(&project, &repository, &fixture.global_sentinel),
+        );
+        let mut config = fixture.config.clone();
+        config.launch_cwd = project.clone();
+        config.workspace_cwd = repository.clone();
+        let real_bwrap = fs::canonicalize(BWRAP_EXECUTABLE).unwrap();
+        let adapter = CodexDeveloperAdapter::discover_with_paths(
+            config,
+            &fixture.codex,
+            &real_bwrap,
+            &fixture.git,
+        )
+        .unwrap();
+        let control = fixture.control(None);
+        let completion = fixture.run(&adapter, &control, b"nested mount-order probe");
+        assert_eq!(completion.exit.code, Some(0));
+        adapter
+            .extract_result(&control, &completion.artifacts)
+            .unwrap();
+        assert!(!project.join("project-write-probe").exists());
+        assert!(!repository.join("repository-write-probe").exists());
     }
 
     #[test]

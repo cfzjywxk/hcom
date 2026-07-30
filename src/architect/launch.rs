@@ -259,7 +259,6 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         paths: paths.clone(),
         auth_source,
         host_runtime: native_environment.runtime_home.clone(),
-        session_runtime_root: control_paths.run_root().to_owned(),
         host_root: HostRootContract::capture(
             &native_environment.cargo_bin_source,
             &native_environment.rustup_home_source,
@@ -1207,7 +1206,6 @@ struct ArchitectSandbox {
     paths: ArchitectLaunchPaths,
     auth_source: PrivateFileIdentity,
     host_runtime: PathBuf,
-    session_runtime_root: PathBuf,
     host_root: HostRootContract,
 }
 
@@ -1227,10 +1225,13 @@ impl ArchitectSandbox {
         if paths_overlap(&self.paths.runtime, &self.host_runtime) {
             bail!("architect relay runtime overlaps the host runtime directory");
         }
-        if paths_overlap(&self.session_runtime_root, &self.host_runtime) {
-            bail!("architect session runtime overlaps the host runtime directory");
-        }
         tools.revalidate()?;
+        let tmp = Path::new("/tmp");
+        let masked_dirs: Vec<&Path> = if self.host_runtime.starts_with(tmp) {
+            vec![tmp]
+        } else {
+            vec![tmp, &self.host_runtime]
+        };
         let mut argv = self.host_root.host_root_argv(HostRootMounts {
             isolated_home: &self.paths.home,
             native_config: &self.paths.codex_home,
@@ -1243,7 +1244,7 @@ impl ArchitectSandbox {
             read_only_files: &[&tools.codex.canonical_path, &tools.component.canonical_path],
             extra_writable_dirs: &[],
             expose_host_root_read_only: true,
-            masked_dirs: &[&self.host_runtime, &self.session_runtime_root],
+            masked_dirs: &masked_dirs,
         })?;
         argv.push("--clearenv".into());
         for (name, value) in environment.sandbox_values(&self.paths)? {
@@ -1868,7 +1869,6 @@ mod tests {
             paths,
             auth_source: PrivateFileIdentity::capture(&root.join("auth.json")).unwrap(),
             host_runtime,
-            session_runtime_root: root.join("session-runtime"),
             host_root: HostRootContract::capture(&cargo_bin_source, &rustup_home_source).unwrap(),
         };
         let report = root.join("architect-state/home/blank-report");
@@ -1908,8 +1908,17 @@ mod tests {
             .tempdir()
             .unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
+        let sibling_session = tempfile::Builder::new()
+            .prefix("hcom-architect-session.sibling.")
+            .tempdir()
+            .unwrap();
+        let sibling_runtime = fs::canonicalize(sibling_session.path()).unwrap();
         let repository = root.join("repo");
-        let external_source = root.join("external-source");
+        let external_temp = tempfile::Builder::new()
+            .prefix("hcom-architect-external.")
+            .tempdir_in("/var/tmp")
+            .unwrap();
+        let external_source = fs::canonicalize(external_temp.path()).unwrap();
         let host_runtime = root.join("run");
         let control_root = host_runtime.join("legacy-control-sentinel");
         let architect_root = root.join("session-runtime");
@@ -1922,7 +1931,6 @@ mod tests {
         let rustup_home_source = root.join("rustup-home");
         for path in [
             &repository,
-            &external_source,
             &host_runtime,
             &control_root,
             &architect_root,
@@ -1958,11 +1966,13 @@ mod tests {
         let registration_socket = control_root.join("registration.sock");
         let relay_socket = runtime.join("relay.sock");
         let other_relay_socket = other_runtime.join("relay.sock");
+        let sibling_relay_socket = sibling_runtime.join("relay.sock");
         let listeners: Vec<_> = [
             &control_socket,
             &registration_socket,
             &relay_socket,
             &other_relay_socket,
+            &sibling_relay_socket,
         ]
         .into_iter()
         .map(|path| {
@@ -2048,6 +2058,7 @@ with open({report}, "w", encoding="utf-8") as output:
                 control_socket.to_string_lossy().into_owned(),
                 registration_socket.to_string_lossy().into_owned(),
                 other_relay_socket.to_string_lossy().into_owned(),
+                sibling_relay_socket.to_string_lossy().into_owned(),
             ])
             .unwrap(),
             relay_socket = serde_json::to_string(&relay_socket).unwrap(),

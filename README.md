@@ -115,6 +115,9 @@ the command starts. See [the Architect user guide](docs/architect.md) for the
 complete schema, all four Codex/Claude role combinations, parent-terminal
 login inheritance, and path-preserving sandbox invariants.
 
+Before approval, the Architect must display every task's repository root,
+branch, and start HEAD together with the exact plan version and hash.
+
 ---
 
 ## How it works

@@ -182,7 +182,15 @@ impl DeveloperInvocationProfile {
 
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::Codex { profile } => profile.validate("Codex developer"),
+            Self::Codex { profile } => {
+                profile.validate("Codex developer")?;
+                if profile.sandbox == CodexSandbox::ReadOnly {
+                    bail!(
+                        "Codex developer sandbox must be workspace-write or danger-full-access because a completed developer turn must commit"
+                    );
+                }
+                Ok(())
+            }
             Self::Claude { profile } => profile.validate("Claude developer"),
         }
     }
@@ -379,6 +387,14 @@ mod tests {
         let mut profile = CodexInvocationProfile::developer_default();
         profile.reasoning_effort = "max --config mcp_servers".into();
         assert!(profile.validate("test").is_err());
+
+        let developer = DeveloperInvocationProfile::Codex {
+            profile: CodexInvocationProfile {
+                sandbox: CodexSandbox::ReadOnly,
+                ..CodexInvocationProfile::developer_default()
+            },
+        };
+        assert!(developer.validate().is_err());
     }
 
     #[test]

@@ -11,7 +11,9 @@ use super::contract::{
     validate_native_session_id,
 };
 use super::environment::{EnvironmentPolicy, ExactEnvironmentRequirement};
-use super::profile::{ClaudeInvocationProfile, CodexInvocationProfile, validate_cli_help_contract};
+use super::profile::{
+    ClaudeInvocationProfile, CodexInvocationProfile, CodexSandbox, validate_cli_help_contract,
+};
 use super::result::{
     CheckStatus, DeveloperDecision, DeveloperResult, MAX_RESULT_BYTES, ReviewerResult,
 };
@@ -53,9 +55,9 @@ const GIT_VERSION: &str = "git version 2.43.0";
 const CODEX_ADAPTER_NAME: &str = "codex-reviewer-0.145.0";
 const CLAUDE_ADAPTER_NAME: &str = "claude-reviewer-2.1.220";
 const CLAUDE_DEVELOPER_ADAPTER_NAME: &str = "claude-developer-2.1.220";
-const CODEX_ADAPTER_CONTRACT_VERSION: u32 = 3;
-const CLAUDE_ADAPTER_CONTRACT_VERSION: u32 = 3;
-const CLAUDE_DEVELOPER_ADAPTER_CONTRACT_VERSION: u32 = 1;
+const CODEX_ADAPTER_CONTRACT_VERSION: u32 = 4;
+const CLAUDE_ADAPTER_CONTRACT_VERSION: u32 = 4;
+const CLAUDE_DEVELOPER_ADAPTER_CONTRACT_VERSION: u32 = 2;
 const REVIEWER_OUTER_POLICY: &str = "bubblewrap-0.9.0-host-path-reviewer-ro-v1";
 const DEVELOPER_OUTER_POLICY: &str = "bubblewrap-0.9.0-host-path-developer-repo-rw-v1";
 const CODEX_RESULT_SCHEMA_FILE: &str = "codex-reviewer-result-schema.json";
@@ -197,6 +199,17 @@ impl CodexReviewerAdapter {
             "--sandbox".into(),
             self.invocation.sandbox.as_str().into(),
         ];
+        if self.invocation.sandbox == CodexSandbox::WorkspaceWrite
+            && self.sandbox.workspace.path() != self.sandbox.launch_cwd.path()
+        {
+            fixed_argv.extend([
+                "--add-dir".into(),
+                path_string(
+                    "Codex reviewer task repository",
+                    self.sandbox.workspace.path(),
+                )?,
+            ]);
+        }
         if let Some(session_id) = resume_session_id {
             validate_native_session_id(session_id)?;
             fixed_argv.extend(["resume".into(), session_id.into()]);
@@ -473,6 +486,15 @@ impl ClaudeDeveloperAdapter {
         self.invocation.validate("Claude developer")?;
 
         let mut fixed_argv = vec!["-p".into(), "--output-format".into(), "json".into()];
+        if self.sandbox.workspace.path() != self.sandbox.launch_cwd.path() {
+            fixed_argv.extend([
+                "--add-dir".into(),
+                path_string(
+                    "Claude developer task repository",
+                    self.sandbox.workspace.path(),
+                )?,
+            ]);
+        }
         if resume_session_id.is_some() {
             fixed_argv.extend(["--resume".into(), exact_session.into()]);
         } else {
@@ -751,6 +773,15 @@ impl ClaudeReviewerAdapter {
         self.invocation.validate("Claude reviewer")?;
 
         let mut fixed_argv = vec!["-p".into(), "--output-format".into(), "json".into()];
+        if self.sandbox.workspace.path() != self.sandbox.launch_cwd.path() {
+            fixed_argv.extend([
+                "--add-dir".into(),
+                path_string(
+                    "Claude reviewer task repository",
+                    self.sandbox.workspace.path(),
+                )?,
+            ]);
+        }
         if resume_session_id.is_some() {
             fixed_argv.extend(["--resume".into(), exact_session.into()]);
         } else {
@@ -894,6 +925,7 @@ fn validate_claude_cli(path: &Path) -> Result<()> {
             "--model",
             "--effort",
             "--dangerously-skip-permissions",
+            "--add-dir",
             "--tools",
             "--setting-sources",
             "--strict-mcp-config",
@@ -1013,6 +1045,14 @@ fn reviewer_capabilities(
 
 fn codex_reviewer_descriptor(invocation: &CodexInvocationProfile) -> Result<AdapterDescriptor> {
     let policy = invocation.effective_policy(REVIEWER_OUTER_POLICY);
+    let mut capabilities = reviewer_capabilities(
+        NativeSessionMode::Discovered,
+        ResultTransport::FinalFile,
+        "outer-bwrap-host-path-reviewer-ro-v1",
+    );
+    capabilities
+        .features
+        .push("native-add-dir-task-repository".into());
     AdapterDescriptor::new(
         CODEX_ADAPTER_NAME,
         CODEX_ADAPTER_CONTRACT_VERSION,
@@ -1020,16 +1060,20 @@ fn codex_reviewer_descriptor(invocation: &CodexInvocationProfile) -> Result<Adap
         &invocation.model,
         &invocation.reasoning_effort,
         &policy,
-        reviewer_capabilities(
-            NativeSessionMode::Discovered,
-            ResultTransport::FinalFile,
-            "outer-bwrap-host-path-reviewer-ro-v1",
-        ),
+        capabilities,
     )
 }
 
 fn claude_reviewer_descriptor(invocation: &ClaudeInvocationProfile) -> Result<AdapterDescriptor> {
     let policy = invocation.effective_policy(REVIEWER_OUTER_POLICY);
+    let mut capabilities = reviewer_capabilities(
+        NativeSessionMode::Preassigned,
+        ResultTransport::Envelope,
+        "outer-bwrap-host-path-reviewer-ro-v1",
+    );
+    capabilities
+        .features
+        .push("native-add-dir-task-repository".into());
     AdapterDescriptor::new(
         CLAUDE_ADAPTER_NAME,
         CLAUDE_ADAPTER_CONTRACT_VERSION,
@@ -1037,11 +1081,7 @@ fn claude_reviewer_descriptor(invocation: &ClaudeInvocationProfile) -> Result<Ad
         &invocation.model,
         &invocation.effort,
         &policy,
-        reviewer_capabilities(
-            NativeSessionMode::Preassigned,
-            ResultTransport::Envelope,
-            "outer-bwrap-host-path-reviewer-ro-v1",
-        ),
+        capabilities,
     )
 }
 
@@ -1061,6 +1101,7 @@ fn claude_developer_descriptor(invocation: &ClaudeInvocationProfile) -> Result<A
             features: vec![
                 "exact-resume".into(),
                 "host-git-evidence".into(),
+                "native-add-dir-task-repository".into(),
                 "outer-bwrap-host-path-developer-repo-rw-v1".into(),
                 "structured-result".into(),
             ],
@@ -2996,6 +3037,12 @@ mod tests {
         .unwrap();
         let command = prepared.command();
         assert_eq!(command.workspace_cwd, project);
+        assert!(
+            command
+                .fixed_argv
+                .windows(2)
+                .any(|pair| { pair == ["--add-dir", fixture.workspace.to_str().unwrap()] })
+        );
         let outer = &command.outer_launch.as_ref().unwrap().fixed_argv;
         assert!(
             outer
@@ -3010,6 +3057,166 @@ mod tests {
             ]
         }));
         assert!(!outer.iter().any(|argument| argument == "/hcom/workspace"));
+
+        let resume_control = fixture.developer_control(CLAUDE_SESSION, 2, None);
+        let resumed = prepare_resume_turn(
+            &adapter,
+            &adapter.profile(),
+            &resume_control,
+            CLAUDE_SESSION,
+            b"resume in the same external task repository".to_vec(),
+        )
+        .unwrap();
+        assert!(
+            resumed
+                .command()
+                .fixed_argv
+                .windows(2)
+                .any(|pair| { pair == ["--add-dir", fixture.workspace.to_str().unwrap()] })
+        );
+        assert!(
+            resumed
+                .command()
+                .fixed_argv
+                .windows(2)
+                .any(|pair| pair == ["--resume", CLAUDE_SESSION])
+        );
+
+        let mut reviewer_config = fixture.claude_config();
+        reviewer_config.launch_cwd = project.clone();
+        let reviewer = ClaudeReviewerAdapter::discover_with_paths(
+            reviewer_config,
+            &fixture.claude,
+            &fixture.bwrap,
+            &fixture.git,
+        )
+        .unwrap();
+        let reviewer_control = fixture.control(
+            "task-claude-external",
+            "logical-claude-external",
+            Some(CLAUDE_SESSION),
+            1,
+            1,
+            &fixture.first_head,
+        );
+        let reviewer_create = prepare_create_turn(
+            &reviewer,
+            &reviewer.profile(),
+            &reviewer_control,
+            b"review the external task repository".to_vec(),
+        )
+        .unwrap();
+        assert!(
+            reviewer_create
+                .command()
+                .fixed_argv
+                .windows(2)
+                .any(|pair| { pair == ["--add-dir", fixture.workspace.to_str().unwrap()] })
+        );
+
+        let reviewer_resume_control = fixture.control(
+            "task-claude-external",
+            "logical-claude-external",
+            Some(CLAUDE_SESSION),
+            2,
+            2,
+            &fixture.first_head,
+        );
+        let reviewer_resume = prepare_resume_turn(
+            &reviewer,
+            &reviewer.profile(),
+            &reviewer_resume_control,
+            CLAUDE_SESSION,
+            b"resume reviewing the external task repository".to_vec(),
+        )
+        .unwrap();
+        assert!(
+            reviewer_resume
+                .command()
+                .fixed_argv
+                .windows(2)
+                .any(|pair| { pair == ["--add-dir", fixture.workspace.to_str().unwrap()] })
+        );
+        assert!(
+            reviewer_resume
+                .command()
+                .fixed_argv
+                .windows(2)
+                .any(|pair| pair == ["--resume", CLAUDE_SESSION])
+        );
+    }
+
+    #[test]
+    fn codex_workspace_write_reviewer_declares_an_external_task_repository() {
+        let fixture = Fixture::new();
+        let project = fixture._temp.path().join("codex-reviewer-project-context");
+        fs::create_dir(&project).unwrap();
+        fs::set_permissions(&project, fs::Permissions::from_mode(0o700)).unwrap();
+        let project = fs::canonicalize(project).unwrap();
+        let mut config = fixture.codex_config();
+        config.launch_cwd = project.clone();
+        config.invocation.sandbox = CodexSandbox::WorkspaceWrite;
+        let adapter = CodexReviewerAdapter::discover_with_paths(
+            config,
+            &fixture.codex,
+            &fixture.bwrap,
+            &fixture.git,
+        )
+        .unwrap();
+        let control = fixture.control(
+            "task-codex-external",
+            "logical-codex-external",
+            None,
+            1,
+            1,
+            &fixture.first_head,
+        );
+        let prepared = prepare_create_turn(
+            &adapter,
+            &adapter.profile(),
+            &control,
+            b"review the external task repository".to_vec(),
+        )
+        .unwrap();
+        let command = prepared.command();
+        assert_eq!(command.workspace_cwd, project);
+        assert!(
+            command
+                .fixed_argv
+                .windows(2)
+                .any(|pair| { pair == ["--add-dir", fixture.workspace.to_str().unwrap()] })
+        );
+
+        let resume_control = fixture.control(
+            "task-codex-external",
+            "logical-codex-external",
+            Some("native-codex-reviewer-external"),
+            2,
+            2,
+            &fixture.first_head,
+        );
+        let resumed = prepare_resume_turn(
+            &adapter,
+            &adapter.profile(),
+            &resume_control,
+            "native-codex-reviewer-external",
+            b"resume reviewing the external task repository".to_vec(),
+        )
+        .unwrap();
+        let resumed_argv = &resumed.command().fixed_argv;
+        let add_dir = resumed_argv
+            .iter()
+            .position(|argument| argument == "--add-dir")
+            .unwrap();
+        let resume = resumed_argv
+            .iter()
+            .position(|argument| argument == "resume")
+            .unwrap();
+        assert!(add_dir < resume);
+        assert_eq!(
+            resumed_argv[add_dir + 1],
+            fixture.workspace.to_string_lossy()
+        );
     }
 
     #[test]

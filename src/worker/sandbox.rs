@@ -125,9 +125,10 @@ impl HostRootContract {
             .revalidate(Some(current_uid), "Rust rustup lease")
     }
 
-    /// Build a path-preserving, minimal mount namespace. Native CLIs see the
-    /// caller's real project/repository paths and start in the exact project
-    /// directory; hcom does not mount the host root or invent a workspace path.
+    /// Build a path-preserving mount namespace. Task workers use the minimal
+    /// explicit-root form; the interactive Architect may use the read-only
+    /// host-root form with explicit masks. Both retain real paths and never
+    /// invent a workspace path.
     pub(crate) fn host_root_argv(&self, mounts: HostRootMounts<'_>) -> Result<Vec<String>> {
         self.revalidate()?;
         for (label, path) in [
@@ -196,9 +197,10 @@ impl HostRootContract {
             }
             let mut directory_targets = BTreeSet::new();
             for target in mounts
-                .writable_roots
+                .readable_roots
                 .iter()
                 .copied()
+                .chain(mounts.writable_roots.iter().copied())
                 .chain(private_writable_dirs.iter().copied())
             {
                 collect_directory_chain(target, true, &mut directory_targets)?;
@@ -219,6 +221,13 @@ impl HostRootContract {
                 {
                     argv.extend(["--dir".into(), text("private mount target", &directory)?]);
                 }
+            }
+            for directory in mounts.readable_roots {
+                argv.extend([
+                    "--ro-bind".into(),
+                    text("readable root", directory)?,
+                    text("readable root", directory)?,
+                ]);
             }
             for directory in mounts.writable_roots {
                 argv.extend([
