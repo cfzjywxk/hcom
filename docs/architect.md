@@ -1,9 +1,11 @@
 # Architect and in-session task workers
 
-`hcom architect` starts one blank, foreground Codex or Claude architect. After
-the human types and approves an ordered plan, the same foreground parent starts
-one fresh no-TUI developer and reviewer per task. State exists only in memory
-and the whole run stops when the parent terminal exits.
+`hcom architect` starts one blank, foreground Codex or Claude architect. The
+Architect can maintain project plans and coordination records. After the human
+either directs the Architect to follow a named existing detailed plan or later
+approves a newly drafted plan, the same foreground parent starts one fresh no-TUI
+developer and reviewer per task. State exists only in memory and the whole run
+stops when the parent terminal exits.
 
 ## Start
 
@@ -28,10 +30,10 @@ the project directory, such as `/home/user/src/hcom`, or nested inside it,
 such as `/home/user/work/tidb_vulcan/src/component`. Different tasks may name
 different repositories.
 
-Repositories are validated and locked when the plan is proposed. After human
-approval, the developer commits directly to the repository for that task.
-There is no final apply, reset, rebase, merge, push, install, or persistent
-recovery.
+Repositories are validated and locked when the typed plan is proposed. After
+execution authorization, the developer commits directly to the repository for
+that task. There is no final apply, reset, rebase, merge, push, install, or
+persistent recovery.
 
 The architect starts with an empty input buffer. hcom does not provide a prompt
 argument, write stdin, inject a key, or submit Enter. The human owns the first
@@ -61,13 +63,15 @@ explicit `[architect.reviewer]` table disables that inheritance.
 The Codex Architect's isolated configuration marks the one
 `hcom_session_task_control` MCP server as approved for this invocation, so
 status, plan, start, and cancel calls do not each show an additional native
-tool-approval dialog. This does not remove hcom's product gate: the Architect
-is instructed to display the complete repository bindings plus exact plan
-version/hash and to call `session_approve_and_start` only after the human
-approves them in the conversation. The supervisor rechecks the exact
-version/hash and a required confirmation bit. This is model-relayed approval,
-not independent OS-level proof of a human keystroke; no additional native MCP
-dialog is expected.
+tool-approval dialog. The Architect must display the complete repository
+bindings plus exact plan version/hash before starting. A human message that
+explicitly directs it to follow, implement, execute, proceed with, or complete
+a named existing detailed plan, specification, or `current_todo` authorizes
+same-turn plan derivation and start. A request only to read, analyze, discuss,
+summarize, draft, or update a plan does not authorize execution and leaves the
+run waiting for approval. The supervisor rechecks the exact version/hash and a
+required confirmation bit. This is model-relayed authorization, not
+independent OS-level proof of a human keystroke.
 
 For a Codex architect, this complete Codex-developer/Claude-reviewer example
 uses explicit profiles for all three roles:
@@ -224,11 +228,13 @@ Profile configuration changes native CLI policy, not the outer containment:
   every task worker;
 - absolute host paths are preserved; no role sees a synthetic
   `/hcom/workspace`;
-- the interactive Architect keeps a whole-host read-only filesystem view so it
-  can follow project documentation to source repositories outside the project
-  directory; `/tmp`, the host XDG runtime, all current/sibling architect
-  session roots, and hcom control sockets are masked, while the exact project
-  and this Architect's private state are rebound as needed;
+- the interactive Architect keeps a whole-host read-write filesystem view so
+  it can create and maintain `current_todo`, technical plans, and discussion
+  records at their real paths; `/tmp`, the host XDG runtime, all
+  current/sibling architect session roots, and hcom control sockets remain
+  masked, while the exact project and this Architect's private state are
+  rebound writable as needed; pinned Architect/MCP executables and the exact
+  credential source remain read-only;
 - the developer receives only its task repository read-write at that
   repository's real absolute path;
 - every reviewer sees the exact project and task repository HEAD read-only at
@@ -249,14 +255,14 @@ Profile configuration changes native CLI policy, not the outer containment:
 - one task gets fresh developer/reviewer sessions, while request-changes
   resumes only the exact sessions already bound to that task.
 
-Whole-host read-only means files outside those masks, including same-user
-configuration such as `$HCOM_DIR` or `~/.ssh`, can be read by the interactive
-Architect. This matches the authority needed to follow arbitrary absolute
-source paths, but it is broader than the task-worker view. Do not start an
-Architect on untrusted project instructions if that read authority is
-unacceptable.
+Whole-host read-write is intentionally broad Architect authority and is much
+broader than the task-worker view. Do not start an Architect on untrusted
+project instructions. Before `session_plan_replace`, the Architect may write
+and commit design artifacts. Once a task repository is bound, the Architect
+must not modify it concurrently: the repository lock and clean
+branch/HEAD/worktree gates will stop the run on drift. Coordination files
+outside bound task repositories can continue to be updated.
 
-Consequently, configuring the Architect or reviewer with
-`danger-full-access`/`dangerously_skip_permissions = true` does not make the
-host checkout writable to those roles. The outer read-only mount remains the
-enforced boundary.
+Reviewer source/Git paths remain read-only regardless of the configured native
+permission mode. Developer write authority remains limited to the current task
+repository by the outer worker namespace.

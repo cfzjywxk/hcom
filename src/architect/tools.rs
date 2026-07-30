@@ -50,10 +50,10 @@ pub(crate) fn control_action(
 fn tool_description(action: ActionName) -> &'static str {
     match action {
         ActionName::SessionPlanReplace => {
-            "Draft or replace the bounded ordered task plan. Read the current project documentation first and set each task's repository_root to that task's real absolute canonical Git top level; it need not equal or live under the project directory. This never starts a worker. Before requesting approval, enumerate every returned task binding to the human with ordinal, task_key, repository_root, branch, and start HEAD (base_revision), then present the exact plan version and exact plan hash. Do not abbreviate or omit a writable repository binding."
+            "Draft or replace the bounded ordered task plan. Read the current project documentation first and set each task's repository_root to that task's real absolute canonical Git top level; it need not equal or live under the project directory. You may create or update architecture plans, current_todo, and discussion records before this call. If such an artifact is inside a task repository, leave that repository clean and committed before binding it; after this call, do not modify a bound task repository yourself. This call never starts a worker. Enumerate every returned task binding to the human with ordinal, task_key, repository_root, branch, and start HEAD (base_revision), then present the exact plan version and exact plan hash. Do not abbreviate or omit a writable repository binding. If the human's current message explicitly directs you to follow, implement, execute, proceed with, or complete a named existing detailed plan, specification, or current_todo (including an instruction meaning \"按照 current_todo\" or \"按照 <named plan> 推进完成开发\"), that message authorizes starting the faithfully derived plan in this same turn after you present these bindings; otherwise wait for a later explicit approval. An explicit instruction not to start always wins."
         }
         ActionName::SessionApproveAndStart => {
-            "Start the exact draft only after the human explicitly approved, in this architect conversation, the complete displayed task binding list (ordinal, task_key, repository_root, branch, and start HEAD/base_revision) together with its returned plan version and plan hash. Never infer approval."
+            "Start the exact draft only with explicit human execution authorization in this architect conversation. Authorization is valid either when the human approves the complete displayed task binding list (ordinal, task_key, repository_root, branch, and start HEAD/base_revision) with its plan version and plan hash, or when the human's current message explicitly directs you to follow, implement, execute, proceed with, or complete a named existing detailed plan, specification, or current_todo (including an instruction meaning \"按照 current_todo\" or \"按照 <named plan> 推进完成开发\") and this draft faithfully derives from that source. In the latter case, present the complete returned bindings, plan version, and plan hash, then call this tool in the same turn without requiring a second human reply. A request only to read, analyze, discuss, summarize, draft, or update a plan is not execution authorization. An explicit instruction not to start always wins. Never infer authorization from vague continuation language or from the existence of a plan."
         }
         ActionName::SessionStatus => {
             "Read the sanitized in-memory status of this foreground architect run."
@@ -111,7 +111,14 @@ fn action_schema(action: ActionName, developer_adapter: &str, reviewer_adapter: 
                 ("expected_session_version", uint_schema()),
                 ("plan_version", positive_uint_schema()),
                 ("plan_hash", sha256_schema()),
-                ("approval_confirmed", json!({"type":"boolean","const":true})),
+                (
+                    "approval_confirmed",
+                    json!({
+                        "type":"boolean",
+                        "const":true,
+                        "description":"Attest that the human explicitly authorized execution either by approving this exact displayed draft or by directing the Architect to follow/implement/execute the named existing detailed plan/specification/current_todo from which this draft was faithfully derived."
+                    }),
+                ),
             ],
         ),
         ActionName::SessionStatus => object_schema(&[], []),
@@ -373,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_contract_requires_every_writable_repository_binding_to_be_displayed() {
+    fn execution_authorization_contract_supports_exact_or_named_plan_start() {
         let tools = tool_definitions("codex-developer-0.145.0", "claude-reviewer-2.1.220");
         let plan = tools
             .iter()
@@ -397,12 +404,11 @@ mod tests {
         }
         assert!(plan.contains("Do not abbreviate or omit"));
 
-        let approve = tools
+        let approve_tool = tools
             .iter()
             .find(|tool| tool["name"] == "session_approve_and_start")
-            .unwrap()["description"]
-            .as_str()
             .unwrap();
+        let approve = approve_tool["description"].as_str().unwrap();
         for required in [
             "task binding list",
             "repository_root",
@@ -410,11 +416,37 @@ mod tests {
             "base_revision",
             "plan version",
             "plan hash",
+            "named existing detailed plan",
+            "same turn",
+            "current_todo",
+            "follow",
         ] {
             assert!(
                 approve.contains(required),
                 "approval description omitted {required}"
             );
         }
+        for required in [
+            "current_todo",
+            "clean and committed",
+            "do not modify a bound task repository",
+            "按照 current_todo",
+            "An explicit instruction not to start always wins",
+        ] {
+            assert!(
+                plan.contains(required),
+                "plan description omitted {required}"
+            );
+        }
+        for non_authorizing in ["analyze", "summarize", "draft", "update a plan"] {
+            assert!(
+                approve.contains(non_authorizing),
+                "approval description omitted non-authorizing verb {non_authorizing}"
+            );
+        }
+        assert_eq!(
+            approve_tool["inputSchema"]["properties"]["approval_confirmed"]["const"],
+            true
+        );
     }
 }

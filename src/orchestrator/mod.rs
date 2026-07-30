@@ -630,7 +630,7 @@ impl SessionSupervisor {
     ) -> Result<()> {
         self.require_version(expected_session_version)?;
         if self.state != SessionState::AwaitingApproval || !approval_confirmed {
-            bail!("run start requires explicit human approval of the exact draft");
+            bail!("run start requires explicit human execution authorization");
         }
         let draft = self
             .draft

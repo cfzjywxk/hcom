@@ -22,7 +22,7 @@ use crate::worker::profile::{
     validate_cli_help_contract,
 };
 use crate::worker::reviewer::{CLAUDE_REVIEWER_CLI_VERSION, CLAUDE_REVIEWER_EXECUTABLE};
-use crate::worker::sandbox::{HostRootContract, HostRootMounts};
+use crate::worker::sandbox::{HostRootAccess, HostRootContract, HostRootMounts};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -150,7 +150,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         write_profile_summary(&mut stdout, &loaded.profiles)?;
         writeln!(
             stdout,
-            "task repositories: discovered from project documentation and bound only after exact plan approval; each developer commits directly there"
+            "task repositories: discovered from project documentation and bound only after explicit execution authorization; each developer commits directly there"
         )?;
         stdout.flush()?;
     }
@@ -1085,9 +1085,10 @@ fn write_isolated_codex_config(paths: &ArchitectLaunchPaths, component: &Path) -
         enabled: true,
         // The server is a per-invocation, capability-bound relay exposing only
         // the four session-plan tools. The tool contract requires the model to
-        // relay prior human approval; hcom itself verifies the exact plan/hash
-        // and confirmation bit, not keyboard provenance. A second native MCP
-        // dialog is intentionally not part of that product contract.
+        // relay explicit human execution authorization, which may be a direct
+        // request to follow a named plan in the current turn. hcom itself
+        // verifies the exact plan/hash and confirmation bit, not keyboard
+        // provenance. A second native MCP dialog is intentionally absent.
         default_tools_approval_mode: IsolatedMcpToolApprovalMode::Approve,
     };
     let config = IsolatedCodexConfig {
@@ -1487,14 +1488,15 @@ impl ArchitectSandbox {
             artifact_dir: &self.paths.runtime,
             auth_source: self.auth_source.path(),
             auth_target: &self.paths.auth_target,
-            readable_roots: &[&self.project_root],
-            writable_roots: &[],
+            readable_roots: &[],
+            writable_roots: &[&self.project_root],
             read_only_files: &[
                 &tools.architect.executable().canonical_path,
                 &tools.component.canonical_path,
+                self.auth_source.path(),
             ],
             extra_writable_dirs,
-            expose_host_root_read_only: true,
+            host_root_access: HostRootAccess::ReadWrite,
             masked_dirs: &masked_dirs,
         })?;
         argv.push("--clearenv".into());
@@ -1638,7 +1640,7 @@ fn architect_native_argv(
                 "--name".into(),
                 "hcom-architect".into(),
                 "--tools".into(),
-                "Bash,Read,Glob,Grep".into(),
+                "Bash,Read,Write,Edit,Glob,Grep".into(),
                 "--setting-sources".into(),
                 String::new(),
                 "--strict-mcp-config".into(),
@@ -2299,6 +2301,10 @@ mod tests {
             argv.windows(2)
                 .any(|pair| pair == ["--setting-sources", ""])
         );
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["--tools", "Bash,Read,Write,Edit,Glob,Grep"])
+        );
         assert!(!argv.iter().any(|argument| argument == "-"));
         let mcp = argv
             .windows(2)
@@ -2409,11 +2415,14 @@ mod tests {
         let status = child.wait().unwrap();
         assert!(status.success(), "fake blank architect failed: {status}");
         assert_eq!(fs::read_to_string(report).unwrap(), "ok\n");
-        assert!(!write_probe.exists());
+        assert_eq!(
+            fs::read_to_string(write_probe).unwrap(),
+            "architect project write\n"
+        );
     }
 
     #[test]
-    fn blank_launch_keeps_terminal_input_empty_and_preserves_project_path() {
+    fn blank_launch_keeps_input_empty_and_grants_path_preserving_architect_write() {
         let temp = tempfile::Builder::new()
             .prefix("hcom-phase7-blank.")
             .tempdir()
@@ -2494,6 +2503,7 @@ mod tests {
         .collect();
 
         let report = home.join("blank-report");
+        let external_write_probe = external_source.join("architect-write-probe");
         let profile = CodexInvocationProfile::architect_default();
         let mut expected_args = vec![
             "--model".to_owned(),
@@ -2531,17 +2541,22 @@ if not all(os.isatty(fd) for fd in (0, 1, 2)):
     raise SystemExit(32)
 if select.select([0], [], [], 0)[0]:
     raise SystemExit(33)
-try:
-    open({write_probe}, "xb").close()
-except OSError as error:
-    if error.errno != errno.EROFS:
-        raise SystemExit(34)
-else:
-    raise SystemExit(35)
+with open({write_probe}, "x", encoding="utf-8") as output:
+    output.write("architect project write\n")
 
 with open({external_source}, encoding="utf-8") as source:
     if source.read() != "external source visible\n":
-        raise SystemExit(36)
+        raise SystemExit(34)
+with open({external_write_probe}, "x", encoding="utf-8") as output:
+    output.write("architect external write\n")
+try:
+    with open({auth_source}, "a", encoding="utf-8") as output:
+        output.write("forbidden")
+except OSError as error:
+    if error.errno != errno.EROFS:
+        raise SystemExit(35)
+else:
+    raise SystemExit(36)
 for hidden in {hidden_sockets}:
     if os.path.exists(hidden):
         raise SystemExit(37)
@@ -2565,6 +2580,8 @@ with open({report}, "w", encoding="utf-8") as output:
             expected_args = serde_json::to_string(&expected_args).unwrap(),
             write_probe = serde_json::to_string(&repository.join("architect-write-probe")).unwrap(),
             external_source = serde_json::to_string(&external_source.join("source.txt")).unwrap(),
+            external_write_probe = serde_json::to_string(&external_write_probe).unwrap(),
+            auth_source = serde_json::to_string(&auth_source).unwrap(),
             hidden_sockets = serde_json::to_string(&[
                 control_socket.to_string_lossy().into_owned(),
                 registration_socket.to_string_lossy().into_owned(),
@@ -2638,7 +2655,15 @@ with open({report}, "w", encoding="utf-8") as output:
             String::from_utf8_lossy(&output)
         );
         assert_eq!(fs::read_to_string(&report).unwrap(), "ok\n");
-        assert!(!repository.join("architect-write-probe").exists());
+        assert_eq!(
+            fs::read_to_string(repository.join("architect-write-probe")).unwrap(),
+            "architect project write\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&external_write_probe).unwrap(),
+            "architect external write\n"
+        );
+        assert_eq!(fs::read_to_string(&auth_source).unwrap(), "");
         assert!(
             listeners
                 .iter()

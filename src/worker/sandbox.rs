@@ -83,8 +83,14 @@ pub(crate) struct HostRootMounts<'a> {
     pub(crate) writable_roots: &'a [&'a Path],
     pub(crate) read_only_files: &'a [&'a Path],
     pub(crate) extra_writable_dirs: &'a [&'a Path],
-    pub(crate) expose_host_root_read_only: bool,
+    pub(crate) host_root_access: HostRootAccess,
     pub(crate) masked_dirs: &'a [&'a Path],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostRootAccess {
+    Hidden,
+    ReadWrite,
 }
 
 impl HostRootContract {
@@ -126,9 +132,9 @@ impl HostRootContract {
     }
 
     /// Build a path-preserving mount namespace. Task workers use the minimal
-    /// explicit-root form; the interactive Architect may use the read-only
-    /// host-root form with explicit masks. Both retain real paths and never
-    /// invent a workspace path.
+    /// explicit-root form; the interactive Architect may use a host-root view
+    /// with explicit masks. Both retain real paths and never invent a
+    /// workspace path.
     pub(crate) fn host_root_argv(&self, mounts: HostRootMounts<'_>) -> Result<Vec<String>> {
         self.revalidate()?;
         for (label, path) in [
@@ -176,13 +182,17 @@ impl HostRootContract {
         .chain(mounts.extra_writable_dirs.iter().copied())
         .collect();
 
-        if mounts.expose_host_root_read_only {
+        if mounts.host_root_access != HostRootAccess::Hidden {
+            let root_bind = match mounts.host_root_access {
+                HostRootAccess::ReadWrite => "--bind",
+                HostRootAccess::Hidden => unreachable!("checked host-root access"),
+            };
             let mut argv = vec![
                 "--die-with-parent".into(),
                 "--unshare-pid".into(),
                 "--unshare-ipc".into(),
                 "--unshare-uts".into(),
-                "--ro-bind".into(),
+                root_bind.into(),
                 "/".into(),
                 "/".into(),
                 "--proc".into(),

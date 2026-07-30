@@ -11,7 +11,7 @@ use super::profile::{CodexInvocationProfile, CodexSandbox, validate_cli_help_con
 use super::result::{
     CheckStatus, CommitSummary, DeveloperDecision, DeveloperResult, MAX_RESULT_BYTES,
 };
-use super::sandbox::{HostRootContract, HostRootMounts};
+use super::sandbox::{HostRootAccess, HostRootContract, HostRootMounts};
 use super::validation::{
     MAX_ITEMS, MAX_PATH_BYTES, validate_git_oid, validate_relative_path, validate_text,
 };
@@ -703,7 +703,7 @@ impl SandboxContract {
             writable_roots: &[self.workspace.path()],
             read_only_files: &[&native.canonical_path],
             extra_writable_dirs: &[self.temp_dir.path(), self.runtime_dir.path()],
-            expose_host_root_read_only: false,
+            host_root_access: HostRootAccess::Hidden,
             masked_dirs: &[],
         })?;
         if argv

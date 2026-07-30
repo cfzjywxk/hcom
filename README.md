@@ -110,18 +110,22 @@ Codex defaults to `gpt-5.6-sol` with `xhigh` reasoning,
 `danger-full-access`, and approval policy `never`; Claude defaults to `opus`
 with `xhigh` effort and skipped native permission prompts. The isolated,
 capability-bound session-control MCP server is approved for the invocation, so
-it does not add a second approval dialog after the model relays the human's
-plan approval. The supervisor validates the exact plan version/hash and the
-required confirmation bit, but does not independently attest an OS-level
-human keystroke. Unless `[architect.reviewer]` is configured explicitly, the
-reviewer follows the selected architect adapter and those effective
-model/effort settings.
+it does not add a second approval dialog. A human request that explicitly says
+to follow or execute a named existing detailed plan, specification, or
+`current_todo` authorizes the Architect to derive the typed plan and start it
+in the same turn. A request only to analyze, discuss, summarize, or draft does
+not; an explicit instruction not to start always wins. The supervisor validates
+the exact plan version/hash and required confirmation bit, but does not
+independently attest an OS-level human keystroke. Unless
+`[architect.reviewer]` is configured explicitly, the reviewer follows the
+selected architect adapter and those effective model/effort settings.
 
 The exact current directory is the project context and remains the native
 working directory for the Architect and every Codex/Claude task worker. It
-does not need to be a Git repository. The Architect reads its documentation
-and binds each approved task to the task's actual source repository; that may
-be elsewhere or nested under the project. Architect, developer, and reviewer
+does not need to be a Git repository. The Architect can read and write project
+plans, `current_todo`, design notes, and discussion records, then binds each
+authorized task to its actual source repository; that may be elsewhere or
+nested under the project. Architect, developer, and reviewer
 model/effort/permission profiles are typed TOML settings in
 `$HCOM_DIR/config.toml` (normally `~/.hcom/config.toml`) and are frozen when
 the command starts. A reviewer's canonical project/source and Git state are
@@ -130,8 +134,10 @@ caches remain writable. See [the Architect user guide](docs/architect.md) for
 the complete schema, all four Codex/Claude role combinations, parent-terminal
 login inheritance, and path-preserving sandbox invariants.
 
-Before approval, the Architect must display every task's repository root,
-branch, and start HEAD together with the exact plan version and hash.
+Before starting, the Architect must display every task's repository root,
+branch, and start HEAD together with the exact plan version and hash. An
+explicit follow/execute/implement request for a named existing plan may
+authorize same-turn start; otherwise the Architect waits for a later approval.
 
 ---
 

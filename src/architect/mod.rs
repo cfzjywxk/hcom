@@ -59,7 +59,9 @@ Architect CLI overrides (higher priority than TOML):
 Built-in defaults are Codex gpt-5.6-sol/xhigh with danger-full-access/never,
 or Claude opus/xhigh with dangerously-skip-permissions. The capability-bound
 session-control MCP tools do not add a second native approval prompt. The
-Architect must relay prior human plan approval; hcom validates the exact
+Architect may start in the same turn when the human explicitly directs it to
+follow or execute a named existing detailed plan/specification/current_todo;
+analysis or drafting alone still waits for approval. hcom validates the exact
 version/hash and confirmation bit, not OS-level keyboard provenance. When
 [architect.reviewer] is absent, the reviewer uses the selected architect
 adapter and the same effective model and reasoning/effort. An explicit
@@ -70,15 +72,16 @@ effective sanitized profiles and their SHA-256 hash are printed at startup and
 frozen into the approved plan.
 
 No prompt argument, stdin payload, terminal injection, or automatic first turn
-is used. The human owns every architect terminal input. The architect outer
-filesystem and every reviewer's canonical project/source/Git view remain
-read-only regardless of the configured native sandbox/permission mode. A
-reviewer's session-private HOME, temporary directory, and generated language
-caches remain writable so read-only source checks can run normally. Each
-approved task names the exact canonical Git root discovered by the Architect
-from project documentation. Approved developer tasks commit directly there;
-drift stops the run without reset, rebase, merge, or final apply. The parent
-owns all worker lifetime and no run is recovered after exit.
+is used. The human owns every architect terminal input. The Architect has a
+path-preserving whole-host read-write view for project plans, current_todo, and
+coordination records; protected hcom runtimes and exact credentials/tools stay
+masked or read-only. Every reviewer's canonical project/source/Git view remains
+read-only, while its session-private HOME, temporary directory, and generated
+language caches remain writable. Each authorized task names the exact
+canonical Git root discovered by the Architect from project documentation.
+Developer tasks commit directly there; concurrent Architect or external drift
+stops the run without reset, rebase, merge, or final apply. The parent owns all
+worker lifetime and no run is recovered after exit.
 
 See docs/architect.md for the complete TOML schema and examples."#
 }
