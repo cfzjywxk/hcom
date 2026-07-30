@@ -108,7 +108,9 @@ hcom architect codex
 
 Codex defaults to `gpt-5.6-sol` with `xhigh` reasoning,
 `danger-full-access`, and approval policy `never`; Claude defaults to `opus`
-with `xhigh` effort and skipped native permission prompts. The isolated,
+with `xhigh` effort and skipped native permission prompts. The independent
+built-in developer defaults to Codex `gpt-5.6-sol` with `xhigh` reasoning.
+The isolated,
 capability-bound session-control MCP server is approved for the invocation, so
 it does not add a second approval dialog. A human request that explicitly says
 to follow or execute a named existing detailed plan, specification, or
@@ -119,6 +121,13 @@ the exact plan version/hash and required confirmation bit, but does not
 independently attest an OS-level human keystroke. Unless
 `[architect.reviewer]` is configured explicitly, the reviewer follows the
 selected architect adapter and those effective model/effort settings.
+
+The Codex Architect's private per-run `CODEX_HOME` records the exact invocation
+directory as native `untrusted`. This avoids a repeated first-use folder-trust
+dialog while continuing to ignore project-local `.codex` configuration, hooks,
+rules, and extra MCP servers. It does not copy or modify trust entries in the
+parent Codex configuration. The explicit command-line
+`danger-full-access`/`never` profile remains authoritative.
 
 The exact current directory is the project context and remains the native
 working directory for the Architect and every Codex/Claude task worker. It

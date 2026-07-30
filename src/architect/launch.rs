@@ -174,7 +174,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
     }
     create_empty_private_file(&paths.auth_target)?;
     if architect_adapter == ArchitectAdapter::Codex {
-        write_isolated_codex_config(&paths, &tools.component.canonical_path)?;
+        write_isolated_codex_config(&paths, &tools.component.canonical_path, &project_root)?;
     }
     let preassigned_native_session_id =
         (architect_adapter == ArchitectAdapter::Claude).then(|| uuid::Uuid::new_v4().to_string());
@@ -1199,6 +1199,7 @@ fn create_empty_private_file(path: &Path) -> Result<()> {
 #[serde(deny_unknown_fields)]
 struct IsolatedCodexConfig {
     tui: IsolatedTuiConfig,
+    projects: BTreeMap<String, IsolatedCodexProject>,
     mcp_servers: BTreeMap<String, IsolatedMcpServer>,
 }
 
@@ -1206,6 +1207,18 @@ struct IsolatedCodexConfig {
 #[serde(deny_unknown_fields)]
 struct IsolatedTuiConfig {
     terminal_title: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct IsolatedCodexProject {
+    trust_level: IsolatedCodexProjectTrustLevel,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum IsolatedCodexProjectTrustLevel {
+    Untrusted,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
@@ -1225,7 +1238,11 @@ enum IsolatedMcpToolApprovalMode {
     Approve,
 }
 
-fn write_isolated_codex_config(paths: &ArchitectLaunchPaths, component: &Path) -> Result<()> {
+fn write_isolated_codex_config(
+    paths: &ArchitectLaunchPaths,
+    component: &Path,
+    project_root: &Path,
+) -> Result<()> {
     let server = IsolatedMcpServer {
         command: path_text("architect MCP component", component)?.into(),
         args: vec![
@@ -1248,6 +1265,20 @@ fn write_isolated_codex_config(paths: &ArchitectLaunchPaths, component: &Path) -
         tui: IsolatedTuiConfig {
             terminal_title: vec![],
         },
+        // A fresh CODEX_HOME would otherwise ask the human to decide folder
+        // trust on every Architect invocation. Record an explicit native
+        // decision for this exact cwd, but keep it untrusted: the Architect
+        // already has its separately reviewed OS-level host view, while
+        // project-local .codex config/hooks/rules must not expand the isolated
+        // native control surface.
+        projects: [(
+            path_text("architect project directory", project_root)?.into(),
+            IsolatedCodexProject {
+                trust_level: IsolatedCodexProjectTrustLevel::Untrusted,
+            },
+        )]
+        .into_iter()
+        .collect(),
         mcp_servers: [("hcom_session_task_control".into(), server)]
             .into_iter()
             .collect(),
@@ -2306,9 +2337,11 @@ mod tests {
     }
 
     #[test]
-    fn isolated_codex_config_preapproves_only_the_session_control_server() {
+    fn isolated_codex_config_decides_project_trust_and_preapproves_only_control_server() {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
+        let project = root.join("project");
+        fs::create_dir(&project).unwrap();
         let native_config = root.join("codex-home");
         fs::create_dir(&native_config).unwrap();
         let config_file = native_config.join("config.toml");
@@ -2328,10 +2361,23 @@ mod tests {
         };
         let component = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
 
-        write_isolated_codex_config(&paths, &component).unwrap();
+        write_isolated_codex_config(&paths, &component, &project).unwrap();
 
         let encoded = fs::read_to_string(config_file).unwrap();
         let config: IsolatedCodexConfig = toml::from_str(&encoded).unwrap();
+        assert!(!encoded.contains("[notice]"));
+        assert!(!encoded.contains("hide_full_access_warning"));
+        assert!(!encoded.contains("hide_world_writable_warning"));
+        assert_eq!(config.projects.len(), 1);
+        assert!(matches!(
+            config
+                .projects
+                .get(project.to_str().unwrap())
+                .unwrap()
+                .trust_level,
+            IsolatedCodexProjectTrustLevel::Untrusted
+        ));
+        assert!(encoded.contains("trust_level = \"untrusted\""));
         assert_eq!(config.mcp_servers.len(), 1);
         let server = config.mcp_servers.get("hcom_session_task_control").unwrap();
         assert!(matches!(

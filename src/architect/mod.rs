@@ -59,7 +59,12 @@ Architect CLI overrides (higher priority than TOML):
 Built-in defaults are Codex gpt-5.6-sol/xhigh with danger-full-access/never,
 or Claude opus/xhigh with dangerously-skip-permissions. The capability-bound
 session-control MCP tools do not add a second native approval prompt. The
-Architect may start in the same turn when the human explicitly directs it to
+independent built-in developer is Codex gpt-5.6-sol/xhigh. The Codex
+Architect's per-run private config records the exact project as native
+untrusted, avoiding a repeated folder-trust prompt without loading project-local
+.codex config, hooks, rules, or extra MCP servers. This does not override the
+explicit danger-full-access/never profile. The Architect may start in the same
+turn when the human explicitly directs it to
 follow or execute a named existing detailed plan/specification/current_todo;
 analysis or drafting alone still waits for approval. hcom validates the exact
 version/hash and confirmation bit, not OS-level keyboard provenance. When

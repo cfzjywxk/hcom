@@ -1006,7 +1006,7 @@ ask_for_approval = "never"
 [architect.developer]
 adapter = "codex"
 model = "gpt-5.6-sol"
-reasoning_effort = "high"
+reasoning_effort = "xhigh"
 sandbox = "danger-full-access"
 ask_for_approval = "never"
 
@@ -2228,6 +2228,10 @@ auto_approve = false
             Some(toml::Value::String("never".into()))
         );
         assert!(get_nested(&structure, "architect.developer.adapter").is_some());
+        assert_eq!(
+            get_nested(&structure, "architect.developer.reasoning_effort"),
+            Some(toml::Value::String("xhigh".into()))
+        );
         assert!(get_nested(&structure, "architect.reviewer").is_none());
         assert!(get_nested(&structure, "preferences.timeout").is_some());
     }

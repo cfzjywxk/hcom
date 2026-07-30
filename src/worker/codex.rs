@@ -35,7 +35,7 @@ pub const CODEX_DEVELOPER_EXECUTABLE: &str =
     "/home/ywxk/.codex/packages/standalone/releases/0.145.0-x86_64-unknown-linux-musl/bin/codex";
 pub const CODEX_DEVELOPER_CLI_VERSION: &str = "codex-cli 0.145.0";
 pub const CODEX_DEVELOPER_MODEL: &str = "gpt-5.6-sol";
-pub const CODEX_DEVELOPER_REASONING: &str = "high";
+pub const CODEX_DEVELOPER_REASONING: &str = "xhigh";
 pub const BWRAP_EXECUTABLE: &str = "/usr/bin/bwrap";
 pub const BWRAP_VERSION: &str = "bubblewrap 0.9.0";
 pub const GIT_EXECUTABLE: &str = "/usr/bin/git";

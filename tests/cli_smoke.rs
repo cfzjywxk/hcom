@@ -436,6 +436,18 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     assert!(stdout.contains("hcom architect claude"), "stdout={stdout}");
     assert!(stdout.contains("gpt-5.6-sol/xhigh"), "stdout={stdout}");
     assert!(stdout.contains("Claude opus/xhigh"), "stdout={stdout}");
+    assert!(
+        stdout.contains("built-in developer is Codex gpt-5.6-sol/xhigh"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("native")
+            && stdout.contains("untrusted, avoiding")
+            && stdout.contains("repeated folder-trust prompt")
+            && stdout.contains("does not override the")
+            && stdout.contains("danger-full-access/never profile"),
+        "stdout={stdout}"
+    );
     assert!(!stdout.contains("--repo"), "stdout={stdout}");
     assert!(!stdout.contains("--project"), "stdout={stdout}");
     assert!(stdout.contains("session-task tools"), "stdout={stdout}");

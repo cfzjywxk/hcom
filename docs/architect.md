@@ -49,16 +49,25 @@ at most 1 MiB. Run `hcom config --edit` or edit that file directly;
 
 Without profile configuration, the command selects these effective defaults:
 
-| Command | Architect | Reviewer |
-|---|---|---|
-| `hcom architect codex` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, approvals `never` | Codex `gpt-5.6-sol`, `xhigh` |
-| `hcom architect claude` | Claude `opus`, `xhigh`, skip permissions | Claude `opus`, `xhigh` |
+| Command | Architect | Developer | Reviewer |
+|---|---|---|---|
+| `hcom architect codex` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, approvals `never` | Codex `gpt-5.6-sol`, `xhigh` | Codex `gpt-5.6-sol`, `xhigh` |
+| `hcom architect claude` | Claude `opus`, `xhigh`, skip permissions | Codex `gpt-5.6-sol`, `xhigh` | Claude `opus`, `xhigh` |
 
 The developer remains independently configurable and keeps its own built-in
 profile. When `[architect.reviewer]` is absent, the reviewer follows the
 selected architect adapter and its effective model and reasoning/effort,
 including `[architect.profile]` and command-line overrides. Supplying an
 explicit `[architect.reviewer]` table disables that inheritance.
+
+The Codex Architect does not copy the parent `CODEX_HOME`: that would also
+import unrelated native configuration and control surfaces. Its private
+per-run config explicitly records the exact invocation directory as native
+`untrusted`, so Codex does not repeat the unresolved folder-trust dialog and
+does not load project-local `.codex` configuration, hooks, rules, or extra MCP
+servers. This native project-config decision is separate from the Architect's
+reviewed OS-level host read/write sandbox and does not override the explicit
+command-line `danger-full-access`/`never` profile.
 
 The Codex Architect's isolated configuration marks the one
 `hcom_session_task_control` MCP server as approved for this invocation, so

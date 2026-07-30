@@ -14,7 +14,7 @@ pub const CLAUDE_ARCHITECT_ADAPTER: &str = "claude-2.1.220";
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
 const DEFAULT_CLAUDE_DEVELOPER_MODEL: &str = "claude-opus-5";
 const DEFAULT_CLAUDE_ARCHITECT_MODEL: &str = "opus";
-const DEFAULT_DEVELOPER_REASONING: &str = "high";
+const DEFAULT_DEVELOPER_REASONING: &str = "xhigh";
 const DEFAULT_ARCHITECT_REASONING: &str = "xhigh";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -479,6 +479,10 @@ mod tests {
         assert_eq!(
             profiles.developer.codex().unwrap().sandbox,
             CodexSandbox::DangerFullAccess
+        );
+        assert_eq!(
+            profiles.developer.codex().unwrap().reasoning_effort,
+            "xhigh"
         );
         assert_eq!(profiles.developer_adapter_name(), CODEX_DEVELOPER_ADAPTER);
         assert_eq!(profiles.reviewer_adapter_name(), CODEX_REVIEWER_ADAPTER);
