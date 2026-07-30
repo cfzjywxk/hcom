@@ -16,6 +16,10 @@ pub mod architect {
         bail!("hcom architect is supported only on Linux")
     }
 
+    pub fn run_cli_with_config(_args: &[String], _config_path: &std::path::Path) -> Result<i32> {
+        bail!("hcom architect is supported only on Linux")
+    }
+
     pub fn help_text() -> &'static str {
         "Usage:\n  hcom architect\n\nhcom architect is supported only on Linux."
     }

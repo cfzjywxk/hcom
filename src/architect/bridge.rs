@@ -63,6 +63,8 @@ pub(super) struct BridgeConfiguration {
     pub codex_home: PathBuf,
     pub relay_executable: ExecutableIdentity,
     pub relay_runtime_scope_hash: String,
+    pub developer_adapter: String,
+    pub reviewer_adapter: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -238,6 +240,14 @@ fn validate_bridge_configuration(configuration: &BridgeConfiguration) -> Result<
         Some(0o700),
     )?;
     configuration.relay_executable.revalidate()?;
+    if configuration.developer_adapter != "codex-developer-0.145.0"
+        || !matches!(
+            configuration.reviewer_adapter.as_str(),
+            "codex-reviewer-0.145.0" | "claude-reviewer-2.1.220"
+        )
+    {
+        bail!("architect bridge received an unknown session-frozen worker adapter");
+    }
     let paths = ControlPaths::new(&configuration.run_root, &configuration.lock_root)?;
     if paths.socket_path() != configuration.control_socket_path
         || paths.registration_socket_path() != configuration.registration_socket_path
@@ -437,7 +447,10 @@ fn serve_mcp_connection(
                 json!({
                     "jsonrpc":"2.0",
                     "id":id,
-                    "result":{"tools":tool_definitions()}
+                        "result":{"tools":tool_definitions(
+                            &configuration.developer_adapter,
+                            &configuration.reviewer_adapter,
+                        )}
                 })
             }),
             "tools/call" => {
@@ -476,8 +489,13 @@ fn handle_tool_call(
         )
         .context("invalid typed tool call")
         .map_err(|_| NativeSessionBindingRefusal(TOOL_REFUSAL_ENVELOPE))?;
-        let action = control_action(&params.name, params.arguments)
-            .map_err(|_| NativeSessionBindingRefusal(TOOL_REFUSAL_ACTION))?;
+        let action = control_action(
+            &params.name,
+            params.arguments,
+            &configuration.developer_adapter,
+            &configuration.reviewer_adapter,
+        )
+        .map_err(|_| NativeSessionBindingRefusal(TOOL_REFUSAL_ACTION))?;
         let observed = discover_codex_native_session(&configuration.codex_home)
             .map_err(|_| NativeSessionBindingRefusal(NATIVE_SESSION_REFUSAL_DISCOVERY))?;
         match native_session_id {
@@ -964,6 +982,8 @@ mod tests {
                     codex_home,
                     relay_executable: executable,
                     relay_runtime_scope_hash: relay_runtime_scope_hash(&root).unwrap(),
+                    developer_adapter: "codex-developer-0.145.0".into(),
+                    reviewer_adapter: "claude-reviewer-2.1.220".into(),
                 },
                 _session_path: session_path,
             }
@@ -1092,6 +1112,8 @@ mod tests {
             codex_home: root.clone(),
             relay_executable: executable,
             relay_runtime_scope_hash: "unused-by-authorization".into(),
+            developer_adapter: "codex-developer-0.145.0".into(),
+            reviewer_adapter: "claude-reviewer-2.1.220".into(),
         };
         let activation = BridgeActivation {
             architect_pid: std::process::id(),
@@ -1736,6 +1758,8 @@ mod tests {
             codex_home,
             relay_executable: executable,
             relay_runtime_scope_hash: relay_runtime_scope_hash(&relay_root).unwrap(),
+            developer_adapter: "codex-developer-0.145.0".into(),
+            reviewer_adapter: "claude-reviewer-2.1.220".into(),
         };
         validate_bridge_configuration(&configuration).unwrap();
 

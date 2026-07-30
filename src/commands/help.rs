@@ -542,6 +542,10 @@ const CONFIG_HELP: &[HelpEntry] = &[
         "  pane_title_format",
         "Compose pane title ({hcom}, {tool_title})",
     ),
+    (
+        "  architect.*",
+        "Typed session profiles (edit config.toml; see docs/architect.md)",
+    ),
     ("", "hcom config <key> --info for details"),
     ("", ""),
     ("", "Precedence: defaults < config.toml < env vars"),

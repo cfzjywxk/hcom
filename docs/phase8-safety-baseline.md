@@ -32,6 +32,24 @@ session/process group, PID+birth binding, pidfd observation, `PDEATHSIG`, bounde
 concurrent pipe drains, and exact descendant cleanup. Nothing continues or
 recovers after the foreground invocation exits.
 
+## Session-frozen native profiles
+
+The launcher reads typed Architect, Codex developer, and Codex-or-Claude
+reviewer profiles once from `$HCOM_DIR/config.toml`. Only model,
+reasoning/effort, Codex sandbox/approval, Claude skip-permissions, and the
+reviewer adapter are configurable. Raw argv, prompt, resume/fork, working
+directory, schema/output, MCP, hook, plugin, and delegation fields are not.
+
+The sanitized effective profiles have a canonical SHA-256 hash. The configured
+adapter pair is enforced by the Architect tool schema, bridge, and supervisor;
+the profile hash is included in the human-approved plan hash. Later config-file
+changes cannot alter a running session. Native CLI versions and their required
+help options are probed before launch.
+
+These profiles do not weaken the outer mount boundary. The Architect and every
+reviewer continue to see the canonical checkout read-only, and only the
+developer receives it read-write.
+
 ## Canonical checkout boundary
 
 The developer writes and commits directly in the canonical checkout selected by

@@ -92,6 +92,26 @@ hcom
 
 ---
 
+## Foreground architect
+
+`hcom architect` runs one blank interactive Codex architect and an in-memory,
+ordered task supervisor. Each approved task gets a fresh no-TUI Codex developer
+and a fresh Codex or Claude reviewer; same-task review changes resume only that
+task's exact native sessions.
+
+```bash
+hcom architect codex --repo /absolute/canonical/repository
+```
+
+`--repo` is required. Architect, developer, and reviewer model/effort/permission
+profiles are typed TOML settings in `$HCOM_DIR/config.toml` (normally
+`~/.hcom/config.toml`) and are frozen when the command starts. See
+[the Architect user guide](docs/architect.md) for the complete schema, Codex
+`max` and Claude `opus`/`xhigh` examples, parent-terminal login inheritance, and
+sandbox invariants.
+
+---
+
 ## How it works
 
 Hooks record activity to a local SQLite database and deliver messages from it.

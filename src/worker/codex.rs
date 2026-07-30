@@ -7,6 +7,7 @@ use super::contract::{
     validate_native_session_id,
 };
 use super::environment::{EnvironmentPolicy, ExactEnvironmentRequirement};
+use super::profile::{CodexInvocationProfile, validate_cli_help_contract};
 use super::result::{
     CheckStatus, CommitSummary, DeveloperDecision, DeveloperResult, MAX_RESULT_BYTES,
 };
@@ -45,9 +46,8 @@ pub const GIT_EXECUTABLE: &str = "/usr/bin/git";
 pub const GIT_VERSION: &str = "git version 2.43.0";
 
 const ADAPTER_NAME: &str = "codex-developer-0.145.0";
-const ADAPTER_CONTRACT_VERSION: u32 = 2;
-const EFFECTIVE_POLICY: &str =
-    "native=danger-full-access;outer=bubblewrap-0.9.0-empty-root-developer-v2;approval=never";
+const ADAPTER_CONTRACT_VERSION: u32 = 3;
+const OUTER_POLICY: &str = "bubblewrap-0.9.0-empty-root-developer-v2";
 const MAX_CODEX_EVENTS: usize = 4096;
 const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_DURATION: Duration = Duration::from_secs(30);
@@ -96,6 +96,7 @@ pub struct CodexDeveloperConfig {
     pub auth_source: PathBuf,
     pub cargo_bin_source: PathBuf,
     pub rustup_home_source: PathBuf,
+    pub invocation: CodexInvocationProfile,
 }
 
 pub struct CodexDeveloperAdapter {
@@ -104,11 +105,13 @@ pub struct CodexDeveloperAdapter {
     outer_executable: ExecutableIdentity,
     git_executable: ExecutableIdentity,
     sandbox: SandboxContract,
+    invocation: CodexInvocationProfile,
 }
 
 impl CodexDeveloperAdapter {
     pub fn discover(config: CodexDeveloperConfig) -> Result<Self> {
         validate_production_runtime_contract(&config)?;
+        validate_codex_exec_cli(Path::new(CODEX_DEVELOPER_EXECUTABLE))?;
         Self::discover_with_paths(
             config,
             Path::new(CODEX_DEVELOPER_EXECUTABLE),
@@ -172,18 +175,21 @@ impl CodexDeveloperAdapter {
         bwrap_path: &Path,
         git_path: &Path,
     ) -> Result<Self> {
+        config.invocation.validate("Codex developer")?;
+        let invocation = config.invocation.clone();
         let executable = capture_exact_tool(codex_path, CODEX_DEVELOPER_CLI_VERSION)?;
         let outer_executable = capture_exact_tool(bwrap_path, BWRAP_VERSION)?;
         let git_executable = capture_exact_tool(git_path, GIT_VERSION)?;
         let sandbox =
             SandboxContract::capture(config, &executable, &outer_executable, &git_executable)?;
-        let descriptor = developer_descriptor()?;
+        let descriptor = developer_descriptor(&invocation)?;
         Ok(Self {
             descriptor,
             executable,
             outer_executable,
             git_executable,
             sandbox,
+            invocation,
         })
     }
 
@@ -204,23 +210,28 @@ impl CodexDeveloperAdapter {
             &self.outer_executable,
             &self.git_executable,
         )?;
+        self.invocation.validate("Codex developer")?;
 
-        let mut fixed_argv = vec!["exec".into()];
+        let mut fixed_argv = vec![
+            "exec".into(),
+            "--sandbox".into(),
+            self.invocation.sandbox.as_str().into(),
+        ];
         if let Some(session_id) = resume_session_id {
             validate_native_session_id(session_id)?;
             fixed_argv.extend(["resume".into(), session_id.into()]);
         }
         fixed_argv.extend([
             "--json".into(),
+            "--strict-config".into(),
             "--model".into(),
-            CODEX_DEVELOPER_MODEL.into(),
+            self.invocation.model.clone(),
             "--config".into(),
-            "model_reasoning_effort=\"high\"".into(),
+            self.invocation.reasoning_config_argument(),
             "--config".into(),
-            "approval_policy=\"never\"".into(),
+            self.invocation.approval_config_argument(),
             "--config".into(),
             "mcp_servers={}".into(),
-            "--dangerously-bypass-approvals-and-sandbox".into(),
             "--ignore-user-config".into(),
             "--ignore-rules".into(),
         ]);
@@ -284,6 +295,59 @@ impl CodexDeveloperAdapter {
             exact_environment: self.sandbox.exact_environment()?,
         })
     }
+}
+
+fn validate_codex_exec_cli(path: &Path) -> Result<()> {
+    let mut command = Command::new(path);
+    command.args(["exec", "--help"]).env_clear();
+    let output = run_bounded_command(command, 128 * 1024)?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        bail!("Codex developer CLI capability probe failed");
+    }
+    validate_cli_help_contract(
+        "Codex developer CLI",
+        &output.stdout,
+        &[
+            "resume",
+            "--config",
+            "--disable",
+            "--strict-config",
+            "--model",
+            "--sandbox",
+            "--cd",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--output-schema",
+            "--json",
+            "--output-last-message",
+        ],
+    )?;
+
+    // `--sandbox` belongs to the `exec` parent in Codex 0.145. Keep it before
+    // `resume`; the resume subcommand does not declare that option itself.
+    let mut resume = Command::new(path);
+    resume
+        .args(["exec", "--sandbox", "read-only", "resume", "--help"])
+        .env_clear();
+    let output = run_bounded_command(resume, 128 * 1024)?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        bail!("Codex developer resume CLI capability probe failed");
+    }
+    validate_cli_help_contract(
+        "Codex developer resume CLI",
+        &output.stdout,
+        &[
+            "--config",
+            "--disable",
+            "--strict-config",
+            "--model",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--output-schema",
+            "--json",
+            "--output-last-message",
+        ],
+    )
 }
 
 impl WorkerAdapter for CodexDeveloperAdapter {
@@ -354,14 +418,15 @@ impl WorkerAdapter for CodexDeveloperAdapter {
     }
 }
 
-fn developer_descriptor() -> Result<AdapterDescriptor> {
+fn developer_descriptor(invocation: &CodexInvocationProfile) -> Result<AdapterDescriptor> {
+    let policy = invocation.effective_policy(OUTER_POLICY);
     AdapterDescriptor::new(
         ADAPTER_NAME,
         ADAPTER_CONTRACT_VERSION,
         CODEX_DEVELOPER_CLI_VERSION,
-        CODEX_DEVELOPER_MODEL,
-        CODEX_DEVELOPER_REASONING,
-        EFFECTIVE_POLICY,
+        &invocation.model,
+        &invocation.reasoning_effort,
+        &policy,
         AdapterCapabilities {
             roles: vec![WorkerRole::Developer],
             native_session_mode: NativeSessionMode::Discovered,
@@ -1472,6 +1537,7 @@ mod tests {
                     auth_source: fs::canonicalize(auth_source).unwrap(),
                     cargo_bin_source: fs::canonicalize(cargo_bin_source).unwrap(),
                     rustup_home_source: fs::canonicalize(rustup_home_source).unwrap(),
+                    invocation: CodexInvocationProfile::developer_default(),
                 },
                 codex: fs::canonicalize(codex).unwrap(),
                 bwrap: fs::canonicalize(bwrap).unwrap(),
@@ -1729,6 +1795,54 @@ mod tests {
     }
 
     #[test]
+    fn pinned_codex_exec_help_matches_configurable_command_contract_when_installed() {
+        let path = Path::new(CODEX_DEVELOPER_EXECUTABLE);
+        if path.exists() {
+            validate_codex_exec_cli(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn configured_model_and_max_reasoning_reach_exact_codex_argv() {
+        let fixture = Fixture::new();
+        let mut config = fixture.config.clone();
+        config.invocation.model = "gpt-5.6-sol-configured".into();
+        config.invocation.reasoning_effort = "max".into();
+        let adapter = CodexDeveloperAdapter::discover_with_paths(
+            config,
+            &fixture.codex,
+            &fixture.bwrap,
+            &fixture.git,
+        )
+        .unwrap();
+        let profile = adapter.profile();
+        assert_eq!(profile.model, "gpt-5.6-sol-configured");
+        assert_eq!(profile.reasoning, "max");
+        let prepared = prepare_create_turn(
+            &adapter,
+            &profile,
+            &fixture.control(None),
+            b"typed prompt remains stdin-only".to_vec(),
+        )
+        .unwrap();
+        let argv = prepared.command().materialized_control_argv();
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["--model", "gpt-5.6-sol-configured"])
+        );
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["--config", "model_reasoning_effort=\"max\""])
+        );
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["--sandbox", "danger-full-access"])
+        );
+        assert!(argv.iter().any(|argument| argument == "--strict-config"));
+        assert_eq!(argv.last().map(String::as_str), Some("-"));
+    }
+
+    #[test]
     fn exact_profile_outer_envelope_and_fake_create_resume_are_closed() {
         let fixture = Fixture::new();
         let adapter = fixture.adapter();
@@ -1737,7 +1851,10 @@ mod tests {
         assert_eq!(profile.role, WorkerRole::Developer);
         assert_eq!(profile.model, CODEX_DEVELOPER_MODEL);
         assert_eq!(profile.reasoning, CODEX_DEVELOPER_REASONING);
-        assert_eq!(profile.policy, EFFECTIVE_POLICY);
+        assert_eq!(
+            profile.policy,
+            CodexInvocationProfile::developer_default().effective_policy(OUTER_POLICY)
+        );
         assert_eq!(profile.native_session_mode, NativeSessionMode::Discovered);
 
         let prompt = b"private task body sentinel phase-five";
@@ -1749,8 +1866,8 @@ mod tests {
         assert!(argv.iter().any(|argument| argument == "--die-with-parent"));
         assert!(argv.iter().any(|argument| argument == "--unshare-pid"));
         assert!(
-            argv.iter()
-                .any(|argument| argument == "--dangerously-bypass-approvals-and-sandbox")
+            argv.windows(2)
+                .any(|pair| pair == ["--sandbox", "danger-full-access"])
         );
         assert!(!argv.iter().any(|argument| argument == "--new-session"));
         assert!(
@@ -1820,6 +1937,15 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["resume", "native-codex-1"])
         );
+        let sandbox = resume_argv
+            .iter()
+            .position(|argument| argument == "--sandbox")
+            .unwrap();
+        let resume = resume_argv
+            .iter()
+            .position(|argument| argument == "resume")
+            .unwrap();
+        assert!(sandbox < resume);
         assert!(!resume_argv.iter().any(|argument| argument == "--cd"));
         assert!(
             prepare_resume_turn(

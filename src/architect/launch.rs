@@ -2,6 +2,7 @@ use super::bridge::{
     BridgeActivation, BridgeConfiguration, activate_bridge, configure_bridge,
     relay_runtime_scope_hash, sha256_hex,
 };
+use super::profile::{LoadedInvocationProfiles, load_invocation_profiles};
 use crate::control_api::ActionName;
 use crate::control_api::peer::{process_birth_identity, process_owns_foreground_tty};
 use crate::control_api::protocol::PROTOCOL_VERSION;
@@ -13,7 +14,11 @@ use crate::orchestrator::SessionRuntimeSources;
 use crate::worker::ExecutableIdentity;
 use crate::worker::codex::{
     BWRAP_EXECUTABLE, BWRAP_VERSION, CODEX_DEVELOPER_CLI_VERSION, CODEX_DEVELOPER_EXECUTABLE,
-    CODEX_DEVELOPER_MODEL, CODEX_DEVELOPER_REASONING, DISABLED_CODEX_FEATURES,
+    DISABLED_CODEX_FEATURES,
+};
+use crate::worker::profile::{
+    CodexApprovalPolicy, CodexInvocationProfile, CodexSandbox, ReviewerInvocationProfile,
+    SessionInvocationProfiles, validate_cli_help_contract,
 };
 use crate::worker::sandbox::{
     EmptyRootContract, INSIDE_CARGO_HOME, INSIDE_CODEX, INSIDE_HOME, INSIDE_NATIVE_CONFIG,
@@ -57,17 +62,17 @@ struct ArchitectArgs {
     #[arg(long)]
     repo: PathBuf,
 
-    #[arg(long, default_value = CODEX_DEVELOPER_MODEL)]
-    model: String,
+    #[arg(long)]
+    model: Option<String>,
 
-    #[arg(long, default_value = CODEX_DEVELOPER_REASONING)]
-    reasoning: String,
+    #[arg(long)]
+    reasoning: Option<String>,
 
-    #[arg(long, default_value = "read-only")]
-    sandbox: String,
+    #[arg(long)]
+    sandbox: Option<String>,
 
-    #[arg(long, default_value = "never")]
-    approval: String,
+    #[arg(long, visible_alias = "ask-for-approval")]
+    approval: Option<String>,
 }
 
 fn create_private_session_runtime() -> Result<tempfile::TempDir> {
@@ -78,11 +83,19 @@ fn create_private_session_runtime() -> Result<tempfile::TempDir> {
         .context("failed to create private architect-session runtime")
 }
 
-pub(super) fn run_cli(argv: &[String]) -> Result<i32> {
+pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32> {
     let args = ArchitectArgs::try_parse_from(
         std::iter::once("hcom architect".to_owned()).chain(argv.iter().skip(1).cloned()),
     )?;
-    validate_requested_profile(&args)?;
+    let mut loaded = match config_path {
+        Some(path) => load_invocation_profiles(path)?,
+        None => LoadedInvocationProfiles {
+            profiles: SessionInvocationProfiles::default(),
+            config_path: PathBuf::from("<built-in defaults>"),
+            loaded_from_file: false,
+        },
+    };
+    apply_architect_cli_overrides(&args, &mut loaded.profiles)?;
     validate_foreground_terminal()?;
 
     let repository = canonical_repository(&args.repo)?;
@@ -98,6 +111,7 @@ pub(super) fn run_cli(argv: &[String]) -> Result<i32> {
     let runtime_sources = SessionRuntimeSources::capture(
         native_environment.control_environment.clone(),
         native_environment.runtime_home.clone(),
+        loaded.profiles.clone(),
     )?;
     let supervisor_endpoint = SessionSupervisorEndpoint::bind(
         control_paths.clone(),
@@ -127,6 +141,18 @@ pub(super) fn run_cli(argv: &[String]) -> Result<i32> {
         )?;
         writeln!(stdout, "start branch: {}", startup.start_branch)?;
         writeln!(stdout, "start HEAD: {}", startup.start_head)?;
+        writeln!(
+            stdout,
+            "profile config: {} ({})",
+            loaded.config_path.display(),
+            if loaded.loaded_from_file {
+                "loaded once"
+            } else {
+                "not present; built-in defaults"
+            }
+        )?;
+        writeln!(stdout, "profile hash: {}", loaded.profiles.canonical_hash())?;
+        write_profile_summary(&mut stdout, &loaded.profiles)?;
         writeln!(
             stdout,
             "canonical-checkout risk: approved developer tasks commit directly in this checkout; drift stops the run without reset, rebase, merge, or final apply"
@@ -226,6 +252,8 @@ pub(super) fn run_cli(argv: &[String]) -> Result<i32> {
         codex_home: paths.codex_home.clone(),
         relay_executable: tools.component.clone(),
         relay_runtime_scope_hash: relay_scope_hash.clone(),
+        developer_adapter: loaded.profiles.developer_adapter_name().into(),
+        reviewer_adapter: loaded.profiles.reviewer_adapter_name().into(),
     };
     if let Err(error) = configure_bridge(&mut bridge.bootstrap, configuration) {
         terminate_child(&mut bridge.child);
@@ -248,20 +276,24 @@ pub(super) fn run_cli(argv: &[String]) -> Result<i32> {
             &native_environment.rustup_home_source,
         )?,
     };
-    let (mut architect, gate_write, info_read) =
-        match spawn_blocked_architect(&tools, &sandbox, &native_environment) {
-            Ok(spawned) => spawned,
-            Err(error) => {
-                terminate_child(&mut bridge.child);
-                best_effort_close_binding(
-                    &registration_client,
-                    &process_birth,
-                    &binding_id,
-                    &[pending_version],
-                );
-                return Err(error);
-            }
-        };
+    let (mut architect, gate_write, info_read) = match spawn_blocked_architect(
+        &tools,
+        &sandbox,
+        &native_environment,
+        &loaded.profiles.architect,
+    ) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            terminate_child(&mut bridge.child);
+            best_effort_close_binding(
+                &registration_client,
+                &process_birth,
+                &binding_id,
+                &[pending_version],
+            );
+            return Err(error);
+        }
+    };
     let info = match read_bwrap_info(&info_read) {
         Ok(info) => info,
         Err(error) => {
@@ -435,14 +467,78 @@ impl Drop for SessionSupervisorThread {
     }
 }
 
-fn validate_requested_profile(args: &ArchitectArgs) -> Result<()> {
-    if args.adapter != "codex"
-        || args.model != CODEX_DEVELOPER_MODEL
-        || args.reasoning != CODEX_DEVELOPER_REASONING
-        || args.sandbox != "read-only"
-        || args.approval != "never"
-    {
-        bail!("session architect enables only the codex gpt-5.6-sol/high/read-only/never profile");
+fn apply_architect_cli_overrides(
+    args: &ArchitectArgs,
+    profiles: &mut SessionInvocationProfiles,
+) -> Result<()> {
+    if args.adapter != "codex" {
+        bail!("session architect enables only the codex adapter");
+    }
+    if let Some(model) = &args.model {
+        profiles.architect.model.clone_from(model);
+    }
+    if let Some(reasoning) = &args.reasoning {
+        profiles.architect.reasoning_effort.clone_from(reasoning);
+    }
+    if let Some(sandbox) = &args.sandbox {
+        profiles.architect.sandbox = match sandbox.as_str() {
+            "read-only" => CodexSandbox::ReadOnly,
+            "workspace-write" => CodexSandbox::WorkspaceWrite,
+            "danger-full-access" => CodexSandbox::DangerFullAccess,
+            _ => {
+                bail!(
+                    "architect --sandbox must be read-only, workspace-write, or danger-full-access"
+                )
+            }
+        };
+    }
+    if let Some(approval) = &args.approval {
+        profiles.architect.approval_policy = match approval.as_str() {
+            "untrusted" => CodexApprovalPolicy::Untrusted,
+            "on-request" => CodexApprovalPolicy::OnRequest,
+            "never" => CodexApprovalPolicy::Never,
+            _ => {
+                bail!("architect --approval must be untrusted, on-request, or never")
+            }
+        };
+    }
+    profiles.validate()
+}
+
+fn write_profile_summary(
+    output: &mut impl Write,
+    profiles: &SessionInvocationProfiles,
+) -> Result<()> {
+    writeln!(
+        output,
+        "architect profile: codex model={} reasoning={} sandbox={} approval={}",
+        profiles.architect.model,
+        profiles.architect.reasoning_effort,
+        profiles.architect.sandbox.as_str(),
+        profiles.architect.approval_policy.as_str()
+    )?;
+    writeln!(
+        output,
+        "developer profile: codex model={} reasoning={} sandbox={} approval={}",
+        profiles.developer.model,
+        profiles.developer.reasoning_effort,
+        profiles.developer.sandbox.as_str(),
+        profiles.developer.approval_policy.as_str()
+    )?;
+    match &profiles.reviewer {
+        ReviewerInvocationProfile::Codex { profile } => writeln!(
+            output,
+            "reviewer profile: codex model={} reasoning={} sandbox={} approval={}",
+            profile.model.clone(),
+            profile.reasoning_effort,
+            profile.sandbox.as_str(),
+            profile.approval_policy.as_str()
+        )?,
+        ReviewerInvocationProfile::Claude { profile } => writeln!(
+            output,
+            "reviewer profile: claude model={} effort={} dangerously_skip_permissions={}",
+            profile.model, profile.effort, profile.dangerously_skip_permissions
+        )?,
     }
     Ok(())
 }
@@ -529,6 +625,7 @@ impl ExactTools {
             Path::new(CODEX_DEVELOPER_EXECUTABLE),
             CODEX_DEVELOPER_CLI_VERSION,
         )?;
+        validate_architect_codex_cli(&codex.canonical_path)?;
         let bwrap = capture_exact_tool(Path::new(BWRAP_EXECUTABLE), BWRAP_VERSION)?;
         let component_path = resolve_component_path()?;
         let component = ExecutableIdentity::capture(component_path)?;
@@ -544,6 +641,45 @@ impl ExactTools {
         revalidate_exact_tool(&self.bwrap, BWRAP_VERSION)?;
         self.component.revalidate()
     }
+}
+
+fn validate_architect_codex_cli(path: &Path) -> Result<()> {
+    let output = Command::new(path)
+        .arg("--help")
+        .env_clear()
+        .output()
+        .context("failed to query architect Codex CLI capabilities")?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        bail!("architect Codex CLI capability probe failed");
+    }
+    validate_cli_help_contract(
+        "architect Codex CLI",
+        &output.stdout,
+        &[
+            "--config",
+            "--disable",
+            "--strict-config",
+            "--model",
+            "--sandbox",
+            "--ask-for-approval",
+            "--cd",
+            "--no-alt-screen",
+        ],
+    )?;
+    let help = std::str::from_utf8(&output.stdout)?;
+    for value in [
+        "read-only",
+        "workspace-write",
+        "danger-full-access",
+        "untrusted",
+        "on-request",
+        "never",
+    ] {
+        if !help.contains(value) {
+            bail!("architect Codex CLI help omitted configured value {value}");
+        }
+    }
+    Ok(())
 }
 
 fn resolve_component_path() -> Result<PathBuf> {
@@ -1168,7 +1304,9 @@ fn spawn_blocked_architect(
     tools: &ExactTools,
     sandbox: &ArchitectSandbox,
     environment: &ArchitectEnvironment,
+    profile: &CodexInvocationProfile,
 ) -> Result<(Child, OwnedFd, OwnedFd)> {
+    profile.validate("architect")?;
     tools.revalidate()?;
     let (gate_read, gate_write) = pipe_cloexec()?;
     let (info_read, info_write) = pipe_cloexec()?;
@@ -1180,13 +1318,13 @@ fn spawn_blocked_architect(
     argv.push(INSIDE_CODEX.into());
     argv.extend([
         "--model".into(),
-        CODEX_DEVELOPER_MODEL.into(),
+        profile.model.clone(),
         "--config".into(),
-        "model_reasoning_effort=\"high\"".into(),
+        profile.reasoning_config_argument(),
         "--sandbox".into(),
-        "read-only".into(),
+        profile.sandbox.as_str().into(),
         "--ask-for-approval".into(),
-        "never".into(),
+        profile.approval_policy.as_str().into(),
         "--cd".into(),
         INSIDE_WORKSPACE.into(),
         "--no-alt-screen".into(),
@@ -1195,7 +1333,7 @@ fn spawn_blocked_architect(
     for feature in DISABLED_CODEX_FEATURES {
         argv.extend(["--disable".into(), (*feature).into()]);
     }
-    validate_native_argv(&argv, tools, sandbox)?;
+    validate_native_argv(&argv, tools, sandbox, profile)?;
     command.args(&argv).env_clear();
     // SAFETY: pre_exec only clears CLOEXEC on the two owned launch-control
     // descriptors before exec.
@@ -1218,6 +1356,7 @@ fn validate_native_argv(
     argv: &[String],
     tools: &ExactTools,
     sandbox: &ArchitectSandbox,
+    profile: &CodexInvocationProfile,
 ) -> Result<()> {
     let separator = argv
         .iter()
@@ -1225,26 +1364,25 @@ fn validate_native_argv(
         .ok_or_else(|| anyhow::anyhow!("architect bwrap argv omitted its separator"))?;
     let native = &argv[separator + 1..];
     let expected_prefix = [
-        INSIDE_CODEX,
-        "--model",
-        CODEX_DEVELOPER_MODEL,
-        "--config",
-        "model_reasoning_effort=\"high\"",
-        "--sandbox",
-        "read-only",
-        "--ask-for-approval",
-        "never",
-        "--cd",
-        INSIDE_WORKSPACE,
-        "--no-alt-screen",
-        "--strict-config",
+        INSIDE_CODEX.to_owned(),
+        "--model".into(),
+        profile.model.clone(),
+        "--config".into(),
+        profile.reasoning_config_argument(),
+        "--sandbox".into(),
+        profile.sandbox.as_str().into(),
+        "--ask-for-approval".into(),
+        profile.approval_policy.as_str().into(),
+        "--cd".into(),
+        INSIDE_WORKSPACE.into(),
+        "--no-alt-screen".into(),
+        "--strict-config".into(),
     ];
     if native.len() != expected_prefix.len() + DISABLED_CODEX_FEATURES.len() * 2
         || !native
             .iter()
             .take(expected_prefix.len())
-            .map(String::as_str)
-            .eq(expected_prefix)
+            .eq(expected_prefix.iter())
     {
         bail!("architect native argv drifted from its exact blank profile");
     }
@@ -1658,17 +1796,58 @@ mod tests {
     }
 
     #[test]
+    fn pinned_codex_root_help_matches_architect_command_contract_when_installed() {
+        let path = Path::new(CODEX_DEVELOPER_EXECUTABLE);
+        if path.exists() {
+            validate_architect_codex_cli(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn explicit_architect_cli_overrides_toml_profile_only() {
+        let args = ArchitectArgs::try_parse_from([
+            "hcom architect",
+            "codex",
+            "--repo",
+            "/repo",
+            "--model",
+            "gpt-5.6-sol-cli",
+            "--reasoning",
+            "max",
+            "--sandbox",
+            "danger-full-access",
+            "--ask-for-approval",
+            "never",
+        ])
+        .unwrap();
+        let mut profiles = SessionInvocationProfiles::default();
+        let developer_before = profiles.developer.clone();
+        let reviewer_before = profiles.reviewer.clone();
+        apply_architect_cli_overrides(&args, &mut profiles).unwrap();
+        assert_eq!(profiles.architect.model, "gpt-5.6-sol-cli");
+        assert_eq!(profiles.architect.reasoning_effort, "max");
+        assert_eq!(profiles.architect.sandbox, CodexSandbox::DangerFullAccess);
+        assert_eq!(
+            profiles.architect.approval_policy,
+            CodexApprovalPolicy::Never
+        );
+        assert_eq!(profiles.developer, developer_before);
+        assert_eq!(profiles.reviewer, reviewer_before);
+    }
+
+    #[test]
     fn native_profile_has_no_prompt_or_secret_transport() {
+        let profile = CodexInvocationProfile::architect_default();
         let native: Vec<String> = vec![
             CODEX_DEVELOPER_EXECUTABLE.into(),
             "--model".into(),
-            CODEX_DEVELOPER_MODEL.into(),
+            profile.model.clone(),
             "--config".into(),
-            "model_reasoning_effort=\"high\"".into(),
+            profile.reasoning_config_argument(),
             "--sandbox".into(),
-            "read-only".into(),
+            profile.sandbox.as_str().into(),
             "--ask-for-approval".into(),
-            "never".into(),
+            profile.approval_policy.as_str().into(),
             "--cd".into(),
             "/repo".into(),
             "--no-alt-screen".into(),
@@ -1735,8 +1914,13 @@ mod tests {
         };
         let report = root.join("architect-state/home/blank-report");
         let write_probe = root.join("repo/architect-write-probe");
-        let (mut child, gate, info) =
-            spawn_blocked_architect(&tools, &sandbox, &environment).unwrap();
+        let (mut child, gate, info) = spawn_blocked_architect(
+            &tools,
+            &sandbox,
+            &environment,
+            &CodexInvocationProfile::architect_default(),
+        )
+        .unwrap();
         let info = match read_bwrap_info(&info) {
             Ok(info) => info,
             Err(error) => {
@@ -1823,15 +2007,16 @@ mod tests {
         .collect();
 
         let report = home.join("blank-report");
+        let profile = CodexInvocationProfile::architect_default();
         let mut expected_args = vec![
             "--model".to_owned(),
-            CODEX_DEVELOPER_MODEL.to_owned(),
+            profile.model.clone(),
             "--config".to_owned(),
-            "model_reasoning_effort=\"high\"".to_owned(),
+            profile.reasoning_config_argument(),
             "--sandbox".to_owned(),
-            "read-only".to_owned(),
+            profile.sandbox.as_str().to_owned(),
             "--ask-for-approval".to_owned(),
-            "never".to_owned(),
+            profile.approval_policy.as_str().to_owned(),
             "--cd".to_owned(),
             INSIDE_WORKSPACE.to_owned(),
             "--no-alt-screen".to_owned(),

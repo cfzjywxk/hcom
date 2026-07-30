@@ -2,20 +2,25 @@ use crate::control_api::{ActionName, ControlAction};
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
-pub(crate) fn tool_definitions() -> Vec<Value> {
+pub(crate) fn tool_definitions(developer_adapter: &str, reviewer_adapter: &str) -> Vec<Value> {
     ActionName::ARCHITECT
         .into_iter()
         .map(|action| {
             json!({
                 "name": action.as_str(),
                 "description": tool_description(action),
-                "inputSchema": action_schema(action),
+                "inputSchema": action_schema(action, developer_adapter, reviewer_adapter),
             })
         })
         .collect()
 }
 
-pub(crate) fn control_action(name: &str, arguments: Value) -> Result<ControlAction> {
+pub(crate) fn control_action(
+    name: &str,
+    arguments: Value,
+    developer_adapter: &str,
+    reviewer_adapter: &str,
+) -> Result<ControlAction> {
     let action = ActionName::ARCHITECT
         .into_iter()
         .find(|action| action.as_str() == name)
@@ -30,6 +35,15 @@ pub(crate) fn control_action(name: &str, arguments: Value) -> Result<ControlActi
     action
         .validate_for_tool()
         .context("architect tool arguments failed protocol validation")?;
+    if let ControlAction::SessionPlanReplace {
+        developer_adapter: requested_developer,
+        reviewer_adapter: requested_reviewer,
+        ..
+    } = &action
+        && (requested_developer != developer_adapter || requested_reviewer != reviewer_adapter)
+    {
+        bail!("architect plan adapters differ from the session-frozen profiles");
+    }
     Ok(action)
 }
 
@@ -50,7 +64,7 @@ fn tool_description(action: ActionName) -> &'static str {
     }
 }
 
-fn action_schema(action: ActionName) -> Value {
+fn action_schema(action: ActionName, developer_adapter: &str, reviewer_adapter: &str) -> Value {
     match action {
         ActionName::SessionPlanReplace => object_schema(
             &[
@@ -65,17 +79,14 @@ fn action_schema(action: ActionName) -> Value {
                     "developer_adapter",
                     json!({
                         "type":"string",
-                        "enum":["codex-developer-0.145.0"]
+                        "enum":[developer_adapter]
                     }),
                 ),
                 (
                     "reviewer_adapter",
                     json!({
                         "type":"string",
-                        "enum":[
-                            "codex-reviewer-0.145.0",
-                            "claude-reviewer-2.1.220"
-                        ]
+                        "enum":[reviewer_adapter]
                     }),
                 ),
                 (
@@ -194,7 +205,7 @@ mod tests {
 
     #[test]
     fn tool_inventory_is_exact_and_contains_no_project_or_generic_authority() {
-        let tools = tool_definitions();
+        let tools = tool_definitions("codex-developer-0.145.0", "claude-reviewer-2.1.220");
         let names: BTreeSet<_> = tools
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
@@ -231,6 +242,8 @@ mod tests {
                 "plan_hash":"a".repeat(64),
                 "approval_confirmed":true
             }),
+            "codex-developer-0.145.0",
+            "claude-reviewer-2.1.220",
         )
         .unwrap();
         assert!(matches!(
@@ -248,11 +261,21 @@ mod tests {
                     "plan_version":1,
                     "plan_hash":"a".repeat(64),
                     "approval_confirmed":false
-                })
+                }),
+                "codex-developer-0.145.0",
+                "claude-reviewer-2.1.220",
             )
             .is_err()
         );
-        assert!(control_action("shell", json!({})).is_err());
+        assert!(
+            control_action(
+                "shell",
+                json!({}),
+                "codex-developer-0.145.0",
+                "claude-reviewer-2.1.220",
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -272,7 +295,13 @@ mod tests {
                 "max_review_rounds":3
             }]
         });
-        let action = control_action("session_plan_replace", arguments.clone()).unwrap();
+        let action = control_action(
+            "session_plan_replace",
+            arguments.clone(),
+            "codex-developer-0.145.0",
+            "claude-reviewer-2.1.220",
+        )
+        .unwrap();
         assert!(matches!(
             action,
             ControlAction::SessionPlanReplace { ref tasks, .. }
@@ -281,6 +310,51 @@ mod tests {
 
         let mut invalid = arguments;
         invalid["tasks"][0]["objective"] = Value::String("safe\n\u{1b}hidden".into());
-        assert!(control_action("session_plan_replace", invalid).is_err());
+        assert!(
+            control_action(
+                "session_plan_replace",
+                invalid,
+                "codex-developer-0.145.0",
+                "claude-reviewer-2.1.220",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn configured_adapter_is_both_schema_visible_and_enforced() {
+        let tools = tool_definitions("codex-developer-0.145.0", "codex-reviewer-0.145.0");
+        let plan = tools
+            .iter()
+            .find(|tool| tool["name"] == "session_plan_replace")
+            .unwrap();
+        assert_eq!(
+            plan["inputSchema"]["properties"]["reviewer_adapter"]["enum"],
+            json!(["codex-reviewer-0.145.0"])
+        );
+        let arguments = json!({
+            "expected_session_version":0,
+            "developer_adapter":"codex-developer-0.145.0",
+            "reviewer_adapter":"claude-reviewer-2.1.220",
+            "tasks":[{
+                "task_key":"one",
+                "title":"one",
+                "objective":"one",
+                "acceptance_criteria":["one"],
+                "required_checks":[],
+                "allowed_paths":["one.txt"],
+                "forbidden_actions":["push"],
+                "max_review_rounds":1
+            }]
+        });
+        assert!(
+            control_action(
+                "session_plan_replace",
+                arguments,
+                "codex-developer-0.145.0",
+                "codex-reviewer-0.145.0",
+            )
+            .is_err()
+        );
     }
 }

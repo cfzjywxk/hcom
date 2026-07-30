@@ -9,6 +9,7 @@ pub mod environment;
 pub mod fake;
 #[cfg(target_os = "linux")]
 pub mod process;
+pub mod profile;
 pub mod result;
 #[cfg(target_os = "linux")]
 pub mod reviewer;

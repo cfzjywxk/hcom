@@ -8,6 +8,7 @@ use super::contract::{
     validate_native_session_id,
 };
 use super::environment::{EnvironmentPolicy, ExactEnvironmentRequirement};
+use super::profile::{ClaudeInvocationProfile, CodexInvocationProfile, validate_cli_help_contract};
 use super::result::{CheckStatus, MAX_RESULT_BYTES, ReviewerResult};
 use super::sandbox::{
     EmptyRootContract, EmptyRootMounts, INSIDE_ARTIFACTS, INSIDE_CARGO_HOME, INSIDE_CLAUDE,
@@ -48,12 +49,9 @@ const GIT_EXECUTABLE: &str = "/usr/bin/git";
 const GIT_VERSION: &str = "git version 2.43.0";
 const CODEX_ADAPTER_NAME: &str = "codex-reviewer-0.145.0";
 const CLAUDE_ADAPTER_NAME: &str = "claude-reviewer-2.1.220";
-const CODEX_ADAPTER_CONTRACT_VERSION: u32 = 2;
-const CLAUDE_ADAPTER_CONTRACT_VERSION: u32 = 2;
-const CODEX_EFFECTIVE_POLICY: &str =
-    "native=danger-full-access;outer=bubblewrap-0.9.0-empty-root-reviewer-ro-v2;approval=never";
-const CLAUDE_EFFECTIVE_POLICY: &str =
-    "native=bypassPermissions;outer=bubblewrap-0.9.0-empty-root-reviewer-ro-v2";
+const CODEX_ADAPTER_CONTRACT_VERSION: u32 = 3;
+const CLAUDE_ADAPTER_CONTRACT_VERSION: u32 = 3;
+const REVIEWER_OUTER_POLICY: &str = "bubblewrap-0.9.0-empty-root-reviewer-ro-v2";
 const CODEX_RESULT_SCHEMA_FILE: &str = "codex-reviewer-result-schema.json";
 const CODEX_FINAL_FILE: &str = "native-final.partial";
 const JSON_SCHEMA_DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
@@ -84,6 +82,7 @@ pub struct CodexReviewerConfig {
     pub auth_source: PathBuf,
     pub cargo_bin_source: PathBuf,
     pub rustup_home_source: PathBuf,
+    pub invocation: CodexInvocationProfile,
 }
 
 pub struct CodexReviewerAdapter {
@@ -92,11 +91,13 @@ pub struct CodexReviewerAdapter {
     outer_executable: ExecutableIdentity,
     git_executable: ExecutableIdentity,
     sandbox: ReviewerSandbox,
+    invocation: CodexInvocationProfile,
 }
 
 impl CodexReviewerAdapter {
     pub fn discover(config: CodexReviewerConfig) -> Result<Self> {
         validate_production_runtime_contract(&config.host_runtime_dir, &config.run_id)?;
+        validate_codex_reviewer_cli(Path::new(CODEX_REVIEWER_EXECUTABLE))?;
         Self::discover_with_paths(
             config,
             Path::new(CODEX_REVIEWER_EXECUTABLE),
@@ -127,6 +128,8 @@ impl CodexReviewerAdapter {
         bwrap_path: &Path,
         git_path: &Path,
     ) -> Result<Self> {
+        config.invocation.validate("Codex reviewer")?;
+        let invocation = config.invocation.clone();
         let executable = capture_exact_tool(codex_path, CODEX_REVIEWER_CLI_VERSION)?;
         let outer_executable = capture_exact_tool(bwrap_path, BWRAP_VERSION)?;
         let git_executable = capture_exact_tool(git_path, GIT_VERSION)?;
@@ -150,13 +153,14 @@ impl CodexReviewerAdapter {
             &outer_executable,
             &git_executable,
         )?;
-        let descriptor = codex_reviewer_descriptor()?;
+        let descriptor = codex_reviewer_descriptor(&invocation)?;
         Ok(Self {
             descriptor,
             executable,
             outer_executable,
             git_executable,
             sandbox,
+            invocation,
         })
     }
 
@@ -176,23 +180,28 @@ impl CodexReviewerAdapter {
         )?;
         self.sandbox
             .validate_revision(control, &self.git_executable)?;
+        self.invocation.validate("Codex reviewer")?;
 
-        let mut fixed_argv = vec!["exec".into()];
+        let mut fixed_argv = vec![
+            "exec".into(),
+            "--sandbox".into(),
+            self.invocation.sandbox.as_str().into(),
+        ];
         if let Some(session_id) = resume_session_id {
             validate_native_session_id(session_id)?;
             fixed_argv.extend(["resume".into(), session_id.into()]);
         }
         fixed_argv.extend([
             "--json".into(),
+            "--strict-config".into(),
             "--model".into(),
-            CODEX_REVIEWER_MODEL.into(),
+            self.invocation.model.clone(),
             "--config".into(),
-            "model_reasoning_effort=\"high\"".into(),
+            self.invocation.reasoning_config_argument(),
             "--config".into(),
-            "approval_policy=\"never\"".into(),
+            self.invocation.approval_config_argument(),
             "--config".into(),
             "mcp_servers={}".into(),
-            "--dangerously-bypass-approvals-and-sandbox".into(),
             "--ignore-user-config".into(),
             "--ignore-rules".into(),
         ]);
@@ -341,6 +350,7 @@ pub struct ClaudeReviewerConfig {
     pub auth_source: PathBuf,
     pub cargo_bin_source: PathBuf,
     pub rustup_home_source: PathBuf,
+    pub invocation: ClaudeInvocationProfile,
 }
 
 pub struct ClaudeReviewerAdapter {
@@ -353,11 +363,13 @@ pub struct ClaudeReviewerAdapter {
     xdg_state_home: DirectoryIdentity,
     xdg_cache_home: DirectoryIdentity,
     xdg_data_home: DirectoryIdentity,
+    invocation: ClaudeInvocationProfile,
 }
 
 impl ClaudeReviewerAdapter {
     pub fn discover(config: ClaudeReviewerConfig) -> Result<Self> {
         validate_production_runtime_contract(&config.host_runtime_dir, &config.run_id)?;
+        validate_claude_reviewer_cli(Path::new(CLAUDE_REVIEWER_EXECUTABLE))?;
         Self::discover_with_paths(
             config,
             Path::new(CLAUDE_REVIEWER_EXECUTABLE),
@@ -396,6 +408,8 @@ impl ClaudeReviewerAdapter {
         bwrap_path: &Path,
         git_path: &Path,
     ) -> Result<Self> {
+        config.invocation.validate("Claude reviewer")?;
+        let invocation = config.invocation.clone();
         let executable = capture_exact_tool(claude_path, CLAUDE_REVIEWER_CLI_VERSION)?;
         let outer_executable = capture_exact_tool(bwrap_path, BWRAP_VERSION)?;
         let git_executable = capture_exact_tool(git_path, GIT_VERSION)?;
@@ -428,7 +442,7 @@ impl ClaudeReviewerAdapter {
             &outer_executable,
             &git_executable,
         )?;
-        let descriptor = claude_reviewer_descriptor()?;
+        let descriptor = claude_reviewer_descriptor(&invocation)?;
         Ok(Self {
             descriptor,
             executable,
@@ -439,6 +453,7 @@ impl ClaudeReviewerAdapter {
             xdg_state_home,
             xdg_cache_home,
             xdg_data_home,
+            invocation,
         })
     }
 
@@ -475,6 +490,7 @@ impl ClaudeReviewerAdapter {
         }
         self.sandbox
             .validate_revision(control, &self.git_executable)?;
+        self.invocation.validate("Claude reviewer")?;
 
         let mut fixed_argv = vec!["-p".into(), "--output-format".into(), "json".into()];
         if resume_session_id.is_some() {
@@ -486,11 +502,9 @@ impl ClaudeReviewerAdapter {
             "--name".into(),
             "hcom-session-reviewer".into(),
             "--model".into(),
-            CLAUDE_REVIEWER_MODEL.into(),
+            self.invocation.model.clone(),
             "--effort".into(),
-            CLAUDE_REVIEWER_REASONING.into(),
-            "--permission-mode".into(),
-            "bypassPermissions".into(),
+            self.invocation.effort.clone(),
             "--tools".into(),
             "Bash,Read".into(),
             "--setting-sources".into(),
@@ -503,6 +517,9 @@ impl ClaudeReviewerAdapter {
             "false".into(),
             "--no-chrome".into(),
         ]);
+        if self.invocation.dangerously_skip_permissions {
+            fixed_argv.push("--dangerously-skip-permissions".into());
+        }
         let expected_artifact_dir = self
             .sandbox
             .artifact_root
@@ -575,6 +592,95 @@ impl ClaudeReviewerAdapter {
     }
 }
 
+fn validate_codex_reviewer_cli(path: &Path) -> Result<()> {
+    let mut command = Command::new(path);
+    command.args(["exec", "--help"]).env_clear();
+    let output = run_bounded_command(command, 128 * 1024)?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        bail!("Codex reviewer CLI capability probe failed");
+    }
+    validate_cli_help_contract(
+        "Codex reviewer CLI",
+        &output.stdout,
+        &[
+            "resume",
+            "--config",
+            "--disable",
+            "--strict-config",
+            "--model",
+            "--sandbox",
+            "--cd",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--output-schema",
+            "--json",
+            "--output-last-message",
+        ],
+    )?;
+
+    // `--sandbox` is an `exec` parent option, so prove the exact ordering used
+    // for same-task resume rather than relying on the create-only help surface.
+    let mut resume = Command::new(path);
+    resume
+        .args(["exec", "--sandbox", "read-only", "resume", "--help"])
+        .env_clear();
+    let output = run_bounded_command(resume, 128 * 1024)?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        bail!("Codex reviewer resume CLI capability probe failed");
+    }
+    validate_cli_help_contract(
+        "Codex reviewer resume CLI",
+        &output.stdout,
+        &[
+            "--config",
+            "--disable",
+            "--strict-config",
+            "--model",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--output-schema",
+            "--json",
+            "--output-last-message",
+        ],
+    )
+}
+
+fn validate_claude_reviewer_cli(path: &Path) -> Result<()> {
+    let mut command = Command::new(path);
+    command.arg("--help").env_clear();
+    let output = run_bounded_command(command, 128 * 1024)?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        bail!("Claude reviewer CLI capability probe failed");
+    }
+    validate_cli_help_contract(
+        "Claude reviewer CLI",
+        &output.stdout,
+        &[
+            "--print",
+            "--output-format",
+            "--session-id",
+            "--resume",
+            "--name",
+            "--model",
+            "--effort",
+            "--dangerously-skip-permissions",
+            "--tools",
+            "--setting-sources",
+            "--strict-mcp-config",
+            "--mcp-config",
+            "--disable-slash-commands",
+            "--prompt-suggestions",
+            "--no-chrome",
+            "--json-schema",
+        ],
+    )?;
+    let help = std::str::from_utf8(&output.stdout)?;
+    if !help.contains("(low, medium, high, xhigh, max)") || !help.contains("'opus'") {
+        bail!("Claude reviewer CLI help omitted a configured effort or model alias");
+    }
+    Ok(())
+}
+
 impl WorkerAdapter for ClaudeReviewerAdapter {
     fn descriptor(&self) -> &AdapterDescriptor {
         &self.descriptor
@@ -594,7 +700,7 @@ impl WorkerAdapter for ClaudeReviewerAdapter {
     }
 
     fn observe_native_record(&self, record: &[u8]) -> Result<Vec<NativeObservation>> {
-        let envelope = parse_claude_envelope(record, None)?;
+        let envelope = parse_claude_envelope(record, None, &self.invocation.model)?;
         Ok(vec![
             NativeObservation::SessionStarted {
                 native_session_id: envelope.session_id,
@@ -618,8 +724,11 @@ impl WorkerAdapter for ClaudeReviewerAdapter {
         if !artifacts.stderr().iter().all(u8::is_ascii_whitespace) {
             bail!("Claude reviewer emitted unexpected stderr");
         }
-        let envelope =
-            parse_claude_envelope(artifacts.stdout(), control.native_session_id.as_deref())?;
+        let envelope = parse_claude_envelope(
+            artifacts.stdout(),
+            control.native_session_id.as_deref(),
+            &self.invocation.model,
+        )?;
         let encoded = serde_json::to_vec(&envelope.structured_output)?;
         let result = ReviewerResult::parse(&encoded)
             .context("Claude structured output is not strict ReviewerResult JSON")?;
@@ -668,14 +777,15 @@ fn reviewer_capabilities(
     }
 }
 
-fn codex_reviewer_descriptor() -> Result<AdapterDescriptor> {
+fn codex_reviewer_descriptor(invocation: &CodexInvocationProfile) -> Result<AdapterDescriptor> {
+    let policy = invocation.effective_policy(REVIEWER_OUTER_POLICY);
     AdapterDescriptor::new(
         CODEX_ADAPTER_NAME,
         CODEX_ADAPTER_CONTRACT_VERSION,
         CODEX_REVIEWER_CLI_VERSION,
-        CODEX_REVIEWER_MODEL,
-        CODEX_REVIEWER_REASONING,
-        CODEX_EFFECTIVE_POLICY,
+        &invocation.model,
+        &invocation.reasoning_effort,
+        &policy,
         reviewer_capabilities(
             NativeSessionMode::Discovered,
             ResultTransport::FinalFile,
@@ -684,14 +794,15 @@ fn codex_reviewer_descriptor() -> Result<AdapterDescriptor> {
     )
 }
 
-fn claude_reviewer_descriptor() -> Result<AdapterDescriptor> {
+fn claude_reviewer_descriptor(invocation: &ClaudeInvocationProfile) -> Result<AdapterDescriptor> {
+    let policy = invocation.effective_policy(REVIEWER_OUTER_POLICY);
     AdapterDescriptor::new(
         CLAUDE_ADAPTER_NAME,
         CLAUDE_ADAPTER_CONTRACT_VERSION,
         CLAUDE_REVIEWER_CLI_VERSION,
-        CLAUDE_REVIEWER_MODEL,
-        CLAUDE_REVIEWER_REASONING,
-        CLAUDE_EFFECTIVE_POLICY,
+        &invocation.model,
+        &invocation.effort,
+        &policy,
         reviewer_capabilities(
             NativeSessionMode::Preassigned,
             ResultTransport::Envelope,
@@ -822,6 +933,7 @@ struct ClaudeResultEnvelope {
 fn parse_claude_envelope(
     bytes: &[u8],
     expected_session_id: Option<&str>,
+    requested_model: &str,
 ) -> Result<ClaudeResultEnvelope> {
     if bytes.is_empty() || bytes.len() > 1024 * 1024 {
         bail!("Claude result envelope exceeds its bound");
@@ -837,7 +949,11 @@ fn parse_claude_envelope(
     if expected_session_id.is_some_and(|expected| expected != envelope.session_id) {
         bail!("Claude reviewer returned a different native session");
     }
-    if envelope.model_usage.len() != 1 || !envelope.model_usage.contains_key(CLAUDE_REVIEWER_MODEL)
+    if envelope.model_usage.len() != 1
+        || !envelope
+            .model_usage
+            .keys()
+            .all(|actual| claude_model_matches(requested_model, actual))
     {
         bail!("Claude reviewer model usage drifted from its exact pinned model");
     }
@@ -845,6 +961,18 @@ fn parse_claude_envelope(
         bail!("Claude reviewer omitted its structured result object");
     }
     Ok(envelope)
+}
+
+fn claude_model_matches(requested: &str, actual: &str) -> bool {
+    if requested == actual {
+        return true;
+    }
+    match requested {
+        "opus" => actual.starts_with("claude-opus-"),
+        "sonnet" => actual.starts_with("claude-sonnet-"),
+        "haiku" => actual.starts_with("claude-haiku-"),
+        _ => false,
+    }
 }
 
 fn validate_claude_session_id(value: &str) -> Result<()> {
@@ -1829,6 +1957,7 @@ mod tests {
                 auth_source: self.codex_auth_source.clone(),
                 cargo_bin_source: self.cargo_bin_source.clone(),
                 rustup_home_source: self.rustup_home_source.clone(),
+                invocation: CodexInvocationProfile::reviewer_default(),
             }
         }
 
@@ -1849,6 +1978,7 @@ mod tests {
                 auth_source: self.claude_auth_source.clone(),
                 cargo_bin_source: self.cargo_bin_source.clone(),
                 rustup_home_source: self.rustup_home_source.clone(),
+                invocation: ClaudeInvocationProfile::reviewer_default(),
             }
         }
 
@@ -2072,6 +2202,67 @@ mod tests {
     }
 
     #[test]
+    fn pinned_reviewer_help_matches_configurable_command_contract_when_installed() {
+        let codex = Path::new(CODEX_REVIEWER_EXECUTABLE);
+        if codex.exists() {
+            validate_codex_reviewer_cli(codex).unwrap();
+        }
+        let claude = Path::new(CLAUDE_REVIEWER_EXECUTABLE);
+        if claude.exists() {
+            validate_claude_reviewer_cli(claude).unwrap();
+        }
+    }
+
+    #[test]
+    fn configured_claude_alias_xhigh_and_skip_permissions_reach_exact_argv() {
+        let fixture = Fixture::new();
+        let mut config = fixture.claude_config();
+        config.invocation.model = "opus".into();
+        config.invocation.effort = "xhigh".into();
+        let adapter = ClaudeReviewerAdapter::discover_with_paths(
+            config,
+            &fixture.claude,
+            &fixture.bwrap,
+            &fixture.git,
+        )
+        .unwrap();
+        let profile = adapter.profile();
+        assert_eq!(profile.model, "opus");
+        assert_eq!(profile.reasoning, "xhigh");
+        let control = fixture.control(
+            "task-configured-claude",
+            "logical-configured-claude",
+            Some(CLAUDE_SESSION),
+            1,
+            1,
+            &fixture.first_head,
+        );
+        let prepared = prepare_create_turn(
+            &adapter,
+            &profile,
+            &control,
+            b"review prompt remains schema-controlled".to_vec(),
+        )
+        .unwrap();
+        let argv = prepared.command().materialized_control_argv();
+        assert!(argv.windows(2).any(|pair| pair == ["--model", "opus"]));
+        assert!(argv.windows(2).any(|pair| pair == ["--effort", "xhigh"]));
+        assert!(
+            argv.iter()
+                .any(|argument| argument == "--dangerously-skip-permissions")
+        );
+        assert!(!argv.iter().any(|argument| argument == "--permission-mode"));
+
+        let envelope = format!(
+            r#"{{"type":"result","subtype":"success","is_error":false,"session_id":"{CLAUDE_SESSION}","structured_output":{{}},"modelUsage":{{"claude-opus-5":{{}}}}}}"#
+        );
+        assert!(parse_claude_envelope(envelope.as_bytes(), Some(CLAUDE_SESSION), "opus").is_ok());
+        assert!(
+            parse_claude_envelope(envelope.as_bytes(), Some(CLAUDE_SESSION), "sonnet").is_err()
+        );
+    }
+
+    #[test]
     fn exact_profiles_fake_create_and_same_task_workspace_refresh_resume_are_closed() {
         let fixture = Fixture::new();
         let prompt = b"review only the exact approved base and head";
@@ -2082,7 +2273,10 @@ mod tests {
         assert_eq!(codex_profile.role, WorkerRole::Reviewer);
         assert_eq!(codex_profile.model, CODEX_REVIEWER_MODEL);
         assert_eq!(codex_profile.reasoning, CODEX_REVIEWER_REASONING);
-        assert_eq!(codex_profile.policy, CODEX_EFFECTIVE_POLICY);
+        assert_eq!(
+            codex_profile.policy,
+            CodexInvocationProfile::reviewer_default().effective_policy(REVIEWER_OUTER_POLICY)
+        );
         assert_eq!(
             codex_profile.adapter_contract_version,
             CODEX_ADAPTER_CONTRACT_VERSION
@@ -2160,6 +2354,16 @@ mod tests {
             argv.windows(2)
                 .any(|pair| pair == ["resume", "native-codex-reviewer-1"])
         );
+        assert!(argv.iter().any(|argument| argument == "--strict-config"));
+        let sandbox = argv
+            .iter()
+            .position(|argument| argument == "--sandbox")
+            .unwrap();
+        let resume = argv
+            .iter()
+            .position(|argument| argument == "resume")
+            .unwrap();
+        assert!(sandbox < resume);
         assert!(!argv.iter().any(|argument| argument == "--cd"));
         assert!(
             prepare_resume_turn(
@@ -2196,7 +2400,10 @@ mod tests {
         assert_eq!(claude_profile.role, WorkerRole::Reviewer);
         assert_eq!(claude_profile.model, CLAUDE_REVIEWER_MODEL);
         assert_eq!(claude_profile.reasoning, CLAUDE_REVIEWER_REASONING);
-        assert_eq!(claude_profile.policy, CLAUDE_EFFECTIVE_POLICY);
+        assert_eq!(
+            claude_profile.policy,
+            ClaudeInvocationProfile::reviewer_default().effective_policy(REVIEWER_OUTER_POLICY)
+        );
         assert_eq!(
             claude_profile.adapter_contract_version,
             CLAUDE_ADAPTER_CONTRACT_VERSION
@@ -2752,8 +2959,8 @@ mod tests {
         assert!(argv.iter().any(|argument| argument == "--die-with-parent"));
         assert!(argv.iter().any(|argument| argument == "--unshare-pid"));
         assert!(
-            argv.iter()
-                .any(|argument| argument == "--dangerously-bypass-approvals-and-sandbox")
+            argv.windows(2)
+                .any(|pair| pair == ["--sandbox", "danger-full-access"])
         );
         assert!(
             argv.windows(2)
@@ -2778,9 +2985,10 @@ mod tests {
         );
         assert!(argv.windows(2).any(|pair| pair == ["--effort", "high"]));
         assert!(
-            argv.windows(2)
-                .any(|pair| pair == ["--permission-mode", "bypassPermissions"])
+            argv.iter()
+                .any(|argument| argument == "--dangerously-skip-permissions")
         );
+        assert!(!argv.iter().any(|argument| argument == "--permission-mode"));
         assert!(argv.windows(2).any(|pair| pair == ["--tools", "Bash,Read"]));
         assert!(
             argv.windows(2)

@@ -997,6 +997,25 @@ args = ""
 [launch.copilot]
 args = ""
 
+[architect.profile]
+model = "gpt-5.6-sol"
+reasoning_effort = "high"
+sandbox = "read-only"
+ask_for_approval = "never"
+
+[architect.developer]
+adapter = "codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "high"
+sandbox = "danger-full-access"
+ask_for_approval = "never"
+
+[architect.reviewer]
+adapter = "claude"
+model = "claude-opus-5"
+effort = "high"
+dangerously_skip_permissions = true
+
 [preferences]
 timeout = 86400
 auto_approve = true
@@ -2201,6 +2220,9 @@ auto_approve = false
         assert!(get_nested(&structure, "launch.tag").is_some());
         assert!(get_nested(&structure, "launch.claude.args").is_some());
         assert!(get_nested(&structure, "relay.url").is_some());
+        assert!(get_nested(&structure, "architect.profile.model").is_some());
+        assert!(get_nested(&structure, "architect.developer.adapter").is_some());
+        assert!(get_nested(&structure, "architect.reviewer.effort").is_some());
         assert!(get_nested(&structure, "preferences.timeout").is_some());
     }
 

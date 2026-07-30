@@ -130,8 +130,13 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     assert!(stdout.contains("hcom architect codex"), "stdout={stdout}");
     assert!(stdout.contains("--repo"), "stdout={stdout}");
     assert!(!stdout.contains("--project"), "stdout={stdout}");
-    assert!(stdout.contains("in-memory session-task"), "stdout={stdout}");
+    assert!(stdout.contains("session-task tools"), "stdout={stdout}");
     assert!(stdout.contains("canonical checkout"), "stdout={stdout}");
+    assert!(stdout.contains("$HCOM_DIR/config.toml"), "stdout={stdout}");
+    assert!(stdout.contains("[architect.profile]"), "stdout={stdout}");
+    assert!(stdout.contains("[architect.developer]"), "stdout={stdout}");
+    assert!(stdout.contains("[architect.reviewer]"), "stdout={stdout}");
+    assert!(stdout.contains("--ask-for-approval"), "stdout={stdout}");
     assert!(
         !db_path.exists(),
         "session architect help must not initialize retained v24 state"

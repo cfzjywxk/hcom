@@ -588,7 +588,8 @@ pub fn dispatch() -> anyhow::Result<()> {
             if flags.name.is_some() || flags.go {
                 anyhow::bail!("hcom architect does not accept retained interactive global flags");
             }
-            let exit_code = hcom::architect::run_cli(&stripped)?;
+            let exit_code =
+                hcom::architect::run_cli_with_config(&stripped, &crate::paths::config_toml_path())?;
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }
