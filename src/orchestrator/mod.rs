@@ -25,6 +25,7 @@ use crate::worker::result::{
 };
 use crate::worker::reviewer::{
     ClaudeReviewerAdapter, ClaudeReviewerConfig, CodexReviewerAdapter, CodexReviewerConfig,
+    claude_auth_redaction_values, validate_claude_auth_readiness,
 };
 use crate::worker::{ExecutableIdentity, prepare_create_turn, prepare_resume_turn};
 use anyhow::{Context, Result, anyhow, bail};
@@ -180,13 +181,32 @@ impl SessionRuntimeSources {
                 values.insert(name.into(), value.into());
             }
         }
-        ExecutionEnvironmentLease::capture(
+        let lease = ExecutionEnvironmentLease::capture(
             format!("lease-{}", Uuid::new_v4()),
             epoch,
             &policy,
             values.into_iter().collect(),
         )
-        .with_context(|| format!("failed to capture worker environment for {run_id}/{task_id}"))
+        .with_context(|| format!("failed to capture worker environment for {run_id}/{task_id}"))?;
+        if adapter == "claude-reviewer-2.1.220" {
+            let source = self
+                .claude_auth_source
+                .as_deref()
+                .ok_or_else(|| anyhow!("Claude auth source is unavailable"))?;
+            return lease.with_secret_redaction_values(claude_auth_redaction_values(source)?);
+        }
+        Ok(lease)
+    }
+
+    fn require_adapter_ready(&self, adapter: &str) -> Result<()> {
+        if adapter == "claude-reviewer-2.1.220" {
+            let source = self
+                .claude_auth_source
+                .as_deref()
+                .ok_or_else(|| anyhow!("Claude auth source is unavailable"))?;
+            validate_claude_auth_readiness(source, SystemTime::now())?;
+        }
+        Ok(())
     }
 }
 
@@ -532,6 +552,19 @@ impl SessionSupervisor {
         if draft.version != plan_version || draft.hash != plan_hash {
             bail!("approved plan version or hash is stale");
         }
+        let developer_adapter = draft.developer_adapter.clone();
+        let reviewer_adapter = draft.reviewer_adapter.clone();
+        if self
+            .sources
+            .require_adapter_ready(&developer_adapter)
+            .and_then(|_| self.sources.require_adapter_ready(&reviewer_adapter))
+            .is_err()
+        {
+            self.needs_human(
+                "selected worker authentication is unavailable, expired, or too close to expiry",
+            );
+            bail!("approved worker adapter failed its authentication readiness gate");
+        }
         self.repository
             .require_exact(&self.startup.start_branch, &self.startup.start_head)?;
         let first = self
@@ -660,6 +693,22 @@ impl SessionSupervisor {
             .is_some_and(|retry| retry.task_index != task_index || retry.role != role)
         {
             bail!("retry token no longer matches the current task state");
+        }
+        let adapter_name = {
+            let draft = self
+                .draft
+                .as_ref()
+                .ok_or_else(|| anyhow!("task adapter requested without a plan"))?;
+            match role {
+                WorkerRole::Developer => draft.developer_adapter.clone(),
+                WorkerRole::Reviewer => draft.reviewer_adapter.clone(),
+            }
+        };
+        if let Err(error) = self.sources.require_adapter_ready(&adapter_name) {
+            self.needs_human(
+                "selected worker authentication expired before its next isolated turn",
+            );
+            return Err(error).context("worker authentication readiness gate failed");
         }
         self.ensure_task_adapter(task_index, role)?;
         let task = &self.tasks[task_index];
@@ -1246,6 +1295,7 @@ impl SessionSupervisor {
         struct Prompt<'a> {
             contract: &'static str,
             role: &'static str,
+            turn_phase: &'static str,
             task_ordinal: usize,
             task: &'a TaskDraft,
             base_revision: &'a str,
@@ -1256,9 +1306,15 @@ impl SessionSupervisor {
             requirements: &'static [&'static str],
         }
         let task = &self.tasks[task_index];
+        let turn_phase = match (role, task.last_review.as_ref()) {
+            (WorkerRole::Developer, None) => "initial_development",
+            (WorkerRole::Developer, Some(_)) => "fix_after_request_changes",
+            (WorkerRole::Reviewer, _) => "independent_review",
+        };
         let prompt = Prompt {
             contract: "hcom-session-worker-turn-v1",
             role: role_name(role),
+            turn_phase,
             task_ordinal: task_index,
             task: &task.spec,
             base_revision: task
@@ -1272,15 +1328,33 @@ impl SessionSupervisor {
                 .then_some(task.last_review.as_ref())
                 .flatten(),
             requirements: match role {
-                WorkerRole::Developer => &[
-                    "Work only on this explicitly approved task.",
-                    "Commit all completed changes in the canonical checkout.",
+                WorkerRole::Developer if task.last_review.is_none() => &[
+                    "This is exactly one initial developer turn; stop after completing and committing only the current developer stage.",
+                    "There has been no reviewer turn. Never claim, simulate, anticipate, or perform reviewer work.",
+                    "Do not start, invoke, delegate to, or wait for any sub-agent or reviewer.",
+                    "Do not implement any later change that is conditional on a future review or future finding.",
+                    "Work only on this explicitly approved task and allowed paths.",
+                    "Run every required check and report each command under its exact approved string.",
+                    "For a completed result, commits must list every commit in chronological base_revision..HEAD order, and changed_paths must list the complete union over that same full task range.",
                     "Return a clean committed HEAD that fast-forwards the exact task base.",
                     "Do not push, install, reset, rebase, merge, or expand scope.",
                 ],
+                WorkerRole::Developer => &[
+                    "This is exactly one resumed developer turn after the prior reviewer request_changes.",
+                    "Address only the supplied prior_review findings within the approved task and allowed paths.",
+                    "Never claim, simulate, anticipate, or perform reviewer work.",
+                    "Do not start, invoke, delegate to, or wait for any sub-agent or reviewer.",
+                    "Run every required check and report each command under its exact approved string.",
+                    "For a completed result, commits must list every commit in chronological base_revision..HEAD order, and changed_paths must list the complete union over that same full task range.",
+                    "The full-range result must include commits and paths from earlier turns; never report only the current resumed turn delta.",
+                    "Commit the bounded fix and return a clean HEAD that fast-forwards both the task base and prior reviewed HEAD.",
+                    "Do not push, install, reset, rebase, merge, or expand scope.",
+                ],
                 WorkerRole::Reviewer => &[
-                    "Review only the exact bound HEAD and task.",
+                    "This is exactly one independent reviewer turn; review only the exact bound HEAD, task, history, and acceptance criteria.",
                     "Do not modify the checkout.",
+                    "Do not start, invoke, delegate to, or wait for any sub-agent or developer.",
+                    "Run every required check and report each command under its exact approved string.",
                     "Return request_changes only with at least one major finding.",
                     "Return lgtm only when no major finding remains.",
                 ],
@@ -2143,7 +2217,7 @@ fn truncate_status_detail(mut detail: String) -> String {
 mod tests {
     use super::*;
     use crate::worker::fake::FakeWorkerAdapter;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     const FAKE_WORKER: &str = r#"#!/usr/bin/python3
 import json
@@ -2502,6 +2576,114 @@ sys.stdout.write(json.dumps({
     }
 
     #[test]
+    fn worker_prompts_enforce_one_role_and_one_review_stage_per_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let repository = initialize_repository(&root);
+        let locks = private_directory(&root.join("locks"));
+        let mut supervisor = open_supervisor(&root, &repository, "normal", "run", &locks);
+        approve(&mut supervisor, vec![task("one", 3)]);
+
+        let initial: serde_json::Value = serde_json::from_slice(
+            &supervisor
+                .build_turn_prompt(0, WorkerRole::Developer, 0)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(initial["role"], "developer");
+        assert_eq!(initial["turn_phase"], "initial_development");
+        assert!(initial["prior_review"].is_null());
+        let initial_requirements = initial["requirements"].as_array().unwrap();
+        assert!(
+            initial_requirements
+                .iter()
+                .any(|requirement| requirement.as_str().unwrap().contains("no reviewer turn"))
+        );
+        assert!(initial_requirements.iter().any(|requirement| {
+            requirement
+                .as_str()
+                .unwrap()
+                .contains("sub-agent or reviewer")
+        }));
+        assert!(initial_requirements.iter().any(|requirement| {
+            requirement
+                .as_str()
+                .unwrap()
+                .contains("conditional on a future review")
+        }));
+        assert!(initial_requirements.iter().any(|requirement| {
+            requirement
+                .as_str()
+                .unwrap()
+                .contains("chronological base_revision..HEAD")
+        }));
+
+        supervisor.tasks[0].last_review = Some(ReviewerResult {
+            decision: ReviewDecision::RequestChanges,
+            summary: "fix the bounded finding".into(),
+            findings: vec![crate::worker::result::ReviewFinding {
+                severity: crate::worker::result::FindingSeverity::Major,
+                title: "bounded finding".into(),
+                body: "change only the approved file".into(),
+                file: Some("one.txt".into()),
+                line: Some(1),
+            }],
+            checks: vec![],
+        });
+        let resumed: serde_json::Value = serde_json::from_slice(
+            &supervisor
+                .build_turn_prompt(0, WorkerRole::Developer, 1)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resumed["turn_phase"], "fix_after_request_changes");
+        assert_eq!(
+            resumed["prior_review"]["decision"],
+            serde_json::json!("request_changes")
+        );
+        assert!(
+            resumed["requirements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|requirement| requirement
+                    .as_str()
+                    .unwrap()
+                    .contains("supplied prior_review findings"))
+        );
+        assert!(
+            resumed["requirements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|requirement| requirement
+                    .as_str()
+                    .unwrap()
+                    .contains("never report only the current resumed turn delta"))
+        );
+
+        let reviewer: serde_json::Value = serde_json::from_slice(
+            &supervisor
+                .build_turn_prompt(0, WorkerRole::Reviewer, 1)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reviewer["role"], "reviewer");
+        assert_eq!(reviewer["turn_phase"], "independent_review");
+        assert!(reviewer["prior_review"].is_null());
+        assert!(
+            reviewer["requirements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|requirement| requirement
+                    .as_str()
+                    .unwrap()
+                    .contains("sub-agent or developer"))
+        );
+    }
+
+    #[test]
     fn review_exhausted_is_not_lgtm_and_still_advances_to_the_next_task() {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
@@ -2790,6 +2972,95 @@ sys.stdout.write(json.dumps({
         ] {
             assert_eq!(values.get(name), Some(&value));
         }
+    }
+
+    #[test]
+    fn expired_claude_auth_fails_before_any_worker_or_repository_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let repository = initialize_repository(&root);
+        let start_head = String::from_utf8(git(&repository, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let locks = private_directory(&root.join("locks"));
+        let run_root = private_directory(&root.join("run"));
+        let toolchain = private_directory(&root.join("toolchain"));
+        let host_auth_dir = private_directory(&root.join("host-auth"));
+        let host_auth = host_auth_dir.join(".credentials.json");
+        let auth = br#"{"claudeAiOauth":{"accessToken":"host-access-token-v1","refreshToken":"host-refresh-token-v1","expiresAt":0,"refreshTokenExpiresAt":1}}"#;
+        fs::write(&host_auth, auth).unwrap();
+        fs::set_permissions(&host_auth, fs::Permissions::from_mode(0o600)).unwrap();
+        let before = fs::metadata(&host_auth).unwrap();
+        let mut sources = SessionRuntimeSources::fake(&toolchain);
+        sources.claude_auth_source = Some(fs::canonicalize(&host_auth).unwrap());
+
+        let mut supervisor = SessionSupervisor::open_with(
+            "run-test".into(),
+            repository.clone(),
+            run_root,
+            locks,
+            sources,
+            WorkerAdapterRegistry::default(),
+            ProcessRunner::default(),
+        )
+        .unwrap();
+        let (plan_version, plan_hash) = supervisor
+            .replace_plan(
+                0,
+                "codex-developer-0.145.0",
+                "claude-reviewer-2.1.220",
+                vec![task("one", 2)],
+            )
+            .unwrap();
+        assert!(
+            supervisor
+                .approve_and_start(1, plan_version, &plan_hash, true)
+                .is_err()
+        );
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, SessionState::NeedsHuman);
+        assert_eq!(snapshot.current_task_ordinal, None);
+        assert_eq!(
+            snapshot.terminal_detail.as_deref(),
+            Some("selected worker authentication is unavailable, expired, or too close to expiry")
+        );
+        assert_eq!(snapshot.tasks.len(), 1);
+        assert_eq!(snapshot.tasks[0].state, TaskState::Pending);
+        assert_eq!(supervisor.spawn_audit().len(), 0);
+        assert_eq!(
+            String::from_utf8(git(&repository, &["rev-parse", "HEAD"]))
+                .unwrap()
+                .trim()
+                .to_owned(),
+            start_head
+        );
+        assert_eq!(fs::read(&host_auth).unwrap(), auth);
+        let after = fs::metadata(&host_auth).unwrap();
+        assert_eq!(
+            (
+                before.dev(),
+                before.ino(),
+                before.nlink(),
+                before.len(),
+                before.mtime(),
+                before.mtime_nsec(),
+                before.ctime(),
+                before.ctime_nsec(),
+                before.permissions().mode() & 0o777,
+            ),
+            (
+                after.dev(),
+                after.ino(),
+                after.nlink(),
+                after.len(),
+                after.mtime(),
+                after.mtime_nsec(),
+                after.ctime(),
+                after.ctime_nsec(),
+                after.permissions().mode() & 0o777,
+            )
+        );
     }
 
     #[test]

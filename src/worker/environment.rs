@@ -1,4 +1,4 @@
-use super::validation::{validate_opaque_id, validate_sha256, validate_text};
+use super::validation::{validate_opaque_id, validate_sha256};
 use crate::control_api::WorkerRole;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -7,6 +7,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_ENVIRONMENT_ENTRIES: usize = 64;
 const MAX_ENVIRONMENT_VALUE_BYTES: usize = 16 * 1024;
+// Substring redaction cannot safely treat low-entropy operational atoms such
+// as "1" or "false" as secrets: doing so corrupts otherwise valid structured
+// worker output (for example `task1.txt`) and makes every ordinary occurrence
+// indistinguishable from an environment leak. Secret-shaped environment names
+// are rejected by the closed lease policy, while meaningful inherited values
+// (including complete proxy URLs) remain above this floor and are redacted.
+const MIN_ENVIRONMENT_REDACTION_BYTES: usize = 8;
 
 const BASELINE_INHERITABLE_NAMES: &[&str] = &[
     "ALL_PROXY",
@@ -115,6 +122,7 @@ impl EnvironmentLeaseDescriptor {
 pub struct ExecutionEnvironmentLease {
     descriptor: EnvironmentLeaseDescriptor,
     values: BTreeMap<String, String>,
+    redaction_values: Vec<String>,
 }
 
 impl ExecutionEnvironmentLease {
@@ -149,8 +157,8 @@ impl ExecutionEnvironmentLease {
             }
         }
         for required in &policy.required_names {
-            if !captured.contains_key(required) {
-                bail!("environment lease is missing required name {required}");
+            if captured.get(required).is_none_or(|value| value.is_empty()) {
+                bail!("environment lease is missing a non-empty required name {required}");
             }
         }
 
@@ -169,6 +177,7 @@ impl ExecutionEnvironmentLease {
         Ok(Self {
             descriptor,
             values: captured,
+            redaction_values: Vec::new(),
         })
     }
 
@@ -201,8 +210,38 @@ impl ExecutionEnvironmentLease {
     }
 
     pub(crate) fn redactor(&self) -> SecretRedactor {
-        SecretRedactor::from_values(self.values.values().map(String::as_str))
+        SecretRedactor::from_values(
+            self.values
+                .values()
+                .map(String::as_str)
+                .chain(self.redaction_values.iter().map(String::as_str)),
+        )
     }
+
+    pub(crate) fn with_secret_redaction_values(mut self, values: Vec<String>) -> Result<Self> {
+        validate_secret_redaction_values(&values)?;
+        let mut unique = BTreeSet::new();
+        for value in values {
+            unique.insert(value);
+        }
+        self.redaction_values = unique.into_iter().collect();
+        Ok(self)
+    }
+}
+
+pub(crate) fn validate_secret_redaction_values(values: &[String]) -> Result<()> {
+    if values.len() > MAX_ENVIRONMENT_ENTRIES {
+        bail!("secret redaction inventory exceeds its bounded entry count");
+    }
+    for value in values {
+        if value.len() < MIN_ENVIRONMENT_REDACTION_BYTES
+            || value.len() > MAX_ENVIRONMENT_VALUE_BYTES
+            || value.chars().any(char::is_control)
+        {
+            bail!("secret redaction value has an unsafe or ineffective shape");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -285,7 +324,7 @@ impl SecretRedactor {
     pub(crate) fn from_values<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
         let mut sensitive = BTreeSet::new();
         for value in values {
-            if !value.is_empty() {
+            if value.len() >= MIN_ENVIRONMENT_REDACTION_BYTES {
                 sensitive.insert(value.to_owned());
                 collect_proxy_credentials(value, &mut sensitive);
             }
@@ -428,12 +467,19 @@ fn is_secret_shaped(name: &str) -> bool {
 }
 
 fn validate_environment_value(name: &str, value: &str) -> Result<()> {
-    validate_text(
-        &format!("environment value for {name}"),
-        value,
-        MAX_ENVIRONMENT_VALUE_BYTES,
-        false,
-    )
+    if value.len() > MAX_ENVIRONMENT_VALUE_BYTES
+        || value.chars().any(|character| {
+            character == '\u{1b}'
+                || character == '\r'
+                || character == '\n'
+                || character == '\t'
+                || character.is_control()
+                || ('\u{80}'..='\u{9f}').contains(&character)
+        })
+    {
+        bail!("environment value for {name} has an invalid bounded shape");
+    }
+    Ok(())
 }
 
 fn environment_hash(values: &BTreeMap<String, String>) -> String {
@@ -459,14 +505,14 @@ fn collect_proxy_credentials(value: &str, sensitive: &mut BTreeSet<String>) {
     let Some((userinfo, _)) = authority.rsplit_once('@') else {
         return;
     };
-    if !userinfo.is_empty() {
+    if userinfo.len() >= MIN_ENVIRONMENT_REDACTION_BYTES {
         sensitive.insert(userinfo.to_owned());
     }
     if let Some((username, password)) = userinfo.split_once(':') {
-        if !username.is_empty() {
+        if username.len() >= MIN_ENVIRONMENT_REDACTION_BYTES {
             sensitive.insert(username.to_owned());
         }
-        if !password.is_empty() {
+        if password.len() >= MIN_ENVIRONMENT_REDACTION_BYTES {
             sensitive.insert(password.to_owned());
         }
     }
@@ -748,5 +794,125 @@ mod tests {
         assert!(!output.contains("worker-user"));
         assert!(!output.contains("worker-pass"));
         assert!(output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn short_low_entropy_operational_values_are_not_substring_secrets() {
+        let names = vec![
+            "CLAUDE_CODE_DISABLE_FAST_MODE".into(),
+            "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION".into(),
+            "PATH".into(),
+        ];
+        let lease = ExecutionEnvironmentLease::capture(
+            "lease-short-operational-values",
+            "epoch-1",
+            &EnvironmentPolicy::new(names.clone(), names).unwrap(),
+            vec![
+                ("CLAUDE_CODE_DISABLE_FAST_MODE".into(), "1".into()),
+                (
+                    "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION".into(),
+                    "false".into(),
+                ),
+                ("PATH".into(), "/usr/bin:/bin".into()),
+            ],
+        )
+        .unwrap();
+        let redactor = lease.redactor();
+
+        assert_eq!(
+            redactor.redact("Round 1 reviewed task1.txt; false is a fixed CLI flag"),
+            "Round 1 reviewed task1.txt; false is a fixed CLI flag"
+        );
+        assert!(redactor.would_redact("PATH was /usr/bin:/bin"));
+
+        let prompt_redactor = redactor.with_value("fix it");
+        assert!(
+            !prompt_redactor
+                .redact("model echoed: fix it")
+                .contains("fix it")
+        );
+    }
+
+    #[test]
+    fn empty_optional_proxy_values_preserve_presence_but_required_path_stays_nonempty() {
+        let policy = EnvironmentPolicy::new(
+            vec!["HTTPS_PROXY".into(), "PATH".into()],
+            vec!["PATH".into()],
+        )
+        .unwrap();
+        let lease = ExecutionEnvironmentLease::capture(
+            "lease-empty-proxy",
+            "epoch-1",
+            &policy,
+            vec![
+                ("HTTPS_PROXY".into(), String::new()),
+                ("PATH".into(), "/usr/bin:/bin".into()),
+            ],
+        )
+        .unwrap();
+        let materialized = lease
+            .materialize(
+                "epoch-1",
+                &WorkerEnvironmentIdentity {
+                    role: WorkerRole::Developer,
+                    run_id: "run-1".into(),
+                    task_id: "task-1".into(),
+                },
+            )
+            .unwrap();
+        assert!(
+            materialized
+                .iter()
+                .any(|(name, value)| name == "HTTPS_PROXY" && value.is_empty())
+        );
+        assert!(
+            ExecutionEnvironmentLease::capture(
+                "lease-empty-path",
+                "epoch-1",
+                &policy,
+                vec![
+                    ("HTTPS_PROXY".into(), String::new()),
+                    ("PATH".into(), String::new()),
+                ],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn adapter_private_secrets_are_redacted_without_entering_the_environment() {
+        let lease = fixture_lease("http://proxy.invalid:8080")
+            .with_secret_redaction_values(vec![
+                "session-access-token-v1".into(),
+                "session-refresh-token-v1".into(),
+            ])
+            .unwrap();
+        let materialized = lease
+            .materialize(
+                "epoch-1",
+                &WorkerEnvironmentIdentity {
+                    role: WorkerRole::Reviewer,
+                    run_id: "run-1".into(),
+                    task_id: "task-1".into(),
+                },
+            )
+            .unwrap();
+        assert!(
+            materialized
+                .iter()
+                .all(|(_, value)| !value.contains("session-access-token-v1"))
+        );
+        let redacted = lease
+            .redactor()
+            .redact("access=session-access-token-v1 refresh=session-refresh-token-v1");
+        assert!(!redacted.contains("session-access-token-v1"));
+        assert!(!redacted.contains("session-refresh-token-v1"));
+        assert!(redacted.contains("[REDACTED]"));
+
+        assert!(
+            fixture_lease("http://proxy.invalid:8080")
+                .with_secret_redaction_values(vec!["short".into()])
+                .is_err()
+        );
     }
 }

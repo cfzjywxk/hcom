@@ -19,6 +19,14 @@ use std::time::Duration;
 const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) const REGISTRATION_REFUSAL_GENERIC: &str = "architect_registration";
+pub(crate) const TOOL_REFUSAL_ENVELOPE: &str = "architect_tool_envelope";
+pub(crate) const TOOL_REFUSAL_ACTION: &str = "architect_tool_action";
+pub(crate) const NATIVE_SESSION_REFUSAL_DISCOVERY: &str = "native_session_discovery";
+pub(crate) const NATIVE_SESSION_REFUSAL_CHANGED: &str = "native_session_changed";
+pub(crate) const NATIVE_SESSION_REFUSAL_REGISTRATION_TRANSPORT: &str =
+    "native_session_registration_transport";
+pub(crate) const NATIVE_SESSION_REFUSAL_REGISTRATION_VERSION: &str =
+    "native_session_registration_version";
 pub(crate) const NATIVE_SESSION_REFUSAL_UNAVAILABLE: &str = "native_session_binding_unavailable";
 pub(crate) const NATIVE_SESSION_REFUSAL_BRIDGE_PROCESS: &str = "native_session_bridge_process";
 pub(crate) const NATIVE_SESSION_REFUSAL_ARCHITECT_LIVENESS: &str =
@@ -27,9 +35,20 @@ pub(crate) const NATIVE_SESSION_REFUSAL_CAPABILITY: &str = "native_session_capab
 pub(crate) const NATIVE_SESSION_REFUSAL_IDENTITY: &str = "native_session_identity";
 pub(crate) const NATIVE_SESSION_REFUSAL_VERSION: &str = "native_session_binding_version";
 pub(crate) const NATIVE_SESSION_REFUSAL_STATE: &str = "native_session_binding_state";
+pub(crate) const CONTROL_REFUSAL_TRANSPORT: &str = "architect_control_transport";
 
 pub(crate) fn closed_native_session_refusal_code(value: Option<&str>) -> &'static str {
     match value {
+        Some(TOOL_REFUSAL_ENVELOPE) => TOOL_REFUSAL_ENVELOPE,
+        Some(TOOL_REFUSAL_ACTION) => TOOL_REFUSAL_ACTION,
+        Some(NATIVE_SESSION_REFUSAL_DISCOVERY) => NATIVE_SESSION_REFUSAL_DISCOVERY,
+        Some(NATIVE_SESSION_REFUSAL_CHANGED) => NATIVE_SESSION_REFUSAL_CHANGED,
+        Some(NATIVE_SESSION_REFUSAL_REGISTRATION_TRANSPORT) => {
+            NATIVE_SESSION_REFUSAL_REGISTRATION_TRANSPORT
+        }
+        Some(NATIVE_SESSION_REFUSAL_REGISTRATION_VERSION) => {
+            NATIVE_SESSION_REFUSAL_REGISTRATION_VERSION
+        }
         Some(NATIVE_SESSION_REFUSAL_UNAVAILABLE) => NATIVE_SESSION_REFUSAL_UNAVAILABLE,
         Some(NATIVE_SESSION_REFUSAL_BRIDGE_PROCESS) => NATIVE_SESSION_REFUSAL_BRIDGE_PROCESS,
         Some(NATIVE_SESSION_REFUSAL_ARCHITECT_LIVENESS) => {
@@ -39,6 +58,7 @@ pub(crate) fn closed_native_session_refusal_code(value: Option<&str>) -> &'stati
         Some(NATIVE_SESSION_REFUSAL_IDENTITY) => NATIVE_SESSION_REFUSAL_IDENTITY,
         Some(NATIVE_SESSION_REFUSAL_VERSION) => NATIVE_SESSION_REFUSAL_VERSION,
         Some(NATIVE_SESSION_REFUSAL_STATE) => NATIVE_SESSION_REFUSAL_STATE,
+        Some(CONTROL_REFUSAL_TRANSPORT) => CONTROL_REFUSAL_TRANSPORT,
         _ => REGISTRATION_REFUSAL_GENERIC,
     }
 }

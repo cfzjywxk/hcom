@@ -254,4 +254,33 @@ mod tests {
         );
         assert!(control_action("shell", json!({})).is_err());
     }
+
+    #[test]
+    fn plan_translation_accepts_real_multiline_objective_and_rejects_hidden_controls() {
+        let arguments = json!({
+            "expected_session_version":0,
+            "developer_adapter":"codex-developer-0.145.0",
+            "reviewer_adapter":"claude-reviewer-2.1.220",
+            "tasks":[{
+                "task_key":"p9-task-1",
+                "title":"Phase 9 Task 1",
+                "objective":"Create task1.txt with exactly two lines:\nphase9-task-1\nreview-stage: pending",
+                "acceptance_criteria":["first review requests changes"],
+                "required_checks":["/usr/bin/test -f task1.txt"],
+                "allowed_paths":["README.md","task1.txt"],
+                "forbidden_actions":["push"],
+                "max_review_rounds":3
+            }]
+        });
+        let action = control_action("session_plan_replace", arguments.clone()).unwrap();
+        assert!(matches!(
+            action,
+            ControlAction::SessionPlanReplace { ref tasks, .. }
+                if tasks[0].objective.contains('\n')
+        ));
+
+        let mut invalid = arguments;
+        invalid["tasks"][0]["objective"] = Value::String("safe\n\u{1b}hidden".into());
+        assert!(control_action("session_plan_replace", invalid).is_err());
+    }
 }

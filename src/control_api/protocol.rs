@@ -239,7 +239,10 @@ impl TaskDraft {
             ));
         }
         validate_free_text("task title", &self.title, 512, false)?;
-        validate_free_text("task objective", &self.objective, MAX_TEXT_BYTES, false)?;
+        // Objectives are the one plan field that must preserve human-authored
+        // multi-line instructions (for example, exact file contents). The
+        // remaining task fields stay single-line list entries.
+        validate_free_text("task objective", &self.objective, MAX_TEXT_BYTES, true)?;
         for (label, values, max_bytes) in [
             (
                 "acceptance criterion",
@@ -644,6 +647,24 @@ mod tests {
         };
         tasks[0].task_key = "..".into();
         assert!(traversal.validate().is_err());
+    }
+
+    #[test]
+    fn task_objective_preserves_bounded_multiline_instructions_only() {
+        let mut multiline = task("multiline");
+        multiline.objective =
+            "Create task.txt with exactly two lines:\nphase9-task\nstatus: complete".into();
+        assert!(multiline.validate().is_ok());
+
+        multiline.objective.push('\r');
+        assert!(multiline.validate().is_err());
+        multiline.objective =
+            "Create task.txt with exactly two lines:\nphase9-task\nstatus: complete".into();
+        multiline.title = "Task\nmultiline".into();
+        assert!(multiline.validate().is_err());
+        multiline.title = "Task multiline".into();
+        multiline.acceptance_criteria = vec!["first line\nsecond line".into()];
+        assert!(multiline.validate().is_err());
     }
 
     #[test]

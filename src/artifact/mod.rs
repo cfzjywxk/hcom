@@ -1182,7 +1182,10 @@ fn hex_bytes(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::worker::environment::EnvironmentPolicy;
-    use crate::worker::result::{CheckResult, CheckStatus, CommitSummary, DeveloperDecision};
+    use crate::worker::result::{
+        CheckResult, CheckStatus, CommitSummary, DeveloperDecision, FindingSeverity,
+        ReviewDecision, ReviewFinding,
+    };
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
     const TEST_PROMPT: &[u8] = b"private turn prompt sentinel";
@@ -1556,5 +1559,69 @@ mod tests {
                 .is_err()
         );
         assert!(!attempt.artifact_path(ArtifactKind::Result).exists());
+    }
+
+    #[test]
+    fn short_cli_environment_atoms_do_not_corrupt_structured_artifacts() {
+        let (_temp, root) = fixture_root();
+        let names = vec![
+            "CLAUDE_CODE_DISABLE_FAST_MODE".into(),
+            "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION".into(),
+            "PATH".into(),
+        ];
+        let environment = ExecutionEnvironmentLease::capture(
+            "lease-claude-fixed-values",
+            "epoch-1",
+            &EnvironmentPolicy::new(names.clone(), names).unwrap(),
+            vec![
+                ("CLAUDE_CODE_DISABLE_FAST_MODE".into(), "1".into()),
+                (
+                    "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION".into(),
+                    "false".into(),
+                ),
+                ("PATH".into(), "/usr/bin:/bin".into()),
+            ],
+        )
+        .unwrap();
+        let mut reviewer_scope = scope();
+        reviewer_scope.role = WorkerRole::Reviewer;
+        let attempt =
+            ArtifactAttempt::create(&root, reviewer_scope, &environment, TEST_PROMPT).unwrap();
+
+        let native =
+            br#"{"type":"result","is_error":false,"summary":"Round 1 reviewed task1.txt"}"#;
+        let mut stdout = attempt
+            .start_native_stream(ArtifactKind::NativeStdout, 1024)
+            .unwrap();
+        stdout.write_chunk(native).unwrap();
+        stdout.finish().unwrap();
+        let stored_native = fs::read(attempt.artifact_path(ArtifactKind::NativeStdout)).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&stored_native).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(native).unwrap()
+        );
+
+        let result = ReviewerResult {
+            decision: ReviewDecision::RequestChanges,
+            summary: "Round 1 reviewed task1.txt without false-positive redaction".into(),
+            findings: vec![ReviewFinding {
+                severity: FindingSeverity::Major,
+                title: "Task 1 remains pending".into(),
+                body: "Change task1.txt to review-stage: complete in the second commit".into(),
+                file: Some("task1.txt".into()),
+                line: Some(2),
+            }],
+            checks: vec![CheckResult {
+                command: "/usr/bin/test -f task1.txt".into(),
+                status: CheckStatus::Passed,
+                summary: "Task 1 file exists".into(),
+            }],
+        };
+        let canonical = result.canonical_json().unwrap();
+        attempt.write_result_json(&canonical).unwrap();
+        assert_eq!(
+            fs::read(attempt.artifact_path(ArtifactKind::Result)).unwrap(),
+            canonical
+        );
     }
 }

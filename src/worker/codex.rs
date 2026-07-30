@@ -62,7 +62,9 @@ pub(crate) const DISABLED_CODEX_FEATURES: &[&str] = &[
     "browser_use_external",
     "browser_use_full_cdp_access",
     "code_mode_host",
+    "collaboration_modes",
     "computer_use",
+    "enable_fanout",
     "goals",
     "guardian_approval",
     "hooks",
@@ -70,6 +72,7 @@ pub(crate) const DISABLED_CODEX_FEATURES: &[&str] = &[
     "in_app_browser",
     "memories",
     "multi_agent",
+    "multi_agent_v2",
     "plugins",
     "plugin_sharing",
     "remote_plugin",
@@ -1004,9 +1007,13 @@ fn developer_result_schema() -> Vec<u8> {
         "properties": {
             "decision": {"enum": ["completed", "needs_input", "blocked"]},
             "summary": {"type": "string"},
-            "head_revision": {"type": ["string", "null"]},
+            "head_revision": {
+                "type": ["string", "null"],
+                "description": "Exact full committed HEAD revision after this turn"
+            },
             "commits": {
                 "type": "array",
+                "description": "Every commit in chronological base_revision..HEAD order for the whole approved task, including commits from earlier resumed turns; never only the current-turn delta",
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
@@ -1035,7 +1042,11 @@ fn developer_result_schema() -> Vec<u8> {
             },
             "questions": {"type": "array", "items": {"type": "string"}},
             "risks": {"type": "array", "items": {"type": "string"}},
-            "changed_paths": {"type": "array", "items": {"type": "string"}}
+            "changed_paths": {
+                "type": "array",
+                "description": "Complete union of paths changed anywhere in base_revision..HEAD for the whole approved task, including paths changed in earlier resumed turns",
+                "items": {"type": "string"}
+            }
         }
     }))
     .expect("static Codex developer result schema is valid JSON")
@@ -1139,8 +1150,11 @@ pub(super) fn parse_codex_turn(control: &TurnControl, stdout: &[u8]) -> Result<C
                     serde_json::from_str(line).context("Codex item event is malformed")?;
                 validate_text("Codex item id", &event.item.id, 256, false)?;
                 validate_text("Codex item type", &event.item.kind, 128, false)?;
-                if event.item.kind == "mcp_tool_call" {
-                    bail!("Codex developer emitted forbidden MCP activity");
+                if matches!(
+                    event.item.kind.as_str(),
+                    "mcp_tool_call" | "collab_tool_call"
+                ) {
+                    bail!("Codex worker emitted forbidden delegated activity");
                 }
                 if let Some(status) = &event.item.status {
                     validate_text("Codex item status", status, 128, false)?;
@@ -1150,18 +1164,34 @@ pub(super) fn parse_codex_turn(control: &TurnControl, stdout: &[u8]) -> Result<C
                         .item
                         .command
                         .ok_or_else(|| anyhow!("Codex command event omitted its command"))?;
-                    validate_text("Codex command event", &command, 4096, false)?;
+                    // Codex 0.145 preserves a shell script's embedded newlines
+                    // in the JSONL display command for `/bin/bash -lc`. Keep the
+                    // bounded, no-escape/no-CR terminal-safety checks while
+                    // admitting that native multiline event shape.
+                    validate_text("Codex command event", &command, 4096, true)?;
                     let exit_code = event
                         .item
                         .exit_code
                         .ok_or_else(|| anyhow!("Codex command event omitted its exit code"))?;
-                    if event.item.status.as_deref() != Some("completed") {
-                        bail!("Codex command event did not reach completed status");
-                    }
-                    if exit_code == 0 {
-                        completed_commands.insert(command);
-                    } else {
-                        failed_commands.insert(command);
+                    match (exit_code, event.item.status.as_deref()) {
+                        (0, Some("completed")) => {
+                            for evidence in exact_command_evidence(&command) {
+                                failed_commands.remove(&evidence);
+                                completed_commands.insert(evidence);
+                            }
+                        }
+                        (code, Some("failed")) if code != 0 => {
+                            for evidence in exact_command_evidence(&command) {
+                                completed_commands.remove(&evidence);
+                                failed_commands.insert(evidence);
+                            }
+                        }
+                        (0, _) => {
+                            bail!("successful Codex command event has an invalid status");
+                        }
+                        _ => {
+                            bail!("failed Codex command event has an invalid status");
+                        }
                     }
                 }
             }
@@ -1180,6 +1210,24 @@ pub(super) fn parse_codex_turn(control: &TurnControl, stdout: &[u8]) -> Result<C
         completed_commands,
         failed_commands,
     })
+}
+
+fn exact_command_evidence(command: &str) -> BTreeSet<String> {
+    let mut evidence = BTreeSet::from([command.to_owned()]);
+    if let Ok(argv) = shell_words::split(command)
+        && let [shell, flag, payload] = argv.as_slice()
+        && shell == "/bin/bash"
+        && flag == "-lc"
+        && !payload.is_empty()
+        && validate_text("Codex bash -lc payload", payload, 4096, false).is_ok()
+    {
+        // Codex 0.145 reports shell tool executions as the display command
+        // `/bin/bash -lc '<payload>'`. The approved check is the exact payload,
+        // so expose that one payload as evidence too. No prefix, substring, or
+        // multi-command normalization is accepted.
+        evidence.insert(payload.clone());
+    }
+    evidence
 }
 
 pub(super) fn observe_codex_record(record: &[u8]) -> Result<Vec<NativeObservation>> {
@@ -1215,7 +1263,9 @@ pub(super) fn observe_codex_record(record: &[u8]) -> Result<Vec<NativeObservatio
             validate_text("Codex item id", &event.item.id, 256, false)?;
             let item = match event.item.kind.as_str() {
                 "command_execution" => "command",
-                "mcp_tool_call" => bail!("Codex native record reported forbidden MCP activity"),
+                "mcp_tool_call" | "collab_tool_call" => {
+                    bail!("Codex native record reported forbidden delegated activity")
+                }
                 "agent_message" => "message",
                 _ => "item",
             };
@@ -1599,10 +1649,51 @@ mod tests {
                 "{\"id\":\"mcp\",\"type\":\"mcp_tool_call\"}}\n",
                 "{\"type\":\"turn.completed\"}\n"
             ),
+            concat!(
+                "{\"type\":\"thread.started\",\"thread_id\":\"native-codex-1\"}\n",
+                "{\"type\":\"turn.started\"}\n",
+                "{\"type\":\"item.completed\",\"item\":",
+                "{\"id\":\"delegate\",\"type\":\"collab_tool_call\"}}\n",
+                "{\"type\":\"turn.completed\"}\n"
+            ),
         ] {
             assert!(parse_codex_turn(&control(None), invalid.as_bytes()).is_err());
         }
         assert!(parse_codex_turn(&control(Some("native-other")), stdout.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn codex_0145_adjacent_quoted_bash_payload_is_exact_command_evidence() {
+        let display = "/bin/bash -lc '/usr/bin/git diff --check HEAD''^ HEAD'";
+        let evidence = exact_command_evidence(display);
+        assert!(evidence.contains(display));
+        assert!(evidence.contains("/usr/bin/git diff --check HEAD^ HEAD"));
+
+        let multiline_payload = "set -e\ngit status --porcelain=v1\ngit rev-parse HEAD";
+        let multiline_display = format!("/bin/bash -lc {}", shell_words::quote(multiline_payload));
+        let stdout = format!(
+            "{{\"type\":\"thread.started\",\"thread_id\":\"native-codex-1\"}}\n\
+             {{\"type\":\"turn.started\"}}\n\
+             {{\"type\":\"item.completed\",\"item\":{{\"id\":\"command-1\",\
+             \"type\":\"command_execution\",\"command\":{},\"exit_code\":0,\
+             \"status\":\"completed\"}}}}\n\
+             {{\"type\":\"turn.completed\"}}\n",
+            serde_json::to_string(&multiline_display).unwrap()
+        );
+        let parsed = parse_codex_turn(&control(None), stdout.as_bytes()).unwrap();
+        assert!(parsed.completed_commands.contains(&multiline_display));
+
+        let unsafe_display = "/bin/bash -lc 'printf unsafe\u{1b}'";
+        let unsafe_stdout = format!(
+            "{{\"type\":\"thread.started\",\"thread_id\":\"native-codex-1\"}}\n\
+             {{\"type\":\"turn.started\"}}\n\
+             {{\"type\":\"item.completed\",\"item\":{{\"id\":\"command-2\",\
+             \"type\":\"command_execution\",\"command\":{},\"exit_code\":0,\
+             \"status\":\"completed\"}}}}\n\
+             {{\"type\":\"turn.completed\"}}\n",
+            serde_json::to_string(unsafe_display).unwrap()
+        );
+        assert!(parse_codex_turn(&control(None), unsafe_stdout.as_bytes()).is_err());
     }
 
     #[test]
@@ -1632,6 +1723,9 @@ mod tests {
 
         let mcp = br#"{"type":"item.started","item":{"id":"item-2","type":"mcp_tool_call"}}"#;
         assert!(observe_codex_record(mcp).is_err());
+        let delegate =
+            br#"{"type":"item.completed","item":{"id":"item-3","type":"collab_tool_call"}}"#;
+        assert!(observe_codex_record(delegate).is_err());
     }
 
     #[test]
@@ -1664,6 +1758,17 @@ mod tests {
                 .any(|pair| pair == ["--model", CODEX_DEVELOPER_MODEL])
         );
         assert!(argv.windows(2).any(|pair| pair == ["--disable", "hooks"]));
+        for feature in [
+            "collaboration_modes",
+            "enable_fanout",
+            "multi_agent",
+            "multi_agent_v2",
+        ] {
+            assert!(
+                argv.windows(2).any(|pair| pair == ["--disable", feature]),
+                "missing closed Codex delegation feature: {feature}"
+            );
+        }
         assert!(
             argv.windows(2)
                 .any(|pair| pair == ["--tmpfs", INSIDE_RUNTIME])
@@ -1823,6 +1928,69 @@ mod tests {
             .extract_result(&fixture.control(None), &artifacts)
             .unwrap();
 
+        let wrapped = completed_artifacts(
+            "native-codex-1",
+            &result,
+            "/bin/bash -lc 'cargo test --lib'",
+        );
+        adapter
+            .extract_result(&fixture.control(None), &wrapped)
+            .unwrap();
+
+        let mut shell_escaped_result = result.clone();
+        shell_escaped_result.checks[0].command = "/usr/bin/git diff --check HEAD^ HEAD".into();
+        let shell_escaped = completed_artifacts(
+            "native-codex-1",
+            &shell_escaped_result,
+            "/bin/bash -lc '/usr/bin/git diff --check HEAD''^ HEAD'",
+        );
+        adapter
+            .extract_result(&fixture.control(None), &shell_escaped)
+            .unwrap();
+
+        let recovered_after_unrelated_failure = completed_artifacts_with_commands(
+            "native-codex-1",
+            &result,
+            &[
+                ("git commit -m 'first attempt without identity'", 128),
+                ("cargo test --lib", 0),
+            ],
+        );
+        adapter
+            .extract_result(&fixture.control(None), &recovered_after_unrelated_failure)
+            .unwrap();
+
+        let recovered_required_check = completed_artifacts_with_commands(
+            "native-codex-1",
+            &result,
+            &[("cargo test --lib", 1), ("cargo test --lib", 0)],
+        );
+        adapter
+            .extract_result(&fixture.control(None), &recovered_required_check)
+            .unwrap();
+
+        let regressed_required_check = completed_artifacts_with_commands(
+            "native-codex-1",
+            &result,
+            &[("cargo test --lib", 0), ("cargo test --lib", 1)],
+        );
+        assert!(
+            adapter
+                .extract_result(&fixture.control(None), &regressed_required_check)
+                .is_err()
+        );
+
+        let combined = completed_artifacts(
+            "native-codex-1",
+            &result,
+            "/bin/bash -lc 'cargo test --lib && echo not-the-exact-check'",
+        );
+        assert!(
+            adapter
+                .extract_result(&fixture.control(None), &combined)
+                .is_err()
+        );
+
         let mut wrong_head = result.clone();
         wrong_head.head_revision = Some("f".repeat(40));
         wrong_head.commits[0].sha = "f".repeat(40);
@@ -1892,6 +2060,113 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn resumed_completed_result_requires_the_full_task_range_not_only_the_turn_delta() {
+        let fixture = Fixture::new();
+        let adapter = fixture.adapter();
+        let first_head = fixture.commit_change();
+
+        fs::write(
+            fixture.config.workspace_cwd.join("review-fix.txt"),
+            b"review fix\n",
+        )
+        .unwrap();
+        git_ok(
+            &fixture.git,
+            &fixture.config.workspace_cwd,
+            &["add", "review-fix.txt"],
+        );
+        git_ok(
+            &fixture.git,
+            &fixture.config.workspace_cwd,
+            &["commit", "--quiet", "-m", "Fix reviewed task"],
+        );
+        let final_head = git_line(
+            &fixture.git,
+            &fixture.config.workspace_cwd,
+            &["rev-parse", "HEAD"],
+        );
+
+        let full_range = DeveloperResult {
+            decision: DeveloperDecision::Completed,
+            summary: "completed the reviewed task".into(),
+            head_revision: Some(final_head.clone()),
+            commits: vec![
+                CommitSummary {
+                    sha: first_head,
+                    subject: "Implement exact task".into(),
+                },
+                CommitSummary {
+                    sha: final_head.clone(),
+                    subject: "Fix reviewed task".into(),
+                },
+            ],
+            checks: vec![],
+            questions: vec![],
+            risks: vec![],
+            changed_paths: vec!["implemented.txt".into(), "review-fix.txt".into()],
+        };
+        let resumed_control = fixture.control(Some("native-codex-1"));
+        adapter
+            .extract_result(
+                &resumed_control,
+                &completed_artifacts_with_commands("native-codex-1", &full_range, &[]),
+            )
+            .unwrap();
+
+        let mut current_turn_only = full_range.clone();
+        current_turn_only.commits.remove(0);
+        current_turn_only.changed_paths.remove(0);
+        assert!(
+            adapter
+                .extract_result(
+                    &resumed_control,
+                    &completed_artifacts_with_commands("native-codex-1", &current_turn_only, &[])
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn developer_result_schema_explains_full_range_resume_semantics() {
+        let schema: serde_json::Value = serde_json::from_slice(&developer_result_schema()).unwrap();
+        assert!(
+            schema["properties"]["commits"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("base_revision..HEAD")
+        );
+        assert!(
+            schema["properties"]["commits"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("earlier resumed turns")
+        );
+        assert!(
+            schema["properties"]["changed_paths"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("whole approved task")
+        );
+    }
+
+    #[test]
+    fn command_completion_status_must_match_its_exit_code() {
+        let control = control(None);
+        for (exit_code, status) in [(0, "failed"), (1, "completed"), (1, "in_progress")] {
+            let stdout = format!(
+                "{{\"type\":\"thread.started\",\"thread_id\":\"native-codex-1\"}}\n\
+                 {{\"type\":\"turn.started\"}}\n\
+                 {{\"type\":\"item.completed\",\"item\":\
+                 {{\"id\":\"item-1\",\"type\":\"command_execution\",\
+                 \"command\":\"cargo test --lib\",\"exit_code\":{exit_code},\
+                 \"status\":\"{status}\"}}}}\n\
+                 {{\"type\":\"turn.completed\"}}\n"
+            );
+            assert!(parse_codex_turn(&control, stdout.as_bytes()).is_err());
+        }
     }
 
     #[test]
@@ -2256,10 +2531,15 @@ mod tests {
              {{\"type\":\"turn.started\"}}\n"
         );
         for (index, (command, exit_code)) in commands.iter().enumerate() {
+            let status = if *exit_code == 0 {
+                "completed"
+            } else {
+                "failed"
+            };
             stdout.push_str(&format!(
                 "{{\"type\":\"item.completed\",\"item\":\
                  {{\"id\":\"item-{index}\",\"type\":\"command_execution\",\
-                 \"command\":{},\"exit_code\":{exit_code},\"status\":\"completed\"}}}}\n",
+                 \"command\":{},\"exit_code\":{exit_code},\"status\":\"{status}\"}}}}\n",
                 serde_json::to_string(command).unwrap(),
             ));
         }

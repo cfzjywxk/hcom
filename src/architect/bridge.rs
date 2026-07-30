@@ -9,8 +9,10 @@ use crate::control_api::peer::{
 };
 use crate::control_api::protocol::PROTOCOL_VERSION;
 use crate::control_api::registration::{
+    CONTROL_REFUSAL_TRANSPORT, NATIVE_SESSION_REFUSAL_CHANGED, NATIVE_SESSION_REFUSAL_DISCOVERY,
+    NATIVE_SESSION_REFUSAL_REGISTRATION_TRANSPORT, NATIVE_SESSION_REFUSAL_REGISTRATION_VERSION,
     RegistrationAction, RegistrationCaller, RegistrationClient, RegistrationRequest,
-    closed_native_session_refusal_code,
+    TOOL_REFUSAL_ACTION, TOOL_REFUSAL_ENVELOPE, closed_native_session_refusal_code,
 };
 use crate::control_api::supervisor::ControlPaths;
 use crate::control_api::{CallerAuth, ControlRequest, ControlResponse};
@@ -472,12 +474,15 @@ fn handle_tool_call(
         let params: ToolCallParams = serde_json::from_value(
             params.ok_or_else(|| anyhow::anyhow!("tool call omitted params"))?,
         )
-        .context("invalid typed tool call")?;
-        let action = control_action(&params.name, params.arguments)?;
-        let observed = discover_codex_native_session(&configuration.codex_home)?;
+        .context("invalid typed tool call")
+        .map_err(|_| NativeSessionBindingRefusal(TOOL_REFUSAL_ENVELOPE))?;
+        let action = control_action(&params.name, params.arguments)
+            .map_err(|_| NativeSessionBindingRefusal(TOOL_REFUSAL_ACTION))?;
+        let observed = discover_codex_native_session(&configuration.codex_home)
+            .map_err(|_| NativeSessionBindingRefusal(NATIVE_SESSION_REFUSAL_DISCOVERY))?;
         match native_session_id {
             Some(expected) if expected != &observed => {
-                bail!("architect native session changed inside one live binding")
+                bail!(NativeSessionBindingRefusal(NATIVE_SESSION_REFUSAL_CHANGED))
             }
             Some(_) => {}
             None => {
@@ -495,17 +500,25 @@ fn handle_tool_call(
                             expected_version: *binding_version,
                             native_session_id: observed.clone(),
                         },
+                    })
+                    .map_err(|_| {
+                        NativeSessionBindingRefusal(NATIVE_SESSION_REFUSAL_REGISTRATION_TRANSPORT)
                     })?;
                 if !response.ok {
                     bail!(NativeSessionBindingRefusal(
                         closed_native_session_refusal_code(response.error.as_deref())
                     ));
                 }
-                let next_version = binding_version
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("architect binding version overflow"))?;
+                let next_version =
+                    binding_version
+                        .checked_add(1)
+                        .ok_or(NativeSessionBindingRefusal(
+                            NATIVE_SESSION_REFUSAL_REGISTRATION_VERSION,
+                        ))?;
                 if response.binding_version != Some(next_version) {
-                    bail!("native session response returned an invalid version");
+                    bail!(NativeSessionBindingRefusal(
+                        NATIVE_SESSION_REFUSAL_REGISTRATION_VERSION
+                    ));
                 }
                 *binding_version = next_version;
                 *native_session_id = Some(observed.clone());
@@ -522,7 +535,9 @@ fn handle_tool_call(
             },
             action,
         };
-        ControlClient::new(&configuration.control_socket_path).request(&request)
+        Ok(ControlClient::new(&configuration.control_socket_path)
+            .request(&request)
+            .map_err(|_| NativeSessionBindingRefusal(CONTROL_REFUSAL_TRANSPORT))?)
     })();
 
     match result {
@@ -865,6 +880,8 @@ struct ToolCallParams {
     name: String,
     #[serde(default = "empty_object")]
     arguments: Value,
+    #[serde(default, rename = "_meta")]
+    _metadata: serde_json::Map<String, Value>,
 }
 
 fn empty_object() -> Value {
@@ -889,15 +906,155 @@ struct CodexSessionPayload {
 mod tests {
     use super::*;
     use crate::control_api::registration::{
-        NATIVE_SESSION_REFUSAL_ARCHITECT_LIVENESS, NATIVE_SESSION_REFUSAL_BRIDGE_PROCESS,
-        NATIVE_SESSION_REFUSAL_CAPABILITY, NATIVE_SESSION_REFUSAL_IDENTITY,
-        NATIVE_SESSION_REFUSAL_STATE, NATIVE_SESSION_REFUSAL_UNAVAILABLE,
-        NATIVE_SESSION_REFUSAL_VERSION,
+        CONTROL_REFUSAL_TRANSPORT, NATIVE_SESSION_REFUSAL_ARCHITECT_LIVENESS,
+        NATIVE_SESSION_REFUSAL_BRIDGE_PROCESS, NATIVE_SESSION_REFUSAL_CAPABILITY,
+        NATIVE_SESSION_REFUSAL_CHANGED, NATIVE_SESSION_REFUSAL_DISCOVERY,
+        NATIVE_SESSION_REFUSAL_IDENTITY, NATIVE_SESSION_REFUSAL_REGISTRATION_TRANSPORT,
+        NATIVE_SESSION_REFUSAL_REGISTRATION_VERSION, NATIVE_SESSION_REFUSAL_STATE,
+        NATIVE_SESSION_REFUSAL_UNAVAILABLE, NATIVE_SESSION_REFUSAL_VERSION, RegistrationResponse,
+        TOOL_REFUSAL_ACTION, TOOL_REFUSAL_ENVELOPE,
     };
+    use crate::control_api::{
+        ActionName, ControlAction, ControlErrorCode, ControlResult, SessionState,
+        SessionStatusSnapshot,
+    };
+    use std::net::Shutdown;
     use std::process::{Command, Stdio};
+    use std::thread::JoinHandle;
     use std::time::Instant;
 
     const RELAY_NAMESPACE_HELPER: &str = "HCOM_PHASE9_RELAY_NAMESPACE_HELPER";
+    const TEST_NATIVE_SESSION_ID: &str = "019fa976-e270-7a92-b5f0-6d3d8a0ad3f4";
+
+    struct BridgeTestFixture {
+        _temp: tempfile::TempDir,
+        configuration: BridgeConfiguration,
+        _session_path: PathBuf,
+    }
+
+    impl BridgeTestFixture {
+        fn new(with_session: bool) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(temp.path()).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            let repo_root = root.join("repo");
+            let codex_home = root.join("codex");
+            fs::create_dir(&repo_root).unwrap();
+            fs::create_dir(&codex_home).unwrap();
+            let session_path = codex_session_path(&codex_home, TEST_NATIVE_SESSION_ID);
+            if with_session {
+                write_codex_session(&codex_home, TEST_NATIVE_SESSION_ID);
+            }
+            let executable = ExecutableIdentity::capture(
+                fs::canonicalize(std::env::current_exe().unwrap()).unwrap(),
+            )
+            .unwrap();
+            Self {
+                _temp: temp,
+                configuration: BridgeConfiguration {
+                    binding_id: "binding-session-test".into(),
+                    launch_nonce: "launch-nonce-session-test".into(),
+                    capability: "capability-session-test".into(),
+                    repo_root,
+                    run_root: root.clone(),
+                    lock_root: root.clone(),
+                    relay_socket_path: root.join(RELAY_SOCKET_NAME),
+                    registration_socket_path: root.join("registration.sock"),
+                    control_socket_path: root.join("control.sock"),
+                    codex_home,
+                    relay_executable: executable,
+                    relay_runtime_scope_hash: relay_runtime_scope_hash(&root).unwrap(),
+                },
+                _session_path: session_path,
+            }
+        }
+    }
+
+    fn codex_session_path(codex_home: &Path, id: &str) -> PathBuf {
+        codex_home
+            .join("sessions/2026/07/29")
+            .join(format!("rollout-2026-07-29T00-00-00-{id}.jsonl"))
+    }
+
+    fn write_codex_session(codex_home: &Path, id: &str) -> PathBuf {
+        let path = codex_session_path(codex_home, id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            format!(
+                "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{},\"cli_version\":\"0.145.0\",\"originator\":\"codex_cli_rs\"}}}}\n",
+                serde_json::to_string(INSIDE_WORKSPACE).unwrap()
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn bind_private_listener(path: &Path) -> UnixListener {
+        let listener = UnixListener::bind(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        listener
+    }
+
+    fn spawn_registration_server(
+        listener: UnixListener,
+        respond: impl FnOnce(&RegistrationRequest) -> RegistrationResponse + Send + 'static,
+    ) -> JoinHandle<RegistrationRequest> {
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let frame = read_request_frame(&mut stream).unwrap();
+            let request: RegistrationRequest = serde_json::from_slice(&frame).unwrap();
+            let response = respond(&request);
+            write_response_frame(&mut stream, &serde_json::to_vec(&response).unwrap()).unwrap();
+            request
+        })
+    }
+
+    fn spawn_control_server(
+        listener: UnixListener,
+        respond: impl FnOnce(&ControlRequest) -> ControlResponse + Send + 'static,
+    ) -> JoinHandle<ControlRequest> {
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let frame = read_request_frame(&mut stream).unwrap();
+            let request: ControlRequest = serde_json::from_slice(&frame).unwrap();
+            let response = respond(&request);
+            write_response_frame(&mut stream, &serde_json::to_vec(&response).unwrap()).unwrap();
+            request
+        })
+    }
+
+    fn status_snapshot() -> SessionStatusSnapshot {
+        SessionStatusSnapshot {
+            run_id: "run-test".into(),
+            state: SessionState::AwaitingPlan,
+            version: 0,
+            repo_root: "/repo".into(),
+            start_branch: "main".into(),
+            start_head: "a".repeat(40),
+            current_head: "a".repeat(40),
+            plan_version: None,
+            plan_hash: None,
+            current_task_ordinal: None,
+            terminal_detail: None,
+            tasks: Vec::new(),
+        }
+    }
+
+    fn successful_status_response(request: &ControlRequest) -> ControlResponse {
+        ControlResponse::success(
+            request.request_id.clone(),
+            ControlResult::Session {
+                session: status_snapshot(),
+            },
+        )
+    }
+
+    fn tool_refusal(response: &Value) -> &str {
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool refusal must be text")
+    }
 
     #[test]
     fn relay_mount_namespace_helper_process() {
@@ -1062,6 +1219,12 @@ mod tests {
     #[test]
     fn native_binding_refusal_exposes_only_closed_stage_codes() {
         for code in [
+            TOOL_REFUSAL_ENVELOPE,
+            TOOL_REFUSAL_ACTION,
+            NATIVE_SESSION_REFUSAL_DISCOVERY,
+            NATIVE_SESSION_REFUSAL_CHANGED,
+            NATIVE_SESSION_REFUSAL_REGISTRATION_TRANSPORT,
+            NATIVE_SESSION_REFUSAL_REGISTRATION_VERSION,
             NATIVE_SESSION_REFUSAL_UNAVAILABLE,
             NATIVE_SESSION_REFUSAL_BRIDGE_PROCESS,
             NATIVE_SESSION_REFUSAL_ARCHITECT_LIVENESS,
@@ -1069,6 +1232,7 @@ mod tests {
             NATIVE_SESSION_REFUSAL_IDENTITY,
             NATIVE_SESSION_REFUSAL_VERSION,
             NATIVE_SESSION_REFUSAL_STATE,
+            CONTROL_REFUSAL_TRANSPORT,
         ] {
             let error = anyhow::Error::new(NativeSessionBindingRefusal(code));
             assert_eq!(
@@ -1087,6 +1251,399 @@ mod tests {
             tool_call_refusal_text(&anyhow::anyhow!("must-not-echo-value")),
             "architect control request was refused"
         );
+    }
+
+    #[test]
+    fn tool_call_params_accept_reserved_mcp_metadata_only() {
+        let params: ToolCallParams = serde_json::from_value(json!({
+            "name": "session_status",
+            "arguments": {},
+            "_meta": {
+                "progressToken": 2,
+                "vendor.extension": {"opaque": true}
+            }
+        }))
+        .unwrap();
+        assert_eq!(params.name, "session_status");
+        assert_eq!(params.arguments, json!({}));
+        assert_eq!(params._metadata.len(), 2);
+
+        assert!(
+            serde_json::from_value::<ToolCallParams>(json!({
+                "name": "session_status",
+                "arguments": {},
+                "unexpected": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ToolCallParams>(json!({
+                "name": "session_status",
+                "arguments": {},
+                "_meta": "not-an-object"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_codex_mcp_fixture_reaches_private_registration_and_control_sockets() {
+        let fixture = BridgeTestFixture::new(true);
+        let registration = bind_private_listener(&fixture.configuration.registration_socket_path);
+        let control = bind_private_listener(&fixture.configuration.control_socket_path);
+        let registration_thread = spawn_registration_server(registration, |request| {
+            RegistrationResponse::success(&request.request_id, 2)
+        });
+        let control_thread = spawn_control_server(control, successful_status_response);
+
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        let configuration = fixture.configuration.clone();
+        let bridge_thread = std::thread::spawn(move || {
+            let mut binding_version = 1;
+            let mut native_session_id = None;
+            serve_mcp_connection(
+                &mut server,
+                &configuration,
+                &mut binding_version,
+                &mut native_session_id,
+            )
+            .unwrap();
+            (binding_version, native_session_id)
+        });
+        for request in [
+            json!({
+                "jsonrpc":"2.0",
+                "id":0,
+                "method":"initialize",
+                "params":{
+                    "protocolVersion":"2025-06-18",
+                    "capabilities":{},
+                    "clientInfo":{"name":"codex-mcp-client","version":"0.145.0"}
+                }
+            }),
+            json!({
+                "jsonrpc":"2.0",
+                "method":"notifications/initialized"
+            }),
+            json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"tools/list",
+                "params":{"_meta":{"progressToken":0}}
+            }),
+            json!({
+                "jsonrpc":"2.0",
+                "id":2,
+                "method":"tools/call",
+                "params":{
+                    "name":"session_plan_replace",
+                    "arguments":{
+                        "expected_session_version":0,
+                        "developer_adapter":"codex-developer-0.145.0",
+                        "reviewer_adapter":"claude-reviewer-2.1.220",
+                        "tasks":[{
+                            "task_key":"p9-task-1",
+                            "title":"Phase 9 Task 1",
+                            "objective":"Create task1.txt with exactly two lines:\nphase9-task-1\nreview-stage: pending",
+                            "acceptance_criteria":["first review requests changes"],
+                            "required_checks":["/usr/bin/test -f task1.txt"],
+                            "allowed_paths":["README.md","task1.txt"],
+                            "forbidden_actions":["push"],
+                            "max_review_rounds":3
+                        }]
+                    },
+                    "_meta":{"progressToken":2}
+                }
+            }),
+        ] {
+            write_json_line(&mut client, &request).unwrap();
+        }
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut output = String::new();
+        client.read_to_string(&mut output).unwrap();
+        let responses: Vec<Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(responses.len(), 3);
+        assert_eq!(responses[0]["id"], 0);
+        assert_eq!(
+            responses[0]["result"]["protocolVersion"],
+            MCP_PROTOCOL_VERSION
+        );
+        assert_eq!(responses[1]["id"], 1);
+        assert_eq!(
+            responses[1]["result"]["tools"].as_array().unwrap().len(),
+            ActionName::ARCHITECT.len()
+        );
+        assert_eq!(responses[2]["id"], 2);
+        assert_eq!(responses[2]["result"]["isError"], false);
+        assert_eq!(
+            responses[2]["result"]["structuredContent"]["ok"],
+            Value::Bool(true)
+        );
+
+        let (mut binding_version, mut native_session_id) = bridge_thread.join().unwrap();
+        assert_eq!(binding_version, 2);
+        assert_eq!(native_session_id.as_deref(), Some(TEST_NATIVE_SESSION_ID));
+        let registration_request = registration_thread.join().unwrap();
+        assert!(matches!(
+            registration_request.action,
+            RegistrationAction::ObserveNativeSession {
+                expected_version: 1,
+                ref native_session_id,
+                ..
+            } if native_session_id == TEST_NATIVE_SESSION_ID
+        ));
+        let control_request = control_thread.join().unwrap();
+        assert!(matches!(
+            control_request.action,
+            ControlAction::SessionPlanReplace {
+                expected_session_version: 0,
+                ref developer_adapter,
+                ref reviewer_adapter,
+                ref tasks,
+            } if developer_adapter == "codex-developer-0.145.0"
+                && reviewer_adapter == "claude-reviewer-2.1.220"
+                && tasks.len() == 1
+                && tasks[0].objective
+                    == "Create task1.txt with exactly two lines:\nphase9-task-1\nreview-stage: pending"
+        ));
+        assert!(matches!(
+            control_request.caller,
+            CallerAuth::Architect {
+                native_session_id: Some(ref native_session_id),
+                ..
+            } if native_session_id == TEST_NATIVE_SESSION_ID
+        ));
+
+        fs::remove_file(&fixture.configuration.registration_socket_path).unwrap();
+        fs::remove_file(&fixture.configuration.control_socket_path).unwrap();
+        let control = bind_private_listener(&fixture.configuration.control_socket_path);
+        let control_thread = spawn_control_server(control, successful_status_response);
+        let response = handle_tool_call(
+            json!(3),
+            Some(json!({
+                "name":"session_status",
+                "arguments":{},
+                "_meta":{"progressToken":"same-session"}
+            })),
+            &fixture.configuration,
+            &mut binding_version,
+            &mut native_session_id,
+        );
+        assert_eq!(response["result"]["isError"], false);
+        assert_eq!(binding_version, 2);
+        assert_eq!(native_session_id.as_deref(), Some(TEST_NATIVE_SESSION_ID));
+        assert!(matches!(
+            control_thread.join().unwrap().action,
+            ControlAction::SessionStatus
+        ));
+    }
+
+    #[test]
+    fn tool_call_failure_stages_are_distinct_before_registration() {
+        let missing_session = BridgeTestFixture::new(false);
+        let mut binding_version = 1;
+        let mut native_session_id = None;
+        let envelope = handle_tool_call(
+            json!(1),
+            Some(json!({
+                "name":"session_status",
+                "arguments":{},
+                "unexpected":true
+            })),
+            &missing_session.configuration,
+            &mut binding_version,
+            &mut native_session_id,
+        );
+        assert_eq!(
+            tool_refusal(&envelope),
+            "architect control request was refused: architect_tool_envelope"
+        );
+        let action = handle_tool_call(
+            json!(2),
+            Some(json!({"name":"not-a-tool","arguments":{}})),
+            &missing_session.configuration,
+            &mut binding_version,
+            &mut native_session_id,
+        );
+        assert_eq!(
+            tool_refusal(&action),
+            "architect control request was refused: architect_tool_action"
+        );
+        let discovery = handle_tool_call(
+            json!(3),
+            Some(json!({"name":"session_status","arguments":{}})),
+            &missing_session.configuration,
+            &mut binding_version,
+            &mut native_session_id,
+        );
+        assert_eq!(
+            tool_refusal(&discovery),
+            "architect control request was refused: native_session_discovery"
+        );
+
+        let changed_session = BridgeTestFixture::new(true);
+        let mut native_session_id = Some("019fa976-e270-7a92-b5f0-6d3d8a0ad3f5".to_owned());
+        let changed = handle_tool_call(
+            json!(4),
+            Some(json!({"name":"session_status","arguments":{}})),
+            &changed_session.configuration,
+            &mut binding_version,
+            &mut native_session_id,
+        );
+        assert_eq!(
+            tool_refusal(&changed),
+            "architect control request was refused: native_session_changed"
+        );
+    }
+
+    #[test]
+    fn registration_transport_rejection_and_version_fail_closed() {
+        let missing_socket = BridgeTestFixture::new(true);
+        let mut binding_version = 1;
+        let mut native_session_id = None;
+        let response = handle_tool_call(
+            json!(1),
+            Some(json!({"name":"session_status","arguments":{}})),
+            &missing_socket.configuration,
+            &mut binding_version,
+            &mut native_session_id,
+        );
+        assert_eq!(
+            tool_refusal(&response),
+            "architect control request was refused: native_session_registration_transport"
+        );
+
+        let rejected = BridgeTestFixture::new(true);
+        let registration = bind_private_listener(&rejected.configuration.registration_socket_path);
+        let thread = spawn_registration_server(registration, |request| {
+            RegistrationResponse::error(&request.request_id, NATIVE_SESSION_REFUSAL_CAPABILITY)
+        });
+        let response = handle_tool_call(
+            json!(2),
+            Some(json!({"name":"session_status","arguments":{}})),
+            &rejected.configuration,
+            &mut binding_version,
+            &mut native_session_id,
+        );
+        assert_eq!(
+            tool_refusal(&response),
+            "architect control request was refused: native_session_capability"
+        );
+        thread.join().unwrap();
+
+        let unknown = BridgeTestFixture::new(true);
+        let registration = bind_private_listener(&unknown.configuration.registration_socket_path);
+        let thread = spawn_registration_server(registration, |request| {
+            RegistrationResponse::error(&request.request_id, "must-not-echo-value")
+        });
+        let response = handle_tool_call(
+            json!(3),
+            Some(json!({"name":"session_status","arguments":{}})),
+            &unknown.configuration,
+            &mut binding_version,
+            &mut native_session_id,
+        );
+        assert_eq!(
+            tool_refusal(&response),
+            "architect control request was refused: architect_registration"
+        );
+        thread.join().unwrap();
+
+        let wrong_version = BridgeTestFixture::new(true);
+        let registration =
+            bind_private_listener(&wrong_version.configuration.registration_socket_path);
+        let thread = spawn_registration_server(registration, |request| {
+            RegistrationResponse::success(&request.request_id, 99)
+        });
+        let response = handle_tool_call(
+            json!(4),
+            Some(json!({"name":"session_status","arguments":{}})),
+            &wrong_version.configuration,
+            &mut binding_version,
+            &mut native_session_id,
+        );
+        assert_eq!(
+            tool_refusal(&response),
+            "architect control request was refused: native_session_registration_version"
+        );
+        assert_eq!(binding_version, 1);
+        assert_eq!(native_session_id, None);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn control_transport_recovers_and_structured_control_errors_pass_through() {
+        let fixture = BridgeTestFixture::new(true);
+        let registration = bind_private_listener(&fixture.configuration.registration_socket_path);
+        let registration_thread = spawn_registration_server(registration, |request| {
+            RegistrationResponse::success(&request.request_id, 2)
+        });
+        let mut binding_version = 1;
+        let mut native_session_id = None;
+        let response = handle_tool_call(
+            json!(1),
+            Some(json!({"name":"session_status","arguments":{}})),
+            &fixture.configuration,
+            &mut binding_version,
+            &mut native_session_id,
+        );
+        assert_eq!(
+            tool_refusal(&response),
+            "architect control request was refused: architect_control_transport"
+        );
+        assert_eq!(binding_version, 2);
+        assert_eq!(native_session_id.as_deref(), Some(TEST_NATIVE_SESSION_ID));
+        registration_thread.join().unwrap();
+        fs::remove_file(&fixture.configuration.registration_socket_path).unwrap();
+
+        let control = bind_private_listener(&fixture.configuration.control_socket_path);
+        let control_thread = spawn_control_server(control, successful_status_response);
+        let response = handle_tool_call(
+            json!(2),
+            Some(json!({"name":"session_status","arguments":{}})),
+            &fixture.configuration,
+            &mut binding_version,
+            &mut native_session_id,
+        );
+        assert_eq!(response["result"]["isError"], false);
+        control_thread.join().unwrap();
+
+        let error = BridgeTestFixture::new(true);
+        let registration = bind_private_listener(&error.configuration.registration_socket_path);
+        let control = bind_private_listener(&error.configuration.control_socket_path);
+        let registration_thread = spawn_registration_server(registration, |request| {
+            RegistrationResponse::success(&request.request_id, 2)
+        });
+        let control_thread = spawn_control_server(control, |request| {
+            ControlResponse::error(
+                request.request_id.clone(),
+                ControlErrorCode::Conflict,
+                "expected test conflict",
+            )
+        });
+        let mut binding_version = 1;
+        let mut native_session_id = None;
+        let response = handle_tool_call(
+            json!(3),
+            Some(json!({"name":"session_status","arguments":{}})),
+            &error.configuration,
+            &mut binding_version,
+            &mut native_session_id,
+        );
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["structuredContent"]["error"]["code"],
+            "conflict"
+        );
+        assert_eq!(
+            response["result"]["structuredContent"]["error"]["message"],
+            "expected test conflict"
+        );
+        registration_thread.join().unwrap();
+        control_thread.join().unwrap();
     }
 
     #[test]

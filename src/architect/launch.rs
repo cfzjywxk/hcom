@@ -919,7 +919,9 @@ impl ArchitectEnvironment {
                 values.insert(name.into(), value);
             }
         }
-        if !values.contains_key("PATH") || !values.contains_key("TERM") {
+        if values.get("PATH").is_none_or(|value| value.is_empty())
+            || values.get("TERM").is_none_or(|value| value.is_empty())
+        {
             bail!("architect environment requires PATH and TERM");
         }
         control_environment.extend(values.clone());
@@ -932,10 +934,15 @@ impl ArchitectEnvironment {
         ] {
             if let Some(value) = read_unicode_environment(name)? {
                 validate_environment_value(name, &value)?;
-                control_environment.insert(name.into(), value);
+                if name == "HOME" || !value.is_empty() {
+                    control_environment.insert(name.into(), value);
+                }
             }
         }
-        if !control_environment.contains_key("HOME") {
+        if control_environment
+            .get("HOME")
+            .is_none_or(|value| value.is_empty())
+        {
             bail!("architect control environment requires parent HOME");
         }
         let parent_home = PathBuf::from(
@@ -944,10 +951,12 @@ impl ArchitectEnvironment {
                 .expect("checked architect parent HOME"),
         );
         let cargo_bin_source = std::env::var_os("CARGO_HOME")
+            .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| parent_home.join(".cargo"))
             .join("bin");
         let rustup_home_source = std::env::var_os("RUSTUP_HOME")
+            .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| parent_home.join(".rustup"));
         Ok(Self {
@@ -1004,8 +1013,7 @@ fn canonical_private_runtime(path: &Path) -> Result<PathBuf> {
 }
 
 fn validate_environment_value(name: &str, value: &str) -> Result<()> {
-    if value.is_empty()
-        || value.len() > 16 * 1024
+    if value.len() > 16 * 1024
         || value
             .chars()
             .any(|character| character == '\0' || ('\u{80}'..='\u{9f}').contains(&character))
@@ -1527,7 +1535,62 @@ mod tests {
     use std::os::unix::process::CommandExt;
 
     const BLANK_HELPER_ROOT: &str = "HCOM_PHASE7_BLANK_HELPER_ROOT";
+    const ENVIRONMENT_HELPER_ROOT: &str = "HCOM_PHASE9_ENVIRONMENT_HELPER_ROOT";
     const RUNTIME_MODE_HELPER: &str = "HCOM_PHASE9_RUNTIME_MODE_HELPER";
+
+    #[test]
+    fn architect_environment_helper_process() {
+        if std::env::var_os(ENVIRONMENT_HELPER_ROOT).is_none() {
+            return;
+        }
+        let environment = ArchitectEnvironment::capture().unwrap();
+        assert_eq!(environment.values.get("COLORTERM"), Some(&String::new()));
+        assert_eq!(
+            environment.control_environment.get("COLORTERM"),
+            Some(&String::new())
+        );
+        assert!(!environment.control_environment.contains_key("CARGO_HOME"));
+        assert!(!environment.control_environment.contains_key("CODEX_HOME"));
+    }
+
+    #[test]
+    fn empty_optional_terminal_and_tool_overrides_do_not_block_blank_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let home = root.join("home");
+        let config = root.join("config");
+        let state = root.join("state");
+        let runtime = root.join("runtime");
+        for directory in [&home, &config, &state, &runtime] {
+            fs::create_dir(directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "architect::launch::tests::architect_environment_helper_process",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(ENVIRONMENT_HELPER_ROOT, &root)
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("TERM", "xterm-256color")
+            .env("COLORTERM", "")
+            .env("CARGO_HOME", "")
+            .env("CODEX_HOME", "")
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_STATE_HOME", &state)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "environment helper failed: {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn session_runtime_helper_process() {

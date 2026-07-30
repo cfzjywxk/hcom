@@ -19,9 +19,9 @@ use crate::control_api::{CapabilitySnapshot, NativeSessionMode, WorkerRole};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
@@ -29,7 +29,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub const CODEX_REVIEWER_EXECUTABLE: &str =
@@ -48,7 +48,8 @@ const GIT_EXECUTABLE: &str = "/usr/bin/git";
 const GIT_VERSION: &str = "git version 2.43.0";
 const CODEX_ADAPTER_NAME: &str = "codex-reviewer-0.145.0";
 const CLAUDE_ADAPTER_NAME: &str = "claude-reviewer-2.1.220";
-const ADAPTER_CONTRACT_VERSION: u32 = 2;
+const CODEX_ADAPTER_CONTRACT_VERSION: u32 = 2;
+const CLAUDE_ADAPTER_CONTRACT_VERSION: u32 = 2;
 const CODEX_EFFECTIVE_POLICY: &str =
     "native=danger-full-access;outer=bubblewrap-0.9.0-empty-root-reviewer-ro-v2;approval=never";
 const CLAUDE_EFFECTIVE_POLICY: &str =
@@ -58,6 +59,8 @@ const CODEX_FINAL_FILE: &str = "native-final.partial";
 const JSON_SCHEMA_DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
 const CODEX_AUTH_FILE: &str = "auth.json";
 const CLAUDE_AUTH_FILE: &str = ".credentials.json";
+const MAX_CLAUDE_CREDENTIAL_BYTES: usize = 1024 * 1024;
+const MIN_CLAUDE_ACCESS_VALIDITY: Duration = Duration::from_secs(15 * 60);
 const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_DURATION: Duration = Duration::from_secs(30);
 
@@ -453,6 +456,7 @@ impl ClaudeReviewerAdapter {
         if resume_session_id.is_some_and(|session| session != exact_session) {
             bail!("Claude reviewer resume must use the exact session-bound native session");
         }
+        validate_claude_auth_readiness(self.sandbox.auth_source.path(), SystemTime::now())?;
         revalidate_exact_tool(&self.executable, CLAUDE_REVIEWER_CLI_VERSION)?;
         revalidate_exact_tool(&self.outer_executable, BWRAP_VERSION)?;
         revalidate_exact_tool(&self.git_executable, GIT_VERSION)?;
@@ -649,6 +653,7 @@ fn profile(descriptor: &AdapterDescriptor, executable: &ExecutableIdentity) -> W
 fn reviewer_capabilities(
     native_session_mode: NativeSessionMode,
     result_transport: ResultTransport,
+    sandbox_feature: &str,
 ) -> AdapterCapabilities {
     AdapterCapabilities {
         roles: vec![WorkerRole::Reviewer],
@@ -656,7 +661,7 @@ fn reviewer_capabilities(
         result_transport,
         features: vec![
             "exact-resume".into(),
-            "outer-bwrap-empty-root-reviewer-ro-v2".into(),
+            sandbox_feature.into(),
             "workspace-attestation".into(),
             "structured-major-minor".into(),
         ],
@@ -666,24 +671,32 @@ fn reviewer_capabilities(
 fn codex_reviewer_descriptor() -> Result<AdapterDescriptor> {
     AdapterDescriptor::new(
         CODEX_ADAPTER_NAME,
-        ADAPTER_CONTRACT_VERSION,
+        CODEX_ADAPTER_CONTRACT_VERSION,
         CODEX_REVIEWER_CLI_VERSION,
         CODEX_REVIEWER_MODEL,
         CODEX_REVIEWER_REASONING,
         CODEX_EFFECTIVE_POLICY,
-        reviewer_capabilities(NativeSessionMode::Discovered, ResultTransport::FinalFile),
+        reviewer_capabilities(
+            NativeSessionMode::Discovered,
+            ResultTransport::FinalFile,
+            "outer-bwrap-empty-root-reviewer-ro-v2",
+        ),
     )
 }
 
 fn claude_reviewer_descriptor() -> Result<AdapterDescriptor> {
     AdapterDescriptor::new(
         CLAUDE_ADAPTER_NAME,
-        ADAPTER_CONTRACT_VERSION,
+        CLAUDE_ADAPTER_CONTRACT_VERSION,
         CLAUDE_REVIEWER_CLI_VERSION,
         CLAUDE_REVIEWER_MODEL,
         CLAUDE_REVIEWER_REASONING,
         CLAUDE_EFFECTIVE_POLICY,
-        reviewer_capabilities(NativeSessionMode::Preassigned, ResultTransport::Envelope),
+        reviewer_capabilities(
+            NativeSessionMode::Preassigned,
+            ResultTransport::Envelope,
+            "outer-bwrap-empty-root-reviewer-ro-v2",
+        ),
     )
 }
 
@@ -1184,11 +1197,7 @@ impl FileIdentity {
         };
         // SAFETY: geteuid has no preconditions.
         let uid = unsafe { libc::geteuid() };
-        if identity.uid != uid
-            || identity.links != 1
-            || identity.mode & 0o077 != 0
-            || identity.mode & 0o600 != 0o600
-        {
+        if identity.uid != uid || identity.links != 1 || identity.mode != 0o600 {
             bail!("reviewer private file has unsafe ownership, links, or permissions");
         }
         Ok(identity)
@@ -1204,6 +1213,145 @@ impl FileIdentity {
         }
         Ok(())
     }
+
+    fn matches_metadata(&self, metadata: &fs::Metadata) -> bool {
+        self.device == metadata.dev()
+            && self.inode == metadata.ino()
+            && self.uid == metadata.uid()
+            && self.mode == metadata.permissions().mode() & 0o777
+            && self.links == metadata.nlink()
+            && self.size == metadata.len()
+            && self.modified_seconds == metadata.mtime()
+            && self.modified_nanos == metadata.mtime_nsec()
+            && self.changed_seconds == metadata.ctime()
+            && self.changed_nanos == metadata.ctime_nsec()
+    }
+}
+
+pub(crate) fn claude_auth_redaction_values(path: &Path) -> Result<Vec<String>> {
+    let bytes = read_private_json_file(path, "Claude auth source")?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let mut values = BTreeMap::<String, ()>::new();
+    collect_secret_values(&value, false, &mut values)?;
+    Ok(values.into_keys().collect())
+}
+
+pub(crate) fn validate_claude_auth_readiness(path: &Path, now: SystemTime) -> Result<()> {
+    let bytes = read_private_json_file(path, "Claude auth source")?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let oauth = value
+        .get("claudeAiOauth")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow!("Claude auth source omitted its OAuth object"))?;
+    for field in ["accessToken", "refreshToken"] {
+        let token = oauth
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("Claude auth source omitted a required OAuth token"))?;
+        if token.len() < 8 || token.len() > 16 * 1024 || token.chars().any(char::is_control) {
+            bail!("Claude auth source contains an invalid OAuth token shape");
+        }
+    }
+    let expires_at = oauth
+        .get("expiresAt")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow!("Claude auth source omitted its access-token expiry"))?;
+    let refresh_expires_at = oauth
+        .get("refreshTokenExpiresAt")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow!("Claude auth source omitted its refresh-token expiry"))?;
+    let now_ms = u64::try_from(now.duration_since(UNIX_EPOCH)?.as_millis())
+        .context("current time exceeds the Claude auth readiness bound")?;
+    let minimum_ms = u64::try_from(MIN_CLAUDE_ACCESS_VALIDITY.as_millis())
+        .expect("Claude minimum validity fits u64");
+    let minimum_expiry = now_ms
+        .checked_add(minimum_ms)
+        .ok_or_else(|| anyhow!("Claude auth readiness time overflow"))?;
+    if expires_at <= minimum_expiry {
+        bail!("Claude access token is expired or too close to expiry");
+    }
+    if refresh_expires_at <= expires_at {
+        bail!("Claude refresh token does not outlive the access token");
+    }
+    Ok(())
+}
+
+fn collect_secret_values(
+    value: &serde_json::Value,
+    secret_context: bool,
+    values: &mut BTreeMap<String, ()>,
+) -> Result<()> {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                let normalized: String = key
+                    .chars()
+                    .filter(char::is_ascii_alphanumeric)
+                    .flat_map(char::to_lowercase)
+                    .collect();
+                let secret = secret_context
+                    || normalized.contains("token")
+                    || normalized.contains("secret")
+                    || normalized.contains("apikey")
+                    || normalized.contains("credential")
+                    || normalized.contains("authorization");
+                collect_secret_values(value, secret, values)?;
+            }
+        }
+        serde_json::Value::Array(array) => {
+            for value in array {
+                collect_secret_values(value, secret_context, values)?;
+            }
+        }
+        serde_json::Value::String(value) if secret_context && value.len() >= 8 => {
+            if value.len() > 16 * 1024 || value.chars().any(char::is_control) {
+                bail!("Claude auth secret has an unsafe bounded shape");
+            }
+            values.insert(value.clone(), ());
+            if values.len() > 64 {
+                bail!("Claude auth secret inventory exceeds its bound");
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn read_private_json_file(path: &Path, label: &str) -> Result<Vec<u8>> {
+    let bytes = read_private_file(path, label)?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).with_context(|| format!("{label} is not valid JSON"))?;
+    if !value.is_object() {
+        bail!("{label} must contain a JSON object");
+    }
+    Ok(bytes)
+}
+
+fn read_private_file(path: &Path, label: &str) -> Result<Vec<u8>> {
+    let before = FileIdentity::capture(path).with_context(|| format!("invalid {label}"))?;
+    if before.size == 0 || before.size > MAX_CLAUDE_CREDENTIAL_BYTES as u64 {
+        bail!("{label} exceeds its non-empty bounded size");
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("failed to open {label}"))?;
+    if !before.matches_metadata(&file.metadata()?) {
+        bail!("{label} changed while it was opened");
+    }
+    let mut bytes = Vec::with_capacity(before.size as usize);
+    (&mut file)
+        .take((MAX_CLAUDE_CREDENTIAL_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {label}"))?;
+    if bytes.len() > MAX_CLAUDE_CREDENTIAL_BYTES {
+        bail!("{label} exceeds its bounded size");
+    }
+    before
+        .revalidate()
+        .with_context(|| format!("{label} changed while it was read"))?;
+    Ok(bytes)
 }
 
 struct GitWorkspaceIdentity {
@@ -1497,6 +1645,8 @@ mod tests {
 
     const CLAUDE_SESSION: &str = "b174295a-e7a8-4bb6-ac78-a96d34b2ab21";
     const OTHER_CLAUDE_SESSION: &str = "7b8a787a-6303-4eb6-b03f-6c3e22042c8b";
+    const CLAUDE_AUTH_V1: &[u8] =
+        br#"{"claudeAiOauth":{"accessToken":"fixture-access-v1","refreshToken":"fixture-refresh-v1","expiresAt":4102444800000,"refreshTokenExpiresAt":4102448400000}}"#;
 
     struct Fixture {
         _temp: tempfile::TempDir,
@@ -1545,6 +1695,7 @@ mod tests {
             let developer_worktree = temp.path().join("developer-worktree");
             let cargo_bin_source = temp.path().join("cargo-bin");
             let rustup_home_source = temp.path().join("rustup-home");
+            let claude_auth_dir = temp.path().join("claude-auth-source");
             let tools = temp.path().join("tools");
             for directory in [
                 &workspace,
@@ -1562,6 +1713,7 @@ mod tests {
                 &developer_worktree,
                 &cargo_bin_source,
                 &rustup_home_source,
+                &claude_auth_dir,
                 &tools,
             ] {
                 fs::create_dir(directory).unwrap();
@@ -1571,12 +1723,9 @@ mod tests {
             let codex_auth_source = temp.path().join("codex-native-auth.json");
             write_private_file(&codex_auth_source, b"codex-private-auth-sentinel");
             write_private_file(&codex_home.join(CODEX_AUTH_FILE), b"isolated-placeholder");
-            let claude_auth_source = temp.path().join("claude-native-auth.json");
-            write_private_file(&claude_auth_source, b"claude-private-auth-sentinel");
-            write_private_file(
-                &claude_config_dir.join(CLAUDE_AUTH_FILE),
-                b"isolated-placeholder",
-            );
+            let claude_auth_source = claude_auth_dir.join("claude-native-auth.json");
+            write_private_file(&claude_auth_source, CLAUDE_AUTH_V1);
+            write_private_file(&claude_config_dir.join(CLAUDE_AUTH_FILE), CLAUDE_AUTH_V1);
             let global_sentinel = temp.path().join("global-config-sentinel");
             write_private_file(&global_sentinel, b"global-config-must-not-change");
 
@@ -1848,7 +1997,9 @@ mod tests {
                 .unwrap()
                 .spawn(WorkerRole::Reviewer, prepared, &environment, attempt)
                 .unwrap()
-                .wait(|_| Ok(HeartbeatControl::Continue))
+                .wait_with_cancel(Arc::new(AtomicBool::new(false)), |_| {
+                    Ok(HeartbeatControl::Continue)
+                })
                 .unwrap()
         }
     }
@@ -1932,6 +2083,17 @@ mod tests {
         assert_eq!(codex_profile.model, CODEX_REVIEWER_MODEL);
         assert_eq!(codex_profile.reasoning, CODEX_REVIEWER_REASONING);
         assert_eq!(codex_profile.policy, CODEX_EFFECTIVE_POLICY);
+        assert_eq!(
+            codex_profile.adapter_contract_version,
+            CODEX_ADAPTER_CONTRACT_VERSION
+        );
+        assert!(
+            codex_profile
+                .capability
+                .features
+                .iter()
+                .any(|feature| feature == "outer-bwrap-empty-root-reviewer-ro-v2")
+        );
         assert_eq!(
             codex_profile.native_session_mode,
             NativeSessionMode::Discovered
@@ -2035,6 +2197,17 @@ mod tests {
         assert_eq!(claude_profile.model, CLAUDE_REVIEWER_MODEL);
         assert_eq!(claude_profile.reasoning, CLAUDE_REVIEWER_REASONING);
         assert_eq!(claude_profile.policy, CLAUDE_EFFECTIVE_POLICY);
+        assert_eq!(
+            claude_profile.adapter_contract_version,
+            CLAUDE_ADAPTER_CONTRACT_VERSION
+        );
+        assert!(
+            claude_profile
+                .capability
+                .features
+                .iter()
+                .any(|feature| feature == "outer-bwrap-empty-root-reviewer-ro-v2")
+        );
         assert_eq!(
             claude_profile.native_session_mode,
             NativeSessionMode::Preassigned
@@ -2464,22 +2637,115 @@ mod tests {
     }
 
     #[test]
-    fn claude_auth_mount_target_must_exist_with_exact_private_permissions() {
+    fn claude_oauth_readiness_covers_schema_expiry_and_private_file_gates() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let auth = root.join("credentials.json");
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let now_ms = u64::try_from(now.duration_since(UNIX_EPOCH).unwrap().as_millis()).unwrap();
+        let minimum_ms = u64::try_from(MIN_CLAUDE_ACCESS_VALIDITY.as_millis()).unwrap();
+
+        let write_auth = |value: serde_json::Value| {
+            fs::write(&auth, serde_json::to_vec(&value).unwrap()).unwrap();
+            fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        let valid = |expires_at: u64, refresh_expires_at: u64| {
+            serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "fixture-access-token",
+                    "refreshToken": "fixture-refresh-token",
+                    "expiresAt": expires_at,
+                    "refreshTokenExpiresAt": refresh_expires_at
+                }
+            })
+        };
+
+        write_auth(valid(now_ms + minimum_ms + 1, now_ms + minimum_ms + 2));
+        validate_claude_auth_readiness(&auth, now).unwrap();
+
+        for invalid in [
+            valid(now_ms, now_ms + minimum_ms + 2),
+            valid(now_ms + minimum_ms, now_ms + minimum_ms + 2),
+            valid(now_ms + minimum_ms + 2, now_ms + minimum_ms + 2),
+            serde_json::json!({"claudeAiOauth": {
+                "accessToken": "",
+                "refreshToken": "fixture-refresh-token",
+                "expiresAt": now_ms + minimum_ms + 2,
+                "refreshTokenExpiresAt": now_ms + minimum_ms + 3
+            }}),
+            serde_json::json!({"claudeAiOauth": {
+                "accessToken": "fixture-access-token",
+                "refreshToken": "fixture-refresh-token",
+                "expiresAt": "not-a-number",
+                "refreshTokenExpiresAt": now_ms + minimum_ms + 3
+            }}),
+            serde_json::json!({}),
+        ] {
+            write_auth(invalid);
+            assert!(validate_claude_auth_readiness(&auth, now).is_err());
+        }
+
+        fs::write(&auth, b"{not-json").unwrap();
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(validate_claude_auth_readiness(&auth, now).is_err());
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(validate_claude_auth_readiness(&auth, now).is_err());
+    }
+
+    #[test]
+    fn claude_auth_stays_a_read_only_overlay_and_joins_artifact_redaction() {
         let fixture = Fixture::new();
-        let target = fixture.claude_config_dir.join(CLAUDE_AUTH_FILE);
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o664)).unwrap();
-        let error = ClaudeReviewerAdapter::discover_with_paths(
-            fixture.claude_config(),
-            &fixture.claude,
-            &fixture.bwrap,
-            &fixture.git,
-        )
-        .err()
-        .expect("group-readable Claude auth target must fail before spawn");
-        assert!(
-            format!("{error:#}").contains("unsafe ownership, links, or permissions"),
-            "unexpected error: {error:#}"
+        let adapter = fixture.claude_adapter();
+        let control = fixture.control(
+            "task-auth-overlay",
+            "logical-auth-overlay",
+            Some(CLAUDE_SESSION),
+            1,
+            1,
+            &fixture.first_head,
         );
+        let prepared = prepare_create_turn(
+            &adapter,
+            &adapter.profile(),
+            &control,
+            b"verify read-only auth overlay".to_vec(),
+        )
+        .unwrap();
+        let argv = prepared
+            .command()
+            .outer_launch
+            .as_ref()
+            .unwrap()
+            .fixed_argv
+            .as_slice();
+        assert!(argv.windows(3).any(|part| {
+            part == [
+                "--ro-bind",
+                fixture.claude_auth_source.to_str().unwrap(),
+                "/hcom/native/.credentials.json",
+            ]
+        }));
+        assert!(!argv.windows(3).any(|part| {
+            part[0] == "--bind" && part[1] == fixture.claude_auth_source.to_str().unwrap()
+        }));
+
+        let values = claude_auth_redaction_values(&fixture.claude_auth_source).unwrap();
+        assert_eq!(
+            values,
+            vec![
+                "fixture-access-v1".to_owned(),
+                "fixture-refresh-v1".to_owned()
+            ]
+        );
+        let redactor = fixture
+            .claude_lease("lease-auth-redaction")
+            .with_secret_redaction_values(values)
+            .unwrap()
+            .redactor();
+        let sanitized = redactor.redact("fixture-access-v1 fixture-refresh-v1");
+        assert!(!sanitized.contains("fixture-access-v1"));
+        assert!(!sanitized.contains("fixture-refresh-v1"));
     }
 
     fn assert_closed_codex_argv(argv: &[String], fixture: &Fixture, prompt: &[u8]) {
@@ -2535,6 +2801,26 @@ mod tests {
         assert!(
             argv.iter()
                 .any(|argument| argument == "--disable-slash-commands")
+        );
+        assert!(
+            argv.windows(3).any(|part| {
+                part == [
+                    "--bind",
+                    fixture.claude_config_dir.to_str().unwrap(),
+                    INSIDE_NATIVE_CONFIG,
+                ]
+            }),
+            "Claude session state must stay in its isolated native config"
+        );
+        assert!(
+            argv.windows(3).any(|part| {
+                part == [
+                    "--ro-bind",
+                    fixture.claude_auth_source.to_str().unwrap(),
+                    "/hcom/native/.credentials.json",
+                ]
+            }),
+            "Claude OAuth credentials must remain an exact read-only overlay"
         );
         assert!(!argv.iter().any(|argument| argument == "--new-session"));
         assert!(!argv.iter().any(|argument| argument == "--last"));
