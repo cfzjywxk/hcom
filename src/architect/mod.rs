@@ -58,7 +58,9 @@ Architect CLI overrides (higher priority than TOML):
 
 Built-in defaults are Codex gpt-5.6-sol/xhigh with danger-full-access/never,
 or Claude opus/xhigh with dangerously-skip-permissions. The capability-bound
-session-control MCP tools do not add a second native approval prompt. When
+session-control MCP tools do not add a second native approval prompt. The
+Architect must relay prior human plan approval; hcom validates the exact
+version/hash and confirmation bit, not OS-level keyboard provenance. When
 [architect.reviewer] is absent, the reviewer uses the selected architect
 adapter and the same effective model and reasoning/effort. An explicit
 [architect.reviewer] table takes priority.

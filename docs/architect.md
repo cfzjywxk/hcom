@@ -62,9 +62,12 @@ The Codex Architect's isolated configuration marks the one
 `hcom_session_task_control` MCP server as approved for this invocation, so
 status, plan, start, and cancel calls do not each show an additional native
 tool-approval dialog. This does not remove hcom's product gate: the Architect
-must still display the complete repository bindings plus exact plan
-version/hash, and `session_approve_and_start` is rejected unless the human has
-explicitly approved that exact plan.
+is instructed to display the complete repository bindings plus exact plan
+version/hash and to call `session_approve_and_start` only after the human
+approves them in the conversation. The supervisor rechecks the exact
+version/hash and a required confirmation bit. This is model-relayed approval,
+not independent OS-level proof of a human keystroke; no additional native MCP
+dialog is expected.
 
 For a Codex architect, this complete Codex-developer/Claude-reviewer example
 uses explicit profiles for all three roles:

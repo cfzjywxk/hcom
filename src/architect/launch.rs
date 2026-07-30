@@ -746,21 +746,10 @@ fn validate_architect_codex_cli(path: &Path) -> Result<()> {
             bail!("architect Codex CLI help omitted configured value {value}");
         }
     }
-    let approval_probe = Command::new(path)
-        .args([
-            "--strict-config",
-            "--config",
-            "mcp_servers.hcom_session_task_control.command=\"/bin/true\"",
-            "--config",
-            "mcp_servers.hcom_session_task_control.default_tools_approval_mode=\"approve\"",
-            "--help",
-        ])
-        .env_clear()
-        .output()
-        .context("failed to probe architect Codex MCP approval capability")?;
-    if !approval_probe.status.success() || !approval_probe.stderr.is_empty() {
-        bail!("architect Codex CLI does not support the required MCP approval policy");
-    }
+    // Codex 0.145 does not load or validate config while rendering --help, so
+    // an approval-key probe here would be vacuous. The real Architect always
+    // carries --strict-config; an unsupported serialized key therefore aborts
+    // the production launch instead of being ignored.
     Ok(())
 }
 
@@ -1095,9 +1084,10 @@ fn write_isolated_codex_config(paths: &ArchitectLaunchPaths, component: &Path) -
         tool_timeout_sec: 300,
         enabled: true,
         // The server is a per-invocation, capability-bound relay exposing only
-        // the four session-plan tools. Its own exact plan/hash gate remains
-        // authoritative; a second Codex MCP confirmation would only duplicate
-        // the human approval already enforced by hcom.
+        // the four session-plan tools. The tool contract requires the model to
+        // relay prior human approval; hcom itself verifies the exact plan/hash
+        // and confirmation bit, not keyboard provenance. A second native MCP
+        // dialog is intentionally not part of that product contract.
         default_tools_approval_mode: IsolatedMcpToolApprovalMode::Approve,
     };
     let config = IsolatedCodexConfig {

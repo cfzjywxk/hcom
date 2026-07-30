@@ -110,9 +110,12 @@ Codex defaults to `gpt-5.6-sol` with `xhigh` reasoning,
 `danger-full-access`, and approval policy `never`; Claude defaults to `opus`
 with `xhigh` effort and skipped native permission prompts. The isolated,
 capability-bound session-control MCP server is approved for the invocation, so
-it does not add a second approval dialog after hcom's exact plan gate. Unless
-`[architect.reviewer]` is configured explicitly, the reviewer follows the
-selected architect adapter and those effective model/effort settings.
+it does not add a second approval dialog after the model relays the human's
+plan approval. The supervisor validates the exact plan version/hash and the
+required confirmation bit, but does not independently attest an OS-level
+human keystroke. Unless `[architect.reviewer]` is configured explicitly, the
+reviewer follows the selected architect adapter and those effective
+model/effort settings.
 
 The exact current directory is the project context and remains the native
 working directory for the Architect and every Codex/Claude task worker. It
