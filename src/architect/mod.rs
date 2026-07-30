@@ -74,14 +74,17 @@ frozen into the approved plan.
 No prompt argument, stdin payload, terminal injection, or automatic first turn
 is used. The human owns every architect terminal input. The Architect has a
 path-preserving whole-host read-write view for project plans, current_todo, and
-coordination records; protected hcom runtimes and exact credentials/tools stay
-masked or read-only. Every reviewer's canonical project/source/Git view remains
-read-only, while its session-private HOME, temporary directory, and generated
-language caches remain writable. Each authorized task names the exact
-canonical Git root discovered by the Architect from project documentation.
-Developer tasks commit directly there; concurrent Architect or external drift
-stops the run without reset, rebase, merge, or final apply. The parent owns all
-worker lifetime and no run is recovered after exit.
+coordination records. Live hcom state, parent Codex/Claude config, hcom control
+runtimes, and exact credentials/tools stay isolated, masked, or read-only;
+HCOM_DIR inside the Architect points to private per-run state. Other same-user
+files, including SSH and cloud credentials, remain writable. Every reviewer's
+canonical project/source/Git view remains read-only, while its session-private
+HOME, temporary directory, and generated language caches remain writable. Each
+authorized task names the exact canonical Git root discovered by the Architect
+from project documentation. Developer tasks commit directly there; hcom has no
+repository-root allowlist. Concurrent Architect or external drift can stop the
+run after a partial developer commit, without reset, rebase, merge, or final
+apply. The parent owns all worker lifetime and no run is recovered after exit.
 
 See docs/architect.md for the complete TOML schema and examples."#
 }

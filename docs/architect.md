@@ -233,8 +233,12 @@ Profile configuration changes native CLI policy, not the outer containment:
   records at their real paths; `/tmp`, the host XDG runtime, all
   current/sibling architect session roots, and hcom control sockets remain
   masked, while the exact project and this Architect's private state are
-  rebound writable as needed; pinned Architect/MCP executables and the exact
-  credential source remain read-only;
+  rebound writable as needed; live default/explicit hcom state, parent
+  `.codex`/`.claude` configuration, the launching hcom executable, pinned
+  Architect/MCP executables, and the exact credential source remain read-only;
+- `HCOM_DIR` inside the Architect points to private per-run state, so invoking
+  hcom there cannot message or wake retained interactive agents through the
+  live v24 store;
 - the developer receives only its task repository read-write at that
   repository's real absolute path;
 - every reviewer sees the exact project and task repository HEAD read-only at
@@ -257,11 +261,25 @@ Profile configuration changes native CLI policy, not the outer containment:
 
 Whole-host read-write is intentionally broad Architect authority and is much
 broader than the task-worker view. Do not start an Architect on untrusted
-project instructions. Before `session_plan_replace`, the Architect may write
-and commit design artifacts. Once a task repository is bound, the Architect
-must not modify it concurrently: the repository lock and clean
-branch/HEAD/worktree gates will stop the run on drift. Coordination files
-outside bound task repositories can continue to be updated.
+project instructions. Outside the protected hcom/Codex/Claude control surfaces,
+same-user files including SSH keys, cloud credentials, shell configuration,
+and unrelated application state remain writable. Before
+`session_plan_replace`, the Architect may write and commit design artifacts.
+Once a task repository is bound, the Architect must not modify it concurrently.
+This is an instruction plus drift detection, not a dynamic filesystem
+exclusion: an Architect write inside the task's allowed path scope during a
+developer turn can be swept into the developer commit. Other drift may be
+detected only after the developer has committed, moving the run to
+`needs_human` and leaving that partial commit on the real branch; hcom never
+resets or rebases it. Coordination files outside bound task repositories can
+continue to be updated.
+
+The Architect selects each `repository_root` from the human-named plan and
+attests that the same message authorized execution. hcom validates canonical
+Git identity, cleanliness, branch, HEAD, locks, and later drift, but there is
+no configured repository-root allowlist. The exact binding display is
+therefore visibility and TOCTOU protection, not independent proof that the
+model selected the intended repository.
 
 Reviewer source/Git paths remain read-only regardless of the configured native
 permission mode. Developer write authority remains limited to the current task

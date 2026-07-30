@@ -138,6 +138,11 @@ Before starting, the Architect must display every task's repository root,
 branch, and start HEAD together with the exact plan version and hash. An
 explicit follow/execute/implement request for a named existing plan may
 authorize same-turn start; otherwise the Architect waits for a later approval.
+Repository identity is selected by the Architect from that plan; there is no
+host-path allowlist. Live hcom state, parent Codex/Claude configuration, and
+the launching hcom binary are overlaid read-only, and hcom commands inside the
+Architect use private per-run state. Other same-user host files remain
+writable.
 
 ---
 

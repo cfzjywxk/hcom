@@ -182,17 +182,13 @@ impl HostRootContract {
         .chain(mounts.extra_writable_dirs.iter().copied())
         .collect();
 
-        if mounts.host_root_access != HostRootAccess::Hidden {
-            let root_bind = match mounts.host_root_access {
-                HostRootAccess::ReadWrite => "--bind",
-                HostRootAccess::Hidden => unreachable!("checked host-root access"),
-            };
+        if let HostRootAccess::ReadWrite = mounts.host_root_access {
             let mut argv = vec![
                 "--die-with-parent".into(),
                 "--unshare-pid".into(),
                 "--unshare-ipc".into(),
                 "--unshare-uts".into(),
-                root_bind.into(),
+                "--bind".into(),
                 "/".into(),
                 "/".into(),
                 "--proc".into(),
@@ -232,13 +228,6 @@ impl HostRootContract {
                     argv.extend(["--dir".into(), text("private mount target", &directory)?]);
                 }
             }
-            for directory in mounts.readable_roots {
-                argv.extend([
-                    "--ro-bind".into(),
-                    text("readable root", directory)?,
-                    text("readable root", directory)?,
-                ]);
-            }
             for directory in mounts.writable_roots {
                 argv.extend([
                     "--bind".into(),
@@ -251,6 +240,15 @@ impl HostRootContract {
                     "--bind".into(),
                     text("private writable directory", directory)?,
                     text("private writable directory", directory)?,
+                ]);
+            }
+            // Persistent control/config roots must win over a writable project
+            // parent (for example project_root == $HOME).
+            for directory in mounts.readable_roots {
+                argv.extend([
+                    "--ro-bind".into(),
+                    text("readable root", directory)?,
+                    text("readable root", directory)?,
                 ]);
             }
             for file in mounts.read_only_files {

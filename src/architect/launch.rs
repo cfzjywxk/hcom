@@ -26,7 +26,7 @@ use crate::worker::sandbox::{HostRootAccess, HostRootContract, HostRootMounts};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -97,6 +97,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
 
     let project_root = canonical_project_directory(&std::env::current_dir()?)?;
     let native_environment = ArchitectEnvironment::capture()?;
+    let protected_roots = capture_architect_protected_roots(&project_root, &native_environment)?;
     let session_root = create_private_session_runtime()?;
     let run_root = fs::canonicalize(session_root.path())?;
     let lock_root = native_environment
@@ -283,6 +284,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
             &native_environment.cargo_bin_source,
             &native_environment.rustup_home_source,
         )?,
+        protected_roots,
     };
     let (mut architect, gate_write, info_read) = match spawn_blocked_architect(
         &tools,
@@ -647,6 +649,7 @@ struct ExactTools {
     architect: ExactArchitectTool,
     bwrap: ExecutableIdentity,
     component: ExecutableIdentity,
+    hcom_executables: Vec<ExecutableIdentity>,
 }
 
 enum ExactArchitectTool {
@@ -696,18 +699,42 @@ impl ExactTools {
         let bwrap = capture_exact_tool(Path::new(BWRAP_EXECUTABLE), BWRAP_VERSION)?;
         let component_path = resolve_component_path()?;
         let component = ExecutableIdentity::capture(component_path)?;
+        let hcom_executables = discover_hcom_executables()?;
         Ok(Self {
             architect,
             bwrap,
             component,
+            hcom_executables,
         })
     }
 
     fn revalidate(&self) -> Result<()> {
         self.architect.revalidate()?;
         revalidate_exact_tool(&self.bwrap, BWRAP_VERSION)?;
-        self.component.revalidate()
+        self.component.revalidate()?;
+        for executable in &self.hcom_executables {
+            executable.revalidate()?;
+        }
+        Ok(())
     }
+}
+
+fn discover_hcom_executables() -> Result<Vec<ExecutableIdentity>> {
+    let mut candidates = BTreeSet::from([fs::canonicalize(std::env::current_exe()?)?]);
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path).filter(|path| path.is_absolute()) {
+            let candidate = directory.join("hcom");
+            if fs::metadata(&candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            }) {
+                candidates.insert(fs::canonicalize(candidate)?);
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .map(ExecutableIdentity::capture)
+        .collect()
 }
 
 fn validate_architect_codex_cli(path: &Path) -> Result<()> {
@@ -847,6 +874,7 @@ fn revalidate_exact_tool(identity: &ExecutableIdentity, expected_version: &str) 
 struct ArchitectLaunchPaths {
     state: PathBuf,
     home: PathBuf,
+    hcom_state: PathBuf,
     native_config: PathBuf,
     xdg_config: PathBuf,
     xdg_state: PathBuf,
@@ -870,6 +898,8 @@ impl ArchitectLaunchPaths {
         ensure_private_directory(&runtime, false)?;
         let home = state.join("home");
         ensure_private_directory(&home, false)?;
+        let hcom_state = state.join("hcom");
+        ensure_private_directory(&hcom_state, false)?;
         let native_config = home.join(match adapter {
             ArchitectAdapter::Codex => ".codex",
             ArchitectAdapter::Claude => ".claude",
@@ -889,6 +919,7 @@ impl ArchitectLaunchPaths {
         Ok(Self {
             state,
             home,
+            hcom_state,
             native_config: native_config.clone(),
             xdg_config,
             xdg_state,
@@ -1020,6 +1051,113 @@ impl PrivateFileIdentity {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ProtectedDirectoryIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    uid: u32,
+}
+
+impl ProtectedDirectoryIdentity {
+    fn capture_if_present(path: &Path, label: &str) -> Result<Option<Self>> {
+        let link = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if link.file_type().is_symlink() || !link.is_dir() {
+            bail!("{label} must be a real directory when present");
+        }
+        let canonical = fs::canonicalize(path)?;
+        if canonical != path {
+            bail!("{label} must already use its canonical path");
+        }
+        let metadata = fs::metadata(path)?;
+        // SAFETY: geteuid has no preconditions.
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            bail!("{label} must be current-user owned and not writable by others");
+        }
+        Ok(Some(Self {
+            path: canonical,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+        }))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn revalidate(&self, label: &str) -> Result<()> {
+        if Self::capture_if_present(&self.path, label)?.as_ref() != Some(self) {
+            bail!("{label} identity drifted before architect launch");
+        }
+        Ok(())
+    }
+}
+
+fn capture_architect_protected_roots(
+    project_root: &Path,
+    environment: &ArchitectEnvironment,
+) -> Result<Vec<ProtectedDirectoryIdentity>> {
+    let home = PathBuf::from(
+        environment
+            .control_environment
+            .get("HOME")
+            .ok_or_else(|| anyhow::anyhow!("architect parent HOME disappeared"))?,
+    );
+    // Keep this path resolution aligned with paths::resolve_hcom_dir_from_env;
+    // the architect module is also compiled by the standalone component crate,
+    // where the retained-product paths module is intentionally unavailable.
+    let active_hcom = match read_unicode_environment("HCOM_DIR")? {
+        Some(value) if !value.is_empty() => {
+            let expanded = if value.starts_with('~') {
+                value.replacen('~', path_text("architect parent HOME", &home)?, 1)
+            } else {
+                value
+            };
+            let path = PathBuf::from(expanded);
+            if path.is_relative() {
+                project_root.join(path)
+            } else {
+                path
+            }
+        }
+        _ => home.join(".hcom"),
+    };
+    let mut candidates = BTreeSet::from([
+        home.join(".hcom"),
+        home.join(".codex"),
+        home.join(".claude"),
+        active_hcom,
+    ]);
+    for name in ["CODEX_HOME", "CLAUDE_CONFIG_DIR"] {
+        if let Some(value) = environment.control_environment.get(name) {
+            candidates.insert(PathBuf::from(value));
+        }
+    }
+
+    let mut roots = Vec::new();
+    for candidate in candidates {
+        if !candidate.is_absolute() {
+            bail!("architect protected control root must be absolute");
+        }
+        if let Some(identity) =
+            ProtectedDirectoryIdentity::capture_if_present(&candidate, "architect control root")?
+        {
+            if project_root.starts_with(identity.path()) {
+                bail!("architect project directory is inside a protected control root");
+            }
+            roots.push(identity);
+        }
+    }
+    Ok(roots)
 }
 
 fn create_empty_private_file(path: &Path) -> Result<()> {
@@ -1278,6 +1416,10 @@ impl ArchitectEnvironment {
             .ok_or_else(|| anyhow::anyhow!("architect parent HOME disappeared"))?
             .clone();
         values.insert("HOME".into(), home);
+        values.insert(
+            "HCOM_DIR".into(),
+            path_text("architect isolated hcom state", &paths.hcom_state)?.into(),
+        );
         match adapter {
             ArchitectAdapter::Codex => {
                 values.insert(
@@ -1439,6 +1581,7 @@ struct ArchitectSandbox {
     adapter: ArchitectAdapter,
     host_runtime: PathBuf,
     host_root: HostRootContract,
+    protected_roots: Vec<ProtectedDirectoryIdentity>,
 }
 
 impl ArchitectSandbox {
@@ -1458,6 +1601,9 @@ impl ArchitectSandbox {
             bail!("architect relay runtime overlaps the host runtime directory");
         }
         tools.revalidate()?;
+        for root in &self.protected_roots {
+            root.revalidate("architect control root")?;
+        }
         if !matches!(
             (&tools.architect, self.adapter),
             (ExactArchitectTool::Codex(_), ArchitectAdapter::Codex)
@@ -1471,16 +1617,33 @@ impl ArchitectSandbox {
         } else {
             vec![tmp, &self.host_runtime]
         };
-        let claude_writable_dirs = [
-            self.paths.xdg_config.as_path(),
-            self.paths.xdg_state.as_path(),
-            self.paths.xdg_cache.as_path(),
-            self.paths.xdg_data.as_path(),
+        let mut extra_writable_dirs = vec![self.paths.hcom_state.as_path()];
+        if self.adapter == ArchitectAdapter::Claude {
+            extra_writable_dirs.extend([
+                self.paths.xdg_config.as_path(),
+                self.paths.xdg_state.as_path(),
+                self.paths.xdg_cache.as_path(),
+                self.paths.xdg_data.as_path(),
+            ]);
+        }
+        let protected_roots: Vec<&Path> = self
+            .protected_roots
+            .iter()
+            .map(ProtectedDirectoryIdentity::path)
+            .collect();
+        let mut read_only_files = vec![
+            tools.architect.executable().canonical_path.as_path(),
+            tools.component.canonical_path.as_path(),
+            self.auth_source.path(),
         ];
-        let extra_writable_dirs: &[&Path] = match self.adapter {
-            ArchitectAdapter::Codex => &[],
-            ArchitectAdapter::Claude => &claude_writable_dirs,
-        };
+        read_only_files.extend(
+            tools
+                .hcom_executables
+                .iter()
+                .map(|executable| executable.canonical_path.as_path()),
+        );
+        read_only_files.sort_unstable();
+        read_only_files.dedup();
         let mut argv = self.host_root.host_root_argv(HostRootMounts {
             isolated_home: &self.paths.home,
             native_config: &self.paths.native_config,
@@ -1488,14 +1651,10 @@ impl ArchitectSandbox {
             artifact_dir: &self.paths.runtime,
             auth_source: self.auth_source.path(),
             auth_target: &self.paths.auth_target,
-            readable_roots: &[],
+            readable_roots: &protected_roots,
             writable_roots: &[&self.project_root],
-            read_only_files: &[
-                &tools.architect.executable().canonical_path,
-                &tools.component.canonical_path,
-                self.auth_source.path(),
-            ],
-            extra_writable_dirs,
+            read_only_files: &read_only_files,
+            extra_writable_dirs: &extra_writable_dirs,
             host_root_access: HostRootAccess::ReadWrite,
             masked_dirs: &masked_dirs,
         })?;
@@ -1946,15 +2105,16 @@ mod tests {
     use std::os::unix::process::CommandExt;
 
     const BLANK_HELPER_ROOT: &str = "HCOM_PHASE7_BLANK_HELPER_ROOT";
+    const BLANK_HELPER_CONTROL_HOME: &str = "HCOM_PHASE7_BLANK_HELPER_CONTROL_HOME";
     const ENVIRONMENT_HELPER_ROOT: &str = "HCOM_PHASE9_ENVIRONMENT_HELPER_ROOT";
     const RUNTIME_MODE_HELPER: &str = "HCOM_PHASE9_RUNTIME_MODE_HELPER";
     const TEST_CLAUDE_SESSION: &str = "019fa976-e270-7a92-b5f0-6d3d8a0ad3f4";
 
     #[test]
     fn architect_environment_helper_process() {
-        if std::env::var_os(ENVIRONMENT_HELPER_ROOT).is_none() {
+        let Some(root) = std::env::var_os(ENVIRONMENT_HELPER_ROOT).map(PathBuf::from) else {
             return;
-        }
+        };
         let environment = ArchitectEnvironment::capture().unwrap();
         assert_eq!(environment.values.get("COLORTERM"), Some(&String::new()));
         assert_eq!(
@@ -1963,6 +2123,21 @@ mod tests {
         );
         assert!(!environment.control_environment.contains_key("CARGO_HOME"));
         assert!(!environment.control_environment.contains_key("CODEX_HOME"));
+        let protected: BTreeSet<_> = capture_architect_protected_roots(&root, &environment)
+            .unwrap()
+            .into_iter()
+            .map(|identity| identity.path)
+            .collect();
+        let home = root.join("home");
+        assert_eq!(
+            protected,
+            BTreeSet::from([
+                home.join(".hcom"),
+                home.join(".codex"),
+                home.join(".claude"),
+                root.join("custom-hcom"),
+            ])
+        );
     }
 
     #[test]
@@ -1973,7 +2148,17 @@ mod tests {
         let config = root.join("config");
         let state = root.join("state");
         let runtime = root.join("runtime");
-        for directory in [&home, &config, &state, &runtime] {
+        let custom_hcom = root.join("custom-hcom");
+        for directory in [
+            &home,
+            &config,
+            &state,
+            &runtime,
+            &custom_hcom,
+            &home.join(".hcom"),
+            &home.join(".codex"),
+            &home.join(".claude"),
+        ] {
             fs::create_dir(directory).unwrap();
             fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
         }
@@ -1991,6 +2176,7 @@ mod tests {
             .env("COLORTERM", "")
             .env("CARGO_HOME", "")
             .env("CODEX_HOME", "")
+            .env("HCOM_DIR", &custom_hcom)
             .env("XDG_CONFIG_HOME", &config)
             .env("XDG_STATE_HOME", &state)
             .env("XDG_RUNTIME_DIR", &runtime)
@@ -2095,6 +2281,7 @@ mod tests {
         let paths = ArchitectLaunchPaths {
             state: root.join("state"),
             home: root.join("home"),
+            hcom_state: root.join("state/hcom"),
             native_config,
             xdg_config: root.join("xdg-config"),
             xdg_state: root.join("xdg-state"),
@@ -2259,11 +2446,13 @@ mod tests {
         let tools = ExactTools {
             architect: ExactArchitectTool::Claude(current.clone()),
             bwrap: current.clone(),
-            component: current,
+            component: current.clone(),
+            hcom_executables: vec![current],
         };
         let paths = ArchitectLaunchPaths {
             state,
             home,
+            hcom_state: root.join("state/hcom"),
             native_config: native_config.clone(),
             xdg_config: root.join("xdg-config"),
             xdg_state: root.join("xdg-state"),
@@ -2281,6 +2470,7 @@ mod tests {
             adapter: ArchitectAdapter::Claude,
             host_runtime: root.clone(),
             host_root: HostRootContract::capture(&cargo_bin, &rustup_home).unwrap(),
+            protected_roots: Vec::new(),
         };
         let profile = ArchitectInvocationProfile::Claude {
             profile: crate::worker::profile::ClaudeInvocationProfile::architect_default(),
@@ -2332,6 +2522,7 @@ mod tests {
         let Some(root) = std::env::var_os(BLANK_HELPER_ROOT).map(PathBuf::from) else {
             return;
         };
+        let control_home = PathBuf::from(std::env::var_os(BLANK_HELPER_CONTROL_HOME).unwrap());
         let repository = root.join("repo");
         let host_runtime = root.join("run");
         let state = root.join("architect-state");
@@ -2343,6 +2534,7 @@ mod tests {
         let paths = ArchitectLaunchPaths {
             state,
             home,
+            hcom_state: root.join("architect-state/hcom"),
             native_config: codex_home,
             xdg_config: root.join("xdg-config"),
             xdg_state: root.join("xdg-state"),
@@ -2360,6 +2552,12 @@ mod tests {
             component: codex.clone(),
             architect: ExactArchitectTool::Codex(codex),
             bwrap,
+            hcom_executables: vec![
+                ExecutableIdentity::capture(
+                    fs::canonicalize(control_home.join(".local/bin/hcom")).unwrap(),
+                )
+                .unwrap(),
+            ],
         };
         let environment = ArchitectEnvironment {
             values: [
@@ -2371,7 +2569,7 @@ mod tests {
             .collect(),
             control_environment: BTreeMap::from([(
                 "HOME".into(),
-                root.to_string_lossy().into_owned(),
+                control_home.to_string_lossy().into_owned(),
             )]),
             runtime_home: host_runtime.clone(),
             cargo_bin_source: cargo_bin_source.clone(),
@@ -2384,6 +2582,18 @@ mod tests {
             adapter: ArchitectAdapter::Codex,
             host_runtime,
             host_root: HostRootContract::capture(&cargo_bin_source, &rustup_home_source).unwrap(),
+            protected_roots: [
+                control_home.join(".hcom"),
+                control_home.join(".codex"),
+                control_home.join(".claude"),
+            ]
+            .iter()
+            .map(|path| {
+                ProtectedDirectoryIdentity::capture_if_present(path, "test control root")
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect(),
         };
         let report = root.join("architect-state/home/blank-report");
         let write_probe = root.join("repo/architect-write-probe");
@@ -2439,6 +2649,15 @@ mod tests {
             .tempdir_in("/var/tmp")
             .unwrap();
         let external_source = fs::canonicalize(external_temp.path()).unwrap();
+        let control_home = external_source.join("home");
+        let live_hcom = control_home.join(".hcom");
+        let parent_codex = control_home.join(".codex");
+        let parent_claude = control_home.join(".claude");
+        let installed_bin = control_home.join(".local/bin");
+        let live_hcom_db = live_hcom.join("hcom.db");
+        let parent_codex_config = parent_codex.join("config.toml");
+        let parent_claude_config = parent_claude.join("settings.json");
+        let installed_hcom = installed_bin.join("hcom");
         let host_runtime = root.join("run");
         let control_root = host_runtime.join("legacy-control-sentinel");
         let architect_root = root.join("session-runtime");
@@ -2458,9 +2677,16 @@ mod tests {
             &other_runtime,
             &state,
             &home,
+            &state.join("hcom"),
             &codex_home,
             &cargo_bin_source,
             &rustup_home_source,
+            &control_home,
+            &live_hcom,
+            &parent_codex,
+            &parent_claude,
+            &control_home.join(".local"),
+            &installed_bin,
         ] {
             fs::create_dir(path).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
@@ -2470,6 +2696,15 @@ mod tests {
             "external source visible\n",
         )
         .unwrap();
+        for (path, contents) in [
+            (&live_hcom_db, "live hcom state\n"),
+            (&parent_codex_config, "live codex config\n"),
+            (&parent_claude_config, "live claude config\n"),
+            (&installed_hcom, "#!/bin/sh\nexit 0\n"),
+        ] {
+            fs::write(path, contents).unwrap();
+        }
+        fs::set_permissions(&installed_hcom, fs::Permissions::from_mode(0o700)).unwrap();
         let auth_source = root.join("auth.json");
         let auth_target = codex_home.join("auth.json");
         let config_file = codex_home.join("config.toml");
@@ -2541,33 +2776,53 @@ if not all(os.isatty(fd) for fd in (0, 1, 2)):
     raise SystemExit(32)
 if select.select([0], [], [], 0)[0]:
     raise SystemExit(33)
+if os.environ.get("HCOM_DIR") != {isolated_hcom_state}:
+    raise SystemExit(34)
 with open({write_probe}, "x", encoding="utf-8") as output:
     output.write("architect project write\n")
 
 with open({external_source}, encoding="utf-8") as source:
     if source.read() != "external source visible\n":
-        raise SystemExit(34)
+        raise SystemExit(35)
 with open({external_write_probe}, "x", encoding="utf-8") as output:
     output.write("architect external write\n")
+
+for index, protected in enumerate({protected_files}):
+    try:
+        with open(protected, "a", encoding="utf-8") as output:
+            output.write("forbidden")
+    except OSError as error:
+        if error.errno != errno.EROFS:
+            raise SystemExit(40 + index)
+    else:
+        raise SystemExit(50 + index)
+try:
+    os.unlink({installed_hcom})
+except OSError as error:
+    if error.errno not in (errno.EROFS, errno.EBUSY, errno.EPERM):
+        raise SystemExit(60)
+else:
+    raise SystemExit(61)
+
 try:
     with open({auth_source}, "a", encoding="utf-8") as output:
         output.write("forbidden")
 except OSError as error:
     if error.errno != errno.EROFS:
-        raise SystemExit(35)
+        raise SystemExit(62)
 else:
-    raise SystemExit(36)
+    raise SystemExit(63)
 for hidden in {hidden_sockets}:
     if os.path.exists(hidden):
-        raise SystemExit(37)
+        raise SystemExit(64)
     probe = socket.socket(socket.AF_UNIX)
     try:
         probe.connect(hidden)
     except OSError as error:
         if error.errno != errno.ENOENT:
-            raise SystemExit(38)
+            raise SystemExit(65)
     else:
-        raise SystemExit(39)
+        raise SystemExit(66)
     finally:
         probe.close()
 
@@ -2578,9 +2833,19 @@ with open({report}, "w", encoding="utf-8") as output:
     output.write("ok\n")
 "#,
             expected_args = serde_json::to_string(&expected_args).unwrap(),
+            isolated_hcom_state =
+                serde_json::to_string(&state.join("hcom").to_string_lossy()).unwrap(),
             write_probe = serde_json::to_string(&repository.join("architect-write-probe")).unwrap(),
             external_source = serde_json::to_string(&external_source.join("source.txt")).unwrap(),
             external_write_probe = serde_json::to_string(&external_write_probe).unwrap(),
+            protected_files = serde_json::to_string(&[
+                live_hcom_db.to_string_lossy().into_owned(),
+                parent_codex_config.to_string_lossy().into_owned(),
+                parent_claude_config.to_string_lossy().into_owned(),
+                installed_hcom.to_string_lossy().into_owned(),
+            ])
+            .unwrap(),
+            installed_hcom = serde_json::to_string(&installed_hcom).unwrap(),
             auth_source = serde_json::to_string(&auth_source).unwrap(),
             hidden_sockets = serde_json::to_string(&[
                 control_socket.to_string_lossy().into_owned(),
@@ -2606,6 +2871,7 @@ with open({report}, "w", encoding="utf-8") as output:
                 "--nocapture",
             ])
             .env(BLANK_HELPER_ROOT, &root)
+            .env(BLANK_HELPER_CONTROL_HOME, &control_home)
             .env("XDG_CONFIG_HOME", root.join("xdg-config"))
             .env("XDG_RUNTIME_DIR", &host_runtime)
             .env("XDG_STATE_HOME", root.join("xdg-state"))
@@ -2664,6 +2930,22 @@ with open({report}, "w", encoding="utf-8") as output:
             "architect external write\n"
         );
         assert_eq!(fs::read_to_string(&auth_source).unwrap(), "");
+        assert_eq!(
+            fs::read_to_string(&live_hcom_db).unwrap(),
+            "live hcom state\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&parent_codex_config).unwrap(),
+            "live codex config\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&parent_claude_config).unwrap(),
+            "live claude config\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&installed_hcom).unwrap(),
+            "#!/bin/sh\nexit 0\n"
+        );
         assert!(
             listeners
                 .iter()
