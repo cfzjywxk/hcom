@@ -3480,10 +3480,16 @@ sys.stdout.write(json.dumps({
             ("RUSTUP_HOME".into(), text(&rustup_home)),
             ("PATH".into(), "/usr/bin:/bin".into()),
         ]);
+        let profiles = SessionInvocationProfiles {
+            reviewer: ReviewerInvocationProfile::Claude {
+                profile: ClaudeInvocationProfile::reviewer_default(),
+            },
+            ..SessionInvocationProfiles::default()
+        };
         let sources = SessionRuntimeSources::capture(
             parent_values.clone(),
             runtime.clone(),
-            SessionInvocationProfiles::default(),
+            profiles.clone(),
         )
         .unwrap();
         assert_eq!(
@@ -3496,7 +3502,7 @@ sys.stdout.write(json.dumps({
         );
         assert_eq!(
             sources.profiles.as_ref().unwrap().canonical_hash(),
-            SessionInvocationProfiles::default().canonical_hash()
+            profiles.canonical_hash()
         );
 
         fs::set_permissions(&claude_auth, fs::Permissions::from_mode(0o666)).unwrap();

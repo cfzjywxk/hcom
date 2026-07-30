@@ -1,6 +1,6 @@
 use crate::worker::profile::{
-    CodexInvocationProfile, DeveloperInvocationProfile, ReviewerInvocationProfile,
-    SessionInvocationProfiles,
+    ArchitectAdapter, ArchitectInvocationProfile, ClaudeInvocationProfile, CodexInvocationProfile,
+    DeveloperInvocationProfile, ReviewerInvocationProfile, SessionInvocationProfiles,
 };
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -15,26 +15,31 @@ pub(super) struct LoadedInvocationProfiles {
     pub profiles: SessionInvocationProfiles,
     pub config_path: PathBuf,
     pub loaded_from_file: bool,
+    pub reviewer_explicit: bool,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ArchitectToml {
-    profile: Option<CodexInvocationProfile>,
+    profile: Option<toml::Value>,
     developer: Option<DeveloperInvocationProfile>,
     reviewer: Option<ReviewerInvocationProfile>,
 }
 
-pub(super) fn load_invocation_profiles(path: &Path) -> Result<LoadedInvocationProfiles> {
+pub(super) fn load_invocation_profiles(
+    path: &Path,
+    architect_adapter: ArchitectAdapter,
+) -> Result<LoadedInvocationProfiles> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let profiles = SessionInvocationProfiles::default();
+            let profiles = SessionInvocationProfiles::for_architect(architect_adapter);
             profiles.validate()?;
             return Ok(LoadedInvocationProfiles {
                 profiles,
                 config_path: path.to_owned(),
                 loaded_from_file: false,
+                reviewer_explicit: false,
             });
         }
         Err(error) => {
@@ -92,27 +97,44 @@ pub(super) fn load_invocation_profiles(path: &Path) -> Result<LoadedInvocationPr
     let document: toml::Table = text
         .parse()
         .context("architect profile configuration is malformed TOML")?;
-    let mut profiles = SessionInvocationProfiles::default();
+    let mut profiles = SessionInvocationProfiles::for_architect(architect_adapter);
+    let mut reviewer_explicit = false;
     if let Some(value) = document.get("architect") {
         let configured: ArchitectToml = value
             .clone()
             .try_into()
             .context("invalid [architect] profile configuration")?;
-        if let Some(profile) = configured.profile {
-            profiles.architect = profile;
+        if let Some(value) = configured.profile {
+            profiles.architect = match architect_adapter {
+                ArchitectAdapter::Codex => ArchitectInvocationProfile::Codex {
+                    profile: value
+                        .try_into::<CodexInvocationProfile>()
+                        .context("invalid Codex [architect.profile] configuration")?,
+                },
+                ArchitectAdapter::Claude => ArchitectInvocationProfile::Claude {
+                    profile: value
+                        .try_into::<ClaudeInvocationProfile>()
+                        .context("invalid Claude [architect.profile] configuration")?,
+                },
+            };
         }
         if let Some(developer) = configured.developer {
             profiles.developer = developer;
         }
         if let Some(reviewer) = configured.reviewer {
             profiles.reviewer = reviewer;
+            reviewer_explicit = true;
         }
+    }
+    if !reviewer_explicit {
+        profiles.inherit_reviewer_from_architect();
     }
     profiles.validate()?;
     Ok(LoadedInvocationProfiles {
         profiles,
         config_path: path.to_owned(),
         loaded_from_file: true,
+        reviewer_explicit,
     })
 }
 
@@ -136,13 +158,33 @@ mod tests {
     #[test]
     fn missing_file_uses_reviewed_defaults() {
         let temp = tempfile::tempdir().unwrap();
-        let loaded = load_invocation_profiles(&temp.path().join("missing.toml")).unwrap();
+        let loaded =
+            load_invocation_profiles(&temp.path().join("missing.toml"), ArchitectAdapter::Codex)
+                .unwrap();
         assert!(!loaded.loaded_from_file);
-        assert_eq!(loaded.profiles.architect.sandbox, CodexSandbox::ReadOnly);
+        assert!(!loaded.reviewer_explicit);
+        assert_eq!(
+            loaded.profiles.architect.codex().unwrap().sandbox,
+            CodexSandbox::ReadOnly
+        );
         assert_eq!(
             loaded.profiles.reviewer_adapter_name(),
-            CLAUDE_REVIEWER_ADAPTER
+            CODEX_REVIEWER_ADAPTER
         );
+    }
+
+    #[test]
+    fn missing_file_uses_claude_opus_xhigh_for_architect_and_reviewer() {
+        let temp = tempfile::tempdir().unwrap();
+        let loaded =
+            load_invocation_profiles(&temp.path().join("missing.toml"), ArchitectAdapter::Claude)
+                .unwrap();
+        let architect = loaded.profiles.architect.claude().unwrap();
+        let reviewer = loaded.profiles.reviewer.claude().unwrap();
+        assert_eq!(architect.model, "opus");
+        assert_eq!(architect.effort, "xhigh");
+        assert_eq!(reviewer.model, architect.model);
+        assert_eq!(reviewer.effort, architect.effort);
     }
 
     #[test]
@@ -172,9 +214,13 @@ effort = "xhigh"
 dangerously_skip_permissions = true
 "#,
         );
-        let loaded = load_invocation_profiles(&path).unwrap();
+        let loaded = load_invocation_profiles(&path, ArchitectAdapter::Codex).unwrap();
         assert!(loaded.loaded_from_file);
-        assert_eq!(loaded.profiles.architect.reasoning_effort, "max");
+        assert!(loaded.reviewer_explicit);
+        assert_eq!(
+            loaded.profiles.architect.codex().unwrap().reasoning_effort,
+            "max"
+        );
         assert_eq!(
             loaded.profiles.developer.codex().unwrap().reasoning_effort,
             "max"
@@ -203,7 +249,7 @@ sandbox = "danger-full-access"
 ask_for_approval = "never"
 "#,
         );
-        let loaded = load_invocation_profiles(&path).unwrap();
+        let loaded = load_invocation_profiles(&path, ArchitectAdapter::Codex).unwrap();
         assert_eq!(
             loaded.profiles.developer_adapter_name(),
             CLAUDE_DEVELOPER_ADAPTER
@@ -236,7 +282,7 @@ sandbox = "danger-full-access"
 ask_for_approval = "never"
 "#,
         );
-        let loaded = load_invocation_profiles(&path).unwrap();
+        let loaded = load_invocation_profiles(&path, ArchitectAdapter::Codex).unwrap();
         assert_eq!(
             loaded.profiles.developer_adapter_name(),
             CODEX_DEVELOPER_ADAPTER
@@ -264,7 +310,7 @@ effort = "xhigh"
 dangerously_skip_permissions = true
 "#,
         );
-        let loaded = load_invocation_profiles(&path).unwrap();
+        let loaded = load_invocation_profiles(&path, ArchitectAdapter::Codex).unwrap();
         assert_eq!(
             loaded.profiles.developer_adapter_name(),
             CLAUDE_DEVELOPER_ADAPTER
@@ -287,7 +333,7 @@ sandbox = "danger-full-access"
 ask_for_approval = "never"
 "#,
         );
-        let loaded = load_invocation_profiles(&path).unwrap();
+        let loaded = load_invocation_profiles(&path, ArchitectAdapter::Codex).unwrap();
         assert_eq!(
             loaded.profiles.reviewer_adapter_name(),
             CODEX_REVIEWER_ADAPTER
@@ -310,7 +356,7 @@ ask_for_approval = "never"
 args = ["--resume", "foreign-session"]
 "#,
         );
-        assert!(load_invocation_profiles(&path).is_err());
+        assert!(load_invocation_profiles(&path, ArchitectAdapter::Codex).is_err());
 
         fs::write(
             &path,
@@ -320,7 +366,7 @@ unknown = true
 "#,
         )
         .unwrap();
-        assert!(load_invocation_profiles(&path).is_err());
+        assert!(load_invocation_profiles(&path, ArchitectAdapter::Codex).is_err());
 
         fs::write(
             &path,
@@ -334,9 +380,31 @@ args = ["--resume", "foreign-session"]
 "#,
         )
         .unwrap();
-        assert!(load_invocation_profiles(&path).is_err());
+        assert!(load_invocation_profiles(&path, ArchitectAdapter::Codex).is_err());
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o622)).unwrap();
-        assert!(load_invocation_profiles(&path).is_err());
+        assert!(load_invocation_profiles(&path, ArchitectAdapter::Codex).is_err());
+    }
+
+    #[test]
+    fn claude_profile_is_typed_by_the_selected_architect_adapter() {
+        let (_temp, path) = write_config(
+            r#"
+[architect.profile]
+model = "sonnet"
+effort = "max"
+dangerously_skip_permissions = false
+"#,
+        );
+        let loaded = load_invocation_profiles(&path, ArchitectAdapter::Claude).unwrap();
+        let architect = loaded.profiles.architect.claude().unwrap();
+        let reviewer = loaded.profiles.reviewer.claude().unwrap();
+        assert_eq!(architect.model, "sonnet");
+        assert_eq!(architect.effort, "max");
+        assert!(!architect.dangerously_skip_permissions);
+        assert_eq!(reviewer.model, "sonnet");
+        assert_eq!(reviewer.effort, "max");
+        assert!(reviewer.dangerously_skip_permissions);
+        assert!(!loaded.reviewer_explicit);
     }
 }

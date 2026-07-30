@@ -63,11 +63,18 @@ pub(super) struct BridgeConfiguration {
     pub relay_socket_path: PathBuf,
     pub registration_socket_path: PathBuf,
     pub control_socket_path: PathBuf,
-    pub codex_home: PathBuf,
+    pub native_session_source: ArchitectNativeSessionSource,
     pub relay_executable: ExecutableIdentity,
     pub relay_runtime_scope_hash: String,
     pub developer_adapter: String,
     pub reviewer_adapter: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "adapter", rename_all = "lowercase", deny_unknown_fields)]
+pub(super) enum ArchitectNativeSessionSource {
+    Codex { codex_home: PathBuf },
+    Claude { native_session_id: String },
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -241,11 +248,20 @@ fn validate_bridge_configuration(configuration: &BridgeConfiguration) -> Result<
     if scope_hash != configuration.relay_runtime_scope_hash {
         bail!("architect relay runtime scope drifted before bridge start");
     }
-    validate_canonical_directory(
-        "isolated Codex home",
-        &configuration.codex_home,
-        Some(0o700),
-    )?;
+    match &configuration.native_session_source {
+        ArchitectNativeSessionSource::Codex { codex_home } => {
+            validate_canonical_directory("isolated Codex home", codex_home, Some(0o700))?;
+        }
+        ArchitectNativeSessionSource::Claude { native_session_id } => {
+            validate_native_session_id(native_session_id)?;
+            let canonical = Uuid::parse_str(native_session_id)
+                .context("Claude architect native session id is not a UUID")?
+                .to_string();
+            if &canonical != native_session_id {
+                bail!("Claude architect native session id is not canonical lowercase");
+            }
+        }
+    }
     configuration.relay_executable.revalidate()?;
     if !matches!(
         configuration.developer_adapter.as_str(),
@@ -504,9 +520,8 @@ fn handle_tool_call(
             &configuration.reviewer_adapter,
         )
         .map_err(|_| NativeSessionBindingRefusal(TOOL_REFUSAL_ACTION))?;
-        let observed =
-            discover_codex_native_session(&configuration.codex_home, &configuration.project_root)
-                .map_err(|_| NativeSessionBindingRefusal(NATIVE_SESSION_REFUSAL_DISCOVERY))?;
+        let observed = discover_architect_native_session(configuration)
+            .map_err(|_| NativeSessionBindingRefusal(NATIVE_SESSION_REFUSAL_DISCOVERY))?;
         match native_session_id {
             Some(expected) if expected != &observed => {
                 bail!(NativeSessionBindingRefusal(NATIVE_SESSION_REFUSAL_CHANGED))
@@ -590,6 +605,18 @@ fn handle_tool_call(
                 "isError":true
             }
         }),
+    }
+}
+
+fn discover_architect_native_session(configuration: &BridgeConfiguration) -> Result<String> {
+    match &configuration.native_session_source {
+        ArchitectNativeSessionSource::Codex { codex_home } => {
+            discover_codex_native_session(codex_home, &configuration.project_root)
+        }
+        ArchitectNativeSessionSource::Claude { native_session_id } => {
+            validate_native_session_id(native_session_id)?;
+            Ok(native_session_id.clone())
+        }
     }
 }
 
@@ -985,7 +1012,7 @@ mod tests {
                     relay_socket_path: root.join(RELAY_SOCKET_NAME),
                     registration_socket_path: root.join("registration.sock"),
                     control_socket_path: root.join("control.sock"),
-                    codex_home,
+                    native_session_source: ArchitectNativeSessionSource::Codex { codex_home },
                     relay_executable: executable,
                     relay_runtime_scope_hash: relay_runtime_scope_hash(&root).unwrap(),
                     developer_adapter: "codex-developer-0.145.0".into(),
@@ -1112,7 +1139,9 @@ mod tests {
             relay_socket_path: socket_path.clone(),
             registration_socket_path: root.join("registration.sock"),
             control_socket_path: root.join("control.sock"),
-            codex_home: root.clone(),
+            native_session_source: ArchitectNativeSessionSource::Codex {
+                codex_home: root.clone(),
+            },
             relay_executable: executable,
             relay_runtime_scope_hash: "unused-by-authorization".into(),
             developer_adapter: "codex-developer-0.145.0".into(),
@@ -1719,6 +1748,24 @@ mod tests {
     }
 
     #[test]
+    fn claude_native_session_is_preassigned_and_canonical() {
+        let mut fixture = BridgeTestFixture::new(false);
+        fixture.configuration.native_session_source = ArchitectNativeSessionSource::Claude {
+            native_session_id: TEST_NATIVE_SESSION_ID.into(),
+        };
+        validate_bridge_configuration(&fixture.configuration).unwrap();
+        assert_eq!(
+            discover_architect_native_session(&fixture.configuration).unwrap(),
+            TEST_NATIVE_SESSION_ID
+        );
+
+        fixture.configuration.native_session_source = ArchitectNativeSessionSource::Claude {
+            native_session_id: "NOT-A-UUID".into(),
+        };
+        assert!(validate_bridge_configuration(&fixture.configuration).is_err());
+    }
+
+    #[test]
     fn bounded_line_reader_rejects_partial_or_oversize_frames() {
         let mut valid = BufReader::new(b"{\"jsonrpc\":\"2.0\"}\n".as_slice());
         assert!(read_bounded_line(&mut valid).unwrap().is_some());
@@ -1759,7 +1806,7 @@ mod tests {
             relay_socket_path: relay_root.join(RELAY_SOCKET_NAME),
             registration_socket_path: run_root.join("registration.sock"),
             control_socket_path: run_root.join("control.sock"),
-            codex_home,
+            native_session_source: ArchitectNativeSessionSource::Codex { codex_home },
             relay_executable: executable,
             relay_runtime_scope_hash: relay_runtime_scope_hash(&relay_root).unwrap(),
             developer_adapter: "codex-developer-0.145.0".into(),

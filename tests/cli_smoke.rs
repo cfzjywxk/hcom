@@ -433,6 +433,9 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     let (code, stdout, stderr) = h.run(["architect", "--help"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     assert!(stdout.contains("hcom architect codex"), "stdout={stdout}");
+    assert!(stdout.contains("hcom architect claude"), "stdout={stdout}");
+    assert!(stdout.contains("gpt-5.6-sol/xhigh"), "stdout={stdout}");
+    assert!(stdout.contains("Claude opus/xhigh"), "stdout={stdout}");
     assert!(!stdout.contains("--repo"), "stdout={stdout}");
     assert!(!stdout.contains("--project"), "stdout={stdout}");
     assert!(stdout.contains("session-task tools"), "stdout={stdout}");
@@ -463,6 +466,7 @@ fn architect_help_does_not_read_or_repair_malformed_v24_state() {
     let (code, stdout, stderr) = h.run(["architect", "--help"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     assert!(stdout.contains("hcom architect codex"), "stdout={stdout}");
+    assert!(stdout.contains("hcom architect claude"), "stdout={stdout}");
     assert_eq!(
         std::fs::read(&db_path).unwrap(),
         malformed,
@@ -489,13 +493,15 @@ fn architect_rejects_the_removed_repository_argument() {
 #[test]
 fn architect_refuses_pipe_stdio_before_opening_either_state_lane() {
     let h = Hcom::new();
-    let (code, stdout, stderr) = h.run(["architect", "codex"]);
-    assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
-    assert!(stdout.is_empty(), "stdout={stdout}");
-    assert!(
-        stderr.contains("requires stdin/stdout/stderr on a real terminal"),
-        "stderr={stderr}"
-    );
+    for adapter in ["codex", "claude"] {
+        let (code, stdout, stderr) = h.run(["architect", adapter]);
+        assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
+        assert!(stdout.is_empty(), "stdout={stdout}");
+        assert!(
+            stderr.contains("requires stdin/stdout/stderr on a real terminal"),
+            "stderr={stderr}"
+        );
+    }
     assert!(!h.path().join("hcom.db").exists());
     assert!(
         !h.root_path()

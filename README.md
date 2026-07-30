@@ -94,15 +94,22 @@ hcom
 
 ## Foreground architect
 
-`hcom architect` runs one blank interactive Codex architect and an in-memory,
-ordered task supervisor. Each approved task gets a fresh no-TUI developer and
-reviewer; Codex or Claude can be selected independently for either role.
-Same-task review changes resume only that task's exact native sessions.
+`hcom architect` runs one blank interactive Codex or Claude architect and an
+in-memory, ordered task supervisor. Each approved task gets a fresh no-TUI
+developer and reviewer; Codex or Claude can be selected independently for
+either role. Same-task review changes resume only that task's exact native
+sessions.
 
 ```bash
 cd /path/to/project
 hcom architect codex
+# or: hcom architect claude
 ```
+
+Codex defaults to `gpt-5.6-sol` with `xhigh` reasoning; Claude defaults to
+`opus` with `xhigh` effort. Unless `[architect.reviewer]` is configured
+explicitly, the reviewer follows the selected architect adapter and those
+effective model/effort settings.
 
 The exact current directory is the project context and remains the native
 working directory for the Architect and every Codex/Claude task worker. It

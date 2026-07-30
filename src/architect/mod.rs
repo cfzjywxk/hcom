@@ -35,24 +35,31 @@ pub fn help_text() -> &'static str {
     r#"Usage:
   cd <project-directory>
   hcom architect codex [architect-profile-options]
+  hcom architect claude [architect-profile-options]
 
-Launch one blank, foreground Codex architect with capability-bound in-memory
-session-task tools. The invocation's exact current directory is the project
-context seen by the Architect and every task worker. It does not need to be a
-Git repository.
+Launch one blank, foreground Codex or Claude architect with capability-bound
+in-memory session-task tools. The invocation's exact current directory is the
+project context seen by the Architect and every task worker. It does not need
+to be a Git repository.
 
 Profile configuration is read once from $HCOM_DIR/config.toml (default:
 ~/.hcom/config.toml):
-  [architect.profile]    interactive Codex architect
+  [architect.profile]    interactive architect selected by the command
   [architect.developer]  fresh per-task Codex or Claude developer
   [architect.reviewer]   fresh per-task Codex or Claude reviewer
 
 Architect CLI overrides (higher priority than TOML):
   --model <model>
-  --reasoning <none|minimal|low|medium|high|xhigh|max>
-  --sandbox <read-only|workspace-write|danger-full-access>
-  --approval <untrusted|on-request|never>
+  Codex:  --reasoning <none|minimal|low|medium|high|xhigh|max>
+          --sandbox <read-only|workspace-write|danger-full-access>
+          --approval <untrusted|on-request|never>
   --ask-for-approval is an alias for --approval
+  Claude: --effort <low|medium|high|xhigh|max>
+
+Built-in defaults are Codex gpt-5.6-sol/xhigh or Claude opus/xhigh. When
+[architect.reviewer] is absent, the reviewer uses the selected architect
+adapter and the same effective model and reasoning/effort. An explicit
+[architect.reviewer] table takes priority.
 
 Only typed profile fields are accepted; arbitrary native argv is not. The
 effective sanitized profiles and their SHA-256 hash are printed at startup and

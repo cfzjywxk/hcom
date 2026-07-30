@@ -8,10 +8,37 @@ pub const CODEX_DEVELOPER_ADAPTER: &str = "codex-developer-0.145.0";
 pub const CLAUDE_DEVELOPER_ADAPTER: &str = "claude-developer-2.1.220";
 pub const CODEX_REVIEWER_ADAPTER: &str = "codex-reviewer-0.145.0";
 pub const CLAUDE_REVIEWER_ADAPTER: &str = "claude-reviewer-2.1.220";
+pub const CODEX_ARCHITECT_ADAPTER: &str = "codex-0.145.0";
+pub const CLAUDE_ARCHITECT_ADAPTER: &str = "claude-2.1.220";
 
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
-const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-5";
-const DEFAULT_REASONING: &str = "high";
+const DEFAULT_CLAUDE_DEVELOPER_MODEL: &str = "claude-opus-5";
+const DEFAULT_CLAUDE_ARCHITECT_MODEL: &str = "opus";
+const DEFAULT_DEVELOPER_REASONING: &str = "high";
+const DEFAULT_ARCHITECT_REASONING: &str = "xhigh";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchitectAdapter {
+    Codex,
+    Claude,
+}
+
+impl ArchitectAdapter {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "codex" => Ok(Self::Codex),
+            "claude" => Ok(Self::Claude),
+            _ => bail!("session architect adapter must be codex or claude"),
+        }
+    }
+
+    pub fn contract_name(self) -> &'static str {
+        match self {
+            Self::Codex => CODEX_ARCHITECT_ADAPTER,
+            Self::Claude => CLAUDE_ARCHITECT_ADAPTER,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -63,7 +90,7 @@ impl CodexInvocationProfile {
     pub fn architect_default() -> Self {
         Self {
             model: DEFAULT_CODEX_MODEL.into(),
-            reasoning_effort: DEFAULT_REASONING.into(),
+            reasoning_effort: DEFAULT_ARCHITECT_REASONING.into(),
             sandbox: CodexSandbox::ReadOnly,
             approval_policy: CodexApprovalPolicy::Never,
         }
@@ -72,7 +99,7 @@ impl CodexInvocationProfile {
     pub fn developer_default() -> Self {
         Self {
             model: DEFAULT_CODEX_MODEL.into(),
-            reasoning_effort: DEFAULT_REASONING.into(),
+            reasoning_effort: DEFAULT_DEVELOPER_REASONING.into(),
             sandbox: CodexSandbox::DangerFullAccess,
             approval_policy: CodexApprovalPolicy::Never,
         }
@@ -81,7 +108,7 @@ impl CodexInvocationProfile {
     pub fn reviewer_default() -> Self {
         Self {
             model: DEFAULT_CODEX_MODEL.into(),
-            reasoning_effort: DEFAULT_REASONING.into(),
+            reasoning_effort: DEFAULT_ARCHITECT_REASONING.into(),
             sandbox: CodexSandbox::DangerFullAccess,
             approval_policy: CodexApprovalPolicy::Never,
         }
@@ -126,16 +153,24 @@ pub struct ClaudeInvocationProfile {
 }
 
 impl ClaudeInvocationProfile {
+    pub fn architect_default() -> Self {
+        Self {
+            model: DEFAULT_CLAUDE_ARCHITECT_MODEL.into(),
+            effort: DEFAULT_ARCHITECT_REASONING.into(),
+            dangerously_skip_permissions: true,
+        }
+    }
+
     pub fn developer_default() -> Self {
         Self {
-            model: DEFAULT_CLAUDE_MODEL.into(),
-            effort: DEFAULT_REASONING.into(),
+            model: DEFAULT_CLAUDE_DEVELOPER_MODEL.into(),
+            effort: DEFAULT_DEVELOPER_REASONING.into(),
             dangerously_skip_permissions: true,
         }
     }
 
     pub fn reviewer_default() -> Self {
-        Self::developer_default()
+        Self::architect_default()
     }
 
     pub fn validate(&self, label: &str) -> Result<()> {
@@ -156,6 +191,49 @@ impl ClaudeInvocationProfile {
             "default-permissions"
         };
         format!("native={native};outer={outer}")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "adapter", rename_all = "lowercase", deny_unknown_fields)]
+pub enum ArchitectInvocationProfile {
+    Codex {
+        #[serde(flatten)]
+        profile: CodexInvocationProfile,
+    },
+    Claude {
+        #[serde(flatten)]
+        profile: ClaudeInvocationProfile,
+    },
+}
+
+impl ArchitectInvocationProfile {
+    pub fn adapter(&self) -> ArchitectAdapter {
+        match self {
+            Self::Codex { .. } => ArchitectAdapter::Codex,
+            Self::Claude { .. } => ArchitectAdapter::Claude,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::Codex { profile } => profile.validate("Codex architect"),
+            Self::Claude { profile } => profile.validate("Claude architect"),
+        }
+    }
+
+    pub fn codex(&self) -> Option<&CodexInvocationProfile> {
+        match self {
+            Self::Codex { profile } => Some(profile),
+            Self::Claude { .. } => None,
+        }
+    }
+
+    pub fn claude(&self) -> Option<&ClaudeInvocationProfile> {
+        match self {
+            Self::Claude { profile } => Some(profile),
+            Self::Codex { .. } => None,
+        }
     }
 }
 
@@ -272,14 +350,51 @@ impl Default for ReviewerInvocationProfile {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SessionInvocationProfiles {
-    pub architect: CodexInvocationProfile,
+    pub architect: ArchitectInvocationProfile,
     pub developer: DeveloperInvocationProfile,
     pub reviewer: ReviewerInvocationProfile,
 }
 
 impl SessionInvocationProfiles {
+    pub fn for_architect(adapter: ArchitectAdapter) -> Self {
+        let architect = match adapter {
+            ArchitectAdapter::Codex => ArchitectInvocationProfile::Codex {
+                profile: CodexInvocationProfile::architect_default(),
+            },
+            ArchitectAdapter::Claude => ArchitectInvocationProfile::Claude {
+                profile: ClaudeInvocationProfile::architect_default(),
+            },
+        };
+        let mut profiles = Self {
+            architect,
+            developer: DeveloperInvocationProfile::default(),
+            reviewer: ReviewerInvocationProfile::default(),
+        };
+        profiles.inherit_reviewer_from_architect();
+        profiles
+    }
+
+    pub fn inherit_reviewer_from_architect(&mut self) {
+        self.reviewer = match &self.architect {
+            ArchitectInvocationProfile::Codex { profile } => {
+                let mut reviewer = CodexInvocationProfile::reviewer_default();
+                reviewer.model.clone_from(&profile.model);
+                reviewer
+                    .reasoning_effort
+                    .clone_from(&profile.reasoning_effort);
+                ReviewerInvocationProfile::Codex { profile: reviewer }
+            }
+            ArchitectInvocationProfile::Claude { profile } => {
+                let mut reviewer = ClaudeInvocationProfile::reviewer_default();
+                reviewer.model.clone_from(&profile.model);
+                reviewer.effort.clone_from(&profile.effort);
+                ReviewerInvocationProfile::Claude { profile: reviewer }
+            }
+        };
+    }
+
     pub fn validate(&self) -> Result<()> {
-        self.architect.validate("architect")?;
+        self.architect.validate()?;
         self.developer.validate()?;
         self.reviewer.validate()
     }
@@ -293,7 +408,7 @@ impl SessionInvocationProfiles {
     }
 
     pub fn canonical_hash(&self) -> String {
-        let encoded = serde_json::to_vec(&("hcom-session-invocation-profiles-v2", self))
+        let encoded = serde_json::to_vec(&("hcom-session-invocation-profiles-v3", self))
             .expect("typed invocation profiles are serializable");
         let digest = Sha256::digest(encoded);
         let mut output = String::with_capacity(digest.len() * 2);
@@ -307,11 +422,7 @@ impl SessionInvocationProfiles {
 
 impl Default for SessionInvocationProfiles {
     fn default() -> Self {
-        Self {
-            architect: CodexInvocationProfile::architect_default(),
-            developer: DeveloperInvocationProfile::default(),
-            reviewer: ReviewerInvocationProfile::default(),
-        }
+        Self::for_architect(ArchitectAdapter::Codex)
     }
 }
 
@@ -360,21 +471,33 @@ mod tests {
     fn defaults_preserve_reviewed_outer_safety_and_native_profiles() {
         let profiles = SessionInvocationProfiles::default();
         profiles.validate().unwrap();
-        assert_eq!(profiles.architect.sandbox, CodexSandbox::ReadOnly);
+        let architect = profiles.architect.codex().unwrap();
+        assert_eq!(architect.model, "gpt-5.6-sol");
+        assert_eq!(architect.reasoning_effort, "xhigh");
+        assert_eq!(architect.sandbox, CodexSandbox::ReadOnly);
         assert_eq!(
             profiles.developer.codex().unwrap().sandbox,
             CodexSandbox::DangerFullAccess
         );
         assert_eq!(profiles.developer_adapter_name(), CODEX_DEVELOPER_ADAPTER);
-        assert_eq!(profiles.reviewer_adapter_name(), CLAUDE_REVIEWER_ADAPTER);
-        assert!(
-            profiles
-                .reviewer
-                .claude()
-                .unwrap()
-                .dangerously_skip_permissions
-        );
+        assert_eq!(profiles.reviewer_adapter_name(), CODEX_REVIEWER_ADAPTER);
+        let reviewer = profiles.reviewer.codex().unwrap();
+        assert_eq!(reviewer.model, architect.model);
+        assert_eq!(reviewer.reasoning_effort, architect.reasoning_effort);
         assert_eq!(profiles.canonical_hash().len(), 64);
+    }
+
+    #[test]
+    fn claude_architect_defaults_to_opus_xhigh_with_matching_reviewer() {
+        let profiles = SessionInvocationProfiles::for_architect(ArchitectAdapter::Claude);
+        profiles.validate().unwrap();
+        let architect = profiles.architect.claude().unwrap();
+        let reviewer = profiles.reviewer.claude().unwrap();
+        assert_eq!(architect.model, "opus");
+        assert_eq!(architect.effort, "xhigh");
+        assert_eq!(reviewer.model, architect.model);
+        assert_eq!(reviewer.effort, architect.effort);
+        assert!(reviewer.dangerously_skip_permissions);
     }
 
     #[test]

@@ -17,9 +17,11 @@ use crate::worker::codex::{
     DISABLED_CODEX_FEATURES,
 };
 use crate::worker::profile::{
-    CodexApprovalPolicy, CodexInvocationProfile, CodexSandbox, DeveloperInvocationProfile,
-    ReviewerInvocationProfile, SessionInvocationProfiles, validate_cli_help_contract,
+    ArchitectAdapter, ArchitectInvocationProfile, CodexApprovalPolicy, CodexSandbox,
+    DeveloperInvocationProfile, ReviewerInvocationProfile, SessionInvocationProfiles,
+    validate_cli_help_contract,
 };
+use crate::worker::reviewer::{CLAUDE_REVIEWER_CLI_VERSION, CLAUDE_REVIEWER_EXECUTABLE};
 use crate::worker::sandbox::{HostRootContract, HostRootMounts};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -59,6 +61,9 @@ struct ArchitectArgs {
     reasoning: Option<String>,
 
     #[arg(long)]
+    effort: Option<String>,
+
+    #[arg(long)]
     sandbox: Option<String>,
 
     #[arg(long, visible_alias = "ask-for-approval")]
@@ -77,15 +82,17 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
     let args = ArchitectArgs::try_parse_from(
         std::iter::once("hcom architect".to_owned()).chain(argv.iter().skip(1).cloned()),
     )?;
+    let architect_adapter = ArchitectAdapter::parse(&args.adapter)?;
     let mut loaded = match config_path {
-        Some(path) => load_invocation_profiles(path)?,
+        Some(path) => load_invocation_profiles(path, architect_adapter)?,
         None => LoadedInvocationProfiles {
-            profiles: SessionInvocationProfiles::default(),
+            profiles: SessionInvocationProfiles::for_architect(architect_adapter),
             config_path: PathBuf::from("<built-in defaults>"),
             loaded_from_file: false,
+            reviewer_explicit: false,
         },
     };
-    apply_architect_cli_overrides(&args, &mut loaded.profiles)?;
+    apply_architect_cli_overrides(&args, &mut loaded.profiles, loaded.reviewer_explicit)?;
     validate_foreground_terminal()?;
 
     let project_root = canonical_project_directory(&std::env::current_dir()?)?;
@@ -149,22 +156,27 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
     }
     let registration_client = RegistrationClient::new(control_paths.registration_socket_path());
     validate_supervisor_sockets(&control_paths)?;
-    let tools = ExactTools::discover()?;
+    let tools = ExactTools::discover(architect_adapter)?;
     let launch_id = random_hex(16)?;
     let binding_id = format!("architect-{launch_id}");
     let architect_name = format!("architect-{launch_id}");
     let launch_nonce = random_hex(32)?;
     let capability = random_hex(32)?;
-    let paths = ArchitectLaunchPaths::create(&control_paths, &launch_id)?;
+    let paths = ArchitectLaunchPaths::create(&control_paths, &launch_id, architect_adapter)?;
     validate_path_isolation(&project_root, &paths, &tools)?;
-    let auth_source = PrivateFileIdentity::capture(&discover_codex_auth_source()?)?;
+    let auth_source =
+        PrivateFileIdentity::capture(&discover_architect_auth_source(architect_adapter)?)?;
     if paths_overlap(auth_source.path(), &paths.state)
         || paths_overlap(auth_source.path(), &paths.runtime)
     {
-        bail!("Codex auth source overlaps architect writable state");
+        bail!("native architect auth source overlaps architect writable state");
     }
     create_empty_private_file(&paths.auth_target)?;
-    write_isolated_codex_config(&paths, &tools.component.canonical_path)?;
+    if architect_adapter == ArchitectAdapter::Codex {
+        write_isolated_codex_config(&paths, &tools.component.canonical_path)?;
+    }
+    let preassigned_native_session_id =
+        (architect_adapter == ArchitectAdapter::Claude).then(|| uuid::Uuid::new_v4().to_string());
 
     let process_birth = process_birth_identity(std::process::id())?;
     let relay_contract_hash = sha256_hex(&serde_json::to_vec(&tools.component)?);
@@ -176,7 +188,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
             binding_id: binding_id.clone(),
             project_root: path_text("architect project directory", &project_root)?.into(),
             architect_name,
-            architect_adapter: "codex-0.145.0".into(),
+            architect_adapter: architect_adapter.contract_name().into(),
             launch_nonce: launch_nonce.clone(),
             capability: capability.clone(),
             actions: ActionName::ARCHITECT.into_iter().collect(),
@@ -237,7 +249,14 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         relay_socket_path: paths.relay_socket.clone(),
         registration_socket_path: control_paths.registration_socket_path(),
         control_socket_path: control_paths.socket_path(),
-        codex_home: paths.codex_home.clone(),
+        native_session_source: match &preassigned_native_session_id {
+            Some(native_session_id) => super::bridge::ArchitectNativeSessionSource::Claude {
+                native_session_id: native_session_id.clone(),
+            },
+            None => super::bridge::ArchitectNativeSessionSource::Codex {
+                codex_home: paths.native_config.clone(),
+            },
+        },
         relay_executable: tools.component.clone(),
         relay_runtime_scope_hash: relay_scope_hash.clone(),
         developer_adapter: loaded.profiles.developer_adapter_name().into(),
@@ -258,6 +277,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         project_root: project_root.clone(),
         paths: paths.clone(),
         auth_source,
+        adapter: architect_adapter,
         host_runtime: native_environment.runtime_home.clone(),
         host_root: HostRootContract::capture(
             &native_environment.cargo_bin_source,
@@ -269,6 +289,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         &sandbox,
         &native_environment,
         &loaded.profiles.architect,
+        preassigned_native_session_id.as_deref(),
     ) {
         Ok(spawned) => spawned,
         Err(error) => {
@@ -458,37 +479,62 @@ impl Drop for SessionSupervisorThread {
 fn apply_architect_cli_overrides(
     args: &ArchitectArgs,
     profiles: &mut SessionInvocationProfiles,
+    reviewer_explicit: bool,
 ) -> Result<()> {
-    if args.adapter != "codex" {
-        bail!("session architect enables only the codex adapter");
+    let adapter = ArchitectAdapter::parse(&args.adapter)?;
+    if profiles.architect.adapter() != adapter {
+        bail!("configured architect profile differs from the selected adapter");
     }
-    if let Some(model) = &args.model {
-        profiles.architect.model.clone_from(model);
-    }
-    if let Some(reasoning) = &args.reasoning {
-        profiles.architect.reasoning_effort.clone_from(reasoning);
-    }
-    if let Some(sandbox) = &args.sandbox {
-        profiles.architect.sandbox = match sandbox.as_str() {
-            "read-only" => CodexSandbox::ReadOnly,
-            "workspace-write" => CodexSandbox::WorkspaceWrite,
-            "danger-full-access" => CodexSandbox::DangerFullAccess,
-            _ => {
+    match &mut profiles.architect {
+        ArchitectInvocationProfile::Codex { profile } => {
+            if args.effort.is_some() {
+                bail!("architect --effort is available only with the claude adapter");
+            }
+            if let Some(model) = &args.model {
+                profile.model.clone_from(model);
+            }
+            if let Some(reasoning) = &args.reasoning {
+                profile.reasoning_effort.clone_from(reasoning);
+            }
+            if let Some(sandbox) = &args.sandbox {
+                profile.sandbox = match sandbox.as_str() {
+                    "read-only" => CodexSandbox::ReadOnly,
+                    "workspace-write" => CodexSandbox::WorkspaceWrite,
+                    "danger-full-access" => CodexSandbox::DangerFullAccess,
+                    _ => {
+                        bail!(
+                            "architect --sandbox must be read-only, workspace-write, or danger-full-access"
+                        )
+                    }
+                };
+            }
+            if let Some(approval) = &args.approval {
+                profile.approval_policy = match approval.as_str() {
+                    "untrusted" => CodexApprovalPolicy::Untrusted,
+                    "on-request" => CodexApprovalPolicy::OnRequest,
+                    "never" => CodexApprovalPolicy::Never,
+                    _ => {
+                        bail!("architect --approval must be untrusted, on-request, or never")
+                    }
+                };
+            }
+        }
+        ArchitectInvocationProfile::Claude { profile } => {
+            if args.reasoning.is_some() || args.sandbox.is_some() || args.approval.is_some() {
                 bail!(
-                    "architect --sandbox must be read-only, workspace-write, or danger-full-access"
-                )
+                    "architect --reasoning, --sandbox, and --approval are available only with the codex adapter"
+                );
             }
-        };
+            if let Some(model) = &args.model {
+                profile.model.clone_from(model);
+            }
+            if let Some(effort) = &args.effort {
+                profile.effort.clone_from(effort);
+            }
+        }
     }
-    if let Some(approval) = &args.approval {
-        profiles.architect.approval_policy = match approval.as_str() {
-            "untrusted" => CodexApprovalPolicy::Untrusted,
-            "on-request" => CodexApprovalPolicy::OnRequest,
-            "never" => CodexApprovalPolicy::Never,
-            _ => {
-                bail!("architect --approval must be untrusted, on-request, or never")
-            }
-        };
+    if !reviewer_explicit {
+        profiles.inherit_reviewer_from_architect();
     }
     profiles.validate()
 }
@@ -497,14 +543,21 @@ fn write_profile_summary(
     output: &mut impl Write,
     profiles: &SessionInvocationProfiles,
 ) -> Result<()> {
-    writeln!(
-        output,
-        "architect profile: codex model={} reasoning={} sandbox={} approval={}",
-        profiles.architect.model,
-        profiles.architect.reasoning_effort,
-        profiles.architect.sandbox.as_str(),
-        profiles.architect.approval_policy.as_str()
-    )?;
+    match &profiles.architect {
+        ArchitectInvocationProfile::Codex { profile } => writeln!(
+            output,
+            "architect profile: codex model={} reasoning={} sandbox={} approval={}",
+            profile.model,
+            profile.reasoning_effort,
+            profile.sandbox.as_str(),
+            profile.approval_policy.as_str()
+        )?,
+        ArchitectInvocationProfile::Claude { profile } => writeln!(
+            output,
+            "architect profile: claude model={} effort={} dangerously_skip_permissions={}",
+            profile.model, profile.effort, profile.dangerously_skip_permissions
+        )?,
+    }
     match &profiles.developer {
         DeveloperInvocationProfile::Codex { profile } => writeln!(
             output,
@@ -591,30 +644,67 @@ fn validate_supervisor_sockets(paths: &ControlPaths) -> Result<()> {
 }
 
 struct ExactTools {
-    codex: ExecutableIdentity,
+    architect: ExactArchitectTool,
     bwrap: ExecutableIdentity,
     component: ExecutableIdentity,
 }
 
+enum ExactArchitectTool {
+    Codex(ExecutableIdentity),
+    Claude(ExecutableIdentity),
+}
+
+impl ExactArchitectTool {
+    fn executable(&self) -> &ExecutableIdentity {
+        match self {
+            Self::Codex(executable) | Self::Claude(executable) => executable,
+        }
+    }
+
+    fn revalidate(&self) -> Result<()> {
+        match self {
+            Self::Codex(executable) => {
+                revalidate_exact_tool(executable, CODEX_DEVELOPER_CLI_VERSION)
+            }
+            Self::Claude(executable) => {
+                revalidate_exact_tool(executable, CLAUDE_REVIEWER_CLI_VERSION)
+            }
+        }
+    }
+}
+
 impl ExactTools {
-    fn discover() -> Result<Self> {
-        let codex = capture_exact_tool(
-            Path::new(CODEX_DEVELOPER_EXECUTABLE),
-            CODEX_DEVELOPER_CLI_VERSION,
-        )?;
-        validate_architect_codex_cli(&codex.canonical_path)?;
+    fn discover(adapter: ArchitectAdapter) -> Result<Self> {
+        let architect = match adapter {
+            ArchitectAdapter::Codex => {
+                let executable = capture_exact_tool(
+                    Path::new(CODEX_DEVELOPER_EXECUTABLE),
+                    CODEX_DEVELOPER_CLI_VERSION,
+                )?;
+                validate_architect_codex_cli(&executable.canonical_path)?;
+                ExactArchitectTool::Codex(executable)
+            }
+            ArchitectAdapter::Claude => {
+                let executable = capture_exact_tool(
+                    Path::new(CLAUDE_REVIEWER_EXECUTABLE),
+                    CLAUDE_REVIEWER_CLI_VERSION,
+                )?;
+                validate_architect_claude_cli(&executable.canonical_path)?;
+                ExactArchitectTool::Claude(executable)
+            }
+        };
         let bwrap = capture_exact_tool(Path::new(BWRAP_EXECUTABLE), BWRAP_VERSION)?;
         let component_path = resolve_component_path()?;
         let component = ExecutableIdentity::capture(component_path)?;
         Ok(Self {
-            codex,
+            architect,
             bwrap,
             component,
         })
     }
 
     fn revalidate(&self) -> Result<()> {
-        revalidate_exact_tool(&self.codex, CODEX_DEVELOPER_CLI_VERSION)?;
+        self.architect.revalidate()?;
         revalidate_exact_tool(&self.bwrap, BWRAP_VERSION)?;
         self.component.revalidate()
     }
@@ -655,6 +745,40 @@ fn validate_architect_codex_cli(path: &Path) -> Result<()> {
         if !help.contains(value) {
             bail!("architect Codex CLI help omitted configured value {value}");
         }
+    }
+    Ok(())
+}
+
+fn validate_architect_claude_cli(path: &Path) -> Result<()> {
+    let output = Command::new(path)
+        .arg("--help")
+        .env_clear()
+        .output()
+        .context("failed to query architect Claude CLI capabilities")?;
+    if !output.status.success() || !output.stderr.is_empty() || output.stdout.len() > 128 * 1024 {
+        bail!("architect Claude CLI capability probe failed");
+    }
+    validate_cli_help_contract(
+        "architect Claude CLI",
+        &output.stdout,
+        &[
+            "--model",
+            "--effort",
+            "--session-id",
+            "--name",
+            "--tools",
+            "--setting-sources",
+            "--strict-mcp-config",
+            "--mcp-config",
+            "--disable-slash-commands",
+            "--prompt-suggestions",
+            "--no-chrome",
+            "--dangerously-skip-permissions",
+        ],
+    )?;
+    let help = std::str::from_utf8(&output.stdout)?;
+    if !help.contains("(low, medium, high, xhigh, max)") || !help.contains("'opus'") {
+        bail!("architect Claude CLI help omitted the default effort or model alias");
     }
     Ok(())
 }
@@ -719,15 +843,19 @@ fn revalidate_exact_tool(identity: &ExecutableIdentity, expected_version: &str) 
 struct ArchitectLaunchPaths {
     state: PathBuf,
     home: PathBuf,
-    codex_home: PathBuf,
+    native_config: PathBuf,
+    xdg_config: PathBuf,
+    xdg_state: PathBuf,
+    xdg_cache: PathBuf,
+    xdg_data: PathBuf,
     runtime: PathBuf,
     relay_socket: PathBuf,
     auth_target: PathBuf,
-    config_file: PathBuf,
+    codex_config_file: Option<PathBuf>,
 }
 
 impl ArchitectLaunchPaths {
-    fn create(control: &ControlPaths, launch_id: &str) -> Result<Self> {
+    fn create(control: &ControlPaths, launch_id: &str, adapter: ArchitectAdapter) -> Result<Self> {
         let state_parent = control.architect_state_root_path();
         let runtime_parent = control.architect_runtime_root_path();
         ensure_private_directory(&state_parent, true)?;
@@ -737,17 +865,36 @@ impl ArchitectLaunchPaths {
         ensure_private_directory(&state, false)?;
         ensure_private_directory(&runtime, false)?;
         let home = state.join("home");
-        let codex_home = home.join(".codex");
         ensure_private_directory(&home, false)?;
-        ensure_private_directory(&codex_home, false)?;
+        let native_config = home.join(match adapter {
+            ArchitectAdapter::Codex => ".codex",
+            ArchitectAdapter::Claude => ".claude",
+        });
+        ensure_private_directory(&native_config, false)?;
+        let xdg_config = state.join("xdg-config");
+        let xdg_state = state.join("xdg-state");
+        let xdg_cache = state.join("xdg-cache");
+        let xdg_data = state.join("xdg-data");
+        for directory in [&xdg_config, &xdg_state, &xdg_cache, &xdg_data] {
+            ensure_private_directory(directory, false)?;
+        }
+        let auth_target = native_config.join(match adapter {
+            ArchitectAdapter::Codex => "auth.json",
+            ArchitectAdapter::Claude => ".credentials.json",
+        });
         Ok(Self {
             state,
             home,
-            codex_home: codex_home.clone(),
+            native_config: native_config.clone(),
+            xdg_config,
+            xdg_state,
+            xdg_cache,
+            xdg_data,
             runtime: runtime.clone(),
             relay_socket: runtime.join("relay.sock"),
-            auth_target: codex_home.join("auth.json"),
-            config_file: codex_home.join("config.toml"),
+            auth_target,
+            codex_config_file: (adapter == ArchitectAdapter::Codex)
+                .then(|| native_config.join("config.toml")),
         })
     }
 }
@@ -777,17 +924,27 @@ fn ensure_private_directory(path: &Path, allow_existing: bool) -> Result<()> {
     Ok(())
 }
 
-fn discover_codex_auth_source() -> Result<PathBuf> {
-    let base = match std::env::var_os("CODEX_HOME") {
-        Some(path) => PathBuf::from(path),
-        None => dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("home directory is unavailable"))?
-            .join(".codex"),
+fn discover_architect_auth_source(adapter: ArchitectAdapter) -> Result<PathBuf> {
+    let (override_name, default_directory, filename, label) = match adapter {
+        ArchitectAdapter::Codex => ("CODEX_HOME", ".codex", "auth.json", "Codex"),
+        ArchitectAdapter::Claude => (
+            "CLAUDE_CONFIG_DIR",
+            ".claude",
+            ".credentials.json",
+            "Claude",
+        ),
     };
-    let source = base.join("auth.json");
-    let canonical = fs::canonicalize(&source).context("Codex auth.json is unavailable")?;
+    let base = match std::env::var_os(override_name) {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        _ => dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("home directory is unavailable"))?
+            .join(default_directory),
+    };
+    let source = base.join(filename);
+    let canonical = fs::canonicalize(&source)
+        .with_context(|| format!("{label} architect credential is unavailable"))?;
     if canonical != source {
-        bail!("Codex auth source must already be canonical");
+        bail!("{label} architect credential must already be canonical");
     }
     Ok(canonical)
 }
@@ -811,11 +968,11 @@ impl PrivateFileIdentity {
     fn capture(path: &Path) -> Result<Self> {
         let link = fs::symlink_metadata(path)?;
         if link.file_type().is_symlink() || !link.is_file() {
-            bail!("Codex auth source must be a regular non-symlink file");
+            bail!("native architect auth source must be a regular non-symlink file");
         }
         let canonical = fs::canonicalize(path)?;
         if canonical != path {
-            bail!("Codex auth source must already be canonical");
+            bail!("native architect auth source must already be canonical");
         }
         let file = OpenOptions::new()
             .read(true)
@@ -823,7 +980,7 @@ impl PrivateFileIdentity {
             .open(path)?;
         let metadata = file.metadata()?;
         if metadata.dev() != link.dev() || metadata.ino() != link.ino() {
-            bail!("Codex auth source changed while it was opened");
+            bail!("native architect auth source changed while it was opened");
         }
         let identity = Self {
             path: canonical,
@@ -844,7 +1001,7 @@ impl PrivateFileIdentity {
             || identity.mode & 0o600 != 0o600
             || identity.links != 1
         {
-            bail!("Codex auth source must be a private current-user file");
+            bail!("native architect auth source must be a private current-user file");
         }
         Ok(identity)
     }
@@ -855,7 +1012,7 @@ impl PrivateFileIdentity {
 
     fn revalidate(&self) -> Result<()> {
         if Self::capture(&self.path)? != *self {
-            bail!("Codex auth source identity drifted before architect launch");
+            bail!("native architect auth source identity drifted before architect launch");
         }
         Ok(())
     }
@@ -933,7 +1090,12 @@ fn write_isolated_codex_config(paths: &ArchitectLaunchPaths, component: &Path) -
         .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&paths.config_file)?;
+        .open(
+            paths
+                .codex_config_file
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Codex config target is unavailable"))?,
+        )?;
     file.write_all(&bytes)?;
     file.sync_all()?;
     drop(file);
@@ -941,7 +1103,12 @@ fn write_isolated_codex_config(paths: &ArchitectLaunchPaths, component: &Path) -
     if parsed != config {
         bail!("isolated Codex config failed its exact round trip");
     }
-    let metadata = fs::symlink_metadata(&paths.config_file)?;
+    let metadata = fs::symlink_metadata(
+        paths
+            .codex_config_file
+            .as_ref()
+            .expect("validated Codex config target"),
+    )?;
     if metadata.permissions().mode() & 0o777 != 0o600 {
         bail!("isolated Codex config mode drifted");
     }
@@ -967,7 +1134,7 @@ fn validate_path_isolation(
         }
     }
     for executable in [
-        &tools.codex.canonical_path,
+        &tools.architect.executable().canonical_path,
         &tools.bwrap.canonical_path,
         &tools.component.canonical_path,
     ] {
@@ -1081,7 +1248,11 @@ impl ArchitectEnvironment {
         })
     }
 
-    fn sandbox_values(&self, paths: &ArchitectLaunchPaths) -> Result<BTreeMap<String, String>> {
+    fn sandbox_values(
+        &self,
+        paths: &ArchitectLaunchPaths,
+        adapter: ArchitectAdapter,
+    ) -> Result<BTreeMap<String, String>> {
         let mut values = self.values.clone();
         let home = self
             .control_environment
@@ -1089,10 +1260,52 @@ impl ArchitectEnvironment {
             .ok_or_else(|| anyhow::anyhow!("architect parent HOME disappeared"))?
             .clone();
         values.insert("HOME".into(), home);
-        values.insert(
-            "CODEX_HOME".into(),
-            path_text("architect isolated Codex home", &paths.codex_home)?.into(),
-        );
+        match adapter {
+            ArchitectAdapter::Codex => {
+                values.insert(
+                    "CODEX_HOME".into(),
+                    path_text("architect isolated Codex home", &paths.native_config)?.into(),
+                );
+            }
+            ArchitectAdapter::Claude => {
+                values.insert(
+                    "CLAUDE_CONFIG_DIR".into(),
+                    path_text("architect isolated Claude config", &paths.native_config)?.into(),
+                );
+                for (name, label, path) in [
+                    (
+                        "XDG_CONFIG_HOME",
+                        "architect isolated XDG config",
+                        &paths.xdg_config,
+                    ),
+                    (
+                        "XDG_STATE_HOME",
+                        "architect isolated XDG state",
+                        &paths.xdg_state,
+                    ),
+                    (
+                        "XDG_CACHE_HOME",
+                        "architect isolated XDG cache",
+                        &paths.xdg_cache,
+                    ),
+                    (
+                        "XDG_DATA_HOME",
+                        "architect isolated XDG data",
+                        &paths.xdg_data,
+                    ),
+                ] {
+                    values.insert(name.into(), path_text(label, path)?.into());
+                }
+                for (name, value) in [
+                    ("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1"),
+                    ("CLAUDE_CODE_DISABLE_FAST_MODE", "1"),
+                    ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+                    ("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION", "false"),
+                ] {
+                    values.insert(name.into(), value.into());
+                }
+            }
+        }
         values.insert(
             "TMPDIR".into(),
             path_text("architect private temporary directory", &paths.runtime)?.into(),
@@ -1205,6 +1418,7 @@ struct ArchitectSandbox {
     project_root: PathBuf,
     paths: ArchitectLaunchPaths,
     auth_source: PrivateFileIdentity,
+    adapter: ArchitectAdapter,
     host_runtime: PathBuf,
     host_root: HostRootContract,
 }
@@ -1226,28 +1440,48 @@ impl ArchitectSandbox {
             bail!("architect relay runtime overlaps the host runtime directory");
         }
         tools.revalidate()?;
+        if !matches!(
+            (&tools.architect, self.adapter),
+            (ExactArchitectTool::Codex(_), ArchitectAdapter::Codex)
+                | (ExactArchitectTool::Claude(_), ArchitectAdapter::Claude)
+        ) {
+            bail!("architect executable differs from the selected adapter");
+        }
         let tmp = Path::new("/tmp");
         let masked_dirs: Vec<&Path> = if self.host_runtime.starts_with(tmp) {
             vec![tmp]
         } else {
             vec![tmp, &self.host_runtime]
         };
+        let claude_writable_dirs = [
+            self.paths.xdg_config.as_path(),
+            self.paths.xdg_state.as_path(),
+            self.paths.xdg_cache.as_path(),
+            self.paths.xdg_data.as_path(),
+        ];
+        let extra_writable_dirs: &[&Path] = match self.adapter {
+            ArchitectAdapter::Codex => &[],
+            ArchitectAdapter::Claude => &claude_writable_dirs,
+        };
         let mut argv = self.host_root.host_root_argv(HostRootMounts {
             isolated_home: &self.paths.home,
-            native_config: &self.paths.codex_home,
+            native_config: &self.paths.native_config,
             launch_cwd: &self.project_root,
             artifact_dir: &self.paths.runtime,
             auth_source: self.auth_source.path(),
             auth_target: &self.paths.auth_target,
             readable_roots: &[&self.project_root],
             writable_roots: &[],
-            read_only_files: &[&tools.codex.canonical_path, &tools.component.canonical_path],
-            extra_writable_dirs: &[],
+            read_only_files: &[
+                &tools.architect.executable().canonical_path,
+                &tools.component.canonical_path,
+            ],
+            extra_writable_dirs,
             expose_host_root_read_only: true,
             masked_dirs: &masked_dirs,
         })?;
         argv.push("--clearenv".into());
-        for (name, value) in environment.sandbox_values(&self.paths)? {
+        for (name, value) in environment.sandbox_values(&self.paths, self.adapter)? {
             argv.extend(["--setenv".into(), name, value]);
         }
         argv.extend([
@@ -1271,9 +1505,13 @@ fn spawn_blocked_architect(
     tools: &ExactTools,
     sandbox: &ArchitectSandbox,
     environment: &ArchitectEnvironment,
-    profile: &CodexInvocationProfile,
+    profile: &ArchitectInvocationProfile,
+    preassigned_native_session_id: Option<&str>,
 ) -> Result<(Child, OwnedFd, OwnedFd)> {
-    profile.validate("architect")?;
+    profile.validate()?;
+    if profile.adapter() != sandbox.adapter {
+        bail!("architect profile differs from its sandbox adapter");
+    }
     tools.revalidate()?;
     let (gate_read, gate_write) = pipe_cloexec()?;
     let (info_read, info_write) = pipe_cloexec()?;
@@ -1282,25 +1520,19 @@ fn spawn_blocked_architect(
     let info_fd = info_write.as_raw_fd();
     let mut argv = sandbox.outer_argv(environment, tools, gate_fd, info_fd)?;
     argv.push("--".into());
-    argv.push(path_text("Codex executable", &tools.codex.canonical_path)?.into());
-    argv.extend([
-        "--model".into(),
-        profile.model.clone(),
-        "--config".into(),
-        profile.reasoning_config_argument(),
-        "--sandbox".into(),
-        profile.sandbox.as_str().into(),
-        "--ask-for-approval".into(),
-        profile.approval_policy.as_str().into(),
-        "--cd".into(),
-        path_text("architect project directory", &sandbox.project_root)?.into(),
-        "--no-alt-screen".into(),
-        "--strict-config".into(),
-    ]);
-    for feature in DISABLED_CODEX_FEATURES {
-        argv.extend(["--disable".into(), (*feature).into()]);
-    }
-    validate_native_argv(&argv, tools, sandbox, profile)?;
+    argv.extend(architect_native_argv(
+        tools,
+        sandbox,
+        profile,
+        preassigned_native_session_id,
+    )?);
+    validate_native_argv(
+        &argv,
+        tools,
+        sandbox,
+        profile,
+        preassigned_native_session_id,
+    )?;
     command.args(&argv).env_clear();
     // SAFETY: pre_exec only clears CLOEXEC on the two owned launch-control
     // descriptors before exec.
@@ -1319,53 +1551,116 @@ fn spawn_blocked_architect(
     Ok((child, gate_write, info_read))
 }
 
+fn architect_native_argv(
+    tools: &ExactTools,
+    sandbox: &ArchitectSandbox,
+    profile: &ArchitectInvocationProfile,
+    preassigned_native_session_id: Option<&str>,
+) -> Result<Vec<String>> {
+    let executable = path_text(
+        "architect native executable",
+        &tools.architect.executable().canonical_path,
+    )?
+    .into();
+    match profile {
+        ArchitectInvocationProfile::Codex { profile } => {
+            if preassigned_native_session_id.is_some() {
+                bail!("Codex architect cannot receive a preassigned native session");
+            }
+            let mut argv = vec![
+                executable,
+                "--model".into(),
+                profile.model.clone(),
+                "--config".into(),
+                profile.reasoning_config_argument(),
+                "--sandbox".into(),
+                profile.sandbox.as_str().into(),
+                "--ask-for-approval".into(),
+                profile.approval_policy.as_str().into(),
+                "--cd".into(),
+                path_text("architect project directory", &sandbox.project_root)?.into(),
+                "--no-alt-screen".into(),
+                "--strict-config".into(),
+            ];
+            for feature in DISABLED_CODEX_FEATURES {
+                argv.extend(["--disable".into(), (*feature).into()]);
+            }
+            Ok(argv)
+        }
+        ArchitectInvocationProfile::Claude { profile } => {
+            let native_session_id = preassigned_native_session_id
+                .ok_or_else(|| anyhow::anyhow!("Claude architect requires a native session id"))?;
+            crate::worker::contract::validate_native_session_id(native_session_id)?;
+            let mcp_config = serde_json::to_string(&serde_json::json!({
+                "mcpServers": {
+                    "hcom_session_task_control": {
+                        "type": "stdio",
+                        "command": path_text(
+                            "architect MCP component",
+                            &tools.component.canonical_path,
+                        )?,
+                        "args": [
+                            "relay",
+                            "--socket",
+                            path_text(
+                                "architect relay socket",
+                                &sandbox.paths.relay_socket,
+                            )?,
+                        ],
+                    }
+                }
+            }))?;
+            let mut argv = vec![
+                executable,
+                "--model".into(),
+                profile.model.clone(),
+                "--effort".into(),
+                profile.effort.clone(),
+                "--session-id".into(),
+                native_session_id.into(),
+                "--name".into(),
+                "hcom-architect".into(),
+                "--tools".into(),
+                "Bash,Read,Glob,Grep".into(),
+                "--setting-sources".into(),
+                String::new(),
+                "--strict-mcp-config".into(),
+                "--mcp-config".into(),
+                mcp_config,
+                "--disable-slash-commands".into(),
+                "--prompt-suggestions".into(),
+                "false".into(),
+                "--no-chrome".into(),
+            ];
+            if profile.dangerously_skip_permissions {
+                argv.push("--dangerously-skip-permissions".into());
+            }
+            Ok(argv)
+        }
+    }
+}
+
 fn validate_native_argv(
     argv: &[String],
     tools: &ExactTools,
     sandbox: &ArchitectSandbox,
-    profile: &CodexInvocationProfile,
+    profile: &ArchitectInvocationProfile,
+    preassigned_native_session_id: Option<&str>,
 ) -> Result<()> {
     let separator = argv
         .iter()
         .position(|argument| argument == "--")
         .ok_or_else(|| anyhow::anyhow!("architect bwrap argv omitted its separator"))?;
     let native = &argv[separator + 1..];
-    let expected_prefix = [
-        path_text("Codex executable", &tools.codex.canonical_path)?.into(),
-        "--model".into(),
-        profile.model.clone(),
-        "--config".into(),
-        profile.reasoning_config_argument(),
-        "--sandbox".into(),
-        profile.sandbox.as_str().into(),
-        "--ask-for-approval".into(),
-        profile.approval_policy.as_str().into(),
-        "--cd".into(),
-        path_text("architect project directory", &sandbox.project_root)?.into(),
-        "--no-alt-screen".into(),
-        "--strict-config".into(),
-    ];
-    if native.len() != expected_prefix.len() + DISABLED_CODEX_FEATURES.len() * 2
-        || !native
-            .iter()
-            .take(expected_prefix.len())
-            .eq(expected_prefix.iter())
-    {
+    let expected = architect_native_argv(tools, sandbox, profile, preassigned_native_session_id)?;
+    if native != expected {
         bail!("architect native argv drifted from its exact blank profile");
     }
-    for (pair, feature) in native[expected_prefix.len()..]
-        .chunks_exact(2)
-        .zip(DISABLED_CODEX_FEATURES)
+    if native
+        .iter()
+        .any(|argument| argument == "-" || argument == "--hcom-prompt")
     {
-        if pair[0] != "--disable" || pair[1] != *feature {
-            bail!("architect disabled-feature inventory drifted");
-        }
-    }
-    let relay_socket = path_text("architect relay socket", &sandbox.paths.relay_socket)?;
-    if native.iter().any(|argument| {
-        argument == "-" || argument == "--hcom-prompt" || argument.contains(relay_socket)
-    }) {
-        bail!("architect native argv contains prompt or control material");
+        bail!("architect native argv contains prompt material");
     }
     Ok(())
 }
@@ -1522,10 +1817,10 @@ fn wait_for_architect_and_bridge(
                     }
                     std::thread::sleep(Duration::from_millis(25));
                 }
-                bail!("architect bridge did not revoke its binding after Codex exited");
+                bail!("architect bridge did not revoke its binding after native architect exited");
             }
             if let Some(status) = bridge.try_wait()? {
-                bail!("architect bridge exited before Codex: {status}");
+                bail!("architect bridge exited before native architect: {status}");
             }
             std::thread::sleep(Duration::from_millis(25));
         }
@@ -1625,6 +1920,7 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::profile::CodexInvocationProfile;
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;
@@ -1633,6 +1929,7 @@ mod tests {
     const BLANK_HELPER_ROOT: &str = "HCOM_PHASE7_BLANK_HELPER_ROOT";
     const ENVIRONMENT_HELPER_ROOT: &str = "HCOM_PHASE9_ENVIRONMENT_HELPER_ROOT";
     const RUNTIME_MODE_HELPER: &str = "HCOM_PHASE9_RUNTIME_MODE_HELPER";
+    const TEST_CLAUDE_SESSION: &str = "019fa976-e270-7a92-b5f0-6d3d8a0ad3f4";
 
     #[test]
     fn architect_environment_helper_process() {
@@ -1762,6 +2059,14 @@ mod tests {
     }
 
     #[test]
+    fn pinned_claude_root_help_matches_architect_command_contract_when_installed() {
+        let path = Path::new(CLAUDE_REVIEWER_EXECUTABLE);
+        if path.exists() {
+            validate_architect_claude_cli(path).unwrap();
+        }
+    }
+
+    #[test]
     fn explicit_architect_cli_overrides_toml_profile_only() {
         let args = ArchitectArgs::try_parse_from([
             "hcom architect",
@@ -1778,16 +2083,65 @@ mod tests {
         .unwrap();
         let mut profiles = SessionInvocationProfiles::default();
         let developer_before = profiles.developer.clone();
-        let reviewer_before = profiles.reviewer.clone();
-        apply_architect_cli_overrides(&args, &mut profiles).unwrap();
-        assert_eq!(profiles.architect.model, "gpt-5.6-sol-cli");
-        assert_eq!(profiles.architect.reasoning_effort, "max");
-        assert_eq!(profiles.architect.sandbox, CodexSandbox::DangerFullAccess);
-        assert_eq!(
-            profiles.architect.approval_policy,
-            CodexApprovalPolicy::Never
-        );
+        apply_architect_cli_overrides(&args, &mut profiles, false).unwrap();
+        let architect = profiles.architect.codex().unwrap();
+        assert_eq!(architect.model, "gpt-5.6-sol-cli");
+        assert_eq!(architect.reasoning_effort, "max");
+        assert_eq!(architect.sandbox, CodexSandbox::DangerFullAccess);
+        assert_eq!(architect.approval_policy, CodexApprovalPolicy::Never);
         assert_eq!(profiles.developer, developer_before);
+        let reviewer = profiles.reviewer.codex().unwrap();
+        assert_eq!(reviewer.model, architect.model);
+        assert_eq!(reviewer.reasoning_effort, architect.reasoning_effort);
+    }
+
+    #[test]
+    fn claude_cli_overrides_flow_to_an_implicit_reviewer_only() {
+        let args = ArchitectArgs::try_parse_from([
+            "hcom architect",
+            "claude",
+            "--model",
+            "sonnet",
+            "--effort",
+            "max",
+        ])
+        .unwrap();
+        let mut profiles = SessionInvocationProfiles::for_architect(ArchitectAdapter::Claude);
+        let developer_before = profiles.developer.clone();
+        apply_architect_cli_overrides(&args, &mut profiles, false).unwrap();
+        let architect = profiles.architect.claude().unwrap();
+        let reviewer = profiles.reviewer.claude().unwrap();
+        assert_eq!(architect.model, "sonnet");
+        assert_eq!(architect.effort, "max");
+        assert_eq!(reviewer.model, architect.model);
+        assert_eq!(reviewer.effort, architect.effort);
+        assert_eq!(profiles.developer, developer_before);
+
+        let invalid =
+            ArchitectArgs::try_parse_from(["hcom architect", "claude", "--reasoning", "xhigh"])
+                .unwrap();
+        assert!(apply_architect_cli_overrides(&invalid, &mut profiles, false).is_err());
+    }
+
+    #[test]
+    fn explicit_reviewer_is_not_replaced_by_architect_cli_overrides() {
+        let args = ArchitectArgs::try_parse_from([
+            "hcom architect",
+            "codex",
+            "--model",
+            "gpt-5.6-sol-cli",
+            "--reasoning",
+            "max",
+        ])
+        .unwrap();
+        let mut profiles = SessionInvocationProfiles {
+            reviewer: ReviewerInvocationProfile::Claude {
+                profile: crate::worker::profile::ClaudeInvocationProfile::reviewer_default(),
+            },
+            ..SessionInvocationProfiles::default()
+        };
+        let reviewer_before = profiles.reviewer.clone();
+        apply_architect_cli_overrides(&args, &mut profiles, true).unwrap();
         assert_eq!(profiles.reviewer, reviewer_before);
     }
 
@@ -1819,6 +2173,103 @@ mod tests {
     }
 
     #[test]
+    fn claude_native_profile_is_blank_and_binds_only_the_exact_mcp_relay() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let project = root.join("project");
+        let state = root.join("state");
+        let home = state.join("home");
+        let native_config = home.join(".claude");
+        let runtime = root.join("runtime");
+        let cargo_bin = root.join("cargo-bin");
+        let rustup_home = root.join("rustup-home");
+        for directory in [
+            &project,
+            &state,
+            &home,
+            &native_config,
+            &runtime,
+            &cargo_bin,
+            &rustup_home,
+        ] {
+            fs::create_dir(directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let auth = root.join("auth");
+        fs::write(&auth, b"auth").unwrap();
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
+        let current = ExecutableIdentity::capture(
+            fs::canonicalize(std::env::current_exe().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let tools = ExactTools {
+            architect: ExactArchitectTool::Claude(current.clone()),
+            bwrap: current.clone(),
+            component: current,
+        };
+        let paths = ArchitectLaunchPaths {
+            state,
+            home,
+            native_config: native_config.clone(),
+            xdg_config: root.join("xdg-config"),
+            xdg_state: root.join("xdg-state"),
+            xdg_cache: root.join("xdg-cache"),
+            xdg_data: root.join("xdg-data"),
+            runtime: runtime.clone(),
+            relay_socket: runtime.join("relay.sock"),
+            auth_target: native_config.join(".credentials.json"),
+            codex_config_file: None,
+        };
+        let sandbox = ArchitectSandbox {
+            project_root: project,
+            paths,
+            auth_source: PrivateFileIdentity::capture(&auth).unwrap(),
+            adapter: ArchitectAdapter::Claude,
+            host_runtime: root.clone(),
+            host_root: HostRootContract::capture(&cargo_bin, &rustup_home).unwrap(),
+        };
+        let profile = ArchitectInvocationProfile::Claude {
+            profile: crate::worker::profile::ClaudeInvocationProfile::architect_default(),
+        };
+        let argv =
+            architect_native_argv(&tools, &sandbox, &profile, Some(TEST_CLAUDE_SESSION)).unwrap();
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("--dangerously-skip-permissions")
+        );
+        assert!(argv.windows(2).any(|pair| pair == ["--model", "opus"]));
+        assert!(argv.windows(2).any(|pair| pair == ["--effort", "xhigh"]));
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["--session-id", TEST_CLAUDE_SESSION])
+        );
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["--setting-sources", ""])
+        );
+        assert!(!argv.iter().any(|argument| argument == "-"));
+        let mcp = argv
+            .windows(2)
+            .find(|pair| pair[0] == "--mcp-config")
+            .map(|pair| &pair[1])
+            .unwrap();
+        let mcp: serde_json::Value = serde_json::from_str(mcp).unwrap();
+        let server = &mcp["mcpServers"]["hcom_session_task_control"];
+        assert_eq!(
+            server["command"],
+            tools.component.canonical_path.to_str().unwrap()
+        );
+        assert_eq!(
+            server["args"],
+            serde_json::json!([
+                "relay",
+                "--socket",
+                sandbox.paths.relay_socket.to_str().unwrap()
+            ])
+        );
+    }
+
+    #[test]
     fn blank_launch_helper_process() {
         let Some(root) = std::env::var_os(BLANK_HELPER_ROOT).map(PathBuf::from) else {
             return;
@@ -1834,18 +2285,22 @@ mod tests {
         let paths = ArchitectLaunchPaths {
             state,
             home,
-            codex_home,
+            native_config: codex_home,
+            xdg_config: root.join("xdg-config"),
+            xdg_state: root.join("xdg-state"),
+            xdg_cache: root.join("xdg-cache"),
+            xdg_data: root.join("xdg-data"),
             runtime: runtime.clone(),
             relay_socket: runtime.join("relay.sock"),
             auth_target: root.join("architect-state/home/.codex/auth.json"),
-            config_file: root.join("architect-state/home/.codex/config.toml"),
+            codex_config_file: Some(root.join("architect-state/home/.codex/config.toml")),
         };
         let fake_codex = fs::canonicalize(root.join("fake-codex")).unwrap();
         let codex = capture_exact_tool(&fake_codex, CODEX_DEVELOPER_CLI_VERSION).unwrap();
         let bwrap = capture_exact_tool(Path::new(BWRAP_EXECUTABLE), BWRAP_VERSION).unwrap();
         let tools = ExactTools {
             component: codex.clone(),
-            codex,
+            architect: ExactArchitectTool::Codex(codex),
             bwrap,
         };
         let environment = ArchitectEnvironment {
@@ -1868,6 +2323,7 @@ mod tests {
             project_root: repository,
             paths,
             auth_source: PrivateFileIdentity::capture(&root.join("auth.json")).unwrap(),
+            adapter: ArchitectAdapter::Codex,
             host_runtime,
             host_root: HostRootContract::capture(&cargo_bin_source, &rustup_home_source).unwrap(),
         };
@@ -1877,7 +2333,10 @@ mod tests {
             &tools,
             &sandbox,
             &environment,
-            &CodexInvocationProfile::architect_default(),
+            &ArchitectInvocationProfile::Codex {
+                profile: CodexInvocationProfile::architect_default(),
+            },
+            None,
         )
         .unwrap();
         let info = match read_bwrap_info(&info) {

@@ -1,15 +1,17 @@
 # Architect and in-session task workers
 
-`hcom architect` starts one blank, foreground Codex architect. After the human
-types and approves an ordered plan, the same foreground parent starts one fresh
-no-TUI developer and reviewer per task. State exists only in memory and the
-whole run stops when the parent terminal exits.
+`hcom architect` starts one blank, foreground Codex or Claude architect. After
+the human types and approves an ordered plan, the same foreground parent starts
+one fresh no-TUI developer and reviewer per task. State exists only in memory
+and the whole run stops when the parent terminal exits.
 
 ## Start
 
 ```bash
 cd /path/to/project
 hcom architect codex
+# or
+hcom architect claude
 ```
 
 The exact current directory is the project directory. It must be an existing
@@ -43,20 +45,33 @@ not be a symlink or hard link, must not be writable by group/other, and must be
 at most 1 MiB. Run `hcom config --edit` or edit that file directly;
 `chmod 600 ~/.hcom/config.toml` is recommended.
 
-The complete Codex-developer/Claude-reviewer example matching these shell
-aliases is:
+Without profile configuration, the command selects these effective defaults:
+
+| Command | Architect | Reviewer |
+|---|---|---|
+| `hcom architect codex` | Codex `gpt-5.6-sol`, `xhigh` | Codex `gpt-5.6-sol`, `xhigh` |
+| `hcom architect claude` | Claude `opus`, `xhigh` | Claude `opus`, `xhigh` |
+
+The developer remains independently configurable and keeps its own built-in
+profile. When `[architect.reviewer]` is absent, the reviewer follows the
+selected architect adapter and its effective model and reasoning/effort,
+including `[architect.profile]` and command-line overrides. Supplying an
+explicit `[architect.reviewer]` table disables that inheritance.
+
+For a Codex architect, this complete Codex-developer/Claude-reviewer example
+uses explicit profiles for all three roles:
 
 ```toml
 [architect.profile]
 model = "gpt-5.6-sol"
-reasoning_effort = "max"
+reasoning_effort = "xhigh"
 sandbox = "danger-full-access"
 ask_for_approval = "never"
 
 [architect.developer]
 adapter = "codex"
 model = "gpt-5.6-sol"
-reasoning_effort = "max"
+reasoning_effort = "xhigh"
 sandbox = "danger-full-access"
 ask_for_approval = "never"
 
@@ -74,7 +89,7 @@ hcom codex --tag dev1 -- \
   --sandbox danger-full-access \
   --ask-for-approval never \
   --model gpt-5.6-sol \
-  --config 'model_reasoning_effort="max"'
+  --config 'model_reasoning_effort="xhigh"'
 
 hcom claude --tag dev2 -- \
   --dangerously-skip-permissions \
@@ -85,6 +100,15 @@ hcom claude --tag dev2 -- \
 Architect session workers are not retained interactive hcom agents, so
 `--tag dev1` and `--tag dev2` do not apply to this lane. Adapter, model,
 reasoning/effort, sandbox/approval, and Claude permission mode do apply.
+
+For a Claude architect, `[architect.profile]` has the Claude shape:
+
+```toml
+[architect.profile]
+model = "opus"
+effort = "xhigh"
+dangerously_skip_permissions = true
+```
 
 Developer and reviewer adapters are independent. For the reverse
 Claude-developer/Codex-reviewer combination:
@@ -145,8 +169,9 @@ built-in defaults < config.toml < explicit hcom architect options
 ```
 
 The explicit options are `--model`, `--reasoning`, `--sandbox`, and
-`--approval` (`--ask-for-approval` is an alias). Developer and reviewer
-profiles come from TOML.
+`--approval` (`--ask-for-approval` is an alias) for Codex, and `--model` plus
+`--effort` for Claude. Developer and explicit reviewer profiles come from
+TOML.
 
 Task workers have no TTY or interactive approval channel. A Codex worker
 approval policy other than `never`, or a Claude worker with
@@ -163,7 +188,8 @@ new `hcom architect` invocation to pick up changes.
 ## Login and environment inheritance
 
 Native login sources are derived from the terminal that starts the Architect,
-for whichever adapters the frozen developer/reviewer profiles select:
+for the selected Architect and whichever adapters the frozen
+developer/reviewer profiles select:
 
 - Codex: `$CODEX_HOME/auth.json` when `CODEX_HOME` is set, otherwise
   `$HOME/.codex/auth.json`.

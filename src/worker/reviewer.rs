@@ -40,11 +40,11 @@ pub const CODEX_REVIEWER_EXECUTABLE: &str =
     "/home/ywxk/.codex/packages/standalone/releases/0.145.0-x86_64-unknown-linux-musl/bin/codex";
 pub const CODEX_REVIEWER_CLI_VERSION: &str = "codex-cli 0.145.0";
 pub const CODEX_REVIEWER_MODEL: &str = "gpt-5.6-sol";
-pub const CODEX_REVIEWER_REASONING: &str = "high";
+pub const CODEX_REVIEWER_REASONING: &str = "xhigh";
 pub const CLAUDE_REVIEWER_EXECUTABLE: &str = "/home/ywxk/.local/share/claude/versions/2.1.220";
 pub const CLAUDE_REVIEWER_CLI_VERSION: &str = "2.1.220 (Claude Code)";
-pub const CLAUDE_REVIEWER_MODEL: &str = "claude-opus-5";
-pub const CLAUDE_REVIEWER_REASONING: &str = "high";
+pub const CLAUDE_REVIEWER_MODEL: &str = "opus";
+pub const CLAUDE_REVIEWER_REASONING: &str = "xhigh";
 pub const CLAUDE_DEVELOPER_EXECUTABLE: &str = CLAUDE_REVIEWER_EXECUTABLE;
 pub const CLAUDE_DEVELOPER_CLI_VERSION: &str = CLAUDE_REVIEWER_CLI_VERSION;
 
@@ -3979,7 +3979,7 @@ mod tests {
             argv.windows(2)
                 .any(|pair| pair == ["--model", CLAUDE_REVIEWER_MODEL])
         );
-        assert!(argv.windows(2).any(|pair| pair == ["--effort", "high"]));
+        assert!(argv.windows(2).any(|pair| pair == ["--effort", "xhigh"]));
         assert!(
             argv.iter()
                 .any(|argument| argument == "--dangerously-skip-permissions")
