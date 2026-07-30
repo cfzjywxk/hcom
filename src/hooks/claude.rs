@@ -102,18 +102,18 @@ pub fn dispatch_claude_hook(hook_type: &str) -> i32 {
         }
     };
 
-    // Some native versions or background Bash invocations do not include
-    // stdout in the matching PostToolUse payload. Retain delayed binding only
-    // when this exact session transcript names an exact pending instance.
-    let delayed_start_candidate = !manual_start_candidate
-        && payload
-            .transcript_path
-            .as_deref()
-            .and_then(|path| common::pending_transcript_bind_candidate(&db, &session_id, path))
-            .is_some();
-    let start_binding_candidate = manual_start_candidate || delayed_start_candidate;
-
-    if !common::interactive_hook_gate_check(&ctx, &db, Some(&session_id), start_binding_candidate) {
+    if !common::interactive_hook_gate_check(&ctx, &db, Some(&session_id), || {
+        // Some native versions or background Bash invocations do not include
+        // stdout in the matching PostToolUse payload. Retain delayed binding
+        // only when this exact session transcript names an exact pending
+        // instance. This closure runs only for an unowned direct session.
+        manual_start_candidate
+            || payload
+                .transcript_path
+                .as_deref()
+                .and_then(|path| common::pending_transcript_bind_candidate(&db, &session_id, path))
+                .is_some()
+    }) {
         return 0;
     }
 

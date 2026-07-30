@@ -527,30 +527,27 @@ pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
         }
     };
 
-    // Preserve the compatibility fallback for native Codex versions and
-    // background commands that omit stdout from PostToolUse. The pre-gate
-    // opens only for a marker naming an exact pending instance in this exact
-    // session's transcript.
-    let delayed_start_candidate = !manual_start_candidate
-        && !common::get_pending_instances(&db).is_empty()
-        && payload
-            .session_id
-            .as_deref()
-            .and_then(|session_id| {
-                codex_binding_transcript_path(session_id, payload.transcript_path.as_deref())
-                    .and_then(|path| {
-                        common::pending_transcript_bind_candidate(&db, session_id, &path)
+    if !common::interactive_hook_gate_check(&ctx, &db, payload.session_id.as_deref(), || {
+        // Preserve the compatibility fallback for native Codex versions
+        // and background commands that omit stdout from PostToolUse. This
+        // closure runs only for an unowned direct session, and opens only
+        // for an exact pending marker in this session's transcript.
+        manual_start_candidate
+            || (!common::get_pending_instances(&db).is_empty()
+                && payload
+                    .session_id
+                    .as_deref()
+                    .and_then(|session_id| {
+                        codex_binding_transcript_path(
+                            session_id,
+                            payload.transcript_path.as_deref(),
+                        )
+                        .and_then(|path| {
+                            common::pending_transcript_bind_candidate(&db, session_id, &path)
+                        })
                     })
-            })
-            .is_some();
-    let start_binding_candidate = manual_start_candidate || delayed_start_candidate;
-
-    if !common::interactive_hook_gate_check(
-        &ctx,
-        &db,
-        payload.session_id.as_deref(),
-        start_binding_candidate,
-    ) {
+                    .is_some())
+    }) {
         return 0;
     }
 

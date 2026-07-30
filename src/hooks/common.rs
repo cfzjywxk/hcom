@@ -110,11 +110,15 @@ pub fn hook_gate_check(ctx: &HcomContext, db: &HcomDb) -> bool {
 /// - an explicit `hcom start` may be proven either by the current PostToolUse
 ///   output or by an exact pending marker in this session's transcript. The
 ///   tool-specific handler still verifies and performs the binding.
+///
+/// The explicit-start check is lazy because transcript discovery can scan a
+/// large native history. Managed and already-bound sessions must return before
+/// evaluating it.
 pub fn interactive_hook_gate_check(
     ctx: &HcomContext,
     db: &HcomDb,
     session_id: Option<&str>,
-    allow_start_binding: bool,
+    evaluate_start_binding: impl FnOnce() -> bool,
 ) -> bool {
     if ctx.is_launched && ctx.process_id.is_some() {
         return true;
@@ -124,7 +128,7 @@ pub fn interactive_hook_gate_check(
     {
         return true;
     }
-    allow_start_binding
+    evaluate_start_binding()
 }
 
 /// Avoid creating hcom state solely because a globally-installed native hook
@@ -1370,6 +1374,7 @@ pub fn update_tool_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::collections::HashMap;
     use std::io::Write;
     use std::path::PathBuf;
@@ -1393,31 +1398,51 @@ mod tests {
         let direct = hook_context(&[("HCOM_DIR", hook_state)]);
         assert!(!interactive_hook_should_open_db(&direct, false));
         assert!(interactive_hook_should_open_db(&direct, true));
+        let delayed_probe_evaluated = Cell::new(false);
         assert!(!interactive_hook_gate_check(
             &direct,
             &db,
             Some("session-unrelated"),
-            false
+            || {
+                delayed_probe_evaluated.set(true);
+                false
+            }
         ));
+        assert!(delayed_probe_evaluated.get());
+
+        delayed_probe_evaluated.set(false);
         assert!(interactive_hook_gate_check(
             &direct,
             &db,
             Some("session-owned"),
-            false
+            || {
+                delayed_probe_evaluated.set(true);
+                false
+            }
         ));
+        assert!(
+            !delayed_probe_evaluated.get(),
+            "an exact bound session must not evaluate transcript fallback"
+        );
+
+        delayed_probe_evaluated.set(false);
         assert!(interactive_hook_gate_check(
             &direct,
             &db,
             Some("session-unrelated"),
-            true
+            || {
+                delayed_probe_evaluated.set(true);
+                true
+            }
         ));
+        assert!(delayed_probe_evaluated.get());
 
         let launched_without_process = hook_context(&[("HCOM_LAUNCHED", "1")]);
         assert!(!interactive_hook_gate_check(
             &launched_without_process,
             &db,
             Some("session-unrelated"),
-            false
+            || false
         ));
 
         let process_without_launch = hook_context(&[("HCOM_PROCESS_ID", "process-1")]);
@@ -1425,7 +1450,7 @@ mod tests {
             &process_without_launch,
             &db,
             Some("session-unrelated"),
-            false
+            || false
         ));
 
         let managed = hook_context(&[
@@ -1434,12 +1459,20 @@ mod tests {
             ("HCOM_PROCESS_ID", "process-1"),
         ]);
         assert!(interactive_hook_should_open_db(&managed, false));
+        delayed_probe_evaluated.set(false);
         assert!(interactive_hook_gate_check(
             &managed,
             &db,
             Some("session-unrelated"),
-            false
+            || {
+                delayed_probe_evaluated.set(true);
+                false
+            }
         ));
+        assert!(
+            !delayed_probe_evaluated.get(),
+            "a managed launch must not evaluate transcript fallback"
+        );
     }
 
     #[test]
