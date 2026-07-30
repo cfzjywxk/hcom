@@ -138,6 +138,9 @@ Hooks go additively into each tool's native config directory on first run.
 remain silent and unbound—even while other hcom agents are running. Their hooks
 engage only for an hcom-launched session, an already-bound exact session, or
 after you explicitly run `hcom start` inside that CLI.
+If that command's output is deferred, binding may complete on a later hook only
+when the same native session's transcript contains the exact marker for a
+currently pending hcom identity. SessionStart does not advertise hcom.
 
 Without hooks, any other AI tool can join by running `hcom start`. Any process can wake agents with `hcom send`.
 

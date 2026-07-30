@@ -187,6 +187,16 @@ fn resolve_instance_codex(db: &HcomDb, ctx: &HcomContext, session_id: &str) -> O
     )
 }
 
+fn codex_binding_transcript_path(
+    session_id: &str,
+    transcript_path: Option<&str>,
+) -> Option<String> {
+    transcript_path
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .or_else(|| derive_codex_transcript_path(session_id))
+}
+
 fn bind_vanilla_instance_codex(
     db: &HcomDb,
     session_id: &str,
@@ -205,20 +215,20 @@ fn bind_vanilla_instance_codex(
         .captures(tool_result)
         .and_then(|captures| captures.get(1))
         .map(|name| name.as_str().to_string());
-    let derived_path = if response_marker.is_none()
-        && (transcript_path.is_none() || transcript_path == Some(""))
-    {
-        derive_codex_transcript_path(session_id)
+    let effective_path = if response_marker.is_none() {
+        codex_binding_transcript_path(session_id, transcript_path)
     } else {
-        None
+        transcript_path
+            .filter(|path| !path.is_empty())
+            .map(str::to_string)
     };
-    let effective_path = transcript_path
-        .filter(|s| !s.is_empty())
-        .or(derived_path.as_deref());
 
-    let instance_name =
-        response_marker.or_else(|| effective_path.and_then(common::find_last_bind_marker))?;
-    if !pending.iter().any(|pending| pending == &instance_name) {
+    let instance_name = response_marker.or_else(|| {
+        effective_path
+            .as_deref()
+            .and_then(|path| common::pending_transcript_bind_candidate(db, session_id, path))
+    })?;
+    if !pending.iter().any(|candidate| candidate == &instance_name) {
         return None;
     }
 
@@ -226,7 +236,7 @@ fn bind_vanilla_instance_codex(
         db,
         &instance_name,
         Some(session_id).filter(|s| !s.is_empty()),
-        effective_path,
+        effective_path.as_deref(),
         "codex",
         "codex-sessionstart",
     )
@@ -494,8 +504,8 @@ pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
     let payload = HookPayload::from_codex_native(codex_event_name(hook_name), raw);
 
     // Codex installs hooks in the user's native global config. Only a managed
-    // launch, this exact bound session, or the current explicit `hcom start`
-    // result may enter the hcom handler.
+    // launch, this exact bound session, or an explicit `hcom start` result may
+    // enter the hcom handler.
     let manual_start_candidate = hook_name == "codex-posttooluse"
         && payload.tool_name == "Bash"
         && BIND_MARKER_RE.is_match(&payload.tool_result);
@@ -517,11 +527,29 @@ pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
         }
     };
 
+    // Preserve the compatibility fallback for native Codex versions and
+    // background commands that omit stdout from PostToolUse. The pre-gate
+    // opens only for a marker naming an exact pending instance in this exact
+    // session's transcript.
+    let delayed_start_candidate = !manual_start_candidate
+        && !common::get_pending_instances(&db).is_empty()
+        && payload
+            .session_id
+            .as_deref()
+            .and_then(|session_id| {
+                codex_binding_transcript_path(session_id, payload.transcript_path.as_deref())
+                    .and_then(|path| {
+                        common::pending_transcript_bind_candidate(&db, session_id, &path)
+                    })
+            })
+            .is_some();
+    let start_binding_candidate = manual_start_candidate || delayed_start_candidate;
+
     if !common::interactive_hook_gate_check(
         &ctx,
         &db,
         payload.session_id.as_deref(),
-        manual_start_candidate,
+        start_binding_candidate,
     ) {
         return 0;
     }

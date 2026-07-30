@@ -107,14 +107,14 @@ pub fn hook_gate_check(ctx: &HcomContext, db: &HcomDb) -> bool {
 /// directly-started CLI. A hook may proceed only when:
 /// - this process carries both managed-launch markers;
 /// - this exact native session is already bound to hcom; or
-/// - the current PostToolUse event may contain the output of an explicit
-///   `hcom start`, in which case the tool-specific handler still verifies the
-///   marker and pending instance before binding anything.
+/// - an explicit `hcom start` may be proven either by the current PostToolUse
+///   output or by an exact pending marker in this session's transcript. The
+///   tool-specific handler still verifies and performs the binding.
 pub fn interactive_hook_gate_check(
     ctx: &HcomContext,
     db: &HcomDb,
     session_id: Option<&str>,
-    allow_manual_start_binding: bool,
+    allow_start_binding: bool,
 ) -> bool {
     if ctx.is_launched && ctx.process_id.is_some() {
         return true;
@@ -124,18 +124,13 @@ pub fn interactive_hook_gate_check(
     {
         return true;
     }
-    allow_manual_start_binding
+    allow_start_binding
 }
 
 /// Avoid creating hcom state solely because a globally-installed native hook
 /// fired in an unrelated direct CLI.
-pub fn interactive_hook_should_open_db(
-    ctx: &HcomContext,
-    allow_manual_start_binding: bool,
-) -> bool {
-    (ctx.is_launched && ctx.process_id.is_some())
-        || allow_manual_start_binding
-        || ctx.db_path().is_file()
+pub fn interactive_hook_should_open_db(ctx: &HcomContext, allow_start_binding: bool) -> bool {
+    (ctx.is_launched && ctx.process_id.is_some()) || allow_start_binding || ctx.db_path().is_file()
 }
 
 /// Convert a db::Message to a serde_json::Value object.
@@ -850,12 +845,12 @@ pub fn init_hook_context(
     (Some(name), updates, is_matched_resume)
 }
 
-/// Transcript marker fallback binding.
+/// Return the exact pending instance named by this session's transcript.
 ///
-/// Searches transcript for [hcom:name] marker and creates session binding
-/// if instance is pending. Fast path: skips file I/O if no pending instances.
-///
-fn try_bind_from_transcript(
+/// This is also the delayed opt-in gate for directly-started Codex/Claude
+/// sessions: an unrelated session with no marker remains inert even when other
+/// hcom instances exist.
+pub fn pending_transcript_bind_candidate(
     db: &HcomDb,
     session_id: &str,
     transcript_path: &str,
@@ -882,9 +877,21 @@ fn try_bind_from_transcript(
         return None;
     }
 
-    // Verify instance exists
-    let instance = db.get_instance_full(&instance_name).ok()??;
-    let _ = instance; // just checking existence
+    db.get_instance_full(&instance_name).ok()??;
+    Some(instance_name)
+}
+
+/// Transcript marker fallback binding.
+///
+/// Searches transcript for [hcom:name] marker and creates session binding
+/// if instance is pending. Fast path: skips file I/O if no pending instances.
+///
+fn try_bind_from_transcript(
+    db: &HcomDb,
+    session_id: &str,
+    transcript_path: &str,
+) -> Option<String> {
+    let instance_name = pending_transcript_bind_candidate(db, session_id, transcript_path)?;
 
     // Create binding
     if let Err(e) = db.rebind_instance_session(&instance_name, session_id) {
@@ -1459,6 +1466,37 @@ mod tests {
 
         let result = find_last_bind_marker(path.to_str().unwrap());
         assert_eq!(result, Some("third".to_string()));
+    }
+
+    #[test]
+    fn pending_transcript_candidate_requires_exact_pending_instance() {
+        let (dir, db) = make_test_db();
+        insert_test_instance(&db, "luna");
+        let path = dir.path().join("transcript.jsonl");
+
+        std::fs::write(&path, "tool output [hcom:nova]\n").unwrap();
+        assert_eq!(
+            pending_transcript_bind_candidate(&db, "session-1", path.to_str().unwrap()),
+            None,
+            "a marker for a non-pending name must not open the hook gate"
+        );
+
+        std::fs::write(&path, "tool output [hcom:luna]\n").unwrap();
+        assert_eq!(
+            pending_transcript_bind_candidate(&db, "session-1", path.to_str().unwrap()),
+            Some("luna".to_string())
+        );
+        assert_eq!(
+            db.get_session_binding("session-1").unwrap(),
+            None,
+            "the pre-gate must validate only; routing owns the binding mutation"
+        );
+
+        assert_eq!(
+            pending_transcript_bind_candidate(&db, "", path.to_str().unwrap()),
+            None,
+            "a transcript alone cannot bind without a native session id"
+        );
     }
 
     #[test]

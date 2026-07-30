@@ -79,7 +79,7 @@ pub fn dispatch_claude_hook(hook_type: &str) -> i32 {
 
     // Claude installs hooks in the user's native global settings. Do not let
     // an unrelated direct CLI join hcom merely because another instance
-    // exists. A Bash PostToolUse carrying an hcom marker is the retained,
+    // exists. A Bash PostToolUse carrying an hcom marker is the primary,
     // explicit `hcom start` opt-in path.
     let manual_start_candidate = hook_type == HOOK_POST
         && payload.tool_name == "Bash"
@@ -102,7 +102,18 @@ pub fn dispatch_claude_hook(hook_type: &str) -> i32 {
         }
     };
 
-    if !common::interactive_hook_gate_check(&ctx, &db, Some(&session_id), manual_start_candidate) {
+    // Some native versions or background Bash invocations do not include
+    // stdout in the matching PostToolUse payload. Retain delayed binding only
+    // when this exact session transcript names an exact pending instance.
+    let delayed_start_candidate = !manual_start_candidate
+        && payload
+            .transcript_path
+            .as_deref()
+            .and_then(|path| common::pending_transcript_bind_candidate(&db, &session_id, path))
+            .is_some();
+    let start_binding_candidate = manual_start_candidate || delayed_start_candidate;
+
+    if !common::interactive_hook_gate_check(&ctx, &db, Some(&session_id), start_binding_candidate) {
         return 0;
     }
 
@@ -110,7 +121,7 @@ pub fn dispatch_claude_hook(hook_type: &str) -> i32 {
         "claude",
         hook_type,
         (0, String::new(), None, DispatchTiming::default()),
-        || route_claude_hook(&db, &ctx, hook_type, &mut payload),
+        || route_claude_hook(&db, &ctx, hook_type, &mut payload, &session_id),
     );
 
     // Output result
@@ -217,6 +228,7 @@ fn route_claude_hook(
     ctx: &HcomContext,
     hook_type: &str,
     payload: &mut HookPayload,
+    session_id: &str,
 ) -> (i32, String, Option<DeliveryAck>, DispatchTiming) {
     let dispatch_start = Instant::now();
     let mut timing = DispatchTiming::default();
@@ -228,9 +240,10 @@ fn route_claude_hook(
 
     timing.init_ms = Some(dispatch_start.elapsed().as_secs_f64() * 1000.0);
 
-    // Correct session_id (fork bug workaround)
+    // The fork workaround was applied before the ownership gate. Reuse that
+    // exact result so dispatch and routing cannot disagree about ownership.
     let session_start = Instant::now();
-    let session_id = get_real_session_id(&payload.raw, ctx.claude_env_file.as_deref(), ctx.is_fork);
+    let session_id = session_id.to_string();
 
     // Update payload in place so downstream handlers don't need another raw clone.
     payload.session_id = Some(session_id.clone());
@@ -2251,14 +2264,12 @@ fn remove_hcom_hooks_from_settings(settings: &mut Value) -> bool {
         }
     }
 
-    // Remove legacy hcom-owned globals from Claude's process environment.
-    // Hook commands now carry their own invocation prefix, and HCOM_DIR must
-    // remain hcom state only rather than redirecting native Claude state.
+    // Remove the legacy hcom-owned executable global. Hook commands now carry
+    // their own invocation prefix. HCOM_DIR may be user-authored and is not a
+    // Claude configuration-root override, so preserve it byte-for-byte.
     if let Some(env) = obj.get_mut("env").and_then(|v| v.as_object_mut()) {
-        for key in ["HCOM", "HCOM_DIR"] {
-            if env.remove(key).is_some() {
-                removed_any = true;
-            }
+        if env.remove("HCOM").is_some() {
+            removed_any = true;
         }
         if env.is_empty() {
             obj.remove("env");
@@ -2660,10 +2671,8 @@ fn verify_claude_hooks_inner(
         }
     }
 
-    for key in ["HCOM", "HCOM_DIR"] {
-        if settings.get("env").and_then(|v| v.get(key)).is_some() {
-            return Err(VerifyFailReason::UnexpectedHcomEnv(key.to_string()));
-        }
+    if settings.get("env").and_then(|v| v.get("HCOM")).is_some() {
+        return Err(VerifyFailReason::UnexpectedHcomEnv("HCOM".to_string()));
     }
 
     if check_permissions {
@@ -3014,18 +3023,18 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_hcom_hooks_removes_legacy_hcom_dir_and_preserves_user_env() {
+    fn test_remove_hcom_hooks_preserves_user_hcom_dir_and_other_env() {
         let mut settings = serde_json::json!({
             "env": {
                 "HCOM": "hcom",
-                "HCOM_DIR": "/tmp/legacy-hcom",
+                "HCOM_DIR": "/tmp/user-hcom-state",
                 "USER_SETTING": "preserved"
             }
         });
         assert!(remove_hcom_hooks_from_settings(&mut settings));
         assert_eq!(settings["env"]["USER_SETTING"], "preserved");
+        assert_eq!(settings["env"]["HCOM_DIR"], "/tmp/user-hcom-state");
         assert!(settings["env"].get("HCOM").is_none());
-        assert!(settings["env"].get("HCOM_DIR").is_none());
     }
 
     #[test]
@@ -3325,6 +3334,28 @@ mod tests {
             verify_claude_hooks_inner(Some(&settings_path), false),
             Err(VerifyFailReason::UnexpectedHcomEnv(key)) if key == "HCOM"
         ));
+    }
+
+    #[test]
+    fn test_verify_accepts_user_hcom_dir_env() {
+        crate::config::Config::init();
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+
+        write_settings_with_mutated_timeout(&settings_path, Some(86400), false);
+        let mut settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        settings["env"] = serde_json::json!({"HCOM_DIR": "/tmp/user-hcom-state"});
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            verify_claude_hooks_inner(Some(&settings_path), false).is_ok(),
+            "user-authored HCOM_DIR must not trigger a settings rewrite"
+        );
     }
 
     #[test]

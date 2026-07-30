@@ -191,6 +191,128 @@ fn direct_codex_and_claude_require_explicit_hcom_start_to_bind() {
             .unwrap();
         assert_eq!(bound_name, instance_name);
     }
+
+    let (send_code, _, send_stderr) = h.run([
+        "send",
+        "-b",
+        &format!("@{claude_name}"),
+        "--",
+        "claude-bound-session-message",
+    ]);
+    assert_eq!(send_code, 0, "send stderr={send_stderr}");
+    let (poll_code, poll_stdout, poll_stderr) = run_native_hook(
+        &h,
+        "poll",
+        serde_json::json!({
+            "session_id": "direct-claude-explicit",
+            "hook_event_name": "Stop"
+        }),
+    );
+    assert_eq!(poll_code, 2, "poll stderr={poll_stderr}");
+    assert!(
+        poll_stdout.contains("claude-bound-session-message"),
+        "bound direct Claude session must remain eligible on later hooks: {poll_stdout}"
+    );
+
+    let (send_code, _, send_stderr) = h.run([
+        "send",
+        "-b",
+        &format!("@{codex_name}"),
+        "--",
+        "codex-bound-session-message",
+    ]);
+    assert_eq!(send_code, 0, "send stderr={send_stderr}");
+    let (prompt_code, prompt_stdout, prompt_stderr) = run_native_hook(
+        &h,
+        "codex-userpromptsubmit",
+        serde_json::json!({
+            "session_id": "direct-codex-explicit",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "<hcom>"
+        }),
+    );
+    assert_eq!(prompt_code, 0, "prompt stderr={prompt_stderr}");
+    assert!(
+        prompt_stdout.contains("codex-bound-session-message"),
+        "bound direct Codex session must remain eligible on later hooks: {prompt_stdout}"
+    );
+}
+
+#[test]
+fn direct_codex_and_claude_bind_from_delayed_transcript_marker() {
+    let h = Hcom::new();
+
+    let claude_start = run_explicit_start(&h, "CLAUDECODE", "1");
+    assert!(
+        claude_start.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&claude_start.stdout),
+        String::from_utf8_lossy(&claude_start.stderr)
+    );
+    let claude_name = parse_hcom_marker(&String::from_utf8_lossy(&claude_start.stdout))
+        .expect("Claude hcom start marker");
+
+    let codex_start = run_explicit_start(&h, "CODEX_MANAGED_BY_NPM", "1");
+    assert!(
+        codex_start.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&codex_start.stdout),
+        String::from_utf8_lossy(&codex_start.stderr)
+    );
+    let codex_name = parse_hcom_marker(&String::from_utf8_lossy(&codex_start.stdout))
+        .expect("Codex hcom start marker");
+
+    let claude_transcript = h.path().join("direct-claude-delayed.jsonl");
+    std::fs::write(
+        &claude_transcript,
+        format!("delayed Bash output [hcom:{claude_name}]\n"),
+    )
+    .unwrap();
+    let codex_transcript = h.path().join("direct-codex-delayed.jsonl");
+    std::fs::write(
+        &codex_transcript,
+        format!("delayed Bash output [hcom:{codex_name}]\n"),
+    )
+    .unwrap();
+
+    for (hook_name, session_id, instance_name, transcript_path) in [
+        (
+            "post",
+            "direct-claude-delayed",
+            claude_name.as_str(),
+            claude_transcript.as_path(),
+        ),
+        (
+            "codex-posttooluse",
+            "direct-codex-delayed",
+            codex_name.as_str(),
+            codex_transcript.as_path(),
+        ),
+    ] {
+        let (code, _stdout, stderr) = run_native_hook(
+            &h,
+            hook_name,
+            serde_json::json!({
+                "session_id": session_id,
+                "transcript_path": transcript_path,
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "hcom start"},
+                "tool_response": {"stdout": "", "output": ""}
+            }),
+        );
+        assert_eq!(code, 0, "hook={hook_name} stderr={stderr}");
+
+        let connection = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+        let bound_name: String = connection
+            .query_row(
+                "SELECT instance_name FROM session_bindings WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bound_name, instance_name);
+    }
 }
 
 #[test]
