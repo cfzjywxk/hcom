@@ -14,7 +14,7 @@ Verified behavior when mixing different AI coding tools via hcom.
 - **Hooks**: SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, PermissionRequest, SubagentStart, SubagentStop, Notification, SessionEnd
 - **Payload**: JSON via stdin
 - **Exit codes**: 0=allow, 2=block with message delivery
-- **Session binding**: On SessionStart hook, immediate
+- **Session binding**: Immediate on SessionStart for hcom-launched sessions. A directly started Claude session stays silent and unbound unless the user explicitly runs `hcom start` in it.
 - **Message delivery**: Hook output in `additionalContext`
 - **Headless mode**: `-p` (print) flag for background, `setsid()` detach
 - **Subagent support**: Yes, via Task with background=true
@@ -23,7 +23,7 @@ Verified behavior when mixing different AI coding tools via hcom.
 ### Codex
 - **Hooks**: SessionStart, UserPromptSubmit, PreToolUse (Bash), PostToolUse (Bash), Stop
 - **Payload**: JSON via stdin
-- **Session binding**: On SessionStart hook, immediate (same as Claude)
+- **Session binding**: Immediate on SessionStart for hcom-launched sessions. A directly started Codex session stays silent and unbound unless the user explicitly runs `hcom start` in it.
 - **Message delivery**: Hook-based auto-delivery when hcom-launched; PTY injection fallback for vanilla sessions
 - **Sandbox modes**: `workspace` (--full-auto + network), `untrusted` (--sandbox workspace-write), `danger-full-access` (--dangerously-bypass-approvals-and-sandbox), `none` (raw)
 - **Bootstrap injection**: Via `-c developer_instructions=<bootstrap>` at launch time

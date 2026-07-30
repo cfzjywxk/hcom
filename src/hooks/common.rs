@@ -100,6 +100,44 @@ pub fn hook_gate_check(ctx: &HcomContext, db: &HcomDb) -> bool {
     }
 }
 
+/// Gate Codex/Claude hooks to an owned session or one explicit manual opt-in.
+///
+/// Their hook definitions live in the native user's global config, so merely
+/// having another hcom instance in the database must not enroll an unrelated
+/// directly-started CLI. A hook may proceed only when:
+/// - this process carries both managed-launch markers;
+/// - this exact native session is already bound to hcom; or
+/// - the current PostToolUse event may contain the output of an explicit
+///   `hcom start`, in which case the tool-specific handler still verifies the
+///   marker and pending instance before binding anything.
+pub fn interactive_hook_gate_check(
+    ctx: &HcomContext,
+    db: &HcomDb,
+    session_id: Option<&str>,
+    allow_manual_start_binding: bool,
+) -> bool {
+    if ctx.is_launched && ctx.process_id.is_some() {
+        return true;
+    }
+    if let Some(session_id) = session_id.filter(|value| !value.is_empty())
+        && db.get_session_binding(session_id).ok().flatten().is_some()
+    {
+        return true;
+    }
+    allow_manual_start_binding
+}
+
+/// Avoid creating hcom state solely because a globally-installed native hook
+/// fired in an unrelated direct CLI.
+pub fn interactive_hook_should_open_db(
+    ctx: &HcomContext,
+    allow_manual_start_binding: bool,
+) -> bool {
+    (ctx.is_launched && ctx.process_id.is_some())
+        || allow_manual_start_binding
+        || ctx.db_path().is_file()
+}
+
 /// Convert a db::Message to a serde_json::Value object.
 pub(crate) fn message_to_value(m: &Message) -> Value {
     let mut obj = serde_json::Map::new();
@@ -1325,7 +1363,77 @@ pub fn update_tool_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::io::Write;
+    use std::path::PathBuf;
+
+    fn hook_context(values: &[(&str, &str)]) -> HcomContext {
+        let env = values
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect::<HashMap<_, _>>();
+        HcomContext::from_env(&env, PathBuf::from("/tmp"))
+    }
+
+    #[test]
+    fn interactive_hook_gate_requires_owned_session_or_explicit_start_binding() {
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "luna");
+        db.rebind_instance_session("luna", "session-owned").unwrap();
+
+        let hook_state = tempfile::tempdir().unwrap();
+        let hook_state = hook_state.path().to_str().unwrap();
+        let direct = hook_context(&[("HCOM_DIR", hook_state)]);
+        assert!(!interactive_hook_should_open_db(&direct, false));
+        assert!(interactive_hook_should_open_db(&direct, true));
+        assert!(!interactive_hook_gate_check(
+            &direct,
+            &db,
+            Some("session-unrelated"),
+            false
+        ));
+        assert!(interactive_hook_gate_check(
+            &direct,
+            &db,
+            Some("session-owned"),
+            false
+        ));
+        assert!(interactive_hook_gate_check(
+            &direct,
+            &db,
+            Some("session-unrelated"),
+            true
+        ));
+
+        let launched_without_process = hook_context(&[("HCOM_LAUNCHED", "1")]);
+        assert!(!interactive_hook_gate_check(
+            &launched_without_process,
+            &db,
+            Some("session-unrelated"),
+            false
+        ));
+
+        let process_without_launch = hook_context(&[("HCOM_PROCESS_ID", "process-1")]);
+        assert!(!interactive_hook_gate_check(
+            &process_without_launch,
+            &db,
+            Some("session-unrelated"),
+            false
+        ));
+
+        let managed = hook_context(&[
+            ("HCOM_DIR", hook_state),
+            ("HCOM_LAUNCHED", "1"),
+            ("HCOM_PROCESS_ID", "process-1"),
+        ]);
+        assert!(interactive_hook_should_open_db(&managed, false));
+        assert!(interactive_hook_gate_check(
+            &managed,
+            &db,
+            Some("session-unrelated"),
+            false
+        ));
+    }
 
     #[test]
     fn test_find_last_bind_marker_basic() {

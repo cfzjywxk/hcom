@@ -70,7 +70,26 @@ pub fn dispatch_claude_hook(hook_type: &str) -> i32 {
         }
     };
 
-    // Open DB (includes schema migration/compat check)
+    // Build context from environment
+    let ctx = HcomContext::from_os();
+
+    // Build payload
+    let mut payload = HookPayload::from_claude(raw);
+    let session_id = get_real_session_id(&payload.raw, ctx.claude_env_file.as_deref(), ctx.is_fork);
+
+    // Claude installs hooks in the user's native global settings. Do not let
+    // an unrelated direct CLI join hcom merely because another instance
+    // exists. A Bash PostToolUse carrying an hcom marker is the retained,
+    // explicit `hcom start` opt-in path.
+    let manual_start_candidate = hook_type == HOOK_POST
+        && payload.tool_name == "Bash"
+        && BIND_MARKER_RE.is_match(&payload.tool_result);
+    if !common::interactive_hook_should_open_db(&ctx, manual_start_candidate) {
+        return 0;
+    }
+
+    // Open DB only after the ownership pre-gate above. An unrelated direct
+    // Claude session must not create hcom state just because the hook exists.
     let db = match HcomDb::open() {
         Ok(db) => db,
         Err(e) => {
@@ -83,16 +102,9 @@ pub fn dispatch_claude_hook(hook_type: &str) -> i32 {
         }
     };
 
-    // Build context from environment
-    let ctx = HcomContext::from_os();
-
-    // Pre-gate: non-participants with empty DB → exit 0, no output
-    if !common::hook_gate_check(&ctx, &db) {
+    if !common::interactive_hook_gate_check(&ctx, &db, Some(&session_id), manual_start_candidate) {
         return 0;
     }
-
-    // Build payload
-    let mut payload = HookPayload::from_claude(raw);
 
     let (exit_code, stdout, delivery_ack, timing) = common::dispatch_with_panic_guard(
         "claude",
@@ -501,16 +513,11 @@ fn handle_sessionstart(
         return (0, serde_json::to_string(&output).unwrap_or_default());
     }
 
-    // Vanilla instance - show hint
+    // An unbound direct Claude session is not an hcom participant. Global
+    // native hooks must remain completely silent unless the user explicitly
+    // opts in with `hcom start`.
     if process_id.is_none() || session_id.is_empty() {
-        let hcom_cmd = crate::runtime_env::build_hcom_command();
-        let output = serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": "SessionStart",
-                "additionalContext": format!("[hcom available - run '{} start' to participate]", hcom_cmd),
-            }
-        });
-        return (0, serde_json::to_string(&output).unwrap_or_default());
+        return (0, String::new());
     }
 
     // HCOM-launched: bind session and inject bootstrap
@@ -2046,20 +2053,25 @@ pub fn load_claude_settings(settings_path: &Path) -> Option<Value> {
 /// Build a hook command that silently exits 0 when hcom is not installed.
 ///
 /// Claude already executes hook commands through a shell, so this command keeps
-/// all shell logic inline instead of spawning another `sh -c`. It uses the
-/// ${HCOM:-hcom} env var (set in settings.json env block) so it works for both
-/// direct `hcom` and `uvx hcom` invocations. When the binary is absent (e.g.
-/// after `brew uninstall hcom`), the hook exits 0 instead of emitting a "command
-/// not found" error inside the tool.
+/// all shell logic inline instead of spawning another `sh -c`. The detected
+/// invocation prefix is embedded in the hcom-owned hook entry instead of
+/// exporting an `HCOM` variable into every Claude process. When the executable
+/// is absent (e.g. after `brew uninstall hcom`), the hook exits 0 instead of
+/// emitting a "command not found" error inside the tool.
 fn build_hook_entry_command(cmd_suffix: &str) -> String {
     // Claude runs hook commands through a POSIX shell on every platform
-    // (Git Bash on Windows), so the same command works everywhere. The
-    // `${HCOM:-hcom}` default plus the `command -v` guard make it silently
-    // exit 0 when hcom isn't on PATH.
-    format!(
-        "cmd=${{HCOM:-hcom}}; command -v \"${{cmd%% *}}\" >/dev/null 2>&1 && exec $cmd {} || exit 0",
-        cmd_suffix
-    )
+    // (Git Bash on Windows), so the same command works everywhere.
+    let prefix = crate::runtime_env::get_hcom_prefix();
+    let executable = crate::tools::args_common::shell_quote(
+        prefix.first().expect("hcom invocation prefix is non-empty"),
+    );
+    let invocation = prefix
+        .iter()
+        .map(|part| crate::tools::args_common::shell_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let suffix = crate::tools::args_common::shell_quote(cmd_suffix);
+    format!("command -v {executable} >/dev/null 2>&1 && exec {invocation} {suffix} || exit 0")
 }
 
 /// Format a single Claude permission pattern: `Bash(prefix cmd:*)`.
@@ -2239,10 +2251,14 @@ fn remove_hcom_hooks_from_settings(settings: &mut Value) -> bool {
         }
     }
 
-    // Remove HCOM from env section
+    // Remove legacy hcom-owned globals from Claude's process environment.
+    // Hook commands now carry their own invocation prefix, and HCOM_DIR must
+    // remain hcom state only rather than redirecting native Claude state.
     if let Some(env) = obj.get_mut("env").and_then(|v| v.as_object_mut()) {
-        if env.remove("HCOM").is_some() {
-            removed_any = true;
+        for key in ["HCOM", "HCOM_DIR"] {
+            if env.remove(key).is_some() {
+                removed_any = true;
+            }
         }
         if env.is_empty() {
             obj.remove("env");
@@ -2286,6 +2302,14 @@ pub enum VerifyFailReason {
         hook_type: String,
         cmd_suffix: String,
     },
+    #[error(
+        "hcom hook command mismatch under hook type '{hook_type}': expected {expected:?}, got {actual:?}"
+    )]
+    HookCommandMismatch {
+        hook_type: String,
+        expected: String,
+        actual: String,
+    },
     #[error("hook type '{hook_type}' matcher mismatch: expected {expected:?}, got {actual:?}")]
     HookMatcherMismatch {
         hook_type: String,
@@ -2298,8 +2322,8 @@ pub enum VerifyFailReason {
     HookTimeoutMissing { hook_type: String },
     #[error("duplicate hcom hook entry for hook type '{0}'")]
     HookDuplicated(String),
-    #[error("HCOM env var not set in settings.json")]
-    HcomEnvMissing,
+    #[error("legacy hcom-owned {0} env var remains in settings.json")]
+    UnexpectedHcomEnv(String),
     #[error("'permissions.allow' missing or not an array")]
     PermissionsAllowMissing,
     #[error("required permission pattern not present: {0}")]
@@ -2348,7 +2372,7 @@ pub enum SetupError {
 ///
 /// - Removes existing hcom hooks first (clean slate)
 /// - Adds all hooks from CLAUDE_HOOK_CONFIGS
-/// - Sets HCOM environment variable
+/// - Removes legacy hcom-owned global environment variables
 /// - Optionally adds permission patterns
 /// - Uses atomic write for concurrent safety
 pub fn try_setup_claude_hooks(include_permissions: bool) -> Result<(), SetupError> {
@@ -2481,16 +2505,6 @@ pub fn try_setup_claude_hooks(include_permissions: bool) -> Result<(), SetupErro
             .push(hook_dict);
     }
 
-    // Set $HCOM environment variable
-    if !settings.get("env").is_some_and(|v| v.is_object()) {
-        settings["env"] = serde_json::json!({});
-    }
-    settings["env"]["HCOM"] = Value::String(crate::runtime_env::build_hcom_command());
-    // Remove stale HCOM_DIR from settings
-    if let Some(env) = settings["env"].as_object_mut() {
-        env.remove("HCOM_DIR");
-    }
-
     // Handle permission patterns
     if include_permissions {
         if !settings.get("permissions").is_some_and(|v| v.is_object()) {
@@ -2582,6 +2596,7 @@ fn verify_claude_hooks_inner(
         .ok_or(VerifyFailReason::HooksKeyMissing)?;
 
     for &(hook_type, expected_matcher, cmd_suffix, expected_timeout) in CLAUDE_HOOK_CONFIGS {
+        let expected_command = build_hook_entry_command(cmd_suffix);
         let hook_matchers = match hooks.get(hook_type).and_then(|v| v.as_array()) {
             Some(a) if !a.is_empty() => a,
             _ => return Err(VerifyFailReason::HookTypeMissing(hook_type.to_string())),
@@ -2600,9 +2615,14 @@ fn verify_claude_hooks_inner(
 
             for hook in hooks_list {
                 let command = hook.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                let has_hcom =
-                    command.contains("${HCOM}") || command.to_lowercase().contains("hcom");
-                if has_hcom && command.contains(cmd_suffix) {
+                if is_hcom_hook_command(command) && command.contains(cmd_suffix) {
+                    if command != expected_command {
+                        return Err(VerifyFailReason::HookCommandMismatch {
+                            hook_type: hook_type.to_string(),
+                            expected: expected_command.clone(),
+                            actual: command.to_string(),
+                        });
+                    }
                     if hcom_hook_found {
                         return Err(VerifyFailReason::HookDuplicated(hook_type.to_string()));
                     }
@@ -2640,8 +2660,10 @@ fn verify_claude_hooks_inner(
         }
     }
 
-    if settings.get("env").and_then(|v| v.get("HCOM")).is_none() {
-        return Err(VerifyFailReason::HcomEnvMissing);
+    for key in ["HCOM", "HCOM_DIR"] {
+        if settings.get("env").and_then(|v| v.get(key)).is_some() {
+            return Err(VerifyFailReason::UnexpectedHcomEnv(key.to_string()));
+        }
     }
 
     if check_permissions {
@@ -2951,10 +2973,11 @@ mod tests {
     #[test]
     fn test_build_hook_entry_command_avoids_nested_shell() {
         let command = build_hook_entry_command("poll");
-        assert_eq!(
-            command,
-            "cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd poll || exit 0"
-        );
+        assert!(command.starts_with("command -v "));
+        assert!(command.contains(" >/dev/null 2>&1 && exec "));
+        assert!(command.ends_with(" poll || exit 0"));
+        assert!(!command.contains("${HCOM"));
+        assert!(!command.contains("cmd="));
         assert!(!command.starts_with("sh -c"));
     }
 
@@ -2986,8 +3009,23 @@ mod tests {
         assert!(remove_hcom_hooks_from_settings(&mut settings));
         // SessionStart should be removed entirely
         assert!(settings["hooks"].get("SessionStart").is_none());
-        // HCOM env should be removed
+        // Legacy hcom-owned env should be removed
         assert!(settings.get("env").is_none());
+    }
+
+    #[test]
+    fn test_remove_hcom_hooks_removes_legacy_hcom_dir_and_preserves_user_env() {
+        let mut settings = serde_json::json!({
+            "env": {
+                "HCOM": "hcom",
+                "HCOM_DIR": "/tmp/legacy-hcom",
+                "USER_SETTING": "preserved"
+            }
+        });
+        assert!(remove_hcom_hooks_from_settings(&mut settings));
+        assert_eq!(settings["env"]["USER_SETTING"], "preserved");
+        assert!(settings["env"].get("HCOM").is_none());
+        assert!(settings["env"].get("HCOM_DIR").is_none());
     }
 
     #[test]
@@ -3120,13 +3158,12 @@ mod tests {
 
         // Can't call setup_claude_hooks directly (uses get_claude_settings_path),
         // but we can test the verify path with a hand-built settings file.
-        let hook_cmd = "${HCOM}";
-        let mut settings = serde_json::json!({"hooks": {}, "env": {"HCOM": "hcom"}});
+        let mut settings = serde_json::json!({"hooks": {}});
 
         for &(hook_type, matcher, cmd_suffix, timeout) in CLAUDE_HOOK_CONFIGS {
             let mut hook_entry = serde_json::json!({
                 "type": "command",
-                "command": format!("{} {}", hook_cmd, cmd_suffix),
+                "command": build_hook_entry_command(cmd_suffix),
             });
             if let Some(t) = timeout {
                 hook_entry["timeout"] = serde_json::json!(t);
@@ -3171,8 +3208,7 @@ mod tests {
                 "SessionStart": [{
                     "hooks": [{"type": "command", "command": "${HCOM} sessionstart"}]
                 }]
-            },
-            "env": {"HCOM": "hcom"}
+            }
         });
         std::fs::write(&settings_path, serde_json::to_string(&settings).unwrap()).unwrap();
 
@@ -3184,13 +3220,12 @@ mod tests {
         new_timeout: Option<u64>,
         include_permissions: bool,
     ) {
-        let hook_cmd = "${HCOM}";
-        let mut settings = serde_json::json!({"hooks": {}, "env": {"HCOM": "hcom"}});
+        let mut settings = serde_json::json!({"hooks": {}});
 
         for &(hook_type, matcher, cmd_suffix, timeout) in CLAUDE_HOOK_CONFIGS {
             let mut hook_entry = serde_json::json!({
                 "type": "command",
-                "command": format!("{} {}", hook_cmd, cmd_suffix),
+                "command": build_hook_entry_command(cmd_suffix),
             });
             if timeout.is_some()
                 && let Some(t) = new_timeout
@@ -3271,22 +3306,49 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_rejects_missing_env() {
+    fn test_verify_rejects_legacy_hcom_global_env() {
         crate::config::Config::init();
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join("settings.json");
 
-        write_settings_with_mutated_timeout(&settings_path, None, false);
+        write_settings_with_mutated_timeout(&settings_path, Some(86400), false);
         let mut settings: Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
-        settings.as_object_mut().unwrap().remove("env");
+        settings["env"] = serde_json::json!({"HCOM": "hcom"});
         std::fs::write(
             &settings_path,
             serde_json::to_string_pretty(&settings).unwrap(),
         )
         .unwrap();
 
-        assert!(!verify_claude_hooks_installed(Some(&settings_path), false));
+        assert!(matches!(
+            verify_claude_hooks_inner(Some(&settings_path), false),
+            Err(VerifyFailReason::UnexpectedHcomEnv(key)) if key == "HCOM"
+        ));
+    }
+
+    #[test]
+    fn test_verify_rejects_legacy_env_dependent_hook_command() {
+        crate::config::Config::init();
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+
+        write_settings_with_mutated_timeout(&settings_path, Some(86400), false);
+        let mut settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        settings["hooks"]["SessionStart"][0]["hooks"][0]["command"] =
+            serde_json::json!("${HCOM} sessionstart");
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            verify_claude_hooks_inner(Some(&settings_path), false),
+            Err(VerifyFailReason::HookCommandMismatch { hook_type, .. })
+                if hook_type == "SessionStart"
+        ));
     }
 
     #[test]
@@ -3527,10 +3589,10 @@ mod tests {
             );
         }
 
-        // HCOM env var should be set
+        // Hook installation must not mark every native Claude process as hcom.
         assert!(
-            settings.get("env").and_then(|v| v.get("HCOM")).is_some(),
-            "HCOM env var should be set"
+            settings.get("env").and_then(|v| v.get("HCOM")).is_none(),
+            "setup must not inject HCOM into every Claude process"
         );
 
         assert!(verify_claude_hooks_installed(Some(&settings_path), false));
@@ -3600,10 +3662,10 @@ mod tests {
 
         let updated = read_json(&settings_path);
 
-        // User env keys preserved (HCOM is added by setup)
+        // User env keys are preserved without adding hcom globals.
         assert_eq!(updated["env"]["MY_VAR"], "test");
         assert_eq!(updated["env"]["OTHER"], "value");
-        assert!(updated["env"].get("HCOM").is_some());
+        assert!(updated["env"].get("HCOM").is_none());
 
         // permissions.deny preserved
         assert_eq!(

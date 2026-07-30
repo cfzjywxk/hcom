@@ -133,7 +133,11 @@ Each agent gets a queryable identity:
 
 Agents can subscribe to events and react instantly. Collision detection is on by default: if two agents edit the same file within 30 seconds, both get notified.
 
-Hooks go additively into each tool's native config directory on first run. `HCOM_DIR` stores hcom state only. If you aren't using hcom, the hooks do nothing.
+Hooks go additively into each tool's native config directory on first run.
+`HCOM_DIR` stores hcom state only. Directly started Codex and Claude sessions
+remain silent and unbound—even while other hcom agents are running. Their hooks
+engage only for an hcom-launched session, an already-bound exact session, or
+after you explicitly run `hcom start` inside that CLI.
 
 Without hooks, any other AI tool can join by running `hcom start`. Any process can wake agents with `hcom send`.
 

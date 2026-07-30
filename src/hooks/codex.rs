@@ -30,6 +30,7 @@ use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 use crate::log;
 use crate::paths;
+use crate::shared::constants::BIND_MARKER_RE;
 use crate::shared::context::HcomContext;
 use crate::shared::{ST_ACTIVE, ST_LISTENING};
 
@@ -128,17 +129,6 @@ fn hook_noop() -> HookResult {
     }
 }
 
-fn hcom_available_hint() -> HookResult {
-    HookResult::Allow {
-        additional_context: Some(format!(
-            "[hcom available - run '{} start' to participate]",
-            crate::runtime_env::build_hcom_command()
-        )),
-        system_message: None,
-        delivery_ack: None,
-    }
-}
-
 fn codex_event_name(hook_name: &str) -> &'static str {
     CODEX_HOOK_COMMANDS
         .iter()
@@ -201,28 +191,42 @@ fn bind_vanilla_instance_codex(
     db: &HcomDb,
     session_id: &str,
     transcript_path: Option<&str>,
+    tool_result: &str,
 ) -> Option<String> {
     let pending = common::get_pending_instances(db);
     if pending.is_empty() {
         return None;
     }
 
-    let derived_path = if transcript_path.is_none() || transcript_path == Some("") {
+    // Prefer the current Bash result. It is the exact explicit opt-in event
+    // and avoids relying on transcript flush timing. Retain transcript lookup
+    // as compatibility fallback for native Codex versions that omit output.
+    let response_marker = BIND_MARKER_RE
+        .captures(tool_result)
+        .and_then(|captures| captures.get(1))
+        .map(|name| name.as_str().to_string());
+    let derived_path = if response_marker.is_none()
+        && (transcript_path.is_none() || transcript_path == Some(""))
+    {
         derive_codex_transcript_path(session_id)
     } else {
         None
     };
     let effective_path = transcript_path
         .filter(|s| !s.is_empty())
-        .or(derived_path.as_deref())?;
+        .or(derived_path.as_deref());
 
-    let instance_name = common::find_last_bind_marker(effective_path)?;
+    let instance_name =
+        response_marker.or_else(|| effective_path.and_then(common::find_last_bind_marker))?;
+    if !pending.iter().any(|pending| pending == &instance_name) {
+        return None;
+    }
 
     family::bind_vanilla_instance(
         db,
         &instance_name,
         Some(session_id).filter(|s| !s.is_empty()),
-        Some(effective_path),
+        effective_path,
         "codex",
         "codex-sessionstart",
     )
@@ -238,8 +242,12 @@ fn resolve_codex_instance(
         return Some(instance);
     }
 
-    let bound_name =
-        bind_vanilla_instance_codex(db, session_id, payload.transcript_path.as_deref())?;
+    let bound_name = bind_vanilla_instance_codex(
+        db,
+        session_id,
+        payload.transcript_path.as_deref(),
+        &payload.tool_result,
+    )?;
     db.get_instance_full(&bound_name).ok().flatten()
 }
 
@@ -321,7 +329,7 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
 
     let instance_name = match instance_name {
         Some(name) => name,
-        None => return hcom_available_hint(),
+        None => return hook_noop(),
     };
 
     let _ = db.rebind_instance_session(&instance_name, session_id);
@@ -482,6 +490,21 @@ pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
         }
     };
 
+    let ctx = HcomContext::from_os();
+    let payload = HookPayload::from_codex_native(codex_event_name(hook_name), raw);
+
+    // Codex installs hooks in the user's native global config. Only a managed
+    // launch, this exact bound session, or the current explicit `hcom start`
+    // result may enter the hcom handler.
+    let manual_start_candidate = hook_name == "codex-posttooluse"
+        && payload.tool_name == "Bash"
+        && BIND_MARKER_RE.is_match(&payload.tool_result);
+    if !common::interactive_hook_should_open_db(&ctx, manual_start_candidate) {
+        return 0;
+    }
+
+    // Open DB only after the ownership pre-gate above. An unrelated direct
+    // Codex session must not create hcom state just because the hook exists.
     let db = match HcomDb::open() {
         Ok(db) => db,
         Err(e) => {
@@ -494,12 +517,15 @@ pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
         }
     };
 
-    let ctx = HcomContext::from_os();
-    if !common::hook_gate_check(&ctx, &db) {
+    if !common::interactive_hook_gate_check(
+        &ctx,
+        &db,
+        payload.session_id.as_deref(),
+        manual_start_candidate,
+    ) {
         return 0;
     }
 
-    let payload = HookPayload::from_codex_native(codex_event_name(hook_name), raw);
     let result = common::dispatch_with_panic_guard("codex", hook_name, hook_noop(), || {
         get_codex_handler(hook_name)
             .map(|handler| handler(&db, &ctx, &payload))

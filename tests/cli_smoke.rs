@@ -3,12 +3,195 @@
 
 mod support;
 
-use std::io::{BufRead as _, BufReader, Read as _};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use support::{Hcom, parse_hcom_marker};
+
+fn run_native_hook(h: &Hcom, hook_name: &str, payload: serde_json::Value) -> (i32, String, String) {
+    let mut child = h
+        .cmd()
+        .arg(hook_name)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn {hook_name}: {error}"));
+    child
+        .stdin
+        .as_mut()
+        .expect("hook stdin")
+        .write_all(payload.to_string().as_bytes())
+        .expect("write hook payload");
+    drop(child.stdin.take());
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("wait for {hook_name}: {error}"));
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+fn run_explicit_start(h: &Hcom, marker_key: &str, marker_value: &str) -> std::process::Output {
+    let run = || {
+        h.cmd()
+            .env(marker_key, marker_value)
+            .arg("start")
+            .output()
+            .expect("run explicit hcom start")
+    };
+    let first = run();
+    if !first.status.success()
+        && String::from_utf8_lossy(&first.stdout).contains("Then run: hcom start")
+    {
+        run()
+    } else {
+        first
+    }
+}
+
+#[test]
+fn unrelated_direct_codex_and_claude_hooks_do_not_create_hcom_state() {
+    let h = Hcom::new();
+    let db_path = h.path().join("hcom.db");
+    assert!(!db_path.exists());
+
+    for (hook_name, session_id) in [
+        ("sessionstart", "direct-claude-without-state"),
+        ("codex-sessionstart", "direct-codex-without-state"),
+    ] {
+        let (code, stdout, stderr) = run_native_hook(
+            &h,
+            hook_name,
+            serde_json::json!({
+                "session_id": session_id,
+                "source": "startup",
+                "hook_event_name": "SessionStart"
+            }),
+        );
+        assert_eq!(code, 0, "hook={hook_name} stderr={stderr}");
+        assert!(stdout.is_empty(), "hook={hook_name} stdout={stdout}");
+        assert!(stderr.is_empty(), "hook={hook_name} stderr={stderr}");
+        assert!(
+            !db_path.exists(),
+            "direct hook {hook_name} must not initialize hcom state"
+        );
+    }
+}
+
+#[test]
+fn unrelated_direct_codex_and_claude_hooks_ignore_other_hcom_instances() {
+    let h = Hcom::new();
+    let unrelated = h.start();
+    let session_ids = ["direct-claude-unrelated", "direct-codex-unrelated"];
+
+    for (hook_name, session_id) in [
+        ("sessionstart", session_ids[0]),
+        ("codex-sessionstart", session_ids[1]),
+    ] {
+        let (code, stdout, stderr) = run_native_hook(
+            &h,
+            hook_name,
+            serde_json::json!({
+                "session_id": session_id,
+                "source": "startup",
+                "hook_event_name": "SessionStart"
+            }),
+        );
+        assert_eq!(code, 0, "hook={hook_name} stderr={stderr}");
+        assert!(stdout.is_empty(), "hook={hook_name} stdout={stdout}");
+        assert!(stderr.is_empty(), "hook={hook_name} stderr={stderr}");
+    }
+
+    let connection = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    let unexpected_bindings: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM session_bindings
+             WHERE session_id IN (?1, ?2)",
+            rusqlite::params![session_ids[0], session_ids[1]],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unexpected_bindings, 0);
+    let unrelated_session: Option<String> = connection
+        .query_row(
+            "SELECT session_id FROM instances WHERE name = ?1",
+            [&unrelated],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        unrelated_session, None,
+        "direct native hooks must not claim an unrelated pending hcom instance"
+    );
+}
+
+#[test]
+fn direct_codex_and_claude_require_explicit_hcom_start_to_bind() {
+    let h = Hcom::new();
+
+    let claude_start = run_explicit_start(&h, "CLAUDECODE", "1");
+    assert!(
+        claude_start.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&claude_start.stdout),
+        String::from_utf8_lossy(&claude_start.stderr)
+    );
+    let claude_name = parse_hcom_marker(&String::from_utf8_lossy(&claude_start.stdout))
+        .expect("Claude hcom start marker");
+
+    let codex_start = run_explicit_start(&h, "CODEX_MANAGED_BY_NPM", "1");
+    assert!(
+        codex_start.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&codex_start.stdout),
+        String::from_utf8_lossy(&codex_start.stderr)
+    );
+    let codex_name = parse_hcom_marker(&String::from_utf8_lossy(&codex_start.stdout))
+        .expect("Codex hcom start marker");
+
+    for (hook_name, session_id, instance_name, tool_response) in [
+        (
+            "post",
+            "direct-claude-explicit",
+            claude_name.as_str(),
+            serde_json::json!({"stdout": format!("[hcom:{claude_name}]")}),
+        ),
+        (
+            "codex-posttooluse",
+            "direct-codex-explicit",
+            codex_name.as_str(),
+            serde_json::json!({"output": format!("[hcom:{codex_name}]")}),
+        ),
+    ] {
+        let (code, _stdout, stderr) = run_native_hook(
+            &h,
+            hook_name,
+            serde_json::json!({
+                "session_id": session_id,
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "hcom start"},
+                "tool_response": tool_response
+            }),
+        );
+        assert_eq!(code, 0, "hook={hook_name} stderr={stderr}");
+
+        let connection = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+        let bound_name: String = connection
+            .query_row(
+                "SELECT instance_name FROM session_bindings WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bound_name, instance_name);
+    }
+}
 
 #[test]
 fn fixture_drop_terminates_registered_process_group() {

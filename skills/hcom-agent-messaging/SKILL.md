@@ -62,6 +62,9 @@ run `hcom --help` for full command syntax and flags.
 | any other ai tool | manual via `hcom listen` | `hcom start` (run inside tool) |
 
 session binding (hcom transcript, hcom r/f by session id) happens on first message or first prompt for all hcom-launched tools.
+Direct Codex and Claude sessions do not auto-bind just because hcom hooks are
+installed or another hcom agent is live; running `hcom start` inside that CLI is
+the explicit opt-in.
 
 ---
 
