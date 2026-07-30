@@ -746,6 +746,21 @@ fn validate_architect_codex_cli(path: &Path) -> Result<()> {
             bail!("architect Codex CLI help omitted configured value {value}");
         }
     }
+    let approval_probe = Command::new(path)
+        .args([
+            "--strict-config",
+            "--config",
+            "mcp_servers.hcom_session_task_control.command=\"/bin/true\"",
+            "--config",
+            "mcp_servers.hcom_session_task_control.default_tools_approval_mode=\"approve\"",
+            "--help",
+        ])
+        .env_clear()
+        .output()
+        .context("failed to probe architect Codex MCP approval capability")?;
+    if !approval_probe.status.success() || !approval_probe.stderr.is_empty() {
+        bail!("architect Codex CLI does not support the required MCP approval policy");
+    }
     Ok(())
 }
 
@@ -1059,6 +1074,13 @@ struct IsolatedMcpServer {
     startup_timeout_sec: u32,
     tool_timeout_sec: u32,
     enabled: bool,
+    default_tools_approval_mode: IsolatedMcpToolApprovalMode,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum IsolatedMcpToolApprovalMode {
+    Approve,
 }
 
 fn write_isolated_codex_config(paths: &ArchitectLaunchPaths, component: &Path) -> Result<()> {
@@ -1072,6 +1094,11 @@ fn write_isolated_codex_config(paths: &ArchitectLaunchPaths, component: &Path) -
         startup_timeout_sec: 10,
         tool_timeout_sec: 300,
         enabled: true,
+        // The server is a per-invocation, capability-bound relay exposing only
+        // the four session-plan tools. Its own exact plan/hash gate remains
+        // authoritative; a second Codex MCP confirmation would only duplicate
+        // the human approval already enforced by hcom.
+        default_tools_approval_mode: IsolatedMcpToolApprovalMode::Approve,
     };
     let config = IsolatedCodexConfig {
         tui: IsolatedTuiConfig {
@@ -2064,6 +2091,41 @@ mod tests {
         if path.exists() {
             validate_architect_claude_cli(path).unwrap();
         }
+    }
+
+    #[test]
+    fn isolated_codex_config_preapproves_only_the_session_control_server() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let native_config = root.join("codex-home");
+        fs::create_dir(&native_config).unwrap();
+        let config_file = native_config.join("config.toml");
+        let paths = ArchitectLaunchPaths {
+            state: root.join("state"),
+            home: root.join("home"),
+            native_config,
+            xdg_config: root.join("xdg-config"),
+            xdg_state: root.join("xdg-state"),
+            xdg_cache: root.join("xdg-cache"),
+            xdg_data: root.join("xdg-data"),
+            runtime: root.join("runtime"),
+            relay_socket: root.join("runtime/relay.sock"),
+            auth_target: root.join("codex-home/auth.json"),
+            codex_config_file: Some(config_file.clone()),
+        };
+        let component = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+
+        write_isolated_codex_config(&paths, &component).unwrap();
+
+        let encoded = fs::read_to_string(config_file).unwrap();
+        let config: IsolatedCodexConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(config.mcp_servers.len(), 1);
+        let server = config.mcp_servers.get("hcom_session_task_control").unwrap();
+        assert!(matches!(
+            server.default_tools_approval_mode,
+            IsolatedMcpToolApprovalMode::Approve
+        ));
+        assert!(encoded.contains("default_tools_approval_mode = \"approve\""));
     }
 
     #[test]

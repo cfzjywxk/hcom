@@ -165,7 +165,7 @@ mod tests {
         assert!(!loaded.reviewer_explicit);
         assert_eq!(
             loaded.profiles.architect.codex().unwrap().sandbox,
-            CodexSandbox::ReadOnly
+            CodexSandbox::DangerFullAccess
         );
         assert_eq!(
             loaded.profiles.reviewer_adapter_name(),

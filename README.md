@@ -106,10 +106,13 @@ hcom architect codex
 # or: hcom architect claude
 ```
 
-Codex defaults to `gpt-5.6-sol` with `xhigh` reasoning; Claude defaults to
-`opus` with `xhigh` effort. Unless `[architect.reviewer]` is configured
-explicitly, the reviewer follows the selected architect adapter and those
-effective model/effort settings.
+Codex defaults to `gpt-5.6-sol` with `xhigh` reasoning,
+`danger-full-access`, and approval policy `never`; Claude defaults to `opus`
+with `xhigh` effort and skipped native permission prompts. The isolated,
+capability-bound session-control MCP server is approved for the invocation, so
+it does not add a second approval dialog after hcom's exact plan gate. Unless
+`[architect.reviewer]` is configured explicitly, the reviewer follows the
+selected architect adapter and those effective model/effort settings.
 
 The exact current directory is the project context and remains the native
 working directory for the Architect and every Codex/Claude task worker. It
@@ -118,8 +121,10 @@ and binds each approved task to the task's actual source repository; that may
 be elsewhere or nested under the project. Architect, developer, and reviewer
 model/effort/permission profiles are typed TOML settings in
 `$HCOM_DIR/config.toml` (normally `~/.hcom/config.toml`) and are frozen when
-the command starts. See [the Architect user guide](docs/architect.md) for the
-complete schema, all four Codex/Claude role combinations, parent-terminal
+the command starts. A reviewer's canonical project/source and Git state are
+read-only, while its private home, temporary directory, and generated language
+caches remain writable. See [the Architect user guide](docs/architect.md) for
+the complete schema, all four Codex/Claude role combinations, parent-terminal
 login inheritance, and path-preserving sandbox invariants.
 
 Before approval, the Architect must display every task's repository root,

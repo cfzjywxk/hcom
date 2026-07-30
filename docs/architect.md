@@ -49,14 +49,22 @@ Without profile configuration, the command selects these effective defaults:
 
 | Command | Architect | Reviewer |
 |---|---|---|
-| `hcom architect codex` | Codex `gpt-5.6-sol`, `xhigh` | Codex `gpt-5.6-sol`, `xhigh` |
-| `hcom architect claude` | Claude `opus`, `xhigh` | Claude `opus`, `xhigh` |
+| `hcom architect codex` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, approvals `never` | Codex `gpt-5.6-sol`, `xhigh` |
+| `hcom architect claude` | Claude `opus`, `xhigh`, skip permissions | Claude `opus`, `xhigh` |
 
 The developer remains independently configurable and keeps its own built-in
 profile. When `[architect.reviewer]` is absent, the reviewer follows the
 selected architect adapter and its effective model and reasoning/effort,
 including `[architect.profile]` and command-line overrides. Supplying an
 explicit `[architect.reviewer]` table disables that inheritance.
+
+The Codex Architect's isolated configuration marks the one
+`hcom_session_task_control` MCP server as approved for this invocation, so
+status, plan, start, and cancel calls do not each show an additional native
+tool-approval dialog. This does not remove hcom's product gate: the Architect
+must still display the complete repository bindings plus exact plan
+version/hash, and `session_approve_and_start` is rejected unless the human has
+explicitly approved that exact plan.
 
 For a Codex architect, this complete Codex-developer/Claude-reviewer example
 uses explicit profiles for all three roles:
@@ -220,8 +228,10 @@ Profile configuration changes native CLI policy, not the outer containment:
   and this Architect's private state are rebound as needed;
 - the developer receives only its task repository read-write at that
   repository's real absolute path;
-- every reviewer sees the exact task repository HEAD read-only at its real
-  absolute path;
+- every reviewer sees the exact project and task repository HEAD read-only at
+  their real absolute paths; this source/Git restriction does not make the
+  whole reviewer environment read-only: its session-private home, temporary
+  directory, and generated language caches remain writable;
 - task-worker namespaces mount only the exact project/repository paths, pinned
   system/toolchain inputs, and private per-role state; they do not mount the
   host root or the user's unrelated HOME contents;

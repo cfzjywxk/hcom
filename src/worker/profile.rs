@@ -91,7 +91,7 @@ impl CodexInvocationProfile {
         Self {
             model: DEFAULT_CODEX_MODEL.into(),
             reasoning_effort: DEFAULT_ARCHITECT_REASONING.into(),
-            sandbox: CodexSandbox::ReadOnly,
+            sandbox: CodexSandbox::DangerFullAccess,
             approval_policy: CodexApprovalPolicy::Never,
         }
     }
@@ -474,7 +474,8 @@ mod tests {
         let architect = profiles.architect.codex().unwrap();
         assert_eq!(architect.model, "gpt-5.6-sol");
         assert_eq!(architect.reasoning_effort, "xhigh");
-        assert_eq!(architect.sandbox, CodexSandbox::ReadOnly);
+        assert_eq!(architect.sandbox, CodexSandbox::DangerFullAccess);
+        assert_eq!(architect.approval_policy, CodexApprovalPolicy::Never);
         assert_eq!(
             profiles.developer.codex().unwrap().sandbox,
             CodexSandbox::DangerFullAccess

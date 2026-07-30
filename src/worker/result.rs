@@ -220,7 +220,10 @@ fn validate_checks(checks: &[CheckResult]) -> Result<()> {
     validate_list("checks", checks)?;
     let mut commands = BTreeSet::new();
     for check in checks {
-        validate_text("check command", &check.command, 4096, false)?;
+        // Codex 0.145 preserves embedded newlines for shell scripts in its
+        // command events. Result commands must be able to carry that exact
+        // evidence while still rejecting escape, CR, C1, and other controls.
+        validate_text("check command", &check.command, 4096, true)?;
         validate_text("check summary", &check.summary, 4096, true)?;
         if !commands.insert(&check.command) {
             bail!("check commands must be unique");
@@ -338,6 +341,12 @@ mod tests {
         let mut control = completed();
         control.summary = "bad\u{1b}]0;title".into();
         assert!(control.validate().is_err());
+
+        let mut multiline_check = completed();
+        multiline_check.checks[0].command = "python3 - <<'PY'\nprint('bounded check')\nPY".into();
+        assert!(multiline_check.validate().is_ok());
+        multiline_check.checks[0].command.push('\r');
+        assert!(multiline_check.validate().is_err());
 
         let mut traversal = completed();
         traversal.changed_paths = vec!["../outside".into()];

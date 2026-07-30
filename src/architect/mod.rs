@@ -56,7 +56,9 @@ Architect CLI overrides (higher priority than TOML):
   --ask-for-approval is an alias for --approval
   Claude: --effort <low|medium|high|xhigh|max>
 
-Built-in defaults are Codex gpt-5.6-sol/xhigh or Claude opus/xhigh. When
+Built-in defaults are Codex gpt-5.6-sol/xhigh with danger-full-access/never,
+or Claude opus/xhigh with dangerously-skip-permissions. The capability-bound
+session-control MCP tools do not add a second native approval prompt. When
 [architect.reviewer] is absent, the reviewer uses the selected architect
 adapter and the same effective model and reasoning/effort. An explicit
 [architect.reviewer] table takes priority.
@@ -67,12 +69,14 @@ frozen into the approved plan.
 
 No prompt argument, stdin payload, terminal injection, or automatic first turn
 is used. The human owns every architect terminal input. The architect outer
-filesystem and every reviewer filesystem remain read-only regardless of the
-configured native sandbox/permission mode. Each approved task names the exact
-canonical Git root discovered by the Architect from project documentation.
-Approved developer tasks commit directly there; drift stops the run without
-reset, rebase, merge, or final apply. The parent owns all worker lifetime and
-no run is recovered after exit.
+filesystem and every reviewer's canonical project/source/Git view remain
+read-only regardless of the configured native sandbox/permission mode. A
+reviewer's session-private HOME, temporary directory, and generated language
+caches remain writable so read-only source checks can run normally. Each
+approved task names the exact canonical Git root discovered by the Architect
+from project documentation. Approved developer tasks commit directly there;
+drift stops the run without reset, rebase, merge, or final apply. The parent
+owns all worker lifetime and no run is recovered after exit.
 
 See docs/architect.md for the complete TOML schema and examples."#
 }

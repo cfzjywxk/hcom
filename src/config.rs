@@ -999,8 +999,8 @@ args = ""
 
 [architect.profile]
 model = "gpt-5.6-sol"
-reasoning_effort = "high"
-sandbox = "read-only"
+reasoning_effort = "xhigh"
+sandbox = "danger-full-access"
 ask_for_approval = "never"
 
 [architect.developer]
@@ -1009,12 +1009,6 @@ model = "gpt-5.6-sol"
 reasoning_effort = "high"
 sandbox = "danger-full-access"
 ask_for_approval = "never"
-
-[architect.reviewer]
-adapter = "claude"
-model = "claude-opus-5"
-effort = "high"
-dangerously_skip_permissions = true
 
 [preferences]
 timeout = 86400
@@ -2221,8 +2215,20 @@ auto_approve = false
         assert!(get_nested(&structure, "launch.claude.args").is_some());
         assert!(get_nested(&structure, "relay.url").is_some());
         assert!(get_nested(&structure, "architect.profile.model").is_some());
+        assert_eq!(
+            get_nested(&structure, "architect.profile.reasoning_effort"),
+            Some(toml::Value::String("xhigh".into()))
+        );
+        assert_eq!(
+            get_nested(&structure, "architect.profile.sandbox"),
+            Some(toml::Value::String("danger-full-access".into()))
+        );
+        assert_eq!(
+            get_nested(&structure, "architect.profile.ask_for_approval"),
+            Some(toml::Value::String("never".into()))
+        );
         assert!(get_nested(&structure, "architect.developer.adapter").is_some());
-        assert!(get_nested(&structure, "architect.reviewer.effort").is_some());
+        assert!(get_nested(&structure, "architect.reviewer").is_none());
         assert!(get_nested(&structure, "preferences.timeout").is_some());
     }
 

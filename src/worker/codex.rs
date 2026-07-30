@@ -125,6 +125,7 @@ impl CodexDeveloperAdapter {
                 "CODEX_HOME",
                 "HOME",
                 "PATH",
+                "PYTHONPYCACHEPREFIX",
                 "RUSTUP_HOME",
                 "TMPDIR",
                 "XDG_RUNTIME_DIR",
@@ -141,6 +142,7 @@ impl CodexDeveloperAdapter {
                 "CODEX_HOME".into(),
                 "HOME".into(),
                 "PATH".into(),
+                "PYTHONPYCACHEPREFIX".into(),
                 "RUSTUP_HOME".into(),
                 "TMPDIR".into(),
                 "XDG_RUNTIME_DIR".into(),
@@ -213,6 +215,7 @@ impl CodexDeveloperAdapter {
             "exec".into(),
             "--sandbox".into(),
             self.invocation.sandbox.as_str().into(),
+            "--skip-git-repo-check".into(),
         ];
         if self.invocation.sandbox == CodexSandbox::WorkspaceWrite
             && self.sandbox.workspace.path() != self.sandbox.launch_cwd.path()
@@ -327,6 +330,7 @@ fn validate_codex_exec_cli(path: &Path) -> Result<()> {
             "--strict-config",
             "--model",
             "--sandbox",
+            "--skip-git-repo-check",
             "--cd",
             "--add-dir",
             "--ignore-user-config",
@@ -406,9 +410,8 @@ impl WorkerAdapter for CodexDeveloperAdapter {
         if control.role != WorkerRole::Developer || artifacts.role() != WorkerRole::Developer {
             bail!("Codex developer result role does not match its exact turn");
         }
-        if !artifacts.stderr().iter().all(u8::is_ascii_whitespace) {
-            bail!("Codex developer emitted unexpected stderr");
-        }
+        validate_codex_worker_stderr(artifacts.stderr())
+            .context("Codex developer emitted unexpected stderr")?;
         let evidence = parse_codex_turn(control, artifacts.stdout())?;
         let final_output = artifacts
             .final_output()
@@ -436,6 +439,57 @@ impl WorkerAdapter for CodexDeveloperAdapter {
             result,
         })
     }
+}
+
+pub(crate) fn validate_codex_worker_stderr(stderr: &[u8]) -> Result<()> {
+    if stderr.iter().all(u8::is_ascii_whitespace) {
+        return Ok(());
+    }
+    let text = std::str::from_utf8(stderr).context("Codex worker stderr is not UTF-8")?;
+    validate_text("Codex worker stderr", text, 4096, true)?;
+    let mut lines = 0usize;
+    for line in text.lines() {
+        lines += 1;
+        if lines > 4 {
+            bail!("Codex worker emitted too many recoverable router diagnostics");
+        }
+        let (timestamp, detail) = line
+            .split_once(" ERROR codex_core::tools::router: error=exec_command failed for ")
+            .ok_or_else(|| anyhow!("Codex worker stderr is not a recoverable router diagnostic"))?;
+        if !is_codex_log_timestamp(timestamp)
+            || !detail.contains("`: CreateProcess { message: \"Rejected(\\\"`")
+            || !detail.ends_with(
+                "rejected: rm -f style commands are not permitted. \
+Use a safer approach\\\")\" }",
+            )
+        {
+            bail!("Codex worker stderr is not the pinned safe-delete rejection");
+        }
+    }
+    if lines == 0 {
+        bail!("Codex worker stderr did not contain a diagnostic");
+    }
+    Ok(())
+}
+
+fn is_codex_log_timestamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 22
+        || bytes.last() != Some(&b'Z')
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+        || bytes.get(19) != Some(&b'.')
+    {
+        return false;
+    }
+    bytes[..19]
+        .iter()
+        .enumerate()
+        .all(|(index, byte)| matches!(index, 4 | 7 | 10 | 13 | 16) || byte.is_ascii_digit())
+        && bytes[20..bytes.len() - 1].iter().all(u8::is_ascii_digit)
 }
 
 fn developer_descriptor(invocation: &CodexInvocationProfile) -> Result<AdapterDescriptor> {
@@ -612,6 +666,13 @@ impl SandboxContract {
             ExactEnvironmentRequirement::new(
                 "CODEX_HOME",
                 path_string("isolated CODEX_HOME", self.codex_home.path())?,
+            )?,
+            ExactEnvironmentRequirement::new(
+                "PYTHONPYCACHEPREFIX",
+                path_string(
+                    "worker Python bytecode cache",
+                    &self.temp_dir.path().join("python-pycache"),
+                )?,
             )?,
             ExactEnvironmentRequirement::new(
                 "TMPDIR",
@@ -1323,14 +1384,15 @@ fn exact_command_evidence(command: &str) -> BTreeSet<String> {
     if let Ok(argv) = shell_words::split(command)
         && let [shell, flag, payload] = argv.as_slice()
         && shell == "/bin/bash"
-        && flag == "-lc"
+        && matches!(flag.as_str(), "-c" | "-lc")
         && !payload.is_empty()
-        && validate_text("Codex bash -lc payload", payload, 4096, false).is_ok()
+        && validate_text("Codex bash -lc payload", payload, 4096, true).is_ok()
     {
-        // Codex 0.145 reports shell tool executions as the display command
-        // `/bin/bash -lc '<payload>'`. The approved check is the exact payload,
-        // so expose that one payload as evidence too. No prefix, substring, or
-        // multi-command normalization is accepted.
+        // Codex 0.145 reports shell tool executions as `/bin/bash -c
+        // '<payload>'` or `/bin/bash -lc '<payload>'`, depending on the tool
+        // path. The approved check is the exact payload, so expose that one
+        // payload, including its exact embedded newlines, as evidence too. No
+        // prefix, substring, or multi-command normalization is accepted.
         evidence.insert(payload.clone());
     }
     evidence
@@ -1630,6 +1692,14 @@ mod tests {
                     ),
                     ("PATH".into(), "/usr/bin:/bin".into()),
                     (
+                        "PYTHONPYCACHEPREFIX".into(),
+                        self.config
+                            .temp_dir
+                            .join("python-pycache")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    (
                         "RUSTUP_HOME".into(),
                         self.config
                             .rustup_home_source
@@ -1803,6 +1873,10 @@ mod tests {
         assert!(evidence.contains(display));
         assert!(evidence.contains("/usr/bin/git diff --check HEAD^ HEAD"));
 
+        let plain_display = "/bin/bash -c 'python3 -m py_compile src/__init__.py src/fibonacci.py'";
+        let plain_evidence = exact_command_evidence(plain_display);
+        assert!(plain_evidence.contains("python3 -m py_compile src/__init__.py src/fibonacci.py"));
+
         let multiline_payload = "set -e\ngit status --porcelain=v1\ngit rev-parse HEAD";
         let multiline_display = format!("/bin/bash -lc {}", shell_words::quote(multiline_payload));
         let stdout = format!(
@@ -1816,6 +1890,7 @@ mod tests {
         );
         let parsed = parse_codex_turn(&control(None), stdout.as_bytes()).unwrap();
         assert!(parsed.completed_commands.contains(&multiline_display));
+        assert!(parsed.completed_commands.contains(multiline_payload));
 
         let unsafe_display = "/bin/bash -lc 'printf unsafe\u{1b}'";
         let unsafe_stdout = format!(
@@ -1906,8 +1981,42 @@ mod tests {
             argv.windows(2)
                 .any(|pair| pair == ["--sandbox", "danger-full-access"])
         );
+        assert!(
+            argv.iter()
+                .any(|argument| argument == "--skip-git-repo-check")
+        );
         assert!(argv.iter().any(|argument| argument == "--strict-config"));
         assert_eq!(argv.last().map(String::as_str), Some("-"));
+    }
+
+    #[test]
+    fn codex_stderr_accepts_only_the_pinned_recovered_safe_delete_rejection() {
+        let accepted = concat!(
+            "2026-07-30T12:44:08.667685Z ERROR codex_core::tools::router: ",
+            "error=exec_command failed for `/bin/bash -c 'rm -rf /tmp/review.abc'`: ",
+            "CreateProcess { message: \"Rejected(\\\"`/bin/bash -c 'rm -rf ",
+            "/tmp/review.abc'` rejected: rm -f style commands are not permitted. ",
+            "Use a safer approach\\\")\" }\n"
+        );
+        validate_codex_worker_stderr(accepted.as_bytes()).unwrap();
+        assert!(validate_codex_worker_stderr(b"\n\t").is_ok());
+        assert!(
+            validate_codex_worker_stderr(accepted.replace(" ERROR ", " WARN ").as_bytes()).is_err()
+        );
+        assert!(
+            validate_codex_worker_stderr(
+                format!("{accepted}provider authentication failed\n").as_bytes()
+            )
+            .is_err()
+        );
+        assert!(
+            validate_codex_worker_stderr(
+                accepted
+                    .replace("rm -f style commands", "network request")
+                    .as_bytes()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1936,6 +2045,10 @@ mod tests {
         assert!(
             argv.windows(2)
                 .any(|pair| pair == ["--sandbox", "danger-full-access"])
+        );
+        assert!(
+            argv.iter()
+                .any(|argument| argument == "--skip-git-repo-check")
         );
         assert!(!argv.iter().any(|argument| argument == "--new-session"));
         assert!(
@@ -2026,6 +2139,11 @@ mod tests {
             .position(|argument| argument == "resume")
             .unwrap();
         assert!(sandbox < resume);
+        let skip_trust = resume_argv
+            .iter()
+            .position(|argument| argument == "--skip-git-repo-check")
+            .unwrap();
+        assert!(skip_trust < resume);
         assert!(!resume_argv.iter().any(|argument| argument == "--cd"));
         assert!(
             prepare_resume_turn(
@@ -2089,6 +2207,12 @@ mod tests {
         assert!(
             command
                 .fixed_argv
+                .iter()
+                .any(|argument| argument == "--skip-git-repo-check")
+        );
+        assert!(
+            command
+                .fixed_argv
                 .windows(2)
                 .any(|pair| pair == ["--cd", command.workspace_cwd.to_str().unwrap()])
         );
@@ -2127,6 +2251,11 @@ mod tests {
             .position(|argument| argument == "resume")
             .unwrap();
         assert!(add_dir < resume);
+        let skip_trust = resumed_argv
+            .iter()
+            .position(|argument| argument == "--skip-git-repo-check")
+            .unwrap();
+        assert!(skip_trust < resume);
         assert_eq!(
             resumed_argv[add_dir + 1],
             fixture.config.workspace_cwd.to_string_lossy()
@@ -2890,6 +3019,7 @@ mod tests {
                 ("CODEX_HOME".into(), "/wrong/codex-home".into()),
                 ("HOME".into(), "/wrong/isolated-home".into()),
                 ("PATH".into(), "/wrong/bin".into()),
+                ("PYTHONPYCACHEPREFIX".into(), "/wrong/python-cache".into()),
                 ("RUSTUP_HOME".into(), "/wrong/rustup-home".into()),
                 ("TMPDIR".into(), "/wrong/temp".into()),
                 ("XDG_RUNTIME_DIR".into(), "/wrong/runtime".into()),

@@ -2,7 +2,7 @@
 
 use super::codex::{
     DISABLED_CODEX_FEATURES, developer_result_schema, observe_codex_record, parse_codex_turn,
-    parse_git_commits, parse_nul_paths,
+    parse_git_commits, parse_nul_paths, validate_codex_worker_stderr,
 };
 use super::contract::{
     AdapterCapabilities, AdapterDescriptor, CommandSpec, ExecutableIdentity, NativeArtifacts,
@@ -121,6 +121,7 @@ impl CodexReviewerAdapter {
             "CODEX_HOME",
             "HOME",
             "PATH",
+            "PYTHONPYCACHEPREFIX",
             "RUSTUP_HOME",
             "TMPDIR",
             "XDG_RUNTIME_DIR",
@@ -198,6 +199,7 @@ impl CodexReviewerAdapter {
             "exec".into(),
             "--sandbox".into(),
             self.invocation.sandbox.as_str().into(),
+            "--skip-git-repo-check".into(),
         ];
         if self.invocation.sandbox == CodexSandbox::WorkspaceWrite
             && self.sandbox.workspace.path() != self.sandbox.launch_cwd.path()
@@ -317,9 +319,8 @@ impl WorkerAdapter for CodexReviewerAdapter {
         artifacts: &NativeArtifacts,
     ) -> Result<NativeResult> {
         validate_reviewer_artifacts(control, artifacts)?;
-        if !artifacts.stderr().iter().all(u8::is_ascii_whitespace) {
-            bail!("Codex reviewer emitted unexpected stderr");
-        }
+        validate_codex_worker_stderr(artifacts.stderr())
+            .context("Codex reviewer emitted unexpected stderr")?;
         let evidence = parse_codex_turn(control, artifacts.stdout())?;
         let output = artifacts
             .final_output()
@@ -870,6 +871,7 @@ fn validate_codex_reviewer_cli(path: &Path) -> Result<()> {
             "--strict-config",
             "--model",
             "--sandbox",
+            "--skip-git-repo-check",
             "--cd",
             "--ignore-user-config",
             "--ignore-rules",
@@ -1119,6 +1121,7 @@ fn claude_environment_policy() -> Result<EnvironmentPolicy> {
         "CLAUDE_CONFIG_DIR",
         "HOME",
         "PATH",
+        "PYTHONPYCACHEPREFIX",
         "RUSTUP_HOME",
         "TMPDIR",
         "XDG_CACHE_HOME",
@@ -1575,6 +1578,13 @@ impl WorkerSandbox {
             ExactEnvironmentRequirement::new(
                 native_config_name,
                 path_string("worker native config", self.native_config.path())?,
+            )?,
+            ExactEnvironmentRequirement::new(
+                "PYTHONPYCACHEPREFIX",
+                path_string(
+                    "worker Python bytecode cache",
+                    &self.temp_dir.path().join("python-pycache"),
+                )?,
             )?,
             ExactEnvironmentRequirement::new(
                 "TMPDIR",
@@ -2616,6 +2626,13 @@ mod tests {
                     ),
                     ("PATH".into(), "/usr/bin:/bin".into()),
                     (
+                        "PYTHONPYCACHEPREFIX".into(),
+                        self.temp_dir
+                            .join("python-pycache")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    (
                         "RUSTUP_HOME".into(),
                         self.rustup_home_source.to_string_lossy().into_owned(),
                     ),
@@ -2651,6 +2668,13 @@ mod tests {
                     self.isolated_home.to_string_lossy().into_owned(),
                 ),
                 ("PATH".into(), "/usr/bin:/bin".into()),
+                (
+                    "PYTHONPYCACHEPREFIX".into(),
+                    self.temp_dir
+                        .join("python-pycache")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
                 (
                     "RUSTUP_HOME".into(),
                     self.rustup_home_source.to_string_lossy().into_owned(),
@@ -3186,6 +3210,12 @@ mod tests {
                 .windows(2)
                 .any(|pair| { pair == ["--add-dir", fixture.workspace.to_str().unwrap()] })
         );
+        assert!(
+            command
+                .fixed_argv
+                .iter()
+                .any(|argument| argument == "--skip-git-repo-check")
+        );
 
         let resume_control = fixture.control(
             "task-codex-external",
@@ -3213,6 +3243,11 @@ mod tests {
             .position(|argument| argument == "resume")
             .unwrap();
         assert!(add_dir < resume);
+        let skip_trust = resumed_argv
+            .iter()
+            .position(|argument| argument == "--skip-git-repo-check")
+            .unwrap();
+        assert!(skip_trust < resume);
         assert_eq!(
             resumed_argv[add_dir + 1],
             fixture.workspace.to_string_lossy()
@@ -3595,6 +3630,7 @@ mod tests {
                 ("CLAUDE_CONFIG_DIR".into(), "/wrong/claude-config".into()),
                 ("HOME".into(), "/wrong/home".into()),
                 ("PATH".into(), "/wrong/bin".into()),
+                ("PYTHONPYCACHEPREFIX".into(), "/wrong/python-cache".into()),
                 ("RUSTUP_HOME".into(), "/wrong/rustup-home".into()),
                 ("TMPDIR".into(), "/wrong/temp".into()),
                 ("XDG_CACHE_HOME".into(), "/wrong/cache".into()),
