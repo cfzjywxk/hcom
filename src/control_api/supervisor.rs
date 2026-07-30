@@ -83,10 +83,10 @@ impl SessionSupervisorEndpoint {
     pub(crate) fn bind(
         paths: ControlPaths,
         run_id: String,
-        repo_root: PathBuf,
+        project_root: PathBuf,
         sources: SessionRuntimeSources,
     ) -> Result<Self> {
-        let control = SessionSupervisorControl::open(&paths, run_id, repo_root, sources)?;
+        let control = SessionSupervisorControl::open(&paths, run_id, project_root, sources)?;
         let socket_guard = SocketGuard::bind(&paths.socket_path())?;
         let listener = socket_guard.listener.try_clone()?;
         let registration_socket_guard = SocketGuard::bind(&paths.registration_socket_path())?;
@@ -187,7 +187,7 @@ enum BindingState {
 
 struct ArchitectBinding {
     id: String,
-    repo_root: PathBuf,
+    project_root: PathBuf,
     launch_nonce_hash: String,
     capability_hash: String,
     action_set_json: String,
@@ -207,7 +207,7 @@ impl SessionSupervisorControl {
     fn open(
         paths: &ControlPaths,
         run_id: String,
-        repo_root: PathBuf,
+        project_root: PathBuf,
         sources: SessionRuntimeSources,
     ) -> Result<Self> {
         // SAFETY: geteuid has no preconditions.
@@ -216,7 +216,7 @@ impl SessionSupervisorControl {
         let parent_birth = process_birth_identity(parent_pid)?;
         let supervisor = SessionSupervisor::open(
             run_id,
-            repo_root,
+            project_root,
             paths.run_root().to_owned(),
             paths.lock_root().to_owned(),
             sources,
@@ -268,7 +268,7 @@ impl SessionSupervisorControl {
                 RegistrationCaller::Human { process_birth },
                 RegistrationAction::CreateBinding {
                     binding_id,
-                    repo_root,
+                    project_root,
                     architect_name,
                     architect_adapter,
                     launch_nonce,
@@ -282,9 +282,9 @@ impl SessionSupervisorControl {
                 validate_text(architect_adapter, 128)?;
                 validate_secret(launch_nonce)?;
                 validate_secret(capability)?;
-                let repo_root = PathBuf::from(repo_root);
-                if repo_root != self.supervisor.startup().repo_root {
-                    bail!("architect binding repository differs from this run");
+                let project_root = PathBuf::from(project_root);
+                if project_root != self.supervisor.startup().project_root {
+                    bail!("architect binding project directory differs from this run");
                 }
                 if self.bindings.contains_key(binding_id) {
                     bail!("architect binding id already exists");
@@ -296,7 +296,7 @@ impl SessionSupervisorControl {
                 }
                 let binding = ArchitectBinding {
                     id: binding_id.clone(),
-                    repo_root,
+                    project_root,
                     launch_nonce_hash: secret_hash(b"hcom-session/launch-nonce/v1", launch_nonce),
                     capability_hash: secret_hash(b"hcom-session/capability/v1", capability),
                     action_set_hash: sha256_hex(action_set_json.as_bytes()),
@@ -613,7 +613,7 @@ impl SessionSupervisorControl {
                     .map_err(|error| anyhow::anyhow!(error))?;
                 if sha256_hex(binding.action_set_json.as_bytes()) != binding.action_set_hash
                     || !actions.contains(&request.action.name())
-                    || binding.repo_root != self.supervisor.startup().repo_root
+                    || binding.project_root != self.supervisor.startup().project_root
                 {
                     bail!("architect action is outside its bound capability");
                 }
@@ -1069,7 +1069,7 @@ mod tests {
             binding_id.into(),
             ArchitectBinding {
                 id: binding_id.into(),
-                repo_root: control.supervisor.startup().repo_root.clone(),
+                project_root: control.supervisor.startup().project_root.clone(),
                 launch_nonce_hash: secret_hash(b"hcom-session/launch-nonce/v1", launch_nonce),
                 capability_hash: secret_hash(b"hcom-session/capability/v1", capability),
                 action_set_hash: sha256_hex(action_set_json.as_bytes()),
@@ -1158,7 +1158,7 @@ mod tests {
             binding_id.into(),
             ArchitectBinding {
                 id: binding_id.into(),
-                repo_root: control.supervisor.startup().repo_root.clone(),
+                project_root: control.supervisor.startup().project_root.clone(),
                 launch_nonce_hash: secret_hash(b"hcom-session/launch-nonce/v1", launch_nonce),
                 capability_hash: secret_hash(b"hcom-session/capability/v1", capability),
                 action_set_hash: sha256_hex(action_set_json.as_bytes()),

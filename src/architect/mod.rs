@@ -33,11 +33,13 @@ pub fn run_cli_with_config(args: &[String], config_path: &Path) -> Result<i32> {
 
 pub fn help_text() -> &'static str {
     r#"Usage:
-  hcom architect codex --repo <canonical-git-root> [architect-profile-options]
+  cd <project-directory>
+  hcom architect codex [architect-profile-options]
 
 Launch one blank, foreground Codex architect with capability-bound in-memory
-session-task tools. --repo is required and must name the exact absolute,
-canonical, clean Git top level.
+session-task tools. The invocation's exact current directory is the project
+context seen by the Architect and every task worker. It does not need to be a
+Git repository.
 
 Profile configuration is read once from $HCOM_DIR/config.toml (default:
 ~/.hcom/config.toml):
@@ -58,11 +60,12 @@ frozen into the approved plan.
 
 No prompt argument, stdin payload, terminal injection, or automatic first turn
 is used. The human owns every architect terminal input. The architect outer
-workspace and every reviewer checkout remain read-only regardless of the
-configured native sandbox/permission mode. Approved developer tasks commit
-directly in the canonical checkout; drift stops the run without reset, rebase,
-merge, or final apply. The parent owns all worker lifetime and no run is
-recovered after exit.
+filesystem and every reviewer filesystem remain read-only regardless of the
+configured native sandbox/permission mode. Each approved task names the exact
+canonical Git root discovered by the Architect from project documentation.
+Approved developer tasks commit directly there; drift stops the run without
+reset, rebase, merge, or final apply. The parent owns all worker lifetime and
+no run is recovered after exit.
 
 See docs/architect.md for the complete TOML schema and examples."#
 }

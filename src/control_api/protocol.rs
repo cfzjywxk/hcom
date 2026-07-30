@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
@@ -217,6 +217,7 @@ pub struct TaskDraft {
     pub task_key: String,
     pub title: String,
     pub objective: String,
+    pub repository_root: String,
     pub acceptance_criteria: Vec<String>,
     pub required_checks: Vec<String>,
     pub allowed_paths: Vec<String>,
@@ -239,6 +240,7 @@ impl TaskDraft {
             ));
         }
         validate_free_text("task title", &self.title, 512, false)?;
+        validate_repository_root(&self.repository_root)?;
         // Objectives are the one plan field that must preserve human-authored
         // multi-line instructions (for example, exact file contents). The
         // remaining task fields stay single-line list entries.
@@ -390,10 +392,7 @@ pub struct SessionStatusSnapshot {
     pub run_id: String,
     pub state: SessionState,
     pub version: u64,
-    pub repo_root: String,
-    pub start_branch: String,
-    pub start_head: String,
-    pub current_head: String,
+    pub project_root: String,
     pub plan_version: Option<u64>,
     pub plan_hash: Option<String>,
     pub current_task_ordinal: Option<u32>,
@@ -407,6 +406,8 @@ pub struct TaskStatusSnapshot {
     pub task_key: String,
     pub ordinal: u32,
     pub state: TaskState,
+    pub repository_root: String,
+    pub branch: Option<String>,
     pub review_round: u32,
     pub max_review_rounds: u8,
     pub base_revision: Option<String>,
@@ -585,6 +586,21 @@ fn validate_task_path(value: &str) -> Result<(), ProtocolValidationError> {
     Ok(())
 }
 
+fn validate_repository_root(value: &str) -> Result<(), ProtocolValidationError> {
+    validate_free_text("task repository root", value, MAX_PATH_BYTES, false)?;
+    let path = Path::new(value);
+    if !path.is_absolute()
+        || !path
+            .components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(ProtocolValidationError::new(
+            "task repository root must be absolute and lexically normalized",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_hash(label: &str, value: &str) -> Result<(), ProtocolValidationError> {
     if value.len() != 64
         || !value
@@ -616,6 +632,7 @@ mod tests {
             task_key: key.into(),
             title: format!("Task {key}"),
             objective: format!("Complete {key}"),
+            repository_root: "/source/example".into(),
             acceptance_criteria: vec!["the bounded behavior works".into()],
             required_checks: vec!["cargo test".into()],
             allowed_paths: vec!["src".into()],
@@ -647,6 +664,12 @@ mod tests {
         };
         tasks[0].task_key = "..".into();
         assert!(traversal.validate().is_err());
+
+        let mut relative_repository = task("relative-repository");
+        relative_repository.repository_root = "src/repository".into();
+        assert!(relative_repository.validate().is_err());
+        relative_repository.repository_root = "/source/../repository".into();
+        assert!(relative_repository.validate().is_err());
     }
 
     #[test]

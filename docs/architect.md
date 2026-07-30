@@ -8,13 +8,28 @@ whole run stops when the parent terminal exits.
 ## Start
 
 ```bash
-hcom architect codex --repo /absolute/canonical/repository
+cd /path/to/project
+hcom architect codex
 ```
 
-`--repo` is mandatory. It must be the existing absolute, canonical Git top
-level, on an attached branch, with a completely clean worktree. The developer
-commits directly to this checkout. There is no final apply, reset, rebase,
-merge, push, install, persistent recovery, or hidden project checkout.
+The exact current directory is the project directory. It must be an existing
+canonical directory, but it does not need to be a Git repository. The
+Architect and every native Codex/Claude task worker start in that same
+directory. hcom does not change it to `/hcom/workspace`, create a hidden
+project checkout, or require a repository argument.
+
+The project documentation tells the Architect where its source repositories
+live. Every task in the proposed plan contains an absolute
+`repository_root`; it must resolve to the exact canonical Git top level, on an
+attached branch, with a completely clean worktree. A repository may be outside
+the project directory, such as `/home/user/src/hcom`, or nested inside it,
+such as `/home/user/work/tidb_vulcan/src/component`. Different tasks may name
+different repositories.
+
+Repositories are validated and locked when the plan is proposed. After human
+approval, the developer commits directly to the repository for that task.
+There is no final apply, reset, rebase, merge, push, install, or persistent
+recovery.
 
 The architect starts with an empty input buffer. hcom does not provide a prompt
 argument, write stdin, inject a key, or submit Enter. The human owns the first
@@ -166,11 +181,22 @@ or Claude login state.
 
 Profile configuration changes native CLI policy, not the outer containment:
 
-- the Architect always sees the canonical checkout read-only;
-- the developer alone receives the canonical checkout read-write;
-- every reviewer receives the exact task HEAD read-only;
+- the exact invocation directory remains the native cwd for the Architect and
+  every task worker;
+- absolute host paths are preserved; no role sees a synthetic
+  `/hcom/workspace`;
+- the interactive Architect keeps a read-only host filesystem view so it can
+  follow project documentation to source repositories outside the project
+  directory; hcom control runtime paths remain masked;
+- the developer receives only its task repository read-write at that
+  repository's real absolute path;
+- every reviewer sees the exact task repository HEAD read-only at its real
+  absolute path;
+- task-worker namespaces mount only the exact project/repository paths, pinned
+  system/toolchain inputs, and private per-role state; they do not mount the
+  host root or the user's unrelated HOME contents;
 - no worker receives a TTY, hcom control socket, sibling session root, host
-  root, or push credential;
+  runtime contents, or push credential;
 - Codex delegation, hooks, plugins, apps, and arbitrary MCP servers remain
   disabled for session workers;
 - one task gets fresh developer/reviewer sessions, while request-changes

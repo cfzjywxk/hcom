@@ -15,11 +15,7 @@ use super::profile::{ClaudeInvocationProfile, CodexInvocationProfile, validate_c
 use super::result::{
     CheckStatus, DeveloperDecision, DeveloperResult, MAX_RESULT_BYTES, ReviewerResult,
 };
-use super::sandbox::{
-    EmptyRootContract, EmptyRootMounts, INSIDE_ARTIFACTS, INSIDE_CARGO_HOME, INSIDE_CLAUDE,
-    INSIDE_CODEX, INSIDE_HOME, INSIDE_NATIVE_CONFIG, INSIDE_PATH, INSIDE_RUNTIME,
-    INSIDE_RUSTUP_HOME, INSIDE_TEMP, INSIDE_WORKSPACE,
-};
+use super::sandbox::{HostRootContract, HostRootMounts};
 use super::validation::{MAX_PATH_BYTES, validate_git_oid, validate_text};
 use crate::control_api::{CapabilitySnapshot, NativeSessionMode, WorkerRole};
 use anyhow::{Context, Result, anyhow, bail};
@@ -60,8 +56,8 @@ const CLAUDE_DEVELOPER_ADAPTER_NAME: &str = "claude-developer-2.1.220";
 const CODEX_ADAPTER_CONTRACT_VERSION: u32 = 3;
 const CLAUDE_ADAPTER_CONTRACT_VERSION: u32 = 3;
 const CLAUDE_DEVELOPER_ADAPTER_CONTRACT_VERSION: u32 = 1;
-const REVIEWER_OUTER_POLICY: &str = "bubblewrap-0.9.0-empty-root-reviewer-ro-v2";
-const DEVELOPER_OUTER_POLICY: &str = "bubblewrap-0.9.0-empty-root-developer-v2";
+const REVIEWER_OUTER_POLICY: &str = "bubblewrap-0.9.0-host-path-reviewer-ro-v1";
+const DEVELOPER_OUTER_POLICY: &str = "bubblewrap-0.9.0-host-path-developer-repo-rw-v1";
 const CODEX_RESULT_SCHEMA_FILE: &str = "codex-reviewer-result-schema.json";
 const CODEX_FINAL_FILE: &str = "native-final.partial";
 const JSON_SCHEMA_DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
@@ -82,6 +78,7 @@ const CLAUDE_EXACT_ENVIRONMENT: &[(&str, &str)] = &[
 #[derive(Clone, PartialEq, Eq)]
 pub struct CodexReviewerConfig {
     pub run_id: String,
+    pub launch_cwd: PathBuf,
     pub workspace_cwd: PathBuf,
     pub artifact_root: PathBuf,
     pub isolated_home: PathBuf,
@@ -148,6 +145,7 @@ impl CodexReviewerAdapter {
                 role: WorkerRole::Reviewer,
                 workspace_writable: false,
                 run_id: config.run_id,
+                launch_cwd: config.launch_cwd,
                 workspace_cwd: config.workspace_cwd,
                 artifact_root: config.artifact_root,
                 isolated_home: config.isolated_home,
@@ -221,14 +219,16 @@ impl CodexReviewerAdapter {
             fixed_argv.extend(["--disable".into(), (*feature).into()]);
         }
         if resume_session_id.is_none() {
-            fixed_argv.extend(["--cd".into(), INSIDE_WORKSPACE.into()]);
+            fixed_argv.extend([
+                "--cd".into(),
+                path_string("Codex reviewer launch cwd", self.sandbox.launch_cwd.path())?,
+            ]);
         }
         let expected_artifact_dir = self
             .sandbox
             .artifact_root
             .path()
             .join(&control.artifact_dir);
-        let production_outer = self.outer_executable.canonical_path == Path::new(BWRAP_EXECUTABLE);
         Ok(CommandSpec {
             executable: self.executable.clone(),
             fixed_argv,
@@ -252,39 +252,21 @@ impl CodexReviewerAdapter {
                 },
             ],
             stdin_prompt_argument: Some("-".into()),
-            workspace_cwd: self.sandbox.workspace.path().to_owned(),
+            workspace_cwd: self.sandbox.launch_cwd.path().to_owned(),
             outer_launch: Some(OuterLaunchEnvelope {
                 executable: self.outer_executable.clone(),
-                fixed_argv: self.sandbox.outer_argv(
-                    &expected_artifact_dir,
-                    &self.executable,
-                    INSIDE_CODEX,
-                    "/hcom/native/auth.json",
-                )?,
+                fixed_argv: self
+                    .sandbox
+                    .outer_argv(&expected_artifact_dir, &self.executable)?,
                 expected_artifact_dir,
-                inside_executable: if production_outer {
-                    INSIDE_CODEX.into()
-                } else {
-                    self.executable.canonical_path.clone()
-                },
-                inside_artifact_dir: if production_outer {
-                    INSIDE_ARTIFACTS.into()
-                } else {
-                    self.sandbox
-                        .artifact_root
-                        .path()
-                        .join(&control.artifact_dir)
-                },
+                inside_executable: self.executable.canonical_path.clone(),
+                inside_artifact_dir: self
+                    .sandbox
+                    .artifact_root
+                    .path()
+                    .join(&control.artifact_dir),
             }),
-            exact_environment: vec![
-                ExactEnvironmentRequirement::new("CARGO_HOME", INSIDE_CARGO_HOME)?,
-                ExactEnvironmentRequirement::new("CODEX_HOME", INSIDE_NATIVE_CONFIG)?,
-                ExactEnvironmentRequirement::new("HOME", INSIDE_HOME)?,
-                ExactEnvironmentRequirement::new("PATH", INSIDE_PATH)?,
-                ExactEnvironmentRequirement::new("RUSTUP_HOME", INSIDE_RUSTUP_HOME)?,
-                ExactEnvironmentRequirement::new("TMPDIR", INSIDE_TEMP)?,
-                ExactEnvironmentRequirement::new("XDG_RUNTIME_DIR", INSIDE_RUNTIME)?,
-            ],
+            exact_environment: self.sandbox.exact_environment("CODEX_HOME", &[])?,
         })
     }
 }
@@ -348,6 +330,7 @@ impl WorkerAdapter for CodexReviewerAdapter {
 #[derive(Clone, PartialEq, Eq)]
 pub struct ClaudeDeveloperConfig {
     pub run_id: String,
+    pub launch_cwd: PathBuf,
     pub workspace_cwd: PathBuf,
     pub artifact_root: PathBuf,
     pub isolated_home: PathBuf,
@@ -418,6 +401,7 @@ impl ClaudeDeveloperAdapter {
                 role: WorkerRole::Developer,
                 workspace_writable: true,
                 run_id: config.run_id,
+                launch_cwd: config.launch_cwd,
                 workspace_cwd: config.workspace_cwd,
                 artifact_root: config.artifact_root,
                 isolated_home: config.isolated_home,
@@ -521,7 +505,6 @@ impl ClaudeDeveloperAdapter {
             .artifact_root
             .path()
             .join(&control.artifact_dir);
-        let production_outer = self.outer_executable.canonical_path == Path::new(BWRAP_EXECUTABLE);
         Ok(CommandSpec {
             executable: self.executable.clone(),
             fixed_argv,
@@ -537,31 +520,23 @@ impl ClaudeDeveloperAdapter {
                 output_argument: None,
             }],
             stdin_prompt_argument: None,
-            workspace_cwd: self.sandbox.workspace.path().to_owned(),
+            workspace_cwd: self.sandbox.launch_cwd.path().to_owned(),
             outer_launch: Some(OuterLaunchEnvelope {
                 executable: self.outer_executable.clone(),
-                fixed_argv: self.sandbox.outer_argv(
-                    &expected_artifact_dir,
-                    &self.executable,
-                    INSIDE_CLAUDE,
-                    "/hcom/native/.credentials.json",
-                )?,
+                fixed_argv: self
+                    .sandbox
+                    .outer_argv(&expected_artifact_dir, &self.executable)?,
                 expected_artifact_dir,
-                inside_executable: if production_outer {
-                    INSIDE_CLAUDE.into()
-                } else {
-                    self.executable.canonical_path.clone()
-                },
-                inside_artifact_dir: if production_outer {
-                    INSIDE_ARTIFACTS.into()
-                } else {
-                    self.sandbox
-                        .artifact_root
-                        .path()
-                        .join(&control.artifact_dir)
-                },
+                inside_executable: self.executable.canonical_path.clone(),
+                inside_artifact_dir: self
+                    .sandbox
+                    .artifact_root
+                    .path()
+                    .join(&control.artifact_dir),
             }),
-            exact_environment: claude_exact_environment()?,
+            exact_environment: self
+                .sandbox
+                .exact_environment("CLAUDE_CONFIG_DIR", CLAUDE_EXACT_ENVIRONMENT)?,
         })
     }
 }
@@ -631,6 +606,7 @@ impl WorkerAdapter for ClaudeDeveloperAdapter {
 #[derive(Clone, PartialEq, Eq)]
 pub struct ClaudeReviewerConfig {
     pub run_id: String,
+    pub launch_cwd: PathBuf,
     pub workspace_cwd: PathBuf,
     pub artifact_root: PathBuf,
     pub isolated_home: PathBuf,
@@ -701,6 +677,7 @@ impl ClaudeReviewerAdapter {
                 role: WorkerRole::Reviewer,
                 workspace_writable: false,
                 run_id: config.run_id,
+                launch_cwd: config.launch_cwd,
                 workspace_cwd: config.workspace_cwd,
                 artifact_root: config.artifact_root,
                 isolated_home: config.isolated_home,
@@ -806,7 +783,6 @@ impl ClaudeReviewerAdapter {
             .artifact_root
             .path()
             .join(&control.artifact_dir);
-        let production_outer = self.outer_executable.canonical_path == Path::new(BWRAP_EXECUTABLE);
         Ok(CommandSpec {
             executable: self.executable.clone(),
             fixed_argv,
@@ -822,36 +798,27 @@ impl ClaudeReviewerAdapter {
                 output_argument: None,
             }],
             stdin_prompt_argument: None,
-            workspace_cwd: self.sandbox.workspace.path().to_owned(),
+            workspace_cwd: self.sandbox.launch_cwd.path().to_owned(),
             outer_launch: Some(OuterLaunchEnvelope {
                 executable: self.outer_executable.clone(),
-                fixed_argv: self.sandbox.outer_argv(
-                    &expected_artifact_dir,
-                    &self.executable,
-                    INSIDE_CLAUDE,
-                    "/hcom/native/.credentials.json",
-                )?,
+                fixed_argv: self
+                    .sandbox
+                    .outer_argv(&expected_artifact_dir, &self.executable)?,
                 expected_artifact_dir,
-                inside_executable: if production_outer {
-                    INSIDE_CLAUDE.into()
-                } else {
-                    self.executable.canonical_path.clone()
-                },
-                inside_artifact_dir: if production_outer {
-                    INSIDE_ARTIFACTS.into()
-                } else {
-                    self.sandbox
-                        .artifact_root
-                        .path()
-                        .join(&control.artifact_dir)
-                },
+                inside_executable: self.executable.canonical_path.clone(),
+                inside_artifact_dir: self
+                    .sandbox
+                    .artifact_root
+                    .path()
+                    .join(&control.artifact_dir),
             }),
             exact_environment: self.exact_environment()?,
         })
     }
 
     fn exact_environment(&self) -> Result<Vec<ExactEnvironmentRequirement>> {
-        claude_exact_environment()
+        self.sandbox
+            .exact_environment("CLAUDE_CONFIG_DIR", CLAUDE_EXACT_ENVIRONMENT)
     }
 }
 
@@ -1056,7 +1023,7 @@ fn codex_reviewer_descriptor(invocation: &CodexInvocationProfile) -> Result<Adap
         reviewer_capabilities(
             NativeSessionMode::Discovered,
             ResultTransport::FinalFile,
-            "outer-bwrap-empty-root-reviewer-ro-v2",
+            "outer-bwrap-host-path-reviewer-ro-v1",
         ),
     )
 }
@@ -1073,7 +1040,7 @@ fn claude_reviewer_descriptor(invocation: &ClaudeInvocationProfile) -> Result<Ad
         reviewer_capabilities(
             NativeSessionMode::Preassigned,
             ResultTransport::Envelope,
-            "outer-bwrap-empty-root-reviewer-ro-v2",
+            "outer-bwrap-host-path-reviewer-ro-v1",
         ),
     )
 }
@@ -1094,7 +1061,7 @@ fn claude_developer_descriptor(invocation: &ClaudeInvocationProfile) -> Result<A
             features: vec![
                 "exact-resume".into(),
                 "host-git-evidence".into(),
-                "outer-bwrap-empty-root-developer-v2".into(),
+                "outer-bwrap-host-path-developer-repo-rw-v1".into(),
                 "structured-result".into(),
             ],
         },
@@ -1121,26 +1088,10 @@ fn claude_environment_policy() -> Result<EnvironmentPolicy> {
     ])
 }
 
-fn claude_exact_environment() -> Result<Vec<ExactEnvironmentRequirement>> {
-    let mut exact = CLAUDE_EXACT_ENVIRONMENT
-        .iter()
-        .map(|(name, value)| ExactEnvironmentRequirement::new(*name, *value))
-        .collect::<Result<Vec<_>>>()?;
-    exact.extend([
-        ExactEnvironmentRequirement::new("CARGO_HOME", INSIDE_CARGO_HOME)?,
-        ExactEnvironmentRequirement::new("CLAUDE_CONFIG_DIR", INSIDE_NATIVE_CONFIG)?,
-        ExactEnvironmentRequirement::new("HOME", INSIDE_HOME)?,
-        ExactEnvironmentRequirement::new("PATH", INSIDE_PATH)?,
-        ExactEnvironmentRequirement::new("RUSTUP_HOME", INSIDE_RUSTUP_HOME)?,
-        ExactEnvironmentRequirement::new("TMPDIR", INSIDE_TEMP)?,
-        ExactEnvironmentRequirement::new("XDG_CACHE_HOME", "/hcom/home/.cache")?,
-        ExactEnvironmentRequirement::new("XDG_CONFIG_HOME", "/hcom/home/.config")?,
-        ExactEnvironmentRequirement::new("XDG_DATA_HOME", "/hcom/home/.data")?,
-        ExactEnvironmentRequirement::new("XDG_RUNTIME_DIR", INSIDE_RUNTIME)?,
-        ExactEnvironmentRequirement::new("XDG_STATE_HOME", "/hcom/home/.state")?,
-    ]);
-    exact.sort_by(|left, right| left.name().cmp(right.name()));
-    Ok(exact)
+fn path_string(label: &str, path: &Path) -> Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("{label} is not valid UTF-8"))
 }
 
 fn policy_with_required(extra: &[&str]) -> Result<EnvironmentPolicy> {
@@ -1346,6 +1297,7 @@ struct WorkerSandboxConfig {
     role: WorkerRole,
     workspace_writable: bool,
     run_id: String,
+    launch_cwd: PathBuf,
     workspace_cwd: PathBuf,
     artifact_root: PathBuf,
     isolated_home: PathBuf,
@@ -1364,6 +1316,7 @@ struct WorkerSandbox {
     role: WorkerRole,
     workspace_writable: bool,
     run_id: String,
+    launch_cwd: DirectoryIdentity,
     workspace: DirectoryIdentity,
     artifact_root: DirectoryIdentity,
     isolated_home: DirectoryIdentity,
@@ -1375,7 +1328,7 @@ struct WorkerSandbox {
     auth_target: FileIdentity,
     extra_private_dirs: Vec<DirectoryIdentity>,
     git_workspace: GitWorkspaceIdentity,
-    empty_root: EmptyRootContract,
+    host_root: HostRootContract,
 }
 
 impl WorkerSandbox {
@@ -1397,6 +1350,8 @@ impl WorkerSandbox {
         if Path::new(&config.auth_target_name).components().count() != 1 {
             bail!("session worker auth target filename must be one normal component");
         }
+        let launch_cwd = DirectoryIdentity::capture(&config.launch_cwd, false)
+            .context("invalid session worker project directory")?;
         let workspace = DirectoryIdentity::capture(&config.workspace_cwd, false)
             .context("invalid session worker checkout root")?;
         let artifact_root = DirectoryIdentity::capture(&config.artifact_root, true)
@@ -1475,12 +1430,13 @@ impl WorkerSandbox {
             }
         }
         let git_workspace = GitWorkspaceIdentity::capture(workspace.path(), git)?;
-        let empty_root =
-            EmptyRootContract::capture(&config.cargo_bin_source, &config.rustup_home_source)?;
+        let host_root =
+            HostRootContract::capture(&config.cargo_bin_source, &config.rustup_home_source)?;
         Ok(Self {
             role: config.role,
             workspace_writable: config.workspace_writable,
             run_id: config.run_id,
+            launch_cwd,
             workspace,
             artifact_root,
             isolated_home,
@@ -1492,7 +1448,7 @@ impl WorkerSandbox {
             auth_target,
             extra_private_dirs: config.extra_private_dirs,
             git_workspace,
-            empty_root,
+            host_root,
         })
     }
 
@@ -1505,6 +1461,7 @@ impl WorkerSandbox {
         native.revalidate()?;
         bwrap.revalidate()?;
         git.revalidate()?;
+        self.launch_cwd.revalidate(false)?;
         self.workspace.revalidate(false)?;
         self.artifact_root.revalidate(true)?;
         self.isolated_home.revalidate(true)?;
@@ -1518,40 +1475,90 @@ impl WorkerSandbox {
         super::validation::validate_opaque_id("session worker run id", &self.run_id)?;
         self.auth_source.revalidate()?;
         self.auth_target.revalidate()?;
-        self.empty_root.revalidate()?;
+        self.host_root.revalidate()?;
         self.git_workspace.revalidate(self.workspace.path(), git)
     }
 
-    fn outer_argv(
-        &self,
-        artifact_dir: &Path,
-        native: &ExecutableIdentity,
-        inside_native: &'static str,
-        auth_target: &'static str,
-    ) -> Result<Vec<String>> {
+    fn outer_argv(&self, artifact_dir: &Path, native: &ExecutableIdentity) -> Result<Vec<String>> {
         if !artifact_dir.starts_with(self.artifact_root.path()) {
             bail!("reviewer artifact attempt escaped its pinned artifact root");
         }
-        let argv = self.empty_root.outer_argv(EmptyRootMounts {
-            native,
-            inside_native,
+        native.revalidate()?;
+        let extra_writable_dirs: Vec<&Path> = self
+            .extra_private_dirs
+            .iter()
+            .map(DirectoryIdentity::path)
+            .chain([self.temp_dir.path(), self.runtime_dir.path()])
+            .collect();
+        let writable_roots: Vec<&Path> = self
+            .workspace_writable
+            .then_some(self.workspace.path())
+            .into_iter()
+            .collect();
+        let argv = self.host_root.host_root_argv(HostRootMounts {
             isolated_home: self.isolated_home.path(),
             native_config: self.native_config.path(),
-            workspace: self.workspace.path(),
-            workspace_writable: self.workspace_writable,
+            launch_cwd: self.launch_cwd.path(),
             artifact_dir,
             auth_source: self.auth_source.path(),
-            auth_target,
+            auth_target: self.auth_target.path(),
+            readable_roots: &[self.launch_cwd.path(), self.workspace.path()],
+            writable_roots: &writable_roots,
+            read_only_files: &[&native.canonical_path],
+            extra_writable_dirs: &extra_writable_dirs,
+            expose_host_root_read_only: false,
+            masked_dirs: &[],
         })?;
         if argv.iter().any(|argument| {
-            argument == "--"
-                || argument.contains("control.sock")
-                || argument == "--new-session"
-                || argument == "/"
+            argument == "--" || argument.contains("control.sock") || argument == "--new-session"
         }) {
             bail!("session worker outer sandbox manifest contains forbidden launch authority");
         }
         Ok(argv)
+    }
+
+    fn exact_environment(
+        &self,
+        native_config_name: &str,
+        fixed: &[(&str, &str)],
+    ) -> Result<Vec<ExactEnvironmentRequirement>> {
+        let mut exact = fixed
+            .iter()
+            .map(|(name, value)| ExactEnvironmentRequirement::new(*name, *value))
+            .collect::<Result<Vec<_>>>()?;
+        exact.extend([
+            ExactEnvironmentRequirement::new(
+                "HOME",
+                path_string("worker isolated HOME", self.isolated_home.path())?,
+            )?,
+            ExactEnvironmentRequirement::new(
+                native_config_name,
+                path_string("worker native config", self.native_config.path())?,
+            )?,
+            ExactEnvironmentRequirement::new(
+                "TMPDIR",
+                path_string("worker temporary directory", self.temp_dir.path())?,
+            )?,
+            ExactEnvironmentRequirement::new(
+                "XDG_RUNTIME_DIR",
+                path_string("worker runtime directory", self.runtime_dir.path())?,
+            )?,
+        ]);
+        if self.extra_private_dirs.len() == 4 {
+            for (name, directory) in [
+                ("XDG_CONFIG_HOME", &self.extra_private_dirs[0]),
+                ("XDG_STATE_HOME", &self.extra_private_dirs[1]),
+                ("XDG_CACHE_HOME", &self.extra_private_dirs[2]),
+                ("XDG_DATA_HOME", &self.extra_private_dirs[3]),
+            ] {
+                exact.push(ExactEnvironmentRequirement::new(
+                    name,
+                    path_string("worker XDG directory", directory.path())?,
+                )?);
+            }
+        }
+        exact.sort_by(|left, right| left.name().cmp(right.name()));
+        Ok(exact)
     }
 
     fn validate_revision(&self, control: &TurnControl, git: &ExecutableIdentity) -> Result<()> {
@@ -2406,6 +2413,7 @@ mod tests {
         fn codex_config(&self) -> CodexReviewerConfig {
             CodexReviewerConfig {
                 run_id: "run-reviewer-fixture".into(),
+                launch_cwd: self.workspace.clone(),
                 workspace_cwd: self.workspace.clone(),
                 artifact_root: self.artifact_root.clone(),
                 isolated_home: self.isolated_home.clone(),
@@ -2423,6 +2431,7 @@ mod tests {
         fn claude_config(&self) -> ClaudeReviewerConfig {
             ClaudeReviewerConfig {
                 run_id: "run-reviewer-fixture".into(),
+                launch_cwd: self.workspace.clone(),
                 workspace_cwd: self.workspace.clone(),
                 artifact_root: self.artifact_root.clone(),
                 isolated_home: self.isolated_home.clone(),
@@ -2444,6 +2453,7 @@ mod tests {
         fn claude_developer_config(&self) -> ClaudeDeveloperConfig {
             ClaudeDeveloperConfig {
                 run_id: "run-developer-fixture".into(),
+                launch_cwd: self.workspace.clone(),
                 workspace_cwd: self.workspace.clone(),
                 artifact_root: self.artifact_root.clone(),
                 isolated_home: self.isolated_home.clone(),
@@ -2547,13 +2557,35 @@ mod tests {
                 "epoch-reviewers",
                 &CodexReviewerAdapter::environment_policy().unwrap(),
                 vec![
-                    ("CARGO_HOME".into(), INSIDE_CARGO_HOME.into()),
-                    ("CODEX_HOME".into(), INSIDE_NATIVE_CONFIG.into()),
-                    ("HOME".into(), INSIDE_HOME.into()),
-                    ("PATH".into(), INSIDE_PATH.into()),
-                    ("RUSTUP_HOME".into(), INSIDE_RUSTUP_HOME.into()),
-                    ("TMPDIR".into(), INSIDE_TEMP.into()),
-                    ("XDG_RUNTIME_DIR".into(), INSIDE_RUNTIME.into()),
+                    (
+                        "CARGO_HOME".into(),
+                        self.cargo_bin_source
+                            .parent()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    (
+                        "CODEX_HOME".into(),
+                        self.codex_home.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "HOME".into(),
+                        self.isolated_home.to_string_lossy().into_owned(),
+                    ),
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                    (
+                        "RUSTUP_HOME".into(),
+                        self.rustup_home_source.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "TMPDIR".into(),
+                        self.temp_dir.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "XDG_RUNTIME_DIR".into(),
+                        self.runtime_dir.to_string_lossy().into_owned(),
+                    ),
                 ],
             )
             .unwrap()
@@ -2561,17 +2593,51 @@ mod tests {
 
         fn claude_lease(&self, id: &str) -> ExecutionEnvironmentLease {
             let mut values = vec![
-                ("CARGO_HOME".into(), INSIDE_CARGO_HOME.into()),
-                ("CLAUDE_CONFIG_DIR".into(), INSIDE_NATIVE_CONFIG.into()),
-                ("HOME".into(), INSIDE_HOME.into()),
-                ("PATH".into(), INSIDE_PATH.into()),
-                ("RUSTUP_HOME".into(), INSIDE_RUSTUP_HOME.into()),
-                ("TMPDIR".into(), INSIDE_TEMP.into()),
-                ("XDG_CACHE_HOME".into(), "/hcom/home/.cache".into()),
-                ("XDG_CONFIG_HOME".into(), "/hcom/home/.config".into()),
-                ("XDG_DATA_HOME".into(), "/hcom/home/.data".into()),
-                ("XDG_RUNTIME_DIR".into(), INSIDE_RUNTIME.into()),
-                ("XDG_STATE_HOME".into(), "/hcom/home/.state".into()),
+                (
+                    "CARGO_HOME".into(),
+                    self.cargo_bin_source
+                        .parent()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                (
+                    "CLAUDE_CONFIG_DIR".into(),
+                    self.claude_config_dir.to_string_lossy().into_owned(),
+                ),
+                (
+                    "HOME".into(),
+                    self.isolated_home.to_string_lossy().into_owned(),
+                ),
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                (
+                    "RUSTUP_HOME".into(),
+                    self.rustup_home_source.to_string_lossy().into_owned(),
+                ),
+                (
+                    "TMPDIR".into(),
+                    self.temp_dir.to_string_lossy().into_owned(),
+                ),
+                (
+                    "XDG_CACHE_HOME".into(),
+                    self.xdg_cache_home.to_string_lossy().into_owned(),
+                ),
+                (
+                    "XDG_CONFIG_HOME".into(),
+                    self.xdg_config_home.to_string_lossy().into_owned(),
+                ),
+                (
+                    "XDG_DATA_HOME".into(),
+                    self.xdg_data_home.to_string_lossy().into_owned(),
+                ),
+                (
+                    "XDG_RUNTIME_DIR".into(),
+                    self.runtime_dir.to_string_lossy().into_owned(),
+                ),
+                (
+                    "XDG_STATE_HOME".into(),
+                    self.xdg_state_home.to_string_lossy().into_owned(),
+                ),
             ];
             values.extend(
                 CLAUDE_EXACT_ENVIRONMENT
@@ -2830,18 +2896,23 @@ mod tests {
         let outer = &command.outer_launch.as_ref().unwrap().fixed_argv;
         assert!(outer.windows(3).any(|part| {
             part == [
-                "--bind",
-                fixture.workspace.to_str().unwrap(),
-                INSIDE_WORKSPACE,
-            ]
-        }));
-        assert!(!outer.windows(3).any(|part| {
-            part == [
                 "--ro-bind",
                 fixture.workspace.to_str().unwrap(),
-                INSIDE_WORKSPACE,
+                fixture.workspace.to_str().unwrap(),
             ]
         }));
+        assert!(outer.windows(3).any(|part| {
+            part == [
+                "--bind",
+                fixture.workspace.to_str().unwrap(),
+                fixture.workspace.to_str().unwrap(),
+            ]
+        }));
+        assert!(
+            outer
+                .windows(2)
+                .any(|part| { part == ["--chdir", fixture.workspace.to_str().unwrap(),] })
+        );
 
         fs::write(
             fixture.workspace.join("claude-developed.txt"),
@@ -2897,6 +2968,48 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["--resume", CLAUDE_SESSION])
         );
+    }
+
+    #[test]
+    fn claude_worker_keeps_project_cwd_and_writes_only_the_task_repository() {
+        let fixture = Fixture::new();
+        let project = fixture._temp.path().join("project-context");
+        fs::create_dir(&project).unwrap();
+        fs::set_permissions(&project, fs::Permissions::from_mode(0o700)).unwrap();
+        let project = fs::canonicalize(project).unwrap();
+        let mut config = fixture.claude_developer_config();
+        config.launch_cwd = project.clone();
+        let adapter = ClaudeDeveloperAdapter::discover_with_paths(
+            config,
+            &fixture.claude,
+            &fixture.bwrap,
+            &fixture.git,
+        )
+        .unwrap();
+        let control = fixture.developer_control(CLAUDE_SESSION, 1, None);
+        let prepared = prepare_create_turn(
+            &adapter,
+            &adapter.profile(),
+            &control,
+            b"read project context and edit only the task repository".to_vec(),
+        )
+        .unwrap();
+        let command = prepared.command();
+        assert_eq!(command.workspace_cwd, project);
+        let outer = &command.outer_launch.as_ref().unwrap().fixed_argv;
+        assert!(
+            outer
+                .windows(2)
+                .any(|pair| { pair == ["--chdir", command.workspace_cwd.to_str().unwrap()] })
+        );
+        assert!(outer.windows(3).any(|part| {
+            part == [
+                "--bind",
+                fixture.workspace.to_str().unwrap(),
+                fixture.workspace.to_str().unwrap(),
+            ]
+        }));
+        assert!(!outer.iter().any(|argument| argument == "/hcom/workspace"));
     }
 
     #[test]
@@ -2960,7 +3073,7 @@ mod tests {
                 .capability
                 .features
                 .iter()
-                .any(|feature| feature == "outer-bwrap-empty-root-reviewer-ro-v2")
+                .any(|feature| feature == "outer-bwrap-host-path-reviewer-ro-v1")
         );
         assert_eq!(
             codex_profile.native_session_mode,
@@ -3087,7 +3200,7 @@ mod tests {
                 .capability
                 .features
                 .iter()
-                .any(|feature| feature == "outer-bwrap-empty-root-reviewer-ro-v2")
+                .any(|feature| feature == "outer-bwrap-host-path-reviewer-ro-v1")
         );
         assert_eq!(
             claude_profile.native_session_mode,
@@ -3261,7 +3374,7 @@ mod tests {
             "epoch-reviewers",
             &ClaudeReviewerAdapter::environment_policy().unwrap(),
             vec![
-                ("CARGO_HOME".into(), INSIDE_CARGO_HOME.into()),
+                ("CARGO_HOME".into(), "/wrong/cargo-home".into()),
                 ("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS".into(), "1".into()),
                 ("CLAUDE_CODE_DISABLE_FAST_MODE".into(), "0".into()),
                 (
@@ -3272,16 +3385,16 @@ mod tests {
                     "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION".into(),
                     "false".into(),
                 ),
-                ("CLAUDE_CONFIG_DIR".into(), INSIDE_NATIVE_CONFIG.into()),
-                ("HOME".into(), INSIDE_HOME.into()),
-                ("PATH".into(), INSIDE_PATH.into()),
-                ("RUSTUP_HOME".into(), INSIDE_RUSTUP_HOME.into()),
-                ("TMPDIR".into(), INSIDE_TEMP.into()),
-                ("XDG_CACHE_HOME".into(), "/hcom/home/.cache".into()),
-                ("XDG_CONFIG_HOME".into(), "/hcom/home/.config".into()),
-                ("XDG_DATA_HOME".into(), "/hcom/home/.data".into()),
-                ("XDG_RUNTIME_DIR".into(), INSIDE_RUNTIME.into()),
-                ("XDG_STATE_HOME".into(), "/hcom/home/.state".into()),
+                ("CLAUDE_CONFIG_DIR".into(), "/wrong/claude-config".into()),
+                ("HOME".into(), "/wrong/home".into()),
+                ("PATH".into(), "/wrong/bin".into()),
+                ("RUSTUP_HOME".into(), "/wrong/rustup-home".into()),
+                ("TMPDIR".into(), "/wrong/temp".into()),
+                ("XDG_CACHE_HOME".into(), "/wrong/cache".into()),
+                ("XDG_CONFIG_HOME".into(), "/wrong/config".into()),
+                ("XDG_DATA_HOME".into(), "/wrong/data".into()),
+                ("XDG_RUNTIME_DIR".into(), "/wrong/runtime".into()),
+                ("XDG_STATE_HOME".into(), "/wrong/state".into()),
             ],
         )
         .unwrap();
@@ -3600,11 +3713,12 @@ mod tests {
             .unwrap()
             .fixed_argv
             .as_slice();
+        let auth_target = fixture.claude_config_dir.join(CLAUDE_AUTH_FILE);
         assert!(argv.windows(3).any(|part| {
             part == [
                 "--ro-bind",
                 fixture.claude_auth_source.to_str().unwrap(),
-                "/hcom/native/.credentials.json",
+                auth_target.to_str().unwrap(),
             ]
         }));
         assert!(!argv.windows(3).any(|part| {
@@ -3653,6 +3767,7 @@ mod tests {
         prompt: &[u8],
         session_flag: &str,
     ) {
+        let auth_target = fixture.claude_config_dir.join(CLAUDE_AUTH_FILE);
         assert!(
             argv.windows(2)
                 .any(|pair| pair == ["--model", CLAUDE_REVIEWER_MODEL])
@@ -3689,7 +3804,7 @@ mod tests {
                 part == [
                     "--bind",
                     fixture.claude_config_dir.to_str().unwrap(),
-                    INSIDE_NATIVE_CONFIG,
+                    fixture.claude_config_dir.to_str().unwrap(),
                 ]
             }),
             "Claude session state must stay in its isolated native config"
@@ -3699,7 +3814,7 @@ mod tests {
                 part == [
                     "--ro-bind",
                     fixture.claude_auth_source.to_str().unwrap(),
-                    "/hcom/native/.credentials.json",
+                    auth_target.to_str().unwrap(),
                 ]
             }),
             "Claude OAuth credentials must remain an exact read-only overlay"
@@ -3710,22 +3825,24 @@ mod tests {
     }
 
     fn assert_ro_workspace_and_no_authority(argv: &[String], fixture: &Fixture, prompt: &[u8]) {
-        let workspace = fixture.workspace.to_str().unwrap();
-        assert!(
-            argv.windows(3)
-                .any(|part| part == ["--ro-bind", workspace, INSIDE_WORKSPACE])
-        );
-        assert!(
-            !argv
-                .windows(3)
-                .any(|part| part == ["--bind", workspace, INSIDE_WORKSPACE])
-        );
+        assert!(argv.windows(3).any(|part| {
+            part == [
+                "--ro-bind",
+                fixture.workspace.to_str().unwrap(),
+                fixture.workspace.to_str().unwrap(),
+            ]
+        }));
+        assert!(!argv.windows(3).any(|part| {
+            part == [
+                "--bind",
+                fixture.workspace.to_str().unwrap(),
+                fixture.workspace.to_str().unwrap(),
+            ]
+        }));
         assert!(
             argv.windows(2)
-                .any(|pair| pair == ["--tmpfs", INSIDE_RUNTIME])
+                .any(|part| { part == ["--chdir", fixture.workspace.to_str().unwrap()] })
         );
-        assert!(argv.windows(2).any(|pair| pair == ["--tmpfs", INSIDE_TEMP]));
-        assert!(!argv.windows(3).any(|part| part == ["--ro-bind", "/", "/"]));
         let joined = argv.join("\0");
         assert!(!joined.contains(&String::from_utf8_lossy(prompt).to_string()));
         assert!(!joined.contains(fixture.developer_worktree.to_str().unwrap()));
@@ -3804,10 +3921,12 @@ fi
 [ -n "${HCOM_RUN_ID-}" ] && [ -n "${HCOM_TASK_ID-}" ]
 [ -z "${HCOM_AGENT-}" ] && [ -z "${TERM-}" ] && [ -z "${STY-}" ]
 [ -n "${HOME-}" ] && [ -n "${CODEX_HOME-}" ] && [ -n "${TMPDIR-}" ]
-[ "${HOME-}" = /hcom/home ] && [ "${CODEX_HOME-}" = /hcom/native ]
-[ "${TMPDIR-}" = /tmp ] && [ "${XDG_RUNTIME_DIR-}" = /hcom/run ]
-[ "${CARGO_HOME-}" = /hcom/home/.cargo ]
-[ "${RUSTUP_HOME-}" = /hcom/toolchains/rust/rustup ]
+case "${HOME-}" in /*) ;; *) exit 91 ;; esac
+case "${CODEX_HOME-}" in /*) ;; *) exit 92 ;; esac
+case "${TMPDIR-}" in /*) ;; *) exit 93 ;; esac
+case "${XDG_RUNTIME_DIR-}" in /*) ;; *) exit 94 ;; esac
+case "${CARGO_HOME-}" in /*) ;; *) exit 95 ;; esac
+case "${RUSTUP_HOME-}" in /*) ;; *) exit 96 ;; esac
 [ "$1" = exec ]
 shift
 session=native-codex-reviewer-1
@@ -3860,10 +3979,12 @@ fi
 [ -n "${HCOM_RUN_ID-}" ] && [ -n "${HCOM_TASK_ID-}" ]
 [ -z "${HCOM_AGENT-}" ] && [ -z "${TERM-}" ] && [ -z "${STY-}" ]
 [ -n "${HOME-}" ] && [ -n "${CLAUDE_CONFIG_DIR-}" ] && [ -n "${TMPDIR-}" ]
-[ "${HOME-}" = /hcom/home ] && [ "${CLAUDE_CONFIG_DIR-}" = /hcom/native ]
-[ "${TMPDIR-}" = /tmp ] && [ "${XDG_RUNTIME_DIR-}" = /hcom/run ]
-[ "${CARGO_HOME-}" = /hcom/home/.cargo ]
-[ "${RUSTUP_HOME-}" = /hcom/toolchains/rust/rustup ]
+case "${HOME-}" in /*) ;; *) exit 91 ;; esac
+case "${CLAUDE_CONFIG_DIR-}" in /*) ;; *) exit 92 ;; esac
+case "${TMPDIR-}" in /*) ;; *) exit 93 ;; esac
+case "${XDG_RUNTIME_DIR-}" in /*) ;; *) exit 94 ;; esac
+case "${CARGO_HOME-}" in /*) ;; *) exit 95 ;; esac
+case "${RUSTUP_HOME-}" in /*) ;; *) exit 96 ;; esac
 [ "${CLAUDE_CODE_DISABLE_BACKGROUND_TASKS-}" = 1 ]
 [ "${CLAUDE_CODE_DISABLE_FAST_MODE-}" = 1 ]
 [ "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC-}" = 1 ]

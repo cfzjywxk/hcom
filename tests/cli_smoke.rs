@@ -433,10 +433,14 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     let (code, stdout, stderr) = h.run(["architect", "--help"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     assert!(stdout.contains("hcom architect codex"), "stdout={stdout}");
-    assert!(stdout.contains("--repo"), "stdout={stdout}");
+    assert!(!stdout.contains("--repo"), "stdout={stdout}");
     assert!(!stdout.contains("--project"), "stdout={stdout}");
     assert!(stdout.contains("session-task tools"), "stdout={stdout}");
-    assert!(stdout.contains("canonical checkout"), "stdout={stdout}");
+    assert!(
+        stdout.contains("exact current directory"),
+        "stdout={stdout}"
+    );
+    assert!(stdout.contains("canonical Git root"), "stdout={stdout}");
     assert!(stdout.contains("$HCOM_DIR/config.toml"), "stdout={stdout}");
     assert!(stdout.contains("[architect.profile]"), "stdout={stdout}");
     assert!(stdout.contains("[architect.developer]"), "stdout={stdout}");
@@ -468,7 +472,7 @@ fn architect_help_does_not_read_or_repair_malformed_v24_state() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn architect_refuses_pipe_stdio_before_opening_either_state_lane() {
+fn architect_rejects_the_removed_repository_argument() {
     let h = Hcom::new();
     let (code, stdout, stderr) = h.run([
         "architect",
@@ -476,6 +480,16 @@ fn architect_refuses_pipe_stdio_before_opening_either_state_lane() {
         "--repo",
         h.workspace.to_str().unwrap(),
     ]);
+    assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.is_empty(), "stdout={stdout}");
+    assert!(stderr.contains("--repo"), "stderr={stderr}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn architect_refuses_pipe_stdio_before_opening_either_state_lane() {
+    let h = Hcom::new();
+    let (code, stdout, stderr) = h.run(["architect", "codex"]);
     assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
     assert!(stdout.is_empty(), "stdout={stdout}");
     assert!(

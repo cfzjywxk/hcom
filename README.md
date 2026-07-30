@@ -100,15 +100,20 @@ reviewer; Codex or Claude can be selected independently for either role.
 Same-task review changes resume only that task's exact native sessions.
 
 ```bash
-hcom architect codex --repo /absolute/canonical/repository
+cd /path/to/project
+hcom architect codex
 ```
 
-`--repo` is required. Architect, developer, and reviewer model/effort/permission
-profiles are typed TOML settings in `$HCOM_DIR/config.toml` (normally
-`~/.hcom/config.toml`) and are frozen when the command starts. See
-[the Architect user guide](docs/architect.md) for the complete schema, all four
-Codex/Claude role combinations, parent-terminal login inheritance, and sandbox
-invariants.
+The exact current directory is the project context and remains the native
+working directory for the Architect and every Codex/Claude task worker. It
+does not need to be a Git repository. The Architect reads its documentation
+and binds each approved task to the task's actual source repository; that may
+be elsewhere or nested under the project. Architect, developer, and reviewer
+model/effort/permission profiles are typed TOML settings in
+`$HCOM_DIR/config.toml` (normally `~/.hcom/config.toml`) and are frozen when
+the command starts. See [the Architect user guide](docs/architect.md) for the
+complete schema, all four Codex/Claude role combinations, parent-terminal
+login inheritance, and path-preserving sandbox invariants.
 
 ---
 

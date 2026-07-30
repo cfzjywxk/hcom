@@ -22,7 +22,6 @@ use crate::worker::profile::{
     CLAUDE_DEVELOPER_ADAPTER, CLAUDE_REVIEWER_ADAPTER, CODEX_DEVELOPER_ADAPTER,
     CODEX_REVIEWER_ADAPTER,
 };
-use crate::worker::sandbox::INSIDE_WORKSPACE;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -58,7 +57,7 @@ pub(super) struct BridgeConfiguration {
     pub binding_id: String,
     pub launch_nonce: String,
     pub capability: String,
-    pub repo_root: PathBuf,
+    pub project_root: PathBuf,
     pub run_root: PathBuf,
     pub lock_root: PathBuf,
     pub relay_socket_path: PathBuf,
@@ -226,7 +225,11 @@ fn validate_bridge_configuration(configuration: &BridgeConfiguration) -> Result<
     validate_native_session_id(&configuration.binding_id)?;
     validate_secret(&configuration.launch_nonce)?;
     validate_secret(&configuration.capability)?;
-    validate_canonical_directory("architect repository", &configuration.repo_root, None)?;
+    validate_canonical_directory(
+        "architect project directory",
+        &configuration.project_root,
+        None,
+    )?;
     let relay_parent = configuration
         .relay_socket_path
         .parent()
@@ -501,8 +504,9 @@ fn handle_tool_call(
             &configuration.reviewer_adapter,
         )
         .map_err(|_| NativeSessionBindingRefusal(TOOL_REFUSAL_ACTION))?;
-        let observed = discover_codex_native_session(&configuration.codex_home)
-            .map_err(|_| NativeSessionBindingRefusal(NATIVE_SESSION_REFUSAL_DISCOVERY))?;
+        let observed =
+            discover_codex_native_session(&configuration.codex_home, &configuration.project_root)
+                .map_err(|_| NativeSessionBindingRefusal(NATIVE_SESSION_REFUSAL_DISCOVERY))?;
         match native_session_id {
             Some(expected) if expected != &observed => {
                 bail!(NativeSessionBindingRefusal(NATIVE_SESSION_REFUSAL_CHANGED))
@@ -596,7 +600,7 @@ fn tool_call_refusal_text(error: &anyhow::Error) -> String {
     }
 }
 
-fn discover_codex_native_session(codex_home: &Path) -> Result<String> {
+fn discover_codex_native_session(codex_home: &Path, project_root: &Path) -> Result<String> {
     let sessions = codex_home.join("sessions");
     let mut files = Vec::new();
     let mut entries = 0;
@@ -633,14 +637,11 @@ fn discover_codex_native_session(codex_home: &Path) -> Result<String> {
     }
     let metadata: CodexSessionMetadata =
         serde_json::from_slice(trim_line(&first_line)).context("invalid Codex session metadata")?;
-    // Codex runs inside the empty-root mount namespace. Its machine record must
-    // therefore bind the exact namespace-local workspace path, not the host
-    // repository path mounted there by the already-validated sandbox contract.
     if metadata.kind != "session_meta"
-        || metadata.payload.cwd != Path::new(INSIDE_WORKSPACE)
+        || metadata.payload.cwd != project_root
         || metadata.payload.cli_version != "0.145.0"
     {
-        bail!("architect native session metadata does not match the exact workspace");
+        bail!("architect native session metadata does not match the exact project directory");
     }
     let id = Uuid::parse_str(&metadata.payload.id)
         .context("architect native session id is not a canonical UUID")?
@@ -966,7 +967,7 @@ mod tests {
             fs::create_dir(&codex_home).unwrap();
             let session_path = codex_session_path(&codex_home, TEST_NATIVE_SESSION_ID);
             if with_session {
-                write_codex_session(&codex_home, TEST_NATIVE_SESSION_ID);
+                write_codex_session(&codex_home, &repo_root, TEST_NATIVE_SESSION_ID);
             }
             let executable = ExecutableIdentity::capture(
                 fs::canonicalize(std::env::current_exe().unwrap()).unwrap(),
@@ -978,7 +979,7 @@ mod tests {
                     binding_id: "binding-session-test".into(),
                     launch_nonce: "launch-nonce-session-test".into(),
                     capability: "capability-session-test".into(),
-                    repo_root,
+                    project_root: repo_root,
                     run_root: root.clone(),
                     lock_root: root.clone(),
                     relay_socket_path: root.join(RELAY_SOCKET_NAME),
@@ -1001,14 +1002,14 @@ mod tests {
             .join(format!("rollout-2026-07-29T00-00-00-{id}.jsonl"))
     }
 
-    fn write_codex_session(codex_home: &Path, id: &str) -> PathBuf {
+    fn write_codex_session(codex_home: &Path, project_root: &Path, id: &str) -> PathBuf {
         let path = codex_session_path(codex_home, id);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
             format!(
                 "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{},\"cli_version\":\"0.145.0\",\"originator\":\"codex_cli_rs\"}}}}\n",
-                serde_json::to_string(INSIDE_WORKSPACE).unwrap()
+                serde_json::to_string(project_root).unwrap()
             ),
         )
         .unwrap();
@@ -1054,10 +1055,7 @@ mod tests {
             run_id: "run-test".into(),
             state: SessionState::AwaitingPlan,
             version: 0,
-            repo_root: "/repo".into(),
-            start_branch: "main".into(),
-            start_head: "a".repeat(40),
-            current_head: "a".repeat(40),
+            project_root: "/project".into(),
             plan_version: None,
             plan_hash: None,
             current_task_ordinal: None,
@@ -1108,7 +1106,7 @@ mod tests {
             binding_id: "binding-namespace-test".into(),
             launch_nonce: "launch-nonce-namespace-test".into(),
             capability: "capability-namespace-test".into(),
-            repo_root: root.clone(),
+            project_root: root.clone(),
             run_root: root.clone(),
             lock_root: root.clone(),
             relay_socket_path: socket_path.clone(),
@@ -1372,6 +1370,7 @@ mod tests {
                             "task_key":"p9-task-1",
                             "title":"Phase 9 Task 1",
                             "objective":"Create task1.txt with exactly two lines:\nphase9-task-1\nreview-stage: pending",
+                            "repository_root":fixture.configuration.project_root,
                             "acceptance_criteria":["first review requests changes"],
                             "required_checks":["/usr/bin/test -f task1.txt"],
                             "allowed_paths":["README.md","task1.txt"],
@@ -1674,7 +1673,7 @@ mod tests {
     }
 
     #[test]
-    fn native_session_requires_one_exact_namespace_local_machine_record() {
+    fn native_session_requires_one_exact_project_directory_machine_record() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
         let codex = temp.path().join("codex");
@@ -1687,26 +1686,26 @@ mod tests {
             &path,
             format!(
                 "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{},\"cli_version\":\"0.145.0\",\"originator\":\"codex_cli_rs\"}}}}\n",
-                serde_json::to_string(INSIDE_WORKSPACE).unwrap()
+                serde_json::to_string(&repo).unwrap()
             ),
         )
         .unwrap();
-        assert_eq!(discover_codex_native_session(&codex).unwrap(), id);
+        assert_eq!(discover_codex_native_session(&codex, &repo).unwrap(), id);
 
         fs::write(
             &path,
             format!(
                 "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{},\"cli_version\":\"0.145.0\",\"originator\":\"codex_cli_rs\"}}}}\n",
-                serde_json::to_string(&repo).unwrap()
+                serde_json::to_string("/wrong/project-directory").unwrap()
             ),
         )
         .unwrap();
-        assert!(discover_codex_native_session(&codex).is_err());
+        assert!(discover_codex_native_session(&codex, &repo).is_err());
         fs::write(
             &path,
             format!(
                 "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{},\"cli_version\":\"0.145.0\",\"originator\":\"codex_cli_rs\"}}}}\n",
-                serde_json::to_string(INSIDE_WORKSPACE).unwrap()
+                serde_json::to_string(&repo).unwrap()
             ),
         )
         .unwrap();
@@ -1716,7 +1715,7 @@ mod tests {
             "{}\n",
         )
         .unwrap();
-        assert!(discover_codex_native_session(&codex).is_err());
+        assert!(discover_codex_native_session(&codex, &repo).is_err());
     }
 
     #[test]
@@ -1754,7 +1753,7 @@ mod tests {
             binding_id: "binding-session-test".into(),
             launch_nonce: "launch-nonce-session-test".into(),
             capability: "capability-session-test".into(),
-            repo_root,
+            project_root: repo_root,
             run_root: run_root.clone(),
             lock_root: lock_root.clone(),
             relay_socket_path: relay_root.join(RELAY_SOCKET_NAME),

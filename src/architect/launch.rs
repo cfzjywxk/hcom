@@ -20,10 +20,7 @@ use crate::worker::profile::{
     CodexApprovalPolicy, CodexInvocationProfile, CodexSandbox, DeveloperInvocationProfile,
     ReviewerInvocationProfile, SessionInvocationProfiles, validate_cli_help_contract,
 };
-use crate::worker::sandbox::{
-    EmptyRootContract, INSIDE_CARGO_HOME, INSIDE_CODEX, INSIDE_HOME, INSIDE_NATIVE_CONFIG,
-    INSIDE_PATH, INSIDE_RUNTIME, INSIDE_RUSTUP_HOME, INSIDE_TEMP, INSIDE_WORKSPACE,
-};
+use crate::worker::sandbox::{HostRootContract, HostRootMounts};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -44,9 +41,6 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const MAX_BWRAP_INFO_BYTES: usize = 4096;
-const INSIDE_ARCHITECT_RUNTIME: &str = "/hcom/architect";
-const INSIDE_ARCHITECT_RELAY: &str = "/hcom/architect/relay.sock";
-const INSIDE_ARCHITECT_COMPONENT: &str = "/hcom/bin/hcom-architect-mcp";
 
 #[derive(Parser)]
 #[command(
@@ -57,10 +51,6 @@ const INSIDE_ARCHITECT_COMPONENT: &str = "/hcom/bin/hcom-architect-mcp";
 struct ArchitectArgs {
     /// Exact enabled architect adapter.
     adapter: String,
-
-    /// Existing canonical Git repository.
-    #[arg(long)]
-    repo: PathBuf,
 
     #[arg(long)]
     model: Option<String>,
@@ -98,7 +88,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
     apply_architect_cli_overrides(&args, &mut loaded.profiles)?;
     validate_foreground_terminal()?;
 
-    let repository = canonical_repository(&args.repo)?;
+    let project_root = canonical_project_directory(&std::env::current_dir()?)?;
     let native_environment = ArchitectEnvironment::capture()?;
     let session_root = create_private_session_runtime()?;
     let run_root = fs::canonicalize(session_root.path())?;
@@ -116,7 +106,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
     let supervisor_endpoint = SessionSupervisorEndpoint::bind(
         control_paths.clone(),
         run_id.clone(),
-        repository.clone(),
+        project_root.clone(),
         runtime_sources,
     )?;
     let startup = supervisor_endpoint.startup().clone();
@@ -136,11 +126,9 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         writeln!(stdout, "hcom session run: {}", startup.run_id)?;
         writeln!(
             stdout,
-            "canonical repository: {}",
-            startup.repo_root.display()
+            "project directory: {}",
+            startup.project_root.display()
         )?;
-        writeln!(stdout, "start branch: {}", startup.start_branch)?;
-        writeln!(stdout, "start HEAD: {}", startup.start_head)?;
         writeln!(
             stdout,
             "profile config: {} ({})",
@@ -155,7 +143,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         write_profile_summary(&mut stdout, &loaded.profiles)?;
         writeln!(
             stdout,
-            "canonical-checkout risk: approved developer tasks commit directly in this checkout; drift stops the run without reset, rebase, merge, or final apply"
+            "task repositories: discovered from project documentation and bound only after exact plan approval; each developer commits directly there"
         )?;
         stdout.flush()?;
     }
@@ -168,7 +156,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
     let launch_nonce = random_hex(32)?;
     let capability = random_hex(32)?;
     let paths = ArchitectLaunchPaths::create(&control_paths, &launch_id)?;
-    validate_path_isolation(&repository, &paths, &tools)?;
+    validate_path_isolation(&project_root, &paths, &tools)?;
     let auth_source = PrivateFileIdentity::capture(&discover_codex_auth_source()?)?;
     if paths_overlap(auth_source.path(), &paths.state)
         || paths_overlap(auth_source.path(), &paths.runtime)
@@ -176,7 +164,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         bail!("Codex auth source overlaps architect writable state");
     }
     create_empty_private_file(&paths.auth_target)?;
-    write_isolated_codex_config(&paths)?;
+    write_isolated_codex_config(&paths, &tools.component.canonical_path)?;
 
     let process_birth = process_birth_identity(std::process::id())?;
     let relay_contract_hash = sha256_hex(&serde_json::to_vec(&tools.component)?);
@@ -186,7 +174,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         &process_birth,
         RegistrationAction::CreateBinding {
             binding_id: binding_id.clone(),
-            repo_root: path_text("architect repository", &repository)?.into(),
+            project_root: path_text("architect project directory", &project_root)?.into(),
             architect_name,
             architect_adapter: "codex-0.145.0".into(),
             launch_nonce: launch_nonce.clone(),
@@ -243,7 +231,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         binding_id: binding_id.clone(),
         launch_nonce: launch_nonce.clone(),
         capability: capability.clone(),
-        repo_root: repository.clone(),
+        project_root: project_root.clone(),
         run_root: control_paths.run_root().to_owned(),
         lock_root: control_paths.lock_root().to_owned(),
         relay_socket_path: paths.relay_socket.clone(),
@@ -267,11 +255,12 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
     }
 
     let sandbox = ArchitectSandbox {
-        repository: repository.clone(),
+        project_root: project_root.clone(),
         paths: paths.clone(),
         auth_source,
         host_runtime: native_environment.runtime_home.clone(),
-        empty_root: EmptyRootContract::capture(
+        session_runtime_root: control_paths.run_root().to_owned(),
+        host_root: HostRootContract::capture(
             &native_environment.cargo_bin_source,
             &native_environment.rustup_home_source,
         )?,
@@ -570,33 +559,15 @@ fn validate_foreground_terminal() -> Result<()> {
     Ok(())
 }
 
-fn canonical_repository(repo: &Path) -> Result<PathBuf> {
-    if !repo.is_absolute() {
-        bail!("architect repository must be absolute");
+fn canonical_project_directory(project: &Path) -> Result<PathBuf> {
+    if !project.is_absolute() {
+        bail!("architect current project directory must be absolute");
     }
     let canonical =
-        fs::canonicalize(repo).context("failed to canonicalize architect repository")?;
-    if canonical != repo || !canonical.is_dir() {
-        bail!("architect repository must already be an existing canonical directory");
-    }
-    let output = Command::new("/usr/bin/git")
-        .args([
-            "-C",
-            path_text("architect repository", &canonical)?,
-            "rev-parse",
-            "--show-toplevel",
-        ])
-        .env_clear()
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .output()
-        .context("failed to validate architect Git repository")?;
-    if !output.status.success() || !output.stderr.is_empty() || output.stdout.len() > 4096 {
-        bail!("architect repository is not a canonical Git worktree");
-    }
-    let top = std::str::from_utf8(&output.stdout)?.trim_end();
-    if top != path_text("architect repository", &canonical)? {
-        bail!("architect --repo must name the exact Git top level");
+        fs::canonicalize(project).context("failed to canonicalize architect project directory")?;
+    let metadata = fs::symlink_metadata(project)?;
+    if canonical != project || metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("architect current project directory must already be canonical");
     }
     Ok(canonical)
 }
@@ -934,13 +905,13 @@ struct IsolatedMcpServer {
     enabled: bool,
 }
 
-fn write_isolated_codex_config(paths: &ArchitectLaunchPaths) -> Result<()> {
+fn write_isolated_codex_config(paths: &ArchitectLaunchPaths, component: &Path) -> Result<()> {
     let server = IsolatedMcpServer {
-        command: INSIDE_ARCHITECT_COMPONENT.into(),
+        command: path_text("architect MCP component", component)?.into(),
         args: vec![
             "relay".into(),
             "--socket".into(),
-            INSIDE_ARCHITECT_RELAY.into(),
+            path_text("architect relay socket", &paths.relay_socket)?.into(),
         ],
         startup_timeout_sec: 10,
         tool_timeout_sec: 300,
@@ -979,13 +950,13 @@ fn write_isolated_codex_config(paths: &ArchitectLaunchPaths) -> Result<()> {
 }
 
 fn validate_path_isolation(
-    repository: &Path,
+    project_root: &Path,
     paths: &ArchitectLaunchPaths,
     tools: &ExactTools,
 ) -> Result<()> {
     for (left, right, label) in [
-        (repository, paths.state.as_path(), "repository/state"),
-        (repository, paths.runtime.as_path(), "repository/runtime"),
+        (project_root, paths.state.as_path(), "project/state"),
+        (project_root, paths.runtime.as_path(), "project/runtime"),
         (
             paths.state.as_path(),
             paths.runtime.as_path(),
@@ -1111,18 +1082,30 @@ impl ArchitectEnvironment {
         })
     }
 
-    fn sandbox_values(&self, _paths: &ArchitectLaunchPaths) -> Result<BTreeMap<String, String>> {
+    fn sandbox_values(&self, paths: &ArchitectLaunchPaths) -> Result<BTreeMap<String, String>> {
         let mut values = self.values.clone();
-        for (name, value) in [
-            ("CARGO_HOME", INSIDE_CARGO_HOME),
-            ("CODEX_HOME", INSIDE_NATIVE_CONFIG),
-            ("HOME", INSIDE_HOME),
-            ("PATH", INSIDE_PATH),
-            ("RUSTUP_HOME", INSIDE_RUSTUP_HOME),
-            ("TMPDIR", INSIDE_TEMP),
-            ("XDG_RUNTIME_DIR", INSIDE_RUNTIME),
-        ] {
-            values.insert(name.into(), value.into());
+        let home = self
+            .control_environment
+            .get("HOME")
+            .ok_or_else(|| anyhow::anyhow!("architect parent HOME disappeared"))?
+            .clone();
+        values.insert("HOME".into(), home);
+        values.insert(
+            "CODEX_HOME".into(),
+            path_text("architect isolated Codex home", &paths.codex_home)?.into(),
+        );
+        values.insert(
+            "TMPDIR".into(),
+            path_text("architect private temporary directory", &paths.runtime)?.into(),
+        );
+        values.insert(
+            "XDG_RUNTIME_DIR".into(),
+            path_text("architect private runtime directory", &paths.runtime)?.into(),
+        );
+        for name in ["CARGO_HOME", "RUSTUP_HOME"] {
+            if let Some(value) = self.control_environment.get(name) {
+                values.insert(name.into(), value.clone());
+            }
         }
         Ok(values)
     }
@@ -1220,11 +1203,12 @@ fn spawn_bridge(component: &Path, environment: &BTreeMap<String, String>) -> Res
 }
 
 struct ArchitectSandbox {
-    repository: PathBuf,
+    project_root: PathBuf,
     paths: ArchitectLaunchPaths,
     auth_source: PrivateFileIdentity,
     host_runtime: PathBuf,
-    empty_root: EmptyRootContract,
+    session_runtime_root: PathBuf,
+    host_root: HostRootContract,
 }
 
 impl ArchitectSandbox {
@@ -1243,42 +1227,29 @@ impl ArchitectSandbox {
         if paths_overlap(&self.paths.runtime, &self.host_runtime) {
             bail!("architect relay runtime overlaps the host runtime directory");
         }
+        if paths_overlap(&self.session_runtime_root, &self.host_runtime) {
+            bail!("architect session runtime overlaps the host runtime directory");
+        }
         tools.revalidate()?;
-        let mut argv = self.empty_root.base_argv()?;
+        let mut argv = self.host_root.host_root_argv(HostRootMounts {
+            isolated_home: &self.paths.home,
+            native_config: &self.paths.codex_home,
+            launch_cwd: &self.project_root,
+            artifact_dir: &self.paths.runtime,
+            auth_source: self.auth_source.path(),
+            auth_target: &self.paths.auth_target,
+            readable_roots: &[&self.project_root],
+            writable_roots: &[],
+            read_only_files: &[&tools.codex.canonical_path, &tools.component.canonical_path],
+            extra_writable_dirs: &[],
+            expose_host_root_read_only: true,
+            masked_dirs: &[&self.host_runtime, &self.session_runtime_root],
+        })?;
         argv.push("--clearenv".into());
         for (name, value) in environment.sandbox_values(&self.paths)? {
             argv.extend(["--setenv".into(), name, value]);
         }
         argv.extend([
-            "--dir".into(),
-            INSIDE_ARCHITECT_RUNTIME.into(),
-            "--ro-bind".into(),
-            path_text("runtime launch source", &self.paths.runtime)?.into(),
-            INSIDE_ARCHITECT_RUNTIME.into(),
-            "--bind".into(),
-            path_text("architect isolated HOME", &self.paths.home)?.into(),
-            INSIDE_HOME.into(),
-            "--bind".into(),
-            path_text("architect native config", &self.paths.codex_home)?.into(),
-            INSIDE_NATIVE_CONFIG.into(),
-            "--ro-bind".into(),
-            path_text("architect repository", &self.repository)?.into(),
-            INSIDE_WORKSPACE.into(),
-            "--ro-bind".into(),
-            path_text("Codex auth source", self.auth_source.path())?.into(),
-            "/hcom/native/auth.json".into(),
-            "--ro-bind".into(),
-            path_text("Codex executable", &tools.codex.canonical_path)?.into(),
-            INSIDE_CODEX.into(),
-            "--ro-bind".into(),
-            path_text(
-                "architect relay executable",
-                &tools.component.canonical_path,
-            )?
-            .into(),
-            INSIDE_ARCHITECT_COMPONENT.into(),
-            "--chdir".into(),
-            INSIDE_WORKSPACE.into(),
             "--block-fd".into(),
             block_fd.to_string(),
             "--info-fd".into(),
@@ -1290,18 +1261,6 @@ impl ArchitectSandbox {
                 || argument.contains("registration.sock")
         }) {
             bail!("architect sandbox manifest exposes forbidden terminal/control authority");
-        }
-        let relay_directory = path_text("relay directory", &self.paths.runtime)?;
-        if !argv
-            .windows(2)
-            .any(|pair| pair == ["--tmpfs", INSIDE_RUNTIME])
-            || !argv.windows(3).any(|triple| {
-                triple[0] == "--ro-bind"
-                    && triple[1] == relay_directory
-                    && triple[2] == INSIDE_ARCHITECT_RUNTIME
-            })
-        {
-            bail!("architect sandbox manifest does not expose exactly one relay scope");
         }
         Ok(argv)
     }
@@ -1322,7 +1281,7 @@ fn spawn_blocked_architect(
     let info_fd = info_write.as_raw_fd();
     let mut argv = sandbox.outer_argv(environment, tools, gate_fd, info_fd)?;
     argv.push("--".into());
-    argv.push(INSIDE_CODEX.into());
+    argv.push(path_text("Codex executable", &tools.codex.canonical_path)?.into());
     argv.extend([
         "--model".into(),
         profile.model.clone(),
@@ -1333,7 +1292,7 @@ fn spawn_blocked_architect(
         "--ask-for-approval".into(),
         profile.approval_policy.as_str().into(),
         "--cd".into(),
-        INSIDE_WORKSPACE.into(),
+        path_text("architect project directory", &sandbox.project_root)?.into(),
         "--no-alt-screen".into(),
         "--strict-config".into(),
     ]);
@@ -1371,7 +1330,7 @@ fn validate_native_argv(
         .ok_or_else(|| anyhow::anyhow!("architect bwrap argv omitted its separator"))?;
     let native = &argv[separator + 1..];
     let expected_prefix = [
-        INSIDE_CODEX.to_owned(),
+        path_text("Codex executable", &tools.codex.canonical_path)?.into(),
         "--model".into(),
         profile.model.clone(),
         "--config".into(),
@@ -1381,7 +1340,7 @@ fn validate_native_argv(
         "--ask-for-approval".into(),
         profile.approval_policy.as_str().into(),
         "--cd".into(),
-        INSIDE_WORKSPACE.into(),
+        path_text("architect project directory", &sandbox.project_root)?.into(),
         "--no-alt-screen".into(),
         "--strict-config".into(),
     ];
@@ -1401,20 +1360,11 @@ fn validate_native_argv(
             bail!("architect disabled-feature inventory drifted");
         }
     }
-    let relay_socket = INSIDE_ARCHITECT_RELAY;
+    let relay_socket = path_text("architect relay socket", &sandbox.paths.relay_socket)?;
     if native.iter().any(|argument| {
         argument == "-" || argument == "--hcom-prompt" || argument.contains(relay_socket)
     }) {
         bail!("architect native argv contains prompt or control material");
-    }
-    for forbidden in [
-        path_text("host Codex executable", &tools.codex.canonical_path)?,
-        path_text("host architect repository", &sandbox.repository)?,
-        path_text("host architect relay socket", &sandbox.paths.relay_socket)?,
-    ] {
-        if native.iter().any(|argument| argument.contains(forbidden)) {
-            bail!("architect native argv contains a host-only path");
-        }
     }
     Ok(())
 }
@@ -1815,8 +1765,6 @@ mod tests {
         let args = ArchitectArgs::try_parse_from([
             "hcom architect",
             "codex",
-            "--repo",
-            "/repo",
             "--model",
             "gpt-5.6-sol-cli",
             "--reasoning",
@@ -1907,17 +1855,21 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            control_environment: BTreeMap::new(),
+            control_environment: BTreeMap::from([(
+                "HOME".into(),
+                root.to_string_lossy().into_owned(),
+            )]),
             runtime_home: host_runtime.clone(),
             cargo_bin_source: cargo_bin_source.clone(),
             rustup_home_source: rustup_home_source.clone(),
         };
         let sandbox = ArchitectSandbox {
-            repository,
+            project_root: repository,
             paths,
             auth_source: PrivateFileIdentity::capture(&root.join("auth.json")).unwrap(),
             host_runtime,
-            empty_root: EmptyRootContract::capture(&cargo_bin_source, &rustup_home_source).unwrap(),
+            session_runtime_root: root.join("session-runtime"),
+            host_root: HostRootContract::capture(&cargo_bin_source, &rustup_home_source).unwrap(),
         };
         let report = root.join("architect-state/home/blank-report");
         let write_probe = root.join("repo/architect-write-probe");
@@ -1950,13 +1902,14 @@ mod tests {
     }
 
     #[test]
-    fn blank_launch_keeps_terminal_input_empty_and_exposes_only_its_relay() {
+    fn blank_launch_keeps_terminal_input_empty_and_preserves_project_path() {
         let temp = tempfile::Builder::new()
             .prefix("hcom-phase7-blank.")
             .tempdir()
             .unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
         let repository = root.join("repo");
+        let external_source = root.join("external-source");
         let host_runtime = root.join("run");
         let control_root = host_runtime.join("legacy-control-sentinel");
         let architect_root = root.join("session-runtime");
@@ -1969,6 +1922,7 @@ mod tests {
         let rustup_home_source = root.join("rustup-home");
         for path in [
             &repository,
+            &external_source,
             &host_runtime,
             &control_root,
             &architect_root,
@@ -1983,6 +1937,11 @@ mod tests {
             fs::create_dir(path).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
+        fs::write(
+            external_source.join("source.txt"),
+            "external source visible\n",
+        )
+        .unwrap();
         let auth_source = root.join("auth.json");
         let auth_target = codex_home.join("auth.json");
         let config_file = codex_home.join("config.toml");
@@ -2025,7 +1984,7 @@ mod tests {
             "--ask-for-approval".to_owned(),
             profile.approval_policy.as_str().to_owned(),
             "--cd".to_owned(),
-            INSIDE_WORKSPACE.to_owned(),
+            repository.to_string_lossy().into_owned(),
             "--no-alt-screen".to_owned(),
             "--strict-config".to_owned(),
         ];
@@ -2059,18 +2018,22 @@ except OSError as error:
 else:
     raise SystemExit(35)
 
-for path in [{control_socket}, {registration_socket}, {other_relay_socket}]:
-    if os.path.exists(path):
+with open({external_source}, encoding="utf-8") as source:
+    if source.read() != "external source visible\n":
         raise SystemExit(36)
-    client = socket.socket(socket.AF_UNIX)
-    try:
-        client.connect(path)
-    except FileNotFoundError:
-        pass
-    else:
+for hidden in {hidden_sockets}:
+    if os.path.exists(hidden):
         raise SystemExit(37)
+    probe = socket.socket(socket.AF_UNIX)
+    try:
+        probe.connect(hidden)
+    except OSError as error:
+        if error.errno != errno.ENOENT:
+            raise SystemExit(38)
+    else:
+        raise SystemExit(39)
     finally:
-        client.close()
+        probe.close()
 
 relay = socket.socket(socket.AF_UNIX)
 relay.connect({relay_socket})
@@ -2079,16 +2042,16 @@ with open({report}, "w", encoding="utf-8") as output:
     output.write("ok\n")
 "#,
             expected_args = serde_json::to_string(&expected_args).unwrap(),
-            write_probe = serde_json::to_string(
-                &PathBuf::from(INSIDE_WORKSPACE).join("architect-write-probe")
-            )
+            write_probe = serde_json::to_string(&repository.join("architect-write-probe")).unwrap(),
+            external_source = serde_json::to_string(&external_source.join("source.txt")).unwrap(),
+            hidden_sockets = serde_json::to_string(&[
+                control_socket.to_string_lossy().into_owned(),
+                registration_socket.to_string_lossy().into_owned(),
+                other_relay_socket.to_string_lossy().into_owned(),
+            ])
             .unwrap(),
-            control_socket = serde_json::to_string(&control_socket).unwrap(),
-            registration_socket = serde_json::to_string(&registration_socket).unwrap(),
-            other_relay_socket = serde_json::to_string(&other_relay_socket).unwrap(),
-            relay_socket = serde_json::to_string(INSIDE_ARCHITECT_RELAY).unwrap(),
-            report =
-                serde_json::to_string(&PathBuf::from(INSIDE_HOME).join("blank-report")).unwrap(),
+            relay_socket = serde_json::to_string(&relay_socket).unwrap(),
+            report = serde_json::to_string(&report).unwrap(),
         );
         fs::write(&fake_codex, script).unwrap();
         fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).unwrap();

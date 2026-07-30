@@ -90,7 +90,7 @@ pub enum RegistrationCaller {
 pub enum RegistrationAction {
     CreateBinding {
         binding_id: String,
-        repo_root: String,
+        project_root: String,
         architect_name: String,
         architect_adapter: String,
         launch_nonce: String,

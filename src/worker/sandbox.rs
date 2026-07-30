@@ -1,22 +1,10 @@
-//! Shared empty-root bubblewrap manifest for exact session worker profiles.
+//! Shared path-preserving bubblewrap manifest for exact session profiles.
 
-use super::ExecutableIdentity;
 use anyhow::{Context, Result, anyhow, bail};
+use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-
-pub(crate) const INSIDE_HOME: &str = "/hcom/home";
-pub(crate) const INSIDE_NATIVE_CONFIG: &str = "/hcom/native";
-pub(crate) const INSIDE_WORKSPACE: &str = "/hcom/workspace";
-pub(crate) const INSIDE_ARTIFACTS: &str = "/hcom/artifacts";
-pub(crate) const INSIDE_RUNTIME: &str = "/hcom/run";
-pub(crate) const INSIDE_TEMP: &str = "/tmp";
-pub(crate) const INSIDE_CODEX: &str = "/hcom/bin/codex";
-pub(crate) const INSIDE_CLAUDE: &str = "/hcom/bin/claude";
-pub(crate) const INSIDE_CARGO_HOME: &str = "/hcom/home/.cargo";
-pub(crate) const INSIDE_RUSTUP_HOME: &str = "/hcom/toolchains/rust/rustup";
-pub(crate) const INSIDE_PATH: &str = "/hcom/toolchains/rust/bin:/usr/bin:/bin";
 
 const SYSTEM_USR: &str = "/usr";
 const SYSTEM_ETC: &str = "/etc";
@@ -76,7 +64,7 @@ impl ReadOnlyTreeIdentity {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub(crate) struct EmptyRootContract {
+pub(crate) struct HostRootContract {
     usr: ReadOnlyTreeIdentity,
     etc: ReadOnlyTreeIdentity,
     resolver: ReadOnlyTreeIdentity,
@@ -84,19 +72,22 @@ pub(crate) struct EmptyRootContract {
     rustup_home: ReadOnlyTreeIdentity,
 }
 
-pub(crate) struct EmptyRootMounts<'a> {
-    pub(crate) native: &'a ExecutableIdentity,
-    pub(crate) inside_native: &'static str,
+pub(crate) struct HostRootMounts<'a> {
     pub(crate) isolated_home: &'a Path,
     pub(crate) native_config: &'a Path,
-    pub(crate) workspace: &'a Path,
-    pub(crate) workspace_writable: bool,
+    pub(crate) launch_cwd: &'a Path,
     pub(crate) artifact_dir: &'a Path,
     pub(crate) auth_source: &'a Path,
-    pub(crate) auth_target: &'static str,
+    pub(crate) auth_target: &'a Path,
+    pub(crate) readable_roots: &'a [&'a Path],
+    pub(crate) writable_roots: &'a [&'a Path],
+    pub(crate) read_only_files: &'a [&'a Path],
+    pub(crate) extra_writable_dirs: &'a [&'a Path],
+    pub(crate) expose_host_root_read_only: bool,
+    pub(crate) masked_dirs: &'a [&'a Path],
 }
 
-impl EmptyRootContract {
+impl HostRootContract {
     pub(crate) fn capture(cargo_bin: &Path, rustup_home: &Path) -> Result<Self> {
         // SAFETY: geteuid has no preconditions.
         let current_uid = unsafe { libc::geteuid() };
@@ -134,16 +125,31 @@ impl EmptyRootContract {
             .revalidate(Some(current_uid), "Rust rustup lease")
     }
 
-    pub(crate) fn outer_argv(&self, mounts: EmptyRootMounts<'_>) -> Result<Vec<String>> {
-        mounts.native.revalidate()?;
+    /// Build a path-preserving, minimal mount namespace. Native CLIs see the
+    /// caller's real project/repository paths and start in the exact project
+    /// directory; hcom does not mount the host root or invent a workspace path.
+    pub(crate) fn host_root_argv(&self, mounts: HostRootMounts<'_>) -> Result<Vec<String>> {
+        self.revalidate()?;
         for (label, path) in [
             ("isolated HOME", mounts.isolated_home),
             ("isolated native config", mounts.native_config),
-            ("worker workspace", mounts.workspace),
-            ("worker artifact attempt", mounts.artifact_dir),
+            ("launch cwd", mounts.launch_cwd),
+            ("artifact attempt", mounts.artifact_dir),
             ("native auth source", mounts.auth_source),
+            ("native auth target", mounts.auth_target),
         ] {
             if !path.is_absolute() {
+                bail!("{label} must be absolute");
+            }
+        }
+        for (label, paths) in [
+            ("readable root", mounts.readable_roots),
+            ("writable root", mounts.writable_roots),
+            ("read-only file", mounts.read_only_files),
+            ("extra writable directory", mounts.extra_writable_dirs),
+            ("masked directory", mounts.masked_dirs),
+        ] {
+            if paths.iter().any(|path| !path.is_absolute()) {
                 bail!("{label} must be absolute");
             }
         }
@@ -152,59 +158,100 @@ impl EmptyRootContract {
         {
             bail!("isolated native config must be a strict child of isolated HOME");
         }
-        if !matches!(mounts.inside_native, INSIDE_CODEX | INSIDE_CLAUDE) {
-            bail!("empty-root native target is not an enabled exact adapter");
-        }
-        if !matches!(
-            mounts.auth_target,
-            "/hcom/native/auth.json" | "/hcom/native/.credentials.json"
-        ) {
-            bail!("empty-root auth target is outside the closed manifest");
+        if !mounts.auth_target.starts_with(mounts.native_config) {
+            bail!("native auth target must remain inside isolated native config");
         }
         let text = |label: &str, path: &Path| -> Result<String> {
             path.to_str()
                 .map(str::to_owned)
                 .ok_or_else(|| anyhow!("{label} path is not valid UTF-8"))
         };
-        let workspace_bind = if mounts.workspace_writable {
-            "--bind"
-        } else {
-            "--ro-bind"
-        };
-        let mut argv = self.base_argv()?;
-        argv.extend([
-            "--bind".into(),
-            text("isolated HOME", mounts.isolated_home)?,
-            INSIDE_HOME.into(),
-            "--bind".into(),
-            text("isolated native config", mounts.native_config)?,
-            INSIDE_NATIVE_CONFIG.into(),
-            "--bind".into(),
-            text("worker artifact attempt", mounts.artifact_dir)?,
-            INSIDE_ARTIFACTS.into(),
-            workspace_bind.into(),
-            text("worker workspace", mounts.workspace)?,
-            INSIDE_WORKSPACE.into(),
-            "--ro-bind".into(),
-            text("native auth source", mounts.auth_source)?,
-            mounts.auth_target.into(),
-            "--ro-bind".into(),
-            text("native executable", &mounts.native.canonical_path)?,
-            mounts.inside_native.into(),
-            "--chdir".into(),
-            INSIDE_WORKSPACE.into(),
-        ]);
-        Ok(argv)
-    }
+        let private_writable_dirs: Vec<_> = [
+            mounts.isolated_home,
+            mounts.native_config,
+            mounts.artifact_dir,
+        ]
+        .into_iter()
+        .chain(mounts.extra_writable_dirs.iter().copied())
+        .collect();
 
-    pub(crate) fn base_argv(&self) -> Result<Vec<String>> {
-        self.revalidate()?;
-        let text = |label: &str, path: &Path| -> Result<String> {
-            path.to_str()
-                .map(str::to_owned)
-                .ok_or_else(|| anyhow!("{label} path is not valid UTF-8"))
-        };
-        Ok(vec![
+        if mounts.expose_host_root_read_only {
+            let mut argv = vec![
+                "--die-with-parent".into(),
+                "--unshare-pid".into(),
+                "--unshare-ipc".into(),
+                "--unshare-uts".into(),
+                "--ro-bind".into(),
+                "/".into(),
+                "/".into(),
+                "--proc".into(),
+                "/proc".into(),
+                "--dev".into(),
+                "/dev".into(),
+                "--tmpfs".into(),
+                "/dev/shm".into(),
+            ];
+            for directory in mounts.masked_dirs {
+                argv.extend(["--tmpfs".into(), text("masked directory", directory)?]);
+            }
+            let mut directory_targets = BTreeSet::new();
+            for target in mounts
+                .writable_roots
+                .iter()
+                .copied()
+                .chain(private_writable_dirs.iter().copied())
+            {
+                collect_directory_chain(target, true, &mut directory_targets)?;
+            }
+            for target in mounts
+                .read_only_files
+                .iter()
+                .copied()
+                .chain([mounts.auth_target])
+            {
+                collect_directory_chain(target, false, &mut directory_targets)?;
+            }
+            for directory in directory_targets {
+                if mounts
+                    .masked_dirs
+                    .iter()
+                    .any(|masked| directory != **masked && directory.starts_with(masked))
+                {
+                    argv.extend(["--dir".into(), text("private mount target", &directory)?]);
+                }
+            }
+            for directory in mounts.writable_roots {
+                argv.extend([
+                    "--bind".into(),
+                    text("writable root", directory)?,
+                    text("writable root", directory)?,
+                ]);
+            }
+            for directory in &private_writable_dirs {
+                argv.extend([
+                    "--bind".into(),
+                    text("private writable directory", directory)?,
+                    text("private writable directory", directory)?,
+                ]);
+            }
+            for file in mounts.read_only_files {
+                argv.extend([
+                    "--ro-bind".into(),
+                    text("read-only file", file)?,
+                    text("read-only file", file)?,
+                ]);
+            }
+            argv.extend([
+                "--ro-bind".into(),
+                text("native auth source", mounts.auth_source)?,
+                text("native auth target", mounts.auth_target)?,
+                "--chdir".into(),
+                text("launch cwd", mounts.launch_cwd)?,
+            ]);
+            return Ok(argv);
+        }
+
+        let mut argv = vec![
             "--die-with-parent".into(),
             "--unshare-pid".into(),
             "--unshare-ipc".into(),
@@ -246,36 +293,99 @@ impl EmptyRootContract {
             "/var".into(),
             "--tmpfs".into(),
             "/var/tmp".into(),
-            "--dir".into(),
-            "/hcom".into(),
-            "--dir".into(),
-            INSIDE_RUNTIME.into(),
-            "--tmpfs".into(),
-            INSIDE_RUNTIME.into(),
-            "--dir".into(),
-            "/hcom/bin".into(),
-            "--dir".into(),
-            INSIDE_HOME.into(),
-            "--dir".into(),
-            INSIDE_NATIVE_CONFIG.into(),
-            "--dir".into(),
-            INSIDE_WORKSPACE.into(),
-            "--dir".into(),
-            INSIDE_ARTIFACTS.into(),
-            "--dir".into(),
-            "/hcom/toolchains".into(),
-            "--dir".into(),
-            "/hcom/toolchains/rust".into(),
-            "--dir".into(),
-            "/hcom/toolchains/rust/bin".into(),
-            "--dir".into(),
-            INSIDE_RUSTUP_HOME.into(),
+        ];
+
+        let readable_roots = mounts.readable_roots.iter().copied().chain([
+            self.cargo_bin.path.as_path(),
+            self.rustup_home.path.as_path(),
+        ]);
+        let writable_dirs = private_writable_dirs.iter().copied();
+
+        let mut directory_targets = BTreeSet::new();
+        for target in readable_roots
+            .clone()
+            .chain(mounts.writable_roots.iter().copied())
+            .chain(writable_dirs.clone())
+        {
+            collect_directory_chain(target, true, &mut directory_targets)?;
+        }
+        for target in mounts
+            .read_only_files
+            .iter()
+            .copied()
+            .chain([mounts.auth_target])
+        {
+            collect_directory_chain(target, false, &mut directory_targets)?;
+        }
+        for directory in directory_targets {
+            argv.extend(["--dir".into(), text("mount target", &directory)?]);
+        }
+
+        for directory in readable_roots {
+            argv.extend([
+                "--ro-bind".into(),
+                text("readable root", directory)?,
+                text("readable root", directory)?,
+            ]);
+        }
+        for directory in mounts.writable_roots {
+            argv.extend([
+                "--bind".into(),
+                text("writable root", directory)?,
+                text("writable root", directory)?,
+            ]);
+        }
+        for directory in writable_dirs {
+            argv.extend([
+                "--bind".into(),
+                text("private writable directory", directory)?,
+                text("private writable directory", directory)?,
+            ]);
+        }
+        for file in mounts.read_only_files {
+            argv.extend([
+                "--ro-bind".into(),
+                text("read-only file", file)?,
+                text("read-only file", file)?,
+            ]);
+        }
+        argv.extend([
             "--ro-bind".into(),
-            text("Rust cargo-bin lease", &self.cargo_bin.path)?,
-            "/hcom/toolchains/rust/bin".into(),
-            "--ro-bind".into(),
-            text("Rust rustup lease", &self.rustup_home.path)?,
-            INSIDE_RUSTUP_HOME.into(),
-        ])
+            text("native auth source", mounts.auth_source)?,
+            text("native auth target", mounts.auth_target)?,
+            "--chdir".into(),
+            text("launch cwd", mounts.launch_cwd)?,
+        ]);
+        Ok(argv)
     }
+}
+
+fn collect_directory_chain(
+    target: &Path,
+    include_target: bool,
+    directories: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    if !target.is_absolute() {
+        bail!("mount target must be absolute");
+    }
+    let endpoint = if include_target {
+        target
+    } else {
+        target
+            .parent()
+            .ok_or_else(|| anyhow!("mount file target has no parent"))?
+    };
+    for ancestor in endpoint.ancestors() {
+        if ancestor == Path::new("/")
+            || ancestor == Path::new("/tmp")
+            || ancestor == Path::new("/var")
+            || ancestor.starts_with(SYSTEM_USR)
+            || ancestor.starts_with(SYSTEM_ETC)
+            || ancestor.starts_with("/run")
+        {
+            continue;
+        }
+        directories.insert(ancestor.to_owned());
+    }
+    Ok(())
 }

@@ -50,7 +50,7 @@ pub(crate) fn control_action(
 fn tool_description(action: ActionName) -> &'static str {
     match action {
         ActionName::SessionPlanReplace => {
-            "Draft or replace the bounded ordered task plan. This never starts a worker. Present the returned exact plan version and hash to the human before requesting approval."
+            "Draft or replace the bounded ordered task plan. Read the current project documentation first and set each task's repository_root to that task's real absolute canonical Git top level; it need not equal or live under the project directory. This never starts a worker. Present the returned exact plan version and hash to the human before requesting approval."
         }
         ActionName::SessionApproveAndStart => {
             "Start the exact draft only after the human explicitly approved its returned plan version and hash in this architect conversation. Never infer approval."
@@ -131,6 +131,7 @@ fn task_schema() -> Value {
             "task_key",
             "title",
             "objective",
+            "repository_root",
             "acceptance_criteria",
             "required_checks",
             "allowed_paths",
@@ -141,6 +142,7 @@ fn task_schema() -> Value {
             ("task_key", id_schema()),
             ("title", string_schema(1, 512)),
             ("objective", string_schema(1, 65_536)),
+            ("repository_root", absolute_path_schema()),
             (
                 "acceptance_criteria",
                 unique_array(string_schema(1, 65_536)),
@@ -188,6 +190,16 @@ fn sha256_schema() -> Value {
 
 fn string_schema(minimum: usize, maximum: usize) -> Value {
     json!({"type":"string","minLength":minimum,"maxLength":maximum})
+}
+
+fn absolute_path_schema() -> Value {
+    json!({
+        "type":"string",
+        "minLength":1,
+        "maxLength":4096,
+        "pattern":"^/[^\\r\\n]*$",
+        "description":"Real absolute canonical Git top level for this task, discovered from the current project's documentation; it may be outside or nested under the project directory."
+    })
 }
 
 fn uint_schema() -> Value {
@@ -288,6 +300,7 @@ mod tests {
                 "task_key":"p9-task-1",
                 "title":"Phase 9 Task 1",
                 "objective":"Create task1.txt with exactly two lines:\nphase9-task-1\nreview-stage: pending",
+                "repository_root":"/source/example",
                 "acceptance_criteria":["first review requests changes"],
                 "required_checks":["/usr/bin/test -f task1.txt"],
                 "allowed_paths":["README.md","task1.txt"],
@@ -340,6 +353,7 @@ mod tests {
                 "task_key":"one",
                 "title":"one",
                 "objective":"one",
+                "repository_root":"/source/example",
                 "acceptance_criteria":["one"],
                 "required_checks":[],
                 "allowed_paths":["one.txt"],

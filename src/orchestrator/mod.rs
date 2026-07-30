@@ -60,9 +60,7 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionStartup {
     pub(crate) run_id: String,
-    pub(crate) repo_root: PathBuf,
-    pub(crate) start_branch: String,
-    pub(crate) start_head: String,
+    pub(crate) project_root: PathBuf,
 }
 
 #[derive(Clone)]
@@ -74,6 +72,17 @@ pub(crate) struct SessionRuntimeSources {
     rustup_home_source: PathBuf,
     host_runtime_dir: PathBuf,
     profiles: Option<SessionInvocationProfiles>,
+}
+
+struct WorkerEnvironmentPaths {
+    home: PathBuf,
+    native_config: PathBuf,
+    temp: PathBuf,
+    runtime: PathBuf,
+    xdg_config: PathBuf,
+    xdg_state: PathBuf,
+    xdg_cache: PathBuf,
+    xdg_data: PathBuf,
 }
 
 impl SessionRuntimeSources {
@@ -165,6 +174,7 @@ impl SessionRuntimeSources {
         epoch: &str,
         run_id: &str,
         task_id: &str,
+        paths: &WorkerEnvironmentPaths,
     ) -> Result<ExecutionEnvironmentLease> {
         let policy = match adapter {
             CODEX_DEVELOPER_ADAPTER => CodexDeveloperAdapter::environment_policy()?,
@@ -182,26 +192,48 @@ impl SessionRuntimeSources {
                     .map(|value| (name.clone(), value.clone()))
             })
             .collect();
-        for (name, value) in [
-            ("PATH", "/hcom/toolchains/rust/bin:/usr/bin:/bin"),
-            ("HOME", "/hcom/home"),
-            ("CARGO_HOME", "/hcom/home/.cargo"),
-            ("RUSTUP_HOME", "/hcom/toolchains/rust/rustup"),
-            ("TMPDIR", "/tmp"),
-            ("XDG_RUNTIME_DIR", "/hcom/run"),
-            ("CODEX_HOME", "/hcom/native"),
-            ("CLAUDE_CONFIG_DIR", "/hcom/native"),
-            ("XDG_CONFIG_HOME", "/hcom/home/.config"),
-            ("XDG_STATE_HOME", "/hcom/home/.state"),
-            ("XDG_CACHE_HOME", "/hcom/home/.cache"),
-            ("XDG_DATA_HOME", "/hcom/home/.data"),
-            ("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1"),
-            ("CLAUDE_CODE_DISABLE_FAST_MODE", "1"),
-            ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
-            ("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION", "false"),
-        ] {
+        let overrides = [
+            ("HOME", path_value("worker private HOME", &paths.home)?),
+            (
+                "TMPDIR",
+                path_value("worker temporary directory", &paths.temp)?,
+            ),
+            (
+                "XDG_RUNTIME_DIR",
+                path_value("worker runtime directory", &paths.runtime)?,
+            ),
+            (
+                "CODEX_HOME",
+                path_value("worker native config", &paths.native_config)?,
+            ),
+            (
+                "CLAUDE_CONFIG_DIR",
+                path_value("worker native config", &paths.native_config)?,
+            ),
+            (
+                "XDG_CONFIG_HOME",
+                path_value("worker XDG config", &paths.xdg_config)?,
+            ),
+            (
+                "XDG_STATE_HOME",
+                path_value("worker XDG state", &paths.xdg_state)?,
+            ),
+            (
+                "XDG_CACHE_HOME",
+                path_value("worker XDG cache", &paths.xdg_cache)?,
+            ),
+            (
+                "XDG_DATA_HOME",
+                path_value("worker XDG data", &paths.xdg_data)?,
+            ),
+            ("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1".to_owned()),
+            ("CLAUDE_CODE_DISABLE_FAST_MODE", "1".to_owned()),
+            ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".to_owned()),
+            ("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION", "false".to_owned()),
+        ];
+        for (name, value) in overrides {
             if policy.inherited_names.iter().any(|allowed| allowed == name) {
-                values.insert(name.into(), value.into());
+                values.insert(name.into(), value);
             }
         }
         let lease = ExecutionEnvironmentLease::capture(
@@ -399,10 +431,9 @@ pub(crate) struct SessionSupervisor {
     draft: Option<DraftPlan>,
     tasks: Vec<TaskRuntime>,
     current_task: Option<usize>,
-    current_head: String,
     terminal_detail: Option<String>,
-    repository: CanonicalRepository,
-    _repository_lock: RepositoryLock,
+    repositories: BTreeMap<PathBuf, ManagedRepository>,
+    lock_root: PathBuf,
     run_root: PathBuf,
     artifact_root: ArtifactRoot,
     artifact_root_path: PathBuf,
@@ -420,14 +451,14 @@ pub(crate) struct SessionSupervisor {
 impl SessionSupervisor {
     pub(crate) fn open(
         run_id: String,
-        repo_root: PathBuf,
+        project_root: PathBuf,
         run_root: PathBuf,
         lock_root: PathBuf,
         sources: SessionRuntimeSources,
     ) -> Result<Self> {
         Self::open_with(
             run_id,
-            repo_root,
+            project_root,
             run_root,
             lock_root,
             sources,
@@ -438,7 +469,7 @@ impl SessionSupervisor {
 
     fn open_with(
         run_id: String,
-        repo_root: PathBuf,
+        project_root: PathBuf,
         run_root: PathBuf,
         lock_root: PathBuf,
         sources: SessionRuntimeSources,
@@ -446,20 +477,15 @@ impl SessionSupervisor {
         runner: ProcessRunner,
     ) -> Result<Self> {
         validate_id("run id", &run_id)?;
-        let repository = CanonicalRepository::open(&repo_root)?;
-        let repository_lock = RepositoryLock::acquire(&repository, &lock_root)?;
-        let start_branch = repository.branch()?.to_owned();
-        let start_head = repository.head()?;
-        repository.require_exact(&start_branch, &start_head)?;
+        let project_root = canonical_project_directory(&project_root)?;
         let run_root = canonical_private_directory(&run_root, "session runtime root")?;
+        let lock_root = canonical_private_directory(&lock_root, "repository lock root")?;
         let artifact_root_path = run_root.join("artifacts");
         ensure_private_directory(&artifact_root_path)?;
         let artifact_root = ArtifactRoot::open(&artifact_root_path)?;
         let startup = SessionStartup {
             run_id,
-            repo_root: repository.root.clone(),
-            start_branch,
-            start_head: start_head.clone(),
+            project_root,
         };
         Ok(Self {
             startup,
@@ -470,10 +496,9 @@ impl SessionSupervisor {
             draft: None,
             tasks: Vec::new(),
             current_task: None,
-            current_head: start_head,
             terminal_detail: None,
-            repository,
-            _repository_lock: repository_lock,
+            repositories: BTreeMap::new(),
+            lock_root,
             run_root,
             artifact_root,
             artifact_root_path,
@@ -538,26 +563,44 @@ impl SessionSupervisor {
                 bail!("ordered plan task keys must be unique");
             }
         }
-        self.repository
-            .require_exact(&self.startup.start_branch, &self.startup.start_head)?;
+        // A replacement draft may choose different repositories. Release any
+        // prior draft-only leases before acquiring the exact repositories
+        // discovered by the Architect from the project documentation.
+        self.repositories.clear();
+        let repositories = match open_managed_repositories(&tasks, &self.lock_root) {
+            Ok(repositories) => repositories,
+            Err(error) => {
+                self.tasks.clear();
+                self.draft = None;
+                self.state = SessionState::AwaitingPlan;
+                return Err(error);
+            }
+        };
         let plan_version = self.next_plan_version;
         self.next_plan_version = self
             .next_plan_version
             .checked_add(1)
             .ok_or_else(|| anyhow!("plan version overflow"))?;
         let canonical = serde_json::to_vec(&(
-            "hcom-session-plan-v2",
+            "hcom-session-plan-v3",
             plan_version,
-            &self.startup.repo_root,
-            &self.startup.start_branch,
-            &self.startup.start_head,
+            &self.startup.project_root,
+            repository_plan_snapshot(&repositories),
             self.sources.profile_hash(),
             developer_adapter,
             reviewer_adapter,
             &tasks,
         ))?;
         let plan_hash = sha256_hex(&canonical);
+        self.repositories = repositories;
         self.tasks = tasks.iter().cloned().map(TaskRuntime::new).collect();
+        for task in &mut self.tasks {
+            let repository = self
+                .repositories
+                .get(Path::new(&task.spec.repository_root))
+                .ok_or_else(|| anyhow!("draft task repository disappeared"))?;
+            task.base_revision = Some(repository.current_head.clone());
+        }
         self.draft = Some(DraftPlan {
             version: plan_version,
             hash: plan_hash.clone(),
@@ -565,7 +608,6 @@ impl SessionSupervisor {
             reviewer_adapter: reviewer_adapter.to_owned(),
         });
         self.current_task = None;
-        self.current_head.clone_from(&self.startup.start_head);
         self.state = SessionState::AwaitingApproval;
         self.terminal_detail = None;
         self.bump_version()?;
@@ -603,13 +645,20 @@ impl SessionSupervisor {
             );
             bail!("approved worker adapter failed its authentication readiness gate");
         }
-        self.repository
-            .require_exact(&self.startup.start_branch, &self.startup.start_head)?;
+        for repository in self.repositories.values() {
+            repository.require_current_exact()?;
+        }
         let first = self
             .tasks
             .first_mut()
             .ok_or_else(|| anyhow!("approved plan contains no tasks"))?;
-        first.base_revision = Some(self.startup.start_head.clone());
+        first.base_revision = Some(
+            self.repositories
+                .get(Path::new(&first.spec.repository_root))
+                .ok_or_else(|| anyhow!("first task repository disappeared"))?
+                .current_head
+                .clone(),
+        );
         first.state = TaskState::Developing;
         self.current_task = Some(0);
         self.state = SessionState::Running;
@@ -642,10 +691,7 @@ impl SessionSupervisor {
             run_id: self.startup.run_id.clone(),
             state: self.state,
             version: self.version,
-            repo_root: self.startup.repo_root.to_string_lossy().into_owned(),
-            start_branch: self.startup.start_branch.clone(),
-            start_head: self.startup.start_head.clone(),
-            current_head: self.current_head.clone(),
+            project_root: self.startup.project_root.to_string_lossy().into_owned(),
             plan_version: self.draft.as_ref().map(|plan| plan.version),
             plan_hash: self.draft.as_ref().map(|plan| plan.hash.clone()),
             current_task_ordinal: self
@@ -660,6 +706,11 @@ impl SessionSupervisor {
                     task_key: task.spec.task_key.clone(),
                     ordinal: u32::try_from(index).unwrap_or(u32::MAX),
                     state: task.state,
+                    repository_root: task.spec.repository_root.clone(),
+                    branch: self
+                        .repositories
+                        .get(Path::new(&task.spec.repository_root))
+                        .map(|repository| repository.branch.clone()),
                     review_round: task.review_round,
                     max_review_rounds: task.spec.max_review_rounds,
                     base_revision: task.base_revision.clone(),
@@ -769,8 +820,10 @@ impl SessionSupervisor {
             .head_revision
             .clone()
             .unwrap_or_else(|| base_revision.clone());
-        self.repository
-            .require_exact(&self.startup.start_branch, &expected_head)?;
+        self.repositories
+            .get(Path::new(&task.spec.repository_root))
+            .ok_or_else(|| anyhow!("task repository disappeared"))?
+            .require_exact(&expected_head)?;
 
         let (turn_sequence, attempt, review_round, must_resume) = match retry {
             Some(retry) => (
@@ -834,11 +887,14 @@ impl SessionSupervisor {
         } else {
             prepare_create_turn(adapter.as_ref(), &profile, &control, prompt.clone())?
         };
+        let environment_paths =
+            self.worker_environment_paths(task_index, role, &profile.adapter)?;
         let environment = self.sources.environment_for(
             &profile.adapter,
             &self.epoch,
             &self.startup.run_id,
             &task.spec.task_key,
+            &environment_paths,
         )?;
         let attempt_artifact =
             ArtifactAttempt::create(&self.artifact_root, scope, &environment, &prompt)?;
@@ -934,10 +990,11 @@ impl SessionSupervisor {
                 .head_revision
                 .as_deref()
                 .ok_or_else(|| anyhow!("reviewer turn lost exact HEAD"))?;
+            let repository_root = Path::new(&self.tasks[active.task_index].spec.repository_root);
             if self
-                .repository
-                .require_exact(&self.startup.start_branch, expected)
-                .is_err()
+                .repositories
+                .get(repository_root)
+                .is_none_or(|repository| repository.require_exact(expected).is_err())
             {
                 active.reviewer_drifted = true;
                 active.cancel.store(true, Ordering::Release);
@@ -970,7 +1027,7 @@ impl SessionSupervisor {
         self.finish_worker_metric();
         if active.reviewer_drifted {
             self.completion_gate.abandon(&active.token);
-            self.needs_human("canonical checkout drifted during reviewer turn");
+            self.needs_human("task repository drifted during reviewer turn");
             bail!("reviewer HEAD or worktree drifted")
         }
         let completion = match completion {
@@ -1022,7 +1079,7 @@ impl SessionSupervisor {
         let review_workspace_digest = if active.role == WorkerRole::Reviewer {
             Some(sha256_hex(&serde_json::to_vec(&(
                 "hcom-session-review-workspace-v1",
-                &self.startup.repo_root,
+                &self.tasks[active.task_index].spec.repository_root,
                 active
                     .control
                     .head_revision
@@ -1083,12 +1140,19 @@ impl SessionSupervisor {
                     &result.changed_paths,
                     &self.tasks[active.task_index].spec.allowed_paths,
                 )?;
-                let head = self.repository.validate_developer_completion(
-                    &self.startup.start_branch,
+                let repository_root =
+                    PathBuf::from(&self.tasks[active.task_index].spec.repository_root);
+                let repository = self
+                    .repositories
+                    .get_mut(&repository_root)
+                    .ok_or_else(|| anyhow!("developer task repository disappeared"))?;
+                let head = repository.repository.validate_developer_completion(
+                    &repository.branch,
                     base,
                     turn_start_head,
                     &result,
                 )?;
+                repository.current_head.clone_from(&head);
                 let task = &mut self.tasks[active.task_index];
                 task.developer.turn_sequence = active.turn_sequence;
                 task.head_revision = Some(head);
@@ -1110,8 +1174,12 @@ impl SessionSupervisor {
                     .head_revision
                     .as_deref()
                     .ok_or_else(|| anyhow!("reviewer task head disappeared"))?;
-                self.repository
-                    .require_exact(&self.startup.start_branch, expected_head)?;
+                self.repositories
+                    .get(Path::new(
+                        &self.tasks[active.task_index].spec.repository_root,
+                    ))
+                    .ok_or_else(|| anyhow!("reviewer task repository disappeared"))?
+                    .require_exact(expected_head)?;
                 let task = &mut self.tasks[active.task_index];
                 task.reviewer.turn_sequence = active.turn_sequence;
                 task.last_review = Some(result.clone());
@@ -1141,11 +1209,23 @@ impl SessionSupervisor {
             .head_revision
             .clone()
             .ok_or_else(|| anyhow!("reviewed task has no exact head"))?;
-        self.current_head = reviewed_head.clone();
+        let completed_repository = self
+            .repositories
+            .get(Path::new(&self.tasks[completed_index].spec.repository_root))
+            .ok_or_else(|| anyhow!("reviewed task repository disappeared"))?;
+        if completed_repository.current_head != reviewed_head {
+            bail!("reviewed task HEAD differs from its repository state");
+        }
         let next = completed_index + 1;
         if next < self.tasks.len() {
+            let next_base = self
+                .repositories
+                .get(Path::new(&self.tasks[next].spec.repository_root))
+                .ok_or_else(|| anyhow!("next task repository disappeared"))?
+                .current_head
+                .clone();
             let task = &mut self.tasks[next];
-            task.base_revision = Some(reviewed_head);
+            task.base_revision = Some(next_base);
             task.state = TaskState::Developing;
             self.current_task = Some(next);
         } else {
@@ -1220,40 +1300,27 @@ impl SessionSupervisor {
     ) -> Result<Arc<dyn WorkerAdapter>> {
         let profiles = self.sources.profiles.clone().unwrap_or_default();
         let task = &self.tasks[task_index];
-        let workers_root = self.run_root.join("workers");
-        let task_root = workers_root.join(format!("{}-{}", task_index, task.spec.task_key));
-        let role_root = self
-            .run_root
-            .join("workers")
-            .join(format!("{}-{}", task_index, task.spec.task_key))
-            .join(role_name(role));
+        let environment_paths = self.worker_environment_paths(task_index, role, name)?;
+        let role_root = environment_paths
+            .native_config
+            .parent()
+            .ok_or_else(|| anyhow!("worker native config has no private HOME"))?
+            .parent()
+            .ok_or_else(|| anyhow!("worker private HOME has no role root"))?
+            .to_owned();
         let home = role_root.join("home");
-        let native = match name {
-            CLAUDE_DEVELOPER_ADAPTER | CLAUDE_REVIEWER_ADAPTER => home.join(".claude"),
-            _ => home.join(".codex"),
-        };
-        let temp = role_root.join("tmp");
-        let private_run = role_root.join("run");
-        let cargo_home = home.join(".cargo");
-        for directory in [
-            &workers_root,
-            &task_root,
-            &role_root,
-            &home,
-            &native,
-            &temp,
-            &private_run,
-            &cargo_home,
-        ] {
-            ensure_private_directory(directory)?;
-        }
+        let native = environment_paths.native_config.clone();
+        let temp = environment_paths.temp.clone();
+        let private_run = environment_paths.runtime.clone();
+        let repository_root = PathBuf::from(&task.spec.repository_root);
         let adapter: Arc<dyn WorkerAdapter> =
             match (role, name) {
                 (WorkerRole::Developer, CODEX_DEVELOPER_ADAPTER) => {
                     prepare_auth_mount_target(&native.join("auth.json"))?;
                     Arc::new(CodexDeveloperAdapter::discover(CodexDeveloperConfig {
                         run_id: self.startup.run_id.clone(),
-                        workspace_cwd: self.startup.repo_root.clone(),
+                        launch_cwd: self.startup.project_root.clone(),
+                        workspace_cwd: repository_root.clone(),
                         artifact_root: self.artifact_root_path.clone(),
                         isolated_home: home,
                         codex_home: native,
@@ -1283,7 +1350,8 @@ impl SessionSupervisor {
                     }
                     Arc::new(ClaudeDeveloperAdapter::discover(ClaudeDeveloperConfig {
                         run_id: self.startup.run_id.clone(),
-                        workspace_cwd: self.startup.repo_root.clone(),
+                        launch_cwd: self.startup.project_root.clone(),
+                        workspace_cwd: repository_root.clone(),
                         artifact_root: self.artifact_root_path.clone(),
                         isolated_home: home,
                         claude_config_dir: native,
@@ -1310,7 +1378,8 @@ impl SessionSupervisor {
                     prepare_auth_mount_target(&native.join("auth.json"))?;
                     Arc::new(CodexReviewerAdapter::discover(CodexReviewerConfig {
                         run_id: self.startup.run_id.clone(),
-                        workspace_cwd: self.startup.repo_root.clone(),
+                        launch_cwd: self.startup.project_root.clone(),
+                        workspace_cwd: repository_root.clone(),
                         artifact_root: self.artifact_root_path.clone(),
                         isolated_home: home,
                         codex_home: native,
@@ -1340,7 +1409,8 @@ impl SessionSupervisor {
                     }
                     Arc::new(ClaudeReviewerAdapter::discover(ClaudeReviewerConfig {
                         run_id: self.startup.run_id.clone(),
-                        workspace_cwd: self.startup.repo_root.clone(),
+                        launch_cwd: self.startup.project_root.clone(),
+                        workspace_cwd: repository_root,
                         artifact_root: self.artifact_root_path.clone(),
                         isolated_home: home,
                         claude_config_dir: native,
@@ -1368,6 +1438,52 @@ impl SessionSupervisor {
         Ok(adapter)
     }
 
+    fn worker_environment_paths(
+        &self,
+        task_index: usize,
+        role: WorkerRole,
+        adapter: &str,
+    ) -> Result<WorkerEnvironmentPaths> {
+        let task = self
+            .tasks
+            .get(task_index)
+            .ok_or_else(|| anyhow!("worker task index is out of range"))?;
+        let workers_root = self.run_root.join("workers");
+        let task_root = workers_root.join(format!("{}-{}", task_index, task.spec.task_key));
+        let role_root = task_root.join(role_name(role));
+        let home = role_root.join("home");
+        let native_config = match adapter {
+            CLAUDE_DEVELOPER_ADAPTER | CLAUDE_REVIEWER_ADAPTER => home.join(".claude"),
+            _ => home.join(".codex"),
+        };
+        let paths = WorkerEnvironmentPaths {
+            home: home.clone(),
+            native_config,
+            temp: role_root.join("tmp"),
+            runtime: role_root.join("run"),
+            xdg_config: home.join(".config"),
+            xdg_state: home.join(".state"),
+            xdg_cache: home.join(".cache"),
+            xdg_data: home.join(".data"),
+        };
+        for directory in [
+            &workers_root,
+            &task_root,
+            &role_root,
+            &home,
+            &paths.native_config,
+            &paths.temp,
+            &paths.runtime,
+            &paths.xdg_config,
+            &paths.xdg_state,
+            &paths.xdg_cache,
+            &paths.xdg_data,
+        ] {
+            ensure_private_directory(directory)?;
+        }
+        Ok(paths)
+    }
+
     fn build_turn_prompt(
         &self,
         task_index: usize,
@@ -1380,6 +1496,8 @@ impl SessionSupervisor {
             role: &'static str,
             turn_phase: &'static str,
             task_ordinal: usize,
+            project_root: &'a Path,
+            repository_root: &'a str,
             task: &'a TaskDraft,
             base_revision: &'a str,
             head_revision: Option<&'a str>,
@@ -1399,6 +1517,8 @@ impl SessionSupervisor {
             role: role_name(role),
             turn_phase,
             task_ordinal: task_index,
+            project_root: &self.startup.project_root,
+            repository_root: &task.spec.repository_root,
             task: &task.spec,
             base_revision: task
                 .base_revision
@@ -1413,6 +1533,7 @@ impl SessionSupervisor {
             requirements: match role {
                 WorkerRole::Developer if task.last_review.is_none() => &[
                     "This is exactly one initial developer turn; stop after completing and committing only the current developer stage.",
+                    "The native CLI starts in project_root for context. Apply code changes only in repository_root; use absolute paths or git -C repository_root as needed.",
                     "There has been no reviewer turn. Never claim, simulate, anticipate, or perform reviewer work.",
                     "Do not start, invoke, delegate to, or wait for any sub-agent or reviewer.",
                     "Do not implement any later change that is conditional on a future review or future finding.",
@@ -1424,6 +1545,7 @@ impl SessionSupervisor {
                 ],
                 WorkerRole::Developer => &[
                     "This is exactly one resumed developer turn after the prior reviewer request_changes.",
+                    "The native CLI remains in project_root for context. Apply fixes only in repository_root; use absolute paths or git -C repository_root as needed.",
                     "Address only the supplied prior_review findings within the approved task and allowed paths.",
                     "Never claim, simulate, anticipate, or perform reviewer work.",
                     "Do not start, invoke, delegate to, or wait for any sub-agent or reviewer.",
@@ -1435,6 +1557,7 @@ impl SessionSupervisor {
                 ],
                 WorkerRole::Reviewer => &[
                     "This is exactly one independent reviewer turn; review only the exact bound HEAD, task, history, and acceptance criteria.",
+                    "The native CLI starts in project_root for context. Inspect the exact repository_root without changing it.",
                     "Do not modify the checkout.",
                     "Do not start, invoke, delegate to, or wait for any sub-agent or developer.",
                     "Run every required check and report each command under its exact approved string.",
@@ -1623,6 +1746,77 @@ struct CanonicalRepository {
     object_dir: DirectoryIdentity,
 }
 
+struct ManagedRepository {
+    repository: CanonicalRepository,
+    _lock: RepositoryLock,
+    branch: String,
+    start_head: String,
+    current_head: String,
+}
+
+impl ManagedRepository {
+    fn open(root: &Path, lock_root: &Path) -> Result<Self> {
+        let repository = CanonicalRepository::open(root)?;
+        let lock = RepositoryLock::acquire(&repository, lock_root)?;
+        let branch = repository.branch()?;
+        let start_head = repository.head()?;
+        repository.require_exact(&branch, &start_head)?;
+        Ok(Self {
+            repository,
+            _lock: lock,
+            branch,
+            start_head: start_head.clone(),
+            current_head: start_head,
+        })
+    }
+
+    fn require_exact(&self, head: &str) -> Result<()> {
+        self.repository.require_exact(&self.branch, head)
+    }
+
+    fn require_current_exact(&self) -> Result<()> {
+        self.require_exact(&self.current_head)
+    }
+}
+
+fn open_managed_repositories(
+    tasks: &[TaskDraft],
+    lock_root: &Path,
+) -> Result<BTreeMap<PathBuf, ManagedRepository>> {
+    let roots: BTreeSet<PathBuf> = tasks
+        .iter()
+        .map(|task| PathBuf::from(&task.repository_root))
+        .collect();
+    let mut repositories = BTreeMap::new();
+    for root in roots {
+        let repository = ManagedRepository::open(&root, lock_root)
+            .with_context(|| format!("failed to bind task repository {}", root.display()))?;
+        if repository.repository.root != root {
+            bail!(
+                "task repository_root must name the exact canonical Git top level: {}",
+                root.display()
+            );
+        }
+        repositories.insert(root, repository);
+    }
+    Ok(repositories)
+}
+
+fn repository_plan_snapshot(
+    repositories: &BTreeMap<PathBuf, ManagedRepository>,
+) -> Vec<(String, String, String)> {
+    repositories
+        .iter()
+        .map(|(root, repository)| {
+            (
+                root.to_string_lossy().into_owned(),
+                repository.branch.clone(),
+                repository.start_head.clone(),
+            )
+        })
+        .collect()
+}
+
 impl CanonicalRepository {
     fn open(root: &Path) -> Result<Self> {
         if !root.is_absolute() {
@@ -1638,7 +1832,7 @@ impl CanonicalRepository {
         };
         let top = canonical_git_path(&runner.one_line(&["rev-parse", "--show-toplevel"])?)?;
         if top != root {
-            bail!("--repo must name the exact canonical Git top level");
+            bail!("task repository_root must name the exact canonical Git top level");
         }
         let git_dir = canonical_git_path(&runner.one_line(&[
             "rev-parse",
@@ -2090,6 +2284,25 @@ fn canonical_git_path(value: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn canonical_project_directory(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("architect project directory must be absolute");
+    }
+    let canonical =
+        fs::canonicalize(path).context("failed to resolve architect project directory")?;
+    let metadata = fs::symlink_metadata(path)?;
+    if canonical != path || metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("architect project directory must be an existing canonical directory");
+    }
+    Ok(canonical)
+}
+
+fn path_value(label: &str, path: &Path) -> Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("{label} is not valid UTF-8"))
+}
+
 fn ensure_private_directory(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(_) => {}
@@ -2464,6 +2677,7 @@ sys.stdout.write(json.dumps({
             task_key: key.into(),
             title: format!("Task {key}"),
             objective: format!("Implement the bounded {key} task"),
+            repository_root: "/test-fixture-repository".into(),
             acceptance_criteria: vec![format!("{key} is committed and reviewed")],
             required_checks: vec!["fake deterministic check".into()],
             allowed_paths: vec![format!("{key}.txt")],
@@ -2553,7 +2767,14 @@ sys.stdout.write(json.dumps({
         .unwrap()
     }
 
-    fn approve(supervisor: &mut SessionSupervisor, tasks: Vec<TaskDraft>) {
+    fn approve(supervisor: &mut SessionSupervisor, mut tasks: Vec<TaskDraft>) {
+        for task in &mut tasks {
+            task.repository_root = supervisor
+                .startup()
+                .project_root
+                .to_string_lossy()
+                .into_owned();
+        }
         let (plan_version, plan_hash) = supervisor
             .replace_plan(0, "fake-envelope", "fake-envelope", tasks)
             .unwrap();
@@ -2578,11 +2799,87 @@ sys.stdout.write(json.dumps({
         supervisor.sources.profiles = Some(SessionInvocationProfiles::default());
         assert!(
             supervisor
-                .replace_plan(0, "fake-envelope", "fake-envelope", vec![task("one", 1)])
+                .replace_plan(0, "fake-envelope", "fake-envelope", {
+                    let mut task = task("one", 1);
+                    task.repository_root = repository.to_string_lossy().into_owned();
+                    vec![task]
+                })
                 .is_err()
         );
         assert_eq!(supervisor.version, 0);
         assert_eq!(supervisor.state, SessionState::AwaitingPlan);
+    }
+
+    #[test]
+    fn non_git_project_context_can_bind_external_and_nested_task_repositories() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let project = root.join("project-context");
+        let external_parent = root.join("external-source");
+        let nested_parent = project.join("src");
+        for directory in [&project, &external_parent, &nested_parent] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(
+            project.join("AGENTS.md"),
+            "source repositories are external-source/repo and src/repo\n",
+        )
+        .unwrap();
+        let external_repository = initialize_repository(&external_parent);
+        let nested_repository = initialize_repository(&nested_parent);
+        assert!(!project.join(".git").exists());
+
+        let executable = write_fake_worker(&root, "normal");
+        let adapter = Arc::new(
+            FakeWorkerAdapter::preassigned(executable, external_repository.clone()).unwrap(),
+        );
+        let mut adapters = WorkerAdapterRegistry::default();
+        adapters.register(adapter).unwrap();
+        let run_root = private_directory(&root.join("run-project-context"));
+        let lock_root = private_directory(&root.join("locks-project-context"));
+        let toolchain = private_directory(&root.join("toolchain-project-context"));
+        let mut supervisor = SessionSupervisor::open_with(
+            "run-project-context".into(),
+            fs::canonicalize(&project).unwrap(),
+            run_root,
+            lock_root,
+            SessionRuntimeSources::fake(&toolchain),
+            adapters,
+            ProcessRunner::new(Duration::from_millis(10), Duration::from_millis(100)).unwrap(),
+        )
+        .unwrap();
+
+        let mut external_task = task("external", 1);
+        external_task.repository_root = external_repository.to_string_lossy().into_owned();
+        let mut nested_task = task("nested", 1);
+        nested_task.repository_root = nested_repository.to_string_lossy().into_owned();
+        let (plan_version, plan_hash) = supervisor
+            .replace_plan(
+                0,
+                "fake-envelope",
+                "fake-envelope",
+                vec![external_task, nested_task],
+            )
+            .unwrap();
+        supervisor
+            .approve_and_start(1, plan_version, &plan_hash, true)
+            .unwrap();
+
+        let snapshot = supervisor.snapshot();
+        assert_eq!(
+            snapshot.project_root,
+            fs::canonicalize(project).unwrap().to_string_lossy()
+        );
+        assert_eq!(
+            snapshot.tasks[0].repository_root,
+            external_repository.to_string_lossy()
+        );
+        assert_eq!(
+            snapshot.tasks[1].repository_root,
+            nested_repository.to_string_lossy()
+        );
+        assert_eq!(snapshot.tasks[0].state, TaskState::Developing);
+        assert_eq!(snapshot.tasks[1].state, TaskState::Pending);
     }
 
     #[test]
@@ -2625,7 +2922,11 @@ sys.stdout.write(json.dumps({
                 let reviewer_adapter = profiles.reviewer_adapter_name();
                 supervisor.sources.profiles = Some(profiles);
                 supervisor
-                    .replace_plan(0, developer_adapter, reviewer_adapter, vec![task("one", 1)])
+                    .replace_plan(0, developer_adapter, reviewer_adapter, {
+                        let mut task = task("one", 1);
+                        task.repository_root = repository.to_string_lossy().into_owned();
+                        vec![task]
+                    })
                     .unwrap();
                 assert_eq!(supervisor.state, SessionState::AwaitingApproval);
             }
@@ -2980,58 +3281,56 @@ sys.stdout.write(json.dumps({
         let dirty_root = fs::canonicalize(dirty_temp.path()).unwrap();
         let dirty_repository = initialize_repository(&dirty_root);
         fs::write(dirty_repository.join("dirty.txt"), "dirty\n").unwrap();
-        let dirty_run = private_directory(&dirty_root.join("run"));
         let dirty_locks = private_directory(&dirty_root.join("locks"));
-        let dirty_toolchain = private_directory(&dirty_root.join("toolchain"));
+        let mut dirty = open_supervisor(
+            &dirty_root,
+            &dirty_repository,
+            "normal",
+            "run-dirty",
+            &dirty_locks,
+        );
+        let mut dirty_task = task("dirty", 1);
+        dirty_task.repository_root = dirty_repository.to_string_lossy().into_owned();
         assert!(
-            SessionSupervisor::open(
-                "run-dirty".into(),
-                dirty_repository,
-                dirty_run,
-                dirty_locks,
-                SessionRuntimeSources::fake(&dirty_toolchain),
-            )
-            .is_err()
+            dirty
+                .replace_plan(0, "fake-envelope", "fake-envelope", vec![dirty_task])
+                .is_err()
         );
 
         let lock_temp = tempfile::tempdir().unwrap();
         let lock_root = fs::canonicalize(lock_temp.path()).unwrap();
         let repository = initialize_repository(&lock_root);
         let locks = private_directory(&lock_root.join("locks"));
-        let first_run = private_directory(&lock_root.join("run-one"));
-        let second_run = private_directory(&lock_root.join("run-two"));
-        let toolchain = private_directory(&lock_root.join("toolchain"));
-        let first = SessionSupervisor::open(
-            "run-one".into(),
-            repository.clone(),
-            first_run,
-            locks.clone(),
-            SessionRuntimeSources::fake(&toolchain),
-        )
-        .unwrap();
+        let mut first = open_supervisor(&lock_root, &repository, "normal", "run-one", &locks);
+        let mut first_task = task("first", 1);
+        first_task.repository_root = repository.to_string_lossy().into_owned();
+        first
+            .replace_plan(0, "fake-envelope", "fake-envelope", vec![first_task])
+            .unwrap();
+        let mut second = open_supervisor(&lock_root, &repository, "normal", "run-two", &locks);
+        let mut second_task = task("second", 1);
+        second_task.repository_root = repository.to_string_lossy().into_owned();
         assert!(
-            SessionSupervisor::open(
-                "run-two".into(),
-                repository,
-                second_run,
-                locks,
-                SessionRuntimeSources::fake(&toolchain),
-            )
-            .is_err()
+            second
+                .replace_plan(0, "fake-envelope", "fake-envelope", vec![second_task])
+                .is_err()
         );
         let renamed_repository = lock_root.join("renamed-repository");
-        fs::rename(first.startup().repo_root.as_path(), &renamed_repository).unwrap();
+        fs::rename(&repository, &renamed_repository).unwrap();
         let renamed_repository = fs::canonicalize(renamed_repository).unwrap();
-        let renamed_run = private_directory(&lock_root.join("run-renamed"));
+        let mut renamed = open_supervisor(
+            &lock_root,
+            &renamed_repository,
+            "normal",
+            "run-renamed",
+            &lock_root.join("locks"),
+        );
+        let mut renamed_task = task("renamed", 1);
+        renamed_task.repository_root = renamed_repository.to_string_lossy().into_owned();
         assert!(
-            SessionSupervisor::open(
-                "run-renamed".into(),
-                renamed_repository,
-                renamed_run,
-                lock_root.join("locks"),
-                SessionRuntimeSources::fake(&toolchain),
-            )
-            .is_err(),
+            renamed
+                .replace_plan(0, "fake-envelope", "fake-envelope", vec![renamed_task],)
+                .is_err(),
             "renaming the same checkout inode must not bypass its live runtime lock"
         );
         drop(first);
@@ -3102,8 +3401,24 @@ sys.stdout.write(json.dumps({
         ] {
             sources.parent_values.insert(name.into(), value.into());
         }
+        let paths = WorkerEnvironmentPaths {
+            home: root.clone(),
+            native_config: root.clone(),
+            temp: root.clone(),
+            runtime: root.clone(),
+            xdg_config: root.clone(),
+            xdg_state: root.clone(),
+            xdg_cache: root.clone(),
+            xdg_data: root.clone(),
+        };
         let lease = sources
-            .environment_for("fake-envelope", "epoch-proxy", "run-proxy", "task-proxy")
+            .environment_for(
+                "fake-envelope",
+                "epoch-proxy",
+                "run-proxy",
+                "task-proxy",
+                &paths,
+            )
             .unwrap();
         let materialized = lease
             .materialize(
@@ -3254,12 +3569,11 @@ sys.stdout.write(json.dumps({
         )
         .unwrap();
         let (plan_version, plan_hash) = supervisor
-            .replace_plan(
-                0,
-                "codex-developer-0.145.0",
-                "claude-reviewer-2.1.220",
-                vec![task("one", 2)],
-            )
+            .replace_plan(0, "codex-developer-0.145.0", "claude-reviewer-2.1.220", {
+                let mut task = task("one", 2);
+                task.repository_root = repository.to_string_lossy().into_owned();
+                vec![task]
+            })
             .unwrap();
         assert!(
             supervisor
