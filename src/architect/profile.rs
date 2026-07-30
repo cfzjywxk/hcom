@@ -1,5 +1,5 @@
 use crate::worker::profile::{
-    CodexApprovalPolicy, CodexInvocationProfile, CodexSandbox, ReviewerInvocationProfile,
+    CodexInvocationProfile, DeveloperInvocationProfile, ReviewerInvocationProfile,
     SessionInvocationProfiles,
 };
 use anyhow::{Context, Result, bail};
@@ -21,32 +21,8 @@ pub(super) struct LoadedInvocationProfiles {
 #[serde(deny_unknown_fields)]
 struct ArchitectToml {
     profile: Option<CodexInvocationProfile>,
-    developer: Option<CodexDeveloperToml>,
+    developer: Option<DeveloperInvocationProfile>,
     reviewer: Option<ReviewerInvocationProfile>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CodexDeveloperToml {
-    adapter: String,
-    model: String,
-    reasoning_effort: String,
-    sandbox: CodexSandbox,
-    ask_for_approval: CodexApprovalPolicy,
-}
-
-impl CodexDeveloperToml {
-    fn into_profile(self) -> Result<CodexInvocationProfile> {
-        if self.adapter != "codex" {
-            bail!("architect.developer.adapter enables only codex");
-        }
-        Ok(CodexInvocationProfile {
-            model: self.model,
-            reasoning_effort: self.reasoning_effort,
-            sandbox: self.sandbox,
-            approval_policy: self.ask_for_approval,
-        })
-    }
 }
 
 pub(super) fn load_invocation_profiles(path: &Path) -> Result<LoadedInvocationProfiles> {
@@ -126,7 +102,7 @@ pub(super) fn load_invocation_profiles(path: &Path) -> Result<LoadedInvocationPr
             profiles.architect = profile;
         }
         if let Some(developer) = configured.developer {
-            profiles.developer = developer.into_profile()?;
+            profiles.developer = developer;
         }
         if let Some(reviewer) = configured.reviewer {
             profiles.reviewer = reviewer;
@@ -143,7 +119,10 @@ pub(super) fn load_invocation_profiles(path: &Path) -> Result<LoadedInvocationPr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::profile::{CLAUDE_REVIEWER_ADAPTER, CODEX_REVIEWER_ADAPTER, CodexSandbox};
+    use crate::worker::profile::{
+        CLAUDE_DEVELOPER_ADAPTER, CLAUDE_REVIEWER_ADAPTER, CODEX_DEVELOPER_ADAPTER,
+        CODEX_REVIEWER_ADAPTER, CodexSandbox,
+    };
     use std::os::unix::fs::PermissionsExt;
 
     fn write_config(contents: &str) -> (tempfile::TempDir, PathBuf) {
@@ -196,11 +175,104 @@ dangerously_skip_permissions = true
         let loaded = load_invocation_profiles(&path).unwrap();
         assert!(loaded.loaded_from_file);
         assert_eq!(loaded.profiles.architect.reasoning_effort, "max");
-        assert_eq!(loaded.profiles.developer.reasoning_effort, "max");
+        assert_eq!(
+            loaded.profiles.developer.codex().unwrap().reasoning_effort,
+            "max"
+        );
         let reviewer = loaded.profiles.reviewer.claude().unwrap();
         assert_eq!(reviewer.model, "opus");
         assert_eq!(reviewer.effort, "xhigh");
         assert!(reviewer.dangerously_skip_permissions);
+    }
+
+    #[test]
+    fn config_can_select_claude_developer_independently_of_reviewer() {
+        let (_temp, path) = write_config(
+            r#"
+[architect.developer]
+adapter = "claude"
+model = "opus"
+effort = "xhigh"
+dangerously_skip_permissions = true
+
+[architect.reviewer]
+adapter = "codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "xhigh"
+sandbox = "danger-full-access"
+ask_for_approval = "never"
+"#,
+        );
+        let loaded = load_invocation_profiles(&path).unwrap();
+        assert_eq!(
+            loaded.profiles.developer_adapter_name(),
+            CLAUDE_DEVELOPER_ADAPTER
+        );
+        assert_eq!(
+            loaded.profiles.reviewer_adapter_name(),
+            CODEX_REVIEWER_ADAPTER
+        );
+        let developer = loaded.profiles.developer.claude().unwrap();
+        assert_eq!(developer.model, "opus");
+        assert_eq!(developer.effort, "xhigh");
+    }
+
+    #[test]
+    fn config_can_select_codex_for_both_roles() {
+        let (_temp, path) = write_config(
+            r#"
+[architect.developer]
+adapter = "codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "xhigh"
+sandbox = "danger-full-access"
+ask_for_approval = "never"
+
+[architect.reviewer]
+adapter = "codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "xhigh"
+sandbox = "danger-full-access"
+ask_for_approval = "never"
+"#,
+        );
+        let loaded = load_invocation_profiles(&path).unwrap();
+        assert_eq!(
+            loaded.profiles.developer_adapter_name(),
+            CODEX_DEVELOPER_ADAPTER
+        );
+        assert_eq!(
+            loaded.profiles.reviewer_adapter_name(),
+            CODEX_REVIEWER_ADAPTER
+        );
+    }
+
+    #[test]
+    fn config_can_select_claude_for_both_roles() {
+        let (_temp, path) = write_config(
+            r#"
+[architect.developer]
+adapter = "claude"
+model = "opus"
+effort = "xhigh"
+dangerously_skip_permissions = true
+
+[architect.reviewer]
+adapter = "claude"
+model = "opus"
+effort = "xhigh"
+dangerously_skip_permissions = true
+"#,
+        );
+        let loaded = load_invocation_profiles(&path).unwrap();
+        assert_eq!(
+            loaded.profiles.developer_adapter_name(),
+            CLAUDE_DEVELOPER_ADAPTER
+        );
+        assert_eq!(
+            loaded.profiles.reviewer_adapter_name(),
+            CLAUDE_REVIEWER_ADAPTER
+        );
     }
 
     #[test]

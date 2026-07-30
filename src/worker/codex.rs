@@ -1060,7 +1060,7 @@ fn revalidate_exact_tool(identity: &ExecutableIdentity, expected: &str) -> Resul
     Ok(())
 }
 
-fn developer_result_schema() -> Vec<u8> {
+pub(super) fn developer_result_schema() -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -1368,7 +1368,7 @@ fn canonical_git_path(value: &str) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn parse_git_commits(bytes: &[u8]) -> Result<Vec<CommitSummary>> {
+pub(super) fn parse_git_commits(bytes: &[u8]) -> Result<Vec<CommitSummary>> {
     if bytes.is_empty() {
         return Ok(vec![]);
     }
@@ -1396,7 +1396,7 @@ fn parse_git_commits(bytes: &[u8]) -> Result<Vec<CommitSummary>> {
         .collect()
 }
 
-fn parse_nul_paths(bytes: &[u8]) -> Result<Vec<String>> {
+pub(super) fn parse_nul_paths(bytes: &[u8]) -> Result<Vec<String>> {
     let mut paths = Vec::new();
     for component in bytes.split(|byte| *byte == 0) {
         if component.is_empty() {

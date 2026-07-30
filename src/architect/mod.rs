@@ -42,7 +42,7 @@ canonical, clean Git top level.
 Profile configuration is read once from $HCOM_DIR/config.toml (default:
 ~/.hcom/config.toml):
   [architect.profile]    interactive Codex architect
-  [architect.developer]  fresh per-task Codex developer
+  [architect.developer]  fresh per-task Codex or Claude developer
   [architect.reviewer]   fresh per-task Codex or Claude reviewer
 
 Architect CLI overrides (higher priority than TOML):

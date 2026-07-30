@@ -95,9 +95,9 @@ hcom
 ## Foreground architect
 
 `hcom architect` runs one blank interactive Codex architect and an in-memory,
-ordered task supervisor. Each approved task gets a fresh no-TUI Codex developer
-and a fresh Codex or Claude reviewer; same-task review changes resume only that
-task's exact native sessions.
+ordered task supervisor. Each approved task gets a fresh no-TUI developer and
+reviewer; Codex or Claude can be selected independently for either role.
+Same-task review changes resume only that task's exact native sessions.
 
 ```bash
 hcom architect codex --repo /absolute/canonical/repository
@@ -106,9 +106,9 @@ hcom architect codex --repo /absolute/canonical/repository
 `--repo` is required. Architect, developer, and reviewer model/effort/permission
 profiles are typed TOML settings in `$HCOM_DIR/config.toml` (normally
 `~/.hcom/config.toml`) and are frozen when the command starts. See
-[the Architect user guide](docs/architect.md) for the complete schema, Codex
-`max` and Claude `opus`/`xhigh` examples, parent-terminal login inheritance, and
-sandbox invariants.
+[the Architect user guide](docs/architect.md) for the complete schema, all four
+Codex/Claude role combinations, parent-terminal login inheritance, and sandbox
+invariants.
 
 ---
 

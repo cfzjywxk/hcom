@@ -17,8 +17,8 @@ use crate::worker::codex::{
     DISABLED_CODEX_FEATURES,
 };
 use crate::worker::profile::{
-    CodexApprovalPolicy, CodexInvocationProfile, CodexSandbox, ReviewerInvocationProfile,
-    SessionInvocationProfiles, validate_cli_help_contract,
+    CodexApprovalPolicy, CodexInvocationProfile, CodexSandbox, DeveloperInvocationProfile,
+    ReviewerInvocationProfile, SessionInvocationProfiles, validate_cli_help_contract,
 };
 use crate::worker::sandbox::{
     EmptyRootContract, INSIDE_CARGO_HOME, INSIDE_CODEX, INSIDE_HOME, INSIDE_NATIVE_CONFIG,
@@ -517,19 +517,26 @@ fn write_profile_summary(
         profiles.architect.sandbox.as_str(),
         profiles.architect.approval_policy.as_str()
     )?;
-    writeln!(
-        output,
-        "developer profile: codex model={} reasoning={} sandbox={} approval={}",
-        profiles.developer.model,
-        profiles.developer.reasoning_effort,
-        profiles.developer.sandbox.as_str(),
-        profiles.developer.approval_policy.as_str()
-    )?;
+    match &profiles.developer {
+        DeveloperInvocationProfile::Codex { profile } => writeln!(
+            output,
+            "developer profile: codex model={} reasoning={} sandbox={} approval={}",
+            profile.model,
+            profile.reasoning_effort,
+            profile.sandbox.as_str(),
+            profile.approval_policy.as_str()
+        )?,
+        DeveloperInvocationProfile::Claude { profile } => writeln!(
+            output,
+            "developer profile: claude model={} effort={} dangerously_skip_permissions={}",
+            profile.model, profile.effort, profile.dangerously_skip_permissions
+        )?,
+    }
     match &profiles.reviewer {
         ReviewerInvocationProfile::Codex { profile } => writeln!(
             output,
             "reviewer profile: codex model={} reasoning={} sandbox={} approval={}",
-            profile.model.clone(),
+            profile.model,
             profile.reasoning_effort,
             profile.sandbox.as_str(),
             profile.approval_policy.as_str()

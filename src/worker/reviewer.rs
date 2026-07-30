@@ -1,6 +1,9 @@
-//! Exact-version Codex and Claude no-TUI reviewer adapters.
+//! Exact-version no-TUI Codex reviewers and Claude developer/reviewer adapters.
 
-use super::codex::{DISABLED_CODEX_FEATURES, observe_codex_record, parse_codex_turn};
+use super::codex::{
+    DISABLED_CODEX_FEATURES, developer_result_schema, observe_codex_record, parse_codex_turn,
+    parse_git_commits, parse_nul_paths,
+};
 use super::contract::{
     AdapterCapabilities, AdapterDescriptor, CommandSpec, ExecutableIdentity, NativeArtifacts,
     NativeObservation, NativeOutputKind, NativeResult, OuterLaunchEnvelope, OutputDeclaration,
@@ -9,7 +12,9 @@ use super::contract::{
 };
 use super::environment::{EnvironmentPolicy, ExactEnvironmentRequirement};
 use super::profile::{ClaudeInvocationProfile, CodexInvocationProfile, validate_cli_help_contract};
-use super::result::{CheckStatus, MAX_RESULT_BYTES, ReviewerResult};
+use super::result::{
+    CheckStatus, DeveloperDecision, DeveloperResult, MAX_RESULT_BYTES, ReviewerResult,
+};
 use super::sandbox::{
     EmptyRootContract, EmptyRootMounts, INSIDE_ARTIFACTS, INSIDE_CARGO_HOME, INSIDE_CLAUDE,
     INSIDE_CODEX, INSIDE_HOME, INSIDE_NATIVE_CONFIG, INSIDE_PATH, INSIDE_RUNTIME,
@@ -42,6 +47,8 @@ pub const CLAUDE_REVIEWER_EXECUTABLE: &str = "/home/ywxk/.local/share/claude/ver
 pub const CLAUDE_REVIEWER_CLI_VERSION: &str = "2.1.220 (Claude Code)";
 pub const CLAUDE_REVIEWER_MODEL: &str = "claude-opus-5";
 pub const CLAUDE_REVIEWER_REASONING: &str = "high";
+pub const CLAUDE_DEVELOPER_EXECUTABLE: &str = CLAUDE_REVIEWER_EXECUTABLE;
+pub const CLAUDE_DEVELOPER_CLI_VERSION: &str = CLAUDE_REVIEWER_CLI_VERSION;
 
 const BWRAP_EXECUTABLE: &str = "/usr/bin/bwrap";
 const BWRAP_VERSION: &str = "bubblewrap 0.9.0";
@@ -49,9 +56,12 @@ const GIT_EXECUTABLE: &str = "/usr/bin/git";
 const GIT_VERSION: &str = "git version 2.43.0";
 const CODEX_ADAPTER_NAME: &str = "codex-reviewer-0.145.0";
 const CLAUDE_ADAPTER_NAME: &str = "claude-reviewer-2.1.220";
+const CLAUDE_DEVELOPER_ADAPTER_NAME: &str = "claude-developer-2.1.220";
 const CODEX_ADAPTER_CONTRACT_VERSION: u32 = 3;
 const CLAUDE_ADAPTER_CONTRACT_VERSION: u32 = 3;
+const CLAUDE_DEVELOPER_ADAPTER_CONTRACT_VERSION: u32 = 1;
 const REVIEWER_OUTER_POLICY: &str = "bubblewrap-0.9.0-empty-root-reviewer-ro-v2";
+const DEVELOPER_OUTER_POLICY: &str = "bubblewrap-0.9.0-empty-root-developer-v2";
 const CODEX_RESULT_SCHEMA_FILE: &str = "codex-reviewer-result-schema.json";
 const CODEX_FINAL_FILE: &str = "native-final.partial";
 const JSON_SCHEMA_DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
@@ -90,7 +100,7 @@ pub struct CodexReviewerAdapter {
     executable: ExecutableIdentity,
     outer_executable: ExecutableIdentity,
     git_executable: ExecutableIdentity,
-    sandbox: ReviewerSandbox,
+    sandbox: WorkerSandbox,
     invocation: CodexInvocationProfile,
 }
 
@@ -119,7 +129,7 @@ impl CodexReviewerAdapter {
     }
 
     pub fn profile(&self) -> WorkerProfile {
-        profile(&self.descriptor, &self.executable)
+        profile(WorkerRole::Reviewer, &self.descriptor, &self.executable)
     }
 
     fn discover_with_paths(
@@ -133,8 +143,10 @@ impl CodexReviewerAdapter {
         let executable = capture_exact_tool(codex_path, CODEX_REVIEWER_CLI_VERSION)?;
         let outer_executable = capture_exact_tool(bwrap_path, BWRAP_VERSION)?;
         let git_executable = capture_exact_tool(git_path, GIT_VERSION)?;
-        let sandbox = ReviewerSandbox::capture(
-            ReviewerSandboxConfig {
+        let sandbox = WorkerSandbox::capture(
+            WorkerSandboxConfig {
+                role: WorkerRole::Reviewer,
+                workspace_writable: false,
                 run_id: config.run_id,
                 workspace_cwd: config.workspace_cwd,
                 artifact_root: config.artifact_root,
@@ -334,6 +346,289 @@ impl WorkerAdapter for CodexReviewerAdapter {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+pub struct ClaudeDeveloperConfig {
+    pub run_id: String,
+    pub workspace_cwd: PathBuf,
+    pub artifact_root: PathBuf,
+    pub isolated_home: PathBuf,
+    pub claude_config_dir: PathBuf,
+    pub xdg_config_home: PathBuf,
+    pub xdg_state_home: PathBuf,
+    pub xdg_cache_home: PathBuf,
+    pub xdg_data_home: PathBuf,
+    pub temp_dir: PathBuf,
+    pub runtime_dir: PathBuf,
+    pub host_runtime_dir: PathBuf,
+    pub auth_source: PathBuf,
+    pub cargo_bin_source: PathBuf,
+    pub rustup_home_source: PathBuf,
+    pub invocation: ClaudeInvocationProfile,
+}
+
+pub struct ClaudeDeveloperAdapter {
+    descriptor: AdapterDescriptor,
+    executable: ExecutableIdentity,
+    outer_executable: ExecutableIdentity,
+    git_executable: ExecutableIdentity,
+    sandbox: WorkerSandbox,
+    xdg_config_home: DirectoryIdentity,
+    xdg_state_home: DirectoryIdentity,
+    xdg_cache_home: DirectoryIdentity,
+    xdg_data_home: DirectoryIdentity,
+    invocation: ClaudeInvocationProfile,
+}
+
+impl ClaudeDeveloperAdapter {
+    pub fn discover(config: ClaudeDeveloperConfig) -> Result<Self> {
+        validate_production_runtime_contract(&config.host_runtime_dir, &config.run_id)?;
+        validate_claude_cli(Path::new(CLAUDE_DEVELOPER_EXECUTABLE))?;
+        Self::discover_with_paths(
+            config,
+            Path::new(CLAUDE_DEVELOPER_EXECUTABLE),
+            Path::new(BWRAP_EXECUTABLE),
+            Path::new(GIT_EXECUTABLE),
+        )
+    }
+
+    pub fn environment_policy() -> Result<EnvironmentPolicy> {
+        claude_environment_policy()
+    }
+
+    pub fn profile(&self) -> WorkerProfile {
+        profile(WorkerRole::Developer, &self.descriptor, &self.executable)
+    }
+
+    fn discover_with_paths(
+        config: ClaudeDeveloperConfig,
+        claude_path: &Path,
+        bwrap_path: &Path,
+        git_path: &Path,
+    ) -> Result<Self> {
+        config.invocation.validate("Claude developer")?;
+        let invocation = config.invocation.clone();
+        let executable = capture_exact_tool(claude_path, CLAUDE_DEVELOPER_CLI_VERSION)?;
+        let outer_executable = capture_exact_tool(bwrap_path, BWRAP_VERSION)?;
+        let git_executable = capture_exact_tool(git_path, GIT_VERSION)?;
+        let xdg_config_home = DirectoryIdentity::capture(&config.xdg_config_home, true)?;
+        let xdg_state_home = DirectoryIdentity::capture(&config.xdg_state_home, true)?;
+        let xdg_cache_home = DirectoryIdentity::capture(&config.xdg_cache_home, true)?;
+        let xdg_data_home = DirectoryIdentity::capture(&config.xdg_data_home, true)?;
+        let sandbox = WorkerSandbox::capture(
+            WorkerSandboxConfig {
+                role: WorkerRole::Developer,
+                workspace_writable: true,
+                run_id: config.run_id,
+                workspace_cwd: config.workspace_cwd,
+                artifact_root: config.artifact_root,
+                isolated_home: config.isolated_home,
+                native_config_dir: config.claude_config_dir,
+                temp_dir: config.temp_dir,
+                runtime_dir: config.runtime_dir,
+                host_runtime_dir: config.host_runtime_dir,
+                auth_source: config.auth_source,
+                auth_target_name: CLAUDE_AUTH_FILE.into(),
+                cargo_bin_source: config.cargo_bin_source,
+                rustup_home_source: config.rustup_home_source,
+                extra_private_dirs: vec![
+                    xdg_config_home.clone(),
+                    xdg_state_home.clone(),
+                    xdg_cache_home.clone(),
+                    xdg_data_home.clone(),
+                ],
+            },
+            &executable,
+            &outer_executable,
+            &git_executable,
+        )?;
+        let descriptor = claude_developer_descriptor(&invocation)?;
+        Ok(Self {
+            descriptor,
+            executable,
+            outer_executable,
+            git_executable,
+            sandbox,
+            xdg_config_home,
+            xdg_state_home,
+            xdg_cache_home,
+            xdg_data_home,
+            invocation,
+        })
+    }
+
+    fn command(
+        &self,
+        control: &TurnControl,
+        resume_session_id: Option<&str>,
+    ) -> Result<CommandSpec> {
+        validate_developer_control(control)?;
+        let exact_session = control
+            .native_session_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("Claude developer requires a preassigned native session"))?;
+        validate_claude_session_id(exact_session)?;
+        if resume_session_id.is_some_and(|session| session != exact_session) {
+            bail!("Claude developer resume must use the exact session-bound native session");
+        }
+        validate_claude_auth_readiness(self.sandbox.auth_source.path(), SystemTime::now())?;
+        revalidate_exact_tool(&self.executable, CLAUDE_DEVELOPER_CLI_VERSION)?;
+        revalidate_exact_tool(&self.outer_executable, BWRAP_VERSION)?;
+        revalidate_exact_tool(&self.git_executable, GIT_VERSION)?;
+        self.sandbox.revalidate(
+            &self.executable,
+            &self.outer_executable,
+            &self.git_executable,
+        )?;
+        for directory in [
+            &self.xdg_config_home,
+            &self.xdg_state_home,
+            &self.xdg_cache_home,
+            &self.xdg_data_home,
+        ] {
+            directory.revalidate(true)?;
+        }
+        self.invocation.validate("Claude developer")?;
+
+        let mut fixed_argv = vec!["-p".into(), "--output-format".into(), "json".into()];
+        if resume_session_id.is_some() {
+            fixed_argv.extend(["--resume".into(), exact_session.into()]);
+        } else {
+            fixed_argv.extend(["--session-id".into(), exact_session.into()]);
+        }
+        fixed_argv.extend([
+            "--name".into(),
+            "hcom-session-developer".into(),
+            "--model".into(),
+            self.invocation.model.clone(),
+            "--effort".into(),
+            self.invocation.effort.clone(),
+            "--tools".into(),
+            "Bash,Read,Edit,Write,Glob,Grep".into(),
+            "--setting-sources".into(),
+            "project".into(),
+            "--strict-mcp-config".into(),
+            "--mcp-config".into(),
+            r#"{"mcpServers":{}}"#.into(),
+            "--disable-slash-commands".into(),
+            "--prompt-suggestions".into(),
+            "false".into(),
+            "--no-chrome".into(),
+        ]);
+        if self.invocation.dangerously_skip_permissions {
+            fixed_argv.push("--dangerously-skip-permissions".into());
+        }
+        let expected_artifact_dir = self
+            .sandbox
+            .artifact_root
+            .path()
+            .join(&control.artifact_dir);
+        let production_outer = self.outer_executable.canonical_path == Path::new(BWRAP_EXECUTABLE);
+        Ok(CommandSpec {
+            executable: self.executable.clone(),
+            fixed_argv,
+            schema_transport: SchemaTransport::InlineArgument {
+                flag: "--json-schema".into(),
+                json: String::from_utf8(claude_developer_result_schema())
+                    .expect("static developer schema is UTF-8"),
+            },
+            expected_outputs: vec![OutputDeclaration {
+                kind: NativeOutputKind::StdoutEnvelope,
+                relative_path: "native.stdout.partial".into(),
+                max_bytes: 1024 * 1024,
+                output_argument: None,
+            }],
+            stdin_prompt_argument: None,
+            workspace_cwd: self.sandbox.workspace.path().to_owned(),
+            outer_launch: Some(OuterLaunchEnvelope {
+                executable: self.outer_executable.clone(),
+                fixed_argv: self.sandbox.outer_argv(
+                    &expected_artifact_dir,
+                    &self.executable,
+                    INSIDE_CLAUDE,
+                    "/hcom/native/.credentials.json",
+                )?,
+                expected_artifact_dir,
+                inside_executable: if production_outer {
+                    INSIDE_CLAUDE.into()
+                } else {
+                    self.executable.canonical_path.clone()
+                },
+                inside_artifact_dir: if production_outer {
+                    INSIDE_ARTIFACTS.into()
+                } else {
+                    self.sandbox
+                        .artifact_root
+                        .path()
+                        .join(&control.artifact_dir)
+                },
+            }),
+            exact_environment: claude_exact_environment()?,
+        })
+    }
+}
+
+impl WorkerAdapter for ClaudeDeveloperAdapter {
+    fn descriptor(&self) -> &AdapterDescriptor {
+        &self.descriptor
+    }
+
+    fn executable_contract(&self) -> &ExecutableIdentity {
+        &self.executable
+    }
+
+    fn build_create(&self, control: &TurnControl) -> Result<CommandSpec> {
+        self.command(control, None)
+    }
+
+    fn build_resume(&self, native_session_id: &str, control: &TurnControl) -> Result<CommandSpec> {
+        validate_claude_session_id(native_session_id)?;
+        self.command(control, Some(native_session_id))
+    }
+
+    fn observe_native_record(&self, record: &[u8]) -> Result<Vec<NativeObservation>> {
+        let envelope = parse_claude_envelope(record, None, &self.invocation.model)?;
+        Ok(vec![
+            NativeObservation::SessionStarted {
+                native_session_id: envelope.session_id,
+            },
+            NativeObservation::Activity {
+                kind: "turn".into(),
+                message: "completed".into(),
+            },
+        ])
+    }
+
+    fn extract_result(
+        &self,
+        control: &TurnControl,
+        artifacts: &NativeArtifacts,
+    ) -> Result<NativeResult> {
+        validate_developer_artifacts(control, artifacts)?;
+        if artifacts.final_output().is_some() {
+            bail!("Claude developer unexpectedly emitted a final-file result");
+        }
+        if !artifacts.stderr().iter().all(u8::is_ascii_whitespace) {
+            bail!("Claude developer emitted unexpected stderr");
+        }
+        let envelope = parse_claude_envelope(
+            artifacts.stdout(),
+            control.native_session_id.as_deref(),
+            &self.invocation.model,
+        )?;
+        let encoded = serde_json::to_vec(&envelope.structured_output)?;
+        let result = DeveloperResult::parse(&encoded)
+            .context("Claude structured output is not strict DeveloperResult JSON")?;
+        if result.decision == DeveloperDecision::Completed {
+            self.sandbox
+                .validate_developer_completion(control, &result, &self.git_executable)?;
+        }
+        Ok(NativeResult::Developer {
+            native_session_id: envelope.session_id,
+            result,
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct ClaudeReviewerConfig {
     pub run_id: String,
     pub workspace_cwd: PathBuf,
@@ -358,7 +653,7 @@ pub struct ClaudeReviewerAdapter {
     executable: ExecutableIdentity,
     outer_executable: ExecutableIdentity,
     git_executable: ExecutableIdentity,
-    sandbox: ReviewerSandbox,
+    sandbox: WorkerSandbox,
     xdg_config_home: DirectoryIdentity,
     xdg_state_home: DirectoryIdentity,
     xdg_cache_home: DirectoryIdentity,
@@ -369,7 +664,7 @@ pub struct ClaudeReviewerAdapter {
 impl ClaudeReviewerAdapter {
     pub fn discover(config: ClaudeReviewerConfig) -> Result<Self> {
         validate_production_runtime_contract(&config.host_runtime_dir, &config.run_id)?;
-        validate_claude_reviewer_cli(Path::new(CLAUDE_REVIEWER_EXECUTABLE))?;
+        validate_claude_cli(Path::new(CLAUDE_REVIEWER_EXECUTABLE))?;
         Self::discover_with_paths(
             config,
             Path::new(CLAUDE_REVIEWER_EXECUTABLE),
@@ -379,27 +674,11 @@ impl ClaudeReviewerAdapter {
     }
 
     pub fn environment_policy() -> Result<EnvironmentPolicy> {
-        policy_with_required(&[
-            "CARGO_HOME",
-            "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS",
-            "CLAUDE_CODE_DISABLE_FAST_MODE",
-            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-            "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION",
-            "CLAUDE_CONFIG_DIR",
-            "HOME",
-            "PATH",
-            "RUSTUP_HOME",
-            "TMPDIR",
-            "XDG_CACHE_HOME",
-            "XDG_CONFIG_HOME",
-            "XDG_DATA_HOME",
-            "XDG_RUNTIME_DIR",
-            "XDG_STATE_HOME",
-        ])
+        claude_environment_policy()
     }
 
     pub fn profile(&self) -> WorkerProfile {
-        profile(&self.descriptor, &self.executable)
+        profile(WorkerRole::Reviewer, &self.descriptor, &self.executable)
     }
 
     fn discover_with_paths(
@@ -417,8 +696,10 @@ impl ClaudeReviewerAdapter {
         let xdg_state_home = DirectoryIdentity::capture(&config.xdg_state_home, true)?;
         let xdg_cache_home = DirectoryIdentity::capture(&config.xdg_cache_home, true)?;
         let xdg_data_home = DirectoryIdentity::capture(&config.xdg_data_home, true)?;
-        let sandbox = ReviewerSandbox::capture(
-            ReviewerSandboxConfig {
+        let sandbox = WorkerSandbox::capture(
+            WorkerSandboxConfig {
+                role: WorkerRole::Reviewer,
+                workspace_writable: false,
                 run_id: config.run_id,
                 workspace_cwd: config.workspace_cwd,
                 artifact_root: config.artifact_root,
@@ -570,25 +851,7 @@ impl ClaudeReviewerAdapter {
     }
 
     fn exact_environment(&self) -> Result<Vec<ExactEnvironmentRequirement>> {
-        let mut exact = CLAUDE_EXACT_ENVIRONMENT
-            .iter()
-            .map(|(name, value)| ExactEnvironmentRequirement::new(*name, *value))
-            .collect::<Result<Vec<_>>>()?;
-        exact.extend([
-            ExactEnvironmentRequirement::new("CARGO_HOME", INSIDE_CARGO_HOME)?,
-            ExactEnvironmentRequirement::new("CLAUDE_CONFIG_DIR", INSIDE_NATIVE_CONFIG)?,
-            ExactEnvironmentRequirement::new("HOME", INSIDE_HOME)?,
-            ExactEnvironmentRequirement::new("PATH", INSIDE_PATH)?,
-            ExactEnvironmentRequirement::new("RUSTUP_HOME", INSIDE_RUSTUP_HOME)?,
-            ExactEnvironmentRequirement::new("TMPDIR", INSIDE_TEMP)?,
-            ExactEnvironmentRequirement::new("XDG_CACHE_HOME", "/hcom/home/.cache")?,
-            ExactEnvironmentRequirement::new("XDG_CONFIG_HOME", "/hcom/home/.config")?,
-            ExactEnvironmentRequirement::new("XDG_DATA_HOME", "/hcom/home/.data")?,
-            ExactEnvironmentRequirement::new("XDG_RUNTIME_DIR", INSIDE_RUNTIME)?,
-            ExactEnvironmentRequirement::new("XDG_STATE_HOME", "/hcom/home/.state")?,
-        ]);
-        exact.sort_by(|left, right| left.name().cmp(right.name()));
-        Ok(exact)
+        claude_exact_environment()
     }
 }
 
@@ -645,15 +908,15 @@ fn validate_codex_reviewer_cli(path: &Path) -> Result<()> {
     )
 }
 
-fn validate_claude_reviewer_cli(path: &Path) -> Result<()> {
+fn validate_claude_cli(path: &Path) -> Result<()> {
     let mut command = Command::new(path);
     command.arg("--help").env_clear();
     let output = run_bounded_command(command, 128 * 1024)?;
     if !output.status.success() || !output.stderr.is_empty() {
-        bail!("Claude reviewer CLI capability probe failed");
+        bail!("Claude session worker CLI capability probe failed");
     }
     validate_cli_help_contract(
-        "Claude reviewer CLI",
+        "Claude session worker CLI",
         &output.stdout,
         &[
             "--print",
@@ -676,7 +939,7 @@ fn validate_claude_reviewer_cli(path: &Path) -> Result<()> {
     )?;
     let help = std::str::from_utf8(&output.stdout)?;
     if !help.contains("(low, medium, high, xhigh, max)") || !help.contains("'opus'") {
-        bail!("Claude reviewer CLI help omitted a configured effort or model alias");
+        bail!("Claude session worker CLI help omitted a configured effort or model alias");
     }
     Ok(())
 }
@@ -741,9 +1004,13 @@ impl WorkerAdapter for ClaudeReviewerAdapter {
     }
 }
 
-fn profile(descriptor: &AdapterDescriptor, executable: &ExecutableIdentity) -> WorkerProfile {
+fn profile(
+    role: WorkerRole,
+    descriptor: &AdapterDescriptor,
+    executable: &ExecutableIdentity,
+) -> WorkerProfile {
     WorkerProfile {
-        role: WorkerRole::Reviewer,
+        role,
         adapter: descriptor.name.clone(),
         model: descriptor.model.clone(),
         reasoning: descriptor.reasoning.clone(),
@@ -811,6 +1078,71 @@ fn claude_reviewer_descriptor(invocation: &ClaudeInvocationProfile) -> Result<Ad
     )
 }
 
+fn claude_developer_descriptor(invocation: &ClaudeInvocationProfile) -> Result<AdapterDescriptor> {
+    let policy = invocation.effective_policy(DEVELOPER_OUTER_POLICY);
+    AdapterDescriptor::new(
+        CLAUDE_DEVELOPER_ADAPTER_NAME,
+        CLAUDE_DEVELOPER_ADAPTER_CONTRACT_VERSION,
+        CLAUDE_DEVELOPER_CLI_VERSION,
+        &invocation.model,
+        &invocation.effort,
+        &policy,
+        AdapterCapabilities {
+            roles: vec![WorkerRole::Developer],
+            native_session_mode: NativeSessionMode::Preassigned,
+            result_transport: ResultTransport::Envelope,
+            features: vec![
+                "exact-resume".into(),
+                "host-git-evidence".into(),
+                "outer-bwrap-empty-root-developer-v2".into(),
+                "structured-result".into(),
+            ],
+        },
+    )
+}
+
+fn claude_environment_policy() -> Result<EnvironmentPolicy> {
+    policy_with_required(&[
+        "CARGO_HOME",
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS",
+        "CLAUDE_CODE_DISABLE_FAST_MODE",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+        "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION",
+        "CLAUDE_CONFIG_DIR",
+        "HOME",
+        "PATH",
+        "RUSTUP_HOME",
+        "TMPDIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+        "XDG_STATE_HOME",
+    ])
+}
+
+fn claude_exact_environment() -> Result<Vec<ExactEnvironmentRequirement>> {
+    let mut exact = CLAUDE_EXACT_ENVIRONMENT
+        .iter()
+        .map(|(name, value)| ExactEnvironmentRequirement::new(*name, *value))
+        .collect::<Result<Vec<_>>>()?;
+    exact.extend([
+        ExactEnvironmentRequirement::new("CARGO_HOME", INSIDE_CARGO_HOME)?,
+        ExactEnvironmentRequirement::new("CLAUDE_CONFIG_DIR", INSIDE_NATIVE_CONFIG)?,
+        ExactEnvironmentRequirement::new("HOME", INSIDE_HOME)?,
+        ExactEnvironmentRequirement::new("PATH", INSIDE_PATH)?,
+        ExactEnvironmentRequirement::new("RUSTUP_HOME", INSIDE_RUSTUP_HOME)?,
+        ExactEnvironmentRequirement::new("TMPDIR", INSIDE_TEMP)?,
+        ExactEnvironmentRequirement::new("XDG_CACHE_HOME", "/hcom/home/.cache")?,
+        ExactEnvironmentRequirement::new("XDG_CONFIG_HOME", "/hcom/home/.config")?,
+        ExactEnvironmentRequirement::new("XDG_DATA_HOME", "/hcom/home/.data")?,
+        ExactEnvironmentRequirement::new("XDG_RUNTIME_DIR", INSIDE_RUNTIME)?,
+        ExactEnvironmentRequirement::new("XDG_STATE_HOME", "/hcom/home/.state")?,
+    ]);
+    exact.sort_by(|left, right| left.name().cmp(right.name()));
+    Ok(exact)
+}
+
 fn policy_with_required(extra: &[&str]) -> Result<EnvironmentPolicy> {
     let mut inherited = EnvironmentPolicy::baseline().inherited_names;
     inherited.extend(extra.iter().map(|name| (*name).to_owned()));
@@ -821,6 +1153,22 @@ fn policy_with_required(extra: &[&str]) -> Result<EnvironmentPolicy> {
     required.sort();
     required.dedup();
     EnvironmentPolicy::new(inherited, required)
+}
+
+fn validate_developer_control(control: &TurnControl) -> Result<()> {
+    control.validate()?;
+    if control.role != WorkerRole::Developer {
+        bail!("developer adapter cannot build a reviewer turn");
+    }
+    Ok(())
+}
+
+fn validate_developer_artifacts(control: &TurnControl, artifacts: &NativeArtifacts) -> Result<()> {
+    validate_developer_control(control)?;
+    if artifacts.role() != WorkerRole::Developer {
+        bail!("developer native artifacts do not match their exact turn");
+    }
+    Ok(())
 }
 
 fn validate_reviewer_control(control: &TurnControl) -> Result<()> {
@@ -914,6 +1262,16 @@ fn claude_reviewer_result_schema() -> Vec<u8> {
     serialize_reviewer_result_schema(&reviewer_result_schema_shape())
 }
 
+fn claude_developer_result_schema() -> Vec<u8> {
+    let mut schema: serde_json::Value = serde_json::from_slice(&developer_result_schema())
+        .expect("static developer result schema is valid JSON");
+    schema
+        .as_object_mut()
+        .expect("static developer result schema is an object")
+        .remove("$schema");
+    serde_json::to_vec(&schema).expect("static Claude developer result schema is valid JSON")
+}
+
 fn serialize_reviewer_result_schema(schema: &serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(schema).expect("static reviewer result schema is valid JSON")
 }
@@ -943,11 +1301,11 @@ fn parse_claude_envelope(
     let envelope: ClaudeResultEnvelope =
         serde_json::from_slice(bytes).context("Claude result envelope is malformed")?;
     if envelope.kind != "result" || envelope.subtype != "success" || envelope.is_error {
-        bail!("Claude reviewer did not report a successful terminal result");
+        bail!("Claude session worker did not report a successful terminal result");
     }
     validate_claude_session_id(&envelope.session_id)?;
     if expected_session_id.is_some_and(|expected| expected != envelope.session_id) {
-        bail!("Claude reviewer returned a different native session");
+        bail!("Claude session worker returned a different native session");
     }
     if envelope.model_usage.len() != 1
         || !envelope
@@ -955,10 +1313,10 @@ fn parse_claude_envelope(
             .keys()
             .all(|actual| claude_model_matches(requested_model, actual))
     {
-        bail!("Claude reviewer model usage drifted from its exact pinned model");
+        bail!("Claude session worker model usage drifted from its exact pinned model");
     }
     if !envelope.structured_output.is_object() {
-        bail!("Claude reviewer omitted its structured result object");
+        bail!("Claude session worker omitted its structured result object");
     }
     Ok(envelope)
 }
@@ -984,7 +1342,9 @@ fn validate_claude_session_id(value: &str) -> Result<()> {
     Ok(())
 }
 
-struct ReviewerSandboxConfig {
+struct WorkerSandboxConfig {
+    role: WorkerRole,
+    workspace_writable: bool,
     run_id: String,
     workspace_cwd: PathBuf,
     artifact_root: PathBuf,
@@ -1000,7 +1360,9 @@ struct ReviewerSandboxConfig {
     extra_private_dirs: Vec<DirectoryIdentity>,
 }
 
-struct ReviewerSandbox {
+struct WorkerSandbox {
+    role: WorkerRole,
+    workspace_writable: bool,
     run_id: String,
     workspace: DirectoryIdentity,
     artifact_root: DirectoryIdentity,
@@ -1016,40 +1378,43 @@ struct ReviewerSandbox {
     empty_root: EmptyRootContract,
 }
 
-impl ReviewerSandbox {
+impl WorkerSandbox {
     fn capture(
-        config: ReviewerSandboxConfig,
+        config: WorkerSandboxConfig,
         native: &ExecutableIdentity,
         bwrap: &ExecutableIdentity,
         git: &ExecutableIdentity,
     ) -> Result<Self> {
+        if config.workspace_writable != (config.role == WorkerRole::Developer) {
+            bail!("session worker sandbox role and workspace access disagree");
+        }
         validate_text(
-            "reviewer auth target filename",
+            "session worker auth target filename",
             &config.auth_target_name,
             128,
             false,
         )?;
         if Path::new(&config.auth_target_name).components().count() != 1 {
-            bail!("reviewer auth target filename must be one normal component");
+            bail!("session worker auth target filename must be one normal component");
         }
         let workspace = DirectoryIdentity::capture(&config.workspace_cwd, false)
-            .context("invalid reviewer checkout root")?;
+            .context("invalid session worker checkout root")?;
         let artifact_root = DirectoryIdentity::capture(&config.artifact_root, true)
-            .context("invalid reviewer artifact root")?;
+            .context("invalid session worker artifact root")?;
         let isolated_home = DirectoryIdentity::capture(&config.isolated_home, true)
-            .context("invalid reviewer isolated HOME")?;
+            .context("invalid session worker isolated HOME")?;
         let native_config = DirectoryIdentity::capture(&config.native_config_dir, true)
-            .context("invalid reviewer native config root")?;
+            .context("invalid session worker native config root")?;
         let temp_dir = DirectoryIdentity::capture(&config.temp_dir, true)
-            .context("invalid reviewer temporary root")?;
+            .context("invalid session worker temporary root")?;
         let runtime_dir = DirectoryIdentity::capture(&config.runtime_dir, true)
-            .context("invalid reviewer private runtime root")?;
+            .context("invalid session worker private runtime root")?;
         let host_runtime_dir = DirectoryIdentity::capture(&config.host_runtime_dir, true)
-            .context("invalid reviewer host runtime mask")?;
+            .context("invalid session worker host runtime mask")?;
         if !native_config.path().starts_with(isolated_home.path())
             || native_config.path() == isolated_home.path()
         {
-            bail!("reviewer native config root must be a strict child of isolated HOME");
+            bail!("session worker native config root must be a strict child of isolated HOME");
         }
         for extra in &config.extra_private_dirs {
             extra.revalidate(true)?;
@@ -1057,7 +1422,9 @@ impl ReviewerSandbox {
                 || extra.path() == isolated_home.path()
                 || extra.path() == native_config.path()
             {
-                bail!("reviewer extra state roots must be distinct children of isolated HOME");
+                bail!(
+                    "session worker extra state roots must be distinct children of isolated HOME"
+                );
             }
         }
         let mut disjoint = vec![
@@ -1072,7 +1439,7 @@ impl ReviewerSandbox {
             for right in left + 1..disjoint.len() {
                 if paths_overlap(disjoint[left].1, disjoint[right].1) {
                     bail!(
-                        "reviewer {} and {} must not overlap",
+                        "session worker {} and {} must not overlap",
                         disjoint[left].0,
                         disjoint[right].0
                     );
@@ -1085,30 +1452,34 @@ impl ReviewerSandbox {
         let auth_target =
             FileIdentity::capture(&native_config.path().join(&config.auth_target_name))?;
         if auth_source.path() == auth_target.path() {
-            bail!("reviewer auth source must be distinct from its isolated target");
+            bail!("session worker auth source must be distinct from its isolated target");
         }
-        let writable_roots = [artifact_root.path(), isolated_home.path(), temp_dir.path()];
+        let mut writable_roots = vec![artifact_root.path(), isolated_home.path(), temp_dir.path()];
+        if config.workspace_writable {
+            writable_roots.push(workspace.path());
+        }
         for protected in [
             native.canonical_path.as_path(),
             bwrap.canonical_path.as_path(),
             git.canonical_path.as_path(),
             auth_source.path(),
-            workspace.path(),
         ] {
             if protected.starts_with(host_runtime_dir.path()) {
-                bail!("host runtime mask hides a required reviewer sandbox path");
+                bail!("host runtime mask hides a required session worker sandbox path");
             }
             if writable_roots
                 .iter()
                 .any(|root| protected.starts_with(root))
             {
-                bail!("reviewer writable roots contain a protected host path");
+                bail!("session worker writable roots contain a protected host path");
             }
         }
         let git_workspace = GitWorkspaceIdentity::capture(workspace.path(), git)?;
         let empty_root =
             EmptyRootContract::capture(&config.cargo_bin_source, &config.rustup_home_source)?;
         Ok(Self {
+            role: config.role,
+            workspace_writable: config.workspace_writable,
             run_id: config.run_id,
             workspace,
             artifact_root,
@@ -1144,7 +1515,7 @@ impl ReviewerSandbox {
         for directory in &self.extra_private_dirs {
             directory.revalidate(true)?;
         }
-        super::validation::validate_opaque_id("reviewer run id", &self.run_id)?;
+        super::validation::validate_opaque_id("session worker run id", &self.run_id)?;
         self.auth_source.revalidate()?;
         self.auth_target.revalidate()?;
         self.empty_root.revalidate()?;
@@ -1167,7 +1538,7 @@ impl ReviewerSandbox {
             isolated_home: self.isolated_home.path(),
             native_config: self.native_config.path(),
             workspace: self.workspace.path(),
-            workspace_writable: false,
+            workspace_writable: self.workspace_writable,
             artifact_dir,
             auth_source: self.auth_source.path(),
             auth_target,
@@ -1178,12 +1549,15 @@ impl ReviewerSandbox {
                 || argument == "--new-session"
                 || argument == "/"
         }) {
-            bail!("reviewer outer sandbox manifest contains forbidden launch authority");
+            bail!("session worker outer sandbox manifest contains forbidden launch authority");
         }
         Ok(argv)
     }
 
     fn validate_revision(&self, control: &TurnControl, git: &ExecutableIdentity) -> Result<()> {
+        if self.role != WorkerRole::Reviewer || self.workspace_writable {
+            bail!("reviewer revision gate requires a read-only reviewer sandbox");
+        }
         validate_reviewer_control(control)?;
         revalidate_exact_tool(git, GIT_VERSION)?;
         self.git_workspace.revalidate(self.workspace.path(), git)?;
@@ -1221,6 +1595,89 @@ impl ReviewerSandbox {
             || runner.one_line(&["rev-parse", "--verify", "HEAD^{commit}"])? != head
         {
             bail!("review checkout drifted during its revision gate");
+        }
+        Ok(())
+    }
+
+    fn validate_developer_completion(
+        &self,
+        control: &TurnControl,
+        result: &DeveloperResult,
+        git: &ExecutableIdentity,
+    ) -> Result<()> {
+        if self.role != WorkerRole::Developer || !self.workspace_writable {
+            bail!("developer completion gate requires a writable developer sandbox");
+        }
+        validate_developer_control(control)?;
+        revalidate_exact_tool(git, GIT_VERSION)?;
+        self.git_workspace.revalidate(self.workspace.path(), git)?;
+        let runner = GitRunner {
+            executable: git,
+            workspace: self.workspace.path(),
+        };
+        if !runner
+            .success(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?
+            .is_empty()
+        {
+            bail!("completed Claude developer worktree is not clean");
+        }
+        if !runner
+            .success(&["for-each-ref", "--format=%(refname)", "refs/replace/"])?
+            .is_empty()
+        {
+            bail!("completed Claude developer repository contains replacement refs");
+        }
+        let head = runner.one_line(&["rev-parse", "--verify", "HEAD^{commit}"])?;
+        validate_git_oid("actual developer HEAD", &head)?;
+        if result.head_revision.as_deref() != Some(head.as_str()) {
+            bail!("Claude developer result HEAD does not match the worktree");
+        }
+        let ancestor =
+            runner.run(&["merge-base", "--is-ancestor", &control.base_revision, &head])?;
+        if ancestor.status.code() != Some(0) || !ancestor.stderr.is_empty() {
+            bail!("task base revision is not an ancestor of the completed developer HEAD");
+        }
+
+        let range = format!("{}..{head}", control.base_revision);
+        let commit_output = runner.success(&[
+            "log",
+            "-z",
+            "--reverse",
+            "--topo-order",
+            "--max-count=257",
+            "--no-show-signature",
+            "--format=%H%x00%s",
+            &range,
+            "--",
+        ])?;
+        if parse_git_commits(&commit_output)? != result.commits {
+            bail!("Claude developer reported commits do not match the exact Git range");
+        }
+
+        let changed_output = runner.success(&[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-ext-diff",
+            "--no-textconv",
+            &range,
+            "--",
+        ])?;
+        let mut changed_paths = parse_nul_paths(&changed_output)?;
+        let mut reported_paths = result.changed_paths.clone();
+        changed_paths.sort();
+        reported_paths.sort();
+        if changed_paths != reported_paths {
+            bail!("Claude developer changed paths do not match the exact Git range");
+        }
+        revalidate_exact_tool(git, GIT_VERSION)?;
+        self.git_workspace.revalidate(self.workspace.path(), git)?;
+        if !runner
+            .success(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?
+            .is_empty()
+            || runner.one_line(&["rev-parse", "--verify", "HEAD^{commit}"])? != head
+        {
+            bail!("Claude developer Git state drifted during its completed-result gate");
         }
         Ok(())
     }
@@ -1497,7 +1954,7 @@ impl GitWorkspaceIdentity {
         };
         let top_level = canonical_git_path(&runner.one_line(&["rev-parse", "--show-toplevel"])?)?;
         if top_level != workspace {
-            bail!("review checkout is not its exact Git top level");
+            bail!("session worker checkout is not its exact Git top level");
         }
         let git_dir = canonical_git_path(&runner.one_line(&[
             "rev-parse",
@@ -1519,16 +1976,16 @@ impl GitWorkspaceIdentity {
             || !common_dir.starts_with(workspace)
             || !object_dir.starts_with(workspace)
         {
-            bail!("review checkout Git administration must stay inside the read-only workspace");
+            bail!("session worker Git administration must stay inside its workspace");
         }
         let identity = Self {
             top_level,
             git_dir: DirectoryIdentity::capture(&git_dir, false)
-                .context("invalid review checkout Git directory")?,
+                .context("invalid session worker Git directory")?,
             common_dir: DirectoryIdentity::capture(&common_dir, false)
-                .context("invalid review checkout common Git directory")?,
+                .context("invalid session worker common Git directory")?,
             object_dir: DirectoryIdentity::capture(&object_dir, false)
-                .context("invalid review checkout object directory")?,
+                .context("invalid session worker object directory")?,
         };
         identity.reject_admin_indirections()?;
         Ok(identity)
@@ -1541,7 +1998,7 @@ impl GitWorkspaceIdentity {
             || current.common_dir != self.common_dir
             || current.object_dir != self.object_dir
         {
-            bail!("review checkout Git identity drifted");
+            bail!("session worker Git identity drifted");
         }
         Ok(())
     }
@@ -1553,10 +2010,11 @@ impl GitWorkspaceIdentity {
             self.object_dir.path().join("info/http-alternates"),
         ] {
             match fs::symlink_metadata(&path) {
-                Ok(_) => bail!("review checkout uses forbidden Git object indirection"),
+                Ok(_) => bail!("session worker checkout uses forbidden Git object indirection"),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    return Err(error).context("failed to inspect review checkout indirection");
+                    return Err(error)
+                        .context("failed to inspect session worker checkout indirection");
                 }
             }
         }
@@ -1592,17 +2050,18 @@ impl GitRunner<'_> {
     fn success(&self, args: &[&str]) -> Result<Vec<u8>> {
         let output = self.run(args)?;
         if !output.status.success() || !output.stderr.is_empty() {
-            bail!("bounded review Git evidence command failed");
+            bail!("bounded session worker Git evidence command failed");
         }
         Ok(output.stdout)
     }
 
     fn one_line(&self, args: &[&str]) -> Result<String> {
         let output = self.success(args)?;
-        let text = std::str::from_utf8(&output).context("review Git evidence is not UTF-8")?;
+        let text =
+            std::str::from_utf8(&output).context("session worker Git evidence is not UTF-8")?;
         let text = text.strip_suffix('\n').unwrap_or(text);
         if text.is_empty() || text.contains('\n') || text.contains('\r') {
-            bail!("review Git evidence did not contain exactly one bounded line");
+            bail!("session worker Git evidence did not contain exactly one bounded line");
         }
         Ok(text.to_owned())
     }
@@ -1982,6 +2441,27 @@ mod tests {
             }
         }
 
+        fn claude_developer_config(&self) -> ClaudeDeveloperConfig {
+            ClaudeDeveloperConfig {
+                run_id: "run-developer-fixture".into(),
+                workspace_cwd: self.workspace.clone(),
+                artifact_root: self.artifact_root.clone(),
+                isolated_home: self.isolated_home.clone(),
+                claude_config_dir: self.claude_config_dir.clone(),
+                xdg_config_home: self.xdg_config_home.clone(),
+                xdg_state_home: self.xdg_state_home.clone(),
+                xdg_cache_home: self.xdg_cache_home.clone(),
+                xdg_data_home: self.xdg_data_home.clone(),
+                temp_dir: self.temp_dir.clone(),
+                runtime_dir: self.runtime_dir.clone(),
+                host_runtime_dir: self.host_runtime_dir.clone(),
+                auth_source: self.claude_auth_source.clone(),
+                cargo_bin_source: self.cargo_bin_source.clone(),
+                rustup_home_source: self.rustup_home_source.clone(),
+                invocation: ClaudeInvocationProfile::developer_default(),
+            }
+        }
+
         fn codex_adapter(&self) -> CodexReviewerAdapter {
             CodexReviewerAdapter::discover_with_paths(
                 self.codex_config(),
@@ -2033,6 +2513,30 @@ mod tests {
                 head_revision: Some(head.into()),
                 artifact_dir: format!(
                     "run-reviewers/{task_id}/reviewer/{logical_session_id}/turn-{sequence}/attempt-1"
+                ),
+            }
+        }
+
+        fn developer_control(
+            &self,
+            native_session_id: &str,
+            sequence: u32,
+            head: Option<&str>,
+        ) -> TurnControl {
+            TurnControl {
+                run_id: "run-developers".into(),
+                task_id: "task-claude-developer".into(),
+                role: WorkerRole::Developer,
+                logical_session_id: "logical-claude-developer".into(),
+                native_session_id: Some(native_session_id.into()),
+                turn_sequence: sequence,
+                attempt: 1,
+                task_version: u64::from(sequence) + 20,
+                review_round: sequence.saturating_sub(1),
+                base_revision: self.first_head.clone(),
+                head_revision: head.map(str::to_owned),
+                artifact_dir: format!(
+                    "run-developers/task-claude-developer/developer/logical-claude-developer/turn-{sequence}/attempt-1"
                 ),
             }
         }
@@ -2104,7 +2608,7 @@ mod tests {
                 ArtifactScope {
                     run_id: control.run_id.clone(),
                     task_id: control.task_id.clone(),
-                    role: WorkerRole::Reviewer,
+                    role: control.role,
                     logical_session_id: control.logical_session_id.clone(),
                     turn_sequence: control.turn_sequence,
                     attempt: control.attempt,
@@ -2117,7 +2621,7 @@ mod tests {
                 .materialize(
                     "epoch-reviewers",
                     &WorkerEnvironmentIdentity {
-                        role: WorkerRole::Reviewer,
+                        role: control.role,
                         run_id: control.run_id.clone(),
                         task_id: control.task_id.clone(),
                     },
@@ -2125,7 +2629,7 @@ mod tests {
                 .unwrap();
             ProcessRunner::new(Duration::from_millis(10), Duration::from_millis(50))
                 .unwrap()
-                .spawn(WorkerRole::Reviewer, prepared, &environment, attempt)
+                .spawn(control.role, prepared, &environment, attempt)
                 .unwrap()
                 .wait_with_cancel(Arc::new(AtomicBool::new(false)), |_| {
                     Ok(HeartbeatControl::Continue)
@@ -2199,6 +2703,27 @@ mod tests {
             }]
         });
         assert!(ReviewerResult::parse(&serde_json::to_vec(&nested_unknown).unwrap()).is_err());
+
+        let developer: serde_json::Value =
+            serde_json::from_slice(&claude_developer_result_schema()).unwrap();
+        assert!(developer.get("$schema").is_none());
+        assert_eq!(
+            developer.get("required"),
+            Some(&serde_json::json!([
+                "decision",
+                "summary",
+                "head_revision",
+                "commits",
+                "checks",
+                "questions",
+                "risks",
+                "changed_paths"
+            ]))
+        );
+        assert_eq!(
+            developer.get("additionalProperties"),
+            Some(&serde_json::Value::Bool(false))
+        );
     }
 
     #[test]
@@ -2209,7 +2734,7 @@ mod tests {
         }
         let claude = Path::new(CLAUDE_REVIEWER_EXECUTABLE);
         if claude.exists() {
-            validate_claude_reviewer_cli(claude).unwrap();
+            validate_claude_cli(claude).unwrap();
         }
     }
 
@@ -2259,6 +2784,155 @@ mod tests {
         assert!(parse_claude_envelope(envelope.as_bytes(), Some(CLAUDE_SESSION), "opus").is_ok());
         assert!(
             parse_claude_envelope(envelope.as_bytes(), Some(CLAUDE_SESSION), "sonnet").is_err()
+        );
+    }
+
+    #[test]
+    fn claude_developer_create_resume_and_completed_result_use_writable_exact_workspace() {
+        let fixture = Fixture::new();
+        let mut config = fixture.claude_developer_config();
+        config.invocation.model = "opus".into();
+        config.invocation.effort = "xhigh".into();
+        let adapter = ClaudeDeveloperAdapter::discover_with_paths(
+            config,
+            &fixture.claude,
+            &fixture.bwrap,
+            &fixture.git,
+        )
+        .unwrap();
+        let profile = adapter.profile();
+        assert_eq!(profile.role, WorkerRole::Developer);
+        assert_eq!(profile.adapter, CLAUDE_DEVELOPER_ADAPTER_NAME);
+        assert_eq!(profile.model, "opus");
+        assert_eq!(profile.reasoning, "xhigh");
+
+        let create_control = fixture.developer_control(CLAUDE_SESSION, 1, None);
+        let create = prepare_create_turn(
+            &adapter,
+            &profile,
+            &create_control,
+            b"implement only the approved task".to_vec(),
+        )
+        .unwrap();
+        let command = create.command();
+        assert!(
+            command
+                .fixed_argv
+                .windows(2)
+                .any(|pair| { pair == ["--tools", "Bash,Read,Edit,Write,Glob,Grep"] })
+        );
+        assert!(
+            command
+                .fixed_argv
+                .windows(2)
+                .any(|pair| pair == ["--session-id", CLAUDE_SESSION])
+        );
+        let outer = &command.outer_launch.as_ref().unwrap().fixed_argv;
+        assert!(outer.windows(3).any(|part| {
+            part == [
+                "--bind",
+                fixture.workspace.to_str().unwrap(),
+                INSIDE_WORKSPACE,
+            ]
+        }));
+        assert!(!outer.windows(3).any(|part| {
+            part == [
+                "--ro-bind",
+                fixture.workspace.to_str().unwrap(),
+                INSIDE_WORKSPACE,
+            ]
+        }));
+
+        fs::write(
+            fixture.workspace.join("claude-developed.txt"),
+            b"implemented\n",
+        )
+        .unwrap();
+        git_ok(
+            &fixture.git,
+            &fixture.workspace,
+            &["add", "claude-developed.txt"],
+        );
+        git_ok(
+            &fixture.git,
+            &fixture.workspace,
+            &["commit", "--quiet", "-m", "Implement with Claude"],
+        );
+        let head = git_line(&fixture.git, &fixture.workspace, &["rev-parse", "HEAD"]);
+        let structured = serde_json::json!({
+            "decision": "completed",
+            "summary": "implemented the approved change",
+            "head_revision": head,
+            "commits": [{
+                "sha": head,
+                "subject": "Implement with Claude"
+            }],
+            "checks": [],
+            "questions": [],
+            "risks": [],
+            "changed_paths": ["claude-developed.txt"]
+        });
+        let artifacts = claude_worker_artifacts(
+            WorkerRole::Developer,
+            CLAUDE_SESSION,
+            structured,
+            serde_json::json!({"claude-opus-5": {}}),
+        );
+        let native = adapter.extract_result(&create_control, &artifacts).unwrap();
+        assert!(matches!(native, NativeResult::Developer { .. }));
+
+        let resume_control = fixture.developer_control(CLAUDE_SESSION, 2, Some(&head));
+        let resume = prepare_resume_turn(
+            &adapter,
+            &profile,
+            &resume_control,
+            CLAUDE_SESSION,
+            b"address only the approved review findings".to_vec(),
+        )
+        .unwrap();
+        assert!(
+            resume
+                .command()
+                .fixed_argv
+                .windows(2)
+                .any(|pair| pair == ["--resume", CLAUDE_SESSION])
+        );
+    }
+
+    #[test]
+    fn claude_developer_fake_process_executes_closed_schema_and_git_contract() {
+        let fixture = Fixture::new();
+        let adapter = ClaudeDeveloperAdapter::discover_with_paths(
+            fixture.claude_developer_config(),
+            &fixture.claude,
+            &fixture.bwrap,
+            &fixture.git,
+        )
+        .unwrap();
+        let control = fixture.developer_control(CLAUDE_SESSION, 1, None);
+        let completion = fixture.run(
+            &adapter,
+            &adapter.profile(),
+            &control,
+            fixture.claude_lease("lease-claude-developer"),
+            b"execute one fake Claude developer turn",
+        );
+        assert_eq!(
+            completion.exit.code,
+            Some(0),
+            "fake Claude developer stderr: {}",
+            String::from_utf8_lossy(completion.artifacts.stderr())
+        );
+        assert!(completion.exit.signal.is_none());
+        let result = adapter
+            .extract_result(&control, &completion.artifacts)
+            .unwrap();
+        assert!(matches!(result, NativeResult::Developer { .. }));
+        assert!(
+            fixture
+                .workspace
+                .join("fake-claude-developed.txt")
+                .is_file()
         );
     }
 
@@ -3066,6 +3740,20 @@ mod tests {
         structured_output: serde_json::Value,
         model_usage: serde_json::Value,
     ) -> NativeArtifacts {
+        claude_worker_artifacts(
+            WorkerRole::Reviewer,
+            session_id,
+            structured_output,
+            model_usage,
+        )
+    }
+
+    fn claude_worker_artifacts(
+        role: WorkerRole,
+        session_id: &str,
+        structured_output: serde_json::Value,
+        model_usage: serde_json::Value,
+    ) -> NativeArtifacts {
         let envelope = serde_json::json!({
             "type": "result",
             "subtype": "success",
@@ -3074,13 +3762,7 @@ mod tests {
             "structured_output": structured_output,
             "modelUsage": model_usage
         });
-        NativeArtifacts::new(
-            WorkerRole::Reviewer,
-            serde_json::to_vec(&envelope).unwrap(),
-            vec![],
-            None,
-        )
-        .unwrap()
+        NativeArtifacts::new(role, serde_json::to_vec(&envelope).unwrap(), vec![], None).unwrap()
     }
 
     fn write_private_file(path: &Path, contents: &[u8]) {
@@ -3174,7 +3856,7 @@ if [ "${1-}" = "--version" ]; then
     exit 0
 fi
 [ ! -t 0 ] && [ ! -t 1 ] && [ ! -t 2 ]
-[ "${HCOM_WORKER_ROLE-}" = reviewer ]
+[ "${HCOM_WORKER_ROLE-}" = reviewer ] || [ "${HCOM_WORKER_ROLE-}" = developer ]
 [ -n "${HCOM_RUN_ID-}" ] && [ -n "${HCOM_TASK_ID-}" ]
 [ -z "${HCOM_AGENT-}" ] && [ -z "${TERM-}" ] && [ -z "${STY-}" ]
 [ -n "${HOME-}" ] && [ -n "${CLAUDE_CONFIG_DIR-}" ] && [ -n "${TMPDIR-}" ]
@@ -3206,10 +3888,19 @@ if printf '%s' "$schema" | grep -q '"\$schema"'; then
     exit 91
 fi
 printf '%s' "$schema" | grep -q '"additionalProperties":false'
-printf '%s' "$schema" | grep -q '"required":\["decision","summary","findings","checks"\]'
 prompt=$(sed -n '1,$p')
 [ -n "$prompt" ]
-printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","structured_output":{"decision":"lgtm","summary":"fake exact Claude review passed","findings":[],"checks":[]},"modelUsage":{"claude-opus-5":{}}}\n' "$session"
+if [ "${HCOM_WORKER_ROLE-}" = reviewer ]; then
+    printf '%s' "$schema" | grep -q '"required":\["decision","summary","findings","checks"\]'
+    printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","structured_output":{"decision":"lgtm","summary":"fake exact Claude review passed","findings":[],"checks":[]},"modelUsage":{"claude-opus-5":{}}}\n' "$session"
+else
+    printf '%s' "$schema" | grep -q '"required":\["decision","summary","head_revision","commits","checks","questions","risks","changed_paths"\]'
+    printf '%s\n' 'fake Claude developer output' > fake-claude-developed.txt
+    /usr/bin/git add fake-claude-developed.txt
+    /usr/bin/git commit --quiet -m 'Implement with fake Claude'
+    head=$(/usr/bin/git rev-parse HEAD)
+    printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","structured_output":{"decision":"completed","summary":"fake exact Claude development passed","head_revision":"%s","commits":[{"sha":"%s","subject":"Implement with fake Claude"}],"checks":[],"questions":[],"risks":[],"changed_paths":["fake-claude-developed.txt"]},"modelUsage":{"claude-opus-5":{}}}\n' "$session" "$head" "$head"
+fi
 "#
     }
 

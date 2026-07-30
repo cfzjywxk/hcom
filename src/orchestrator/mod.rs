@@ -20,13 +20,17 @@ use crate::worker::environment::{
 use crate::worker::process::{
     HeartbeatControl, ProcessCompletion, ProcessRunner, WorkerTermination,
 };
-use crate::worker::profile::SessionInvocationProfiles;
+use crate::worker::profile::{
+    CLAUDE_DEVELOPER_ADAPTER, CLAUDE_REVIEWER_ADAPTER, CODEX_DEVELOPER_ADAPTER,
+    CODEX_REVIEWER_ADAPTER, SessionInvocationProfiles,
+};
 use crate::worker::result::{
     CheckResult, CheckStatus, DeveloperDecision, DeveloperResult, ReviewDecision, ReviewerResult,
 };
 use crate::worker::reviewer::{
-    ClaudeReviewerAdapter, ClaudeReviewerConfig, CodexReviewerAdapter, CodexReviewerConfig,
-    claude_auth_redaction_values, validate_claude_auth_readiness,
+    ClaudeDeveloperAdapter, ClaudeDeveloperConfig, ClaudeReviewerAdapter, ClaudeReviewerConfig,
+    CodexReviewerAdapter, CodexReviewerConfig, claude_auth_redaction_values,
+    validate_claude_auth_readiness,
 };
 use crate::worker::{ExecutableIdentity, prepare_create_turn, prepare_resume_turn};
 use anyhow::{Context, Result, anyhow, bail};
@@ -93,11 +97,19 @@ impl SessionRuntimeSources {
             .get("CLAUDE_CONFIG_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".claude"));
-        let codex_auth_source = Some(canonical_private_file(
-            &codex_home.join("auth.json"),
-            "Codex auth source",
-        )?);
-        let claude_auth_source = if profiles.reviewer.claude().is_some() {
+        let uses_codex =
+            profiles.developer.codex().is_some() || profiles.reviewer.codex().is_some();
+        let uses_claude =
+            profiles.developer.claude().is_some() || profiles.reviewer.claude().is_some();
+        let codex_auth_source = if uses_codex {
+            Some(canonical_private_file(
+                &codex_home.join("auth.json"),
+                "Codex auth source",
+            )?)
+        } else {
+            None
+        };
+        let claude_auth_source = if uses_claude {
             let claude_auth_path = claude_home.join(".credentials.json");
             match fs::symlink_metadata(&claude_auth_path) {
                 Ok(_) => Some(canonical_private_file(
@@ -155,9 +167,10 @@ impl SessionRuntimeSources {
         task_id: &str,
     ) -> Result<ExecutionEnvironmentLease> {
         let policy = match adapter {
-            "codex-developer-0.145.0" => CodexDeveloperAdapter::environment_policy()?,
-            "codex-reviewer-0.145.0" => CodexReviewerAdapter::environment_policy()?,
-            "claude-reviewer-2.1.220" => ClaudeReviewerAdapter::environment_policy()?,
+            CODEX_DEVELOPER_ADAPTER => CodexDeveloperAdapter::environment_policy()?,
+            CLAUDE_DEVELOPER_ADAPTER => ClaudeDeveloperAdapter::environment_policy()?,
+            CODEX_REVIEWER_ADAPTER => CodexReviewerAdapter::environment_policy()?,
+            CLAUDE_REVIEWER_ADAPTER => ClaudeReviewerAdapter::environment_policy()?,
             _ => EnvironmentPolicy::baseline(),
         };
         let mut values: BTreeMap<String, String> = policy
@@ -198,7 +211,7 @@ impl SessionRuntimeSources {
             values.into_iter().collect(),
         )
         .with_context(|| format!("failed to capture worker environment for {run_id}/{task_id}"))?;
-        if adapter == "claude-reviewer-2.1.220" {
+        if matches!(adapter, CLAUDE_DEVELOPER_ADAPTER | CLAUDE_REVIEWER_ADAPTER) {
             let source = self
                 .claude_auth_source
                 .as_deref()
@@ -209,7 +222,7 @@ impl SessionRuntimeSources {
     }
 
     fn require_adapter_ready(&self, adapter: &str) -> Result<()> {
-        if adapter == "claude-reviewer-2.1.220" {
+        if matches!(adapter, CLAUDE_DEVELOPER_ADAPTER | CLAUDE_REVIEWER_ADAPTER) {
             let source = self
                 .claude_auth_source
                 .as_deref()
@@ -500,14 +513,16 @@ impl SessionSupervisor {
         {
             bail!("task plan adapters differ from the session-frozen profiles");
         }
-        if developer_adapter != "codex-developer-0.145.0"
-            && self.adapters.resolve(developer_adapter).is_err()
+        if !matches!(
+            developer_adapter,
+            CODEX_DEVELOPER_ADAPTER | CLAUDE_DEVELOPER_ADAPTER
+        ) && self.adapters.resolve(developer_adapter).is_err()
         {
             bail!("unknown or disabled developer adapter");
         }
         if !matches!(
             reviewer_adapter,
-            "codex-reviewer-0.145.0" | "claude-reviewer-2.1.220"
+            CODEX_REVIEWER_ADAPTER | CLAUDE_REVIEWER_ADAPTER
         ) && self.adapters.resolve(reviewer_adapter).is_err()
         {
             bail!("unknown or disabled reviewer adapter");
@@ -1214,7 +1229,7 @@ impl SessionSupervisor {
             .join(role_name(role));
         let home = role_root.join("home");
         let native = match name {
-            "claude-reviewer-2.1.220" => home.join(".claude"),
+            CLAUDE_DEVELOPER_ADAPTER | CLAUDE_REVIEWER_ADAPTER => home.join(".claude"),
             _ => home.join(".codex"),
         };
         let temp = role_root.join("tmp");
@@ -1234,7 +1249,7 @@ impl SessionSupervisor {
         }
         let adapter: Arc<dyn WorkerAdapter> =
             match (role, name) {
-                (WorkerRole::Developer, "codex-developer-0.145.0") => {
+                (WorkerRole::Developer, CODEX_DEVELOPER_ADAPTER) => {
                     prepare_auth_mount_target(&native.join("auth.json"))?;
                     Arc::new(CodexDeveloperAdapter::discover(CodexDeveloperConfig {
                         run_id: self.startup.run_id.clone(),
@@ -1252,10 +1267,46 @@ impl SessionSupervisor {
                             .ok_or_else(|| anyhow!("Codex auth source is unavailable"))?,
                         cargo_bin_source: self.sources.cargo_bin_source.clone(),
                         rustup_home_source: self.sources.rustup_home_source.clone(),
-                        invocation: profiles.developer.clone(),
+                        invocation: profiles.developer.codex().cloned().ok_or_else(|| {
+                            anyhow!("session-frozen developer profile is not Codex")
+                        })?,
                     })?)
                 }
-                (WorkerRole::Reviewer, "codex-reviewer-0.145.0") => {
+                (WorkerRole::Developer, CLAUDE_DEVELOPER_ADAPTER) => {
+                    prepare_auth_mount_target(&native.join(".credentials.json"))?;
+                    let xdg_config = home.join(".config");
+                    let xdg_state = home.join(".state");
+                    let xdg_cache = home.join(".cache");
+                    let xdg_data = home.join(".data");
+                    for directory in [&xdg_config, &xdg_state, &xdg_cache, &xdg_data] {
+                        ensure_private_directory(directory)?;
+                    }
+                    Arc::new(ClaudeDeveloperAdapter::discover(ClaudeDeveloperConfig {
+                        run_id: self.startup.run_id.clone(),
+                        workspace_cwd: self.startup.repo_root.clone(),
+                        artifact_root: self.artifact_root_path.clone(),
+                        isolated_home: home,
+                        claude_config_dir: native,
+                        xdg_config_home: xdg_config,
+                        xdg_state_home: xdg_state,
+                        xdg_cache_home: xdg_cache,
+                        xdg_data_home: xdg_data,
+                        temp_dir: temp,
+                        runtime_dir: private_run,
+                        host_runtime_dir: self.sources.host_runtime_dir.clone(),
+                        auth_source: self
+                            .sources
+                            .claude_auth_source
+                            .clone()
+                            .ok_or_else(|| anyhow!("Claude auth source is unavailable"))?,
+                        cargo_bin_source: self.sources.cargo_bin_source.clone(),
+                        rustup_home_source: self.sources.rustup_home_source.clone(),
+                        invocation: profiles.developer.claude().cloned().ok_or_else(|| {
+                            anyhow!("session-frozen developer profile is not Claude")
+                        })?,
+                    })?)
+                }
+                (WorkerRole::Reviewer, CODEX_REVIEWER_ADAPTER) => {
                     prepare_auth_mount_target(&native.join("auth.json"))?;
                     Arc::new(CodexReviewerAdapter::discover(CodexReviewerConfig {
                         run_id: self.startup.run_id.clone(),
@@ -1278,7 +1329,7 @@ impl SessionSupervisor {
                         })?,
                     })?)
                 }
-                (WorkerRole::Reviewer, "claude-reviewer-2.1.220") => {
+                (WorkerRole::Reviewer, CLAUDE_REVIEWER_ADAPTER) => {
                     prepare_auth_mount_target(&native.join(".credentials.json"))?;
                     let xdg_config = home.join(".config");
                     let xdg_state = home.join(".state");
@@ -2249,7 +2300,10 @@ fn truncate_status_detail(mut detail: String) -> String {
 mod tests {
     use super::*;
     use crate::worker::fake::FakeWorkerAdapter;
-    use crate::worker::profile::{CodexInvocationProfile, ReviewerInvocationProfile};
+    use crate::worker::profile::{
+        ClaudeInvocationProfile, CodexInvocationProfile, DeveloperInvocationProfile,
+        ReviewerInvocationProfile,
+    };
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     const FAKE_WORKER: &str = r#"#!/usr/bin/python3
@@ -2529,6 +2583,53 @@ sys.stdout.write(json.dumps({
         );
         assert_eq!(supervisor.version, 0);
         assert_eq!(supervisor.state, SessionState::AwaitingPlan);
+    }
+
+    #[test]
+    fn session_frozen_profiles_accept_all_codex_claude_role_combinations() {
+        let developers = [
+            DeveloperInvocationProfile::Codex {
+                profile: CodexInvocationProfile::developer_default(),
+            },
+            DeveloperInvocationProfile::Claude {
+                profile: ClaudeInvocationProfile::developer_default(),
+            },
+        ];
+        let reviewers = [
+            ReviewerInvocationProfile::Codex {
+                profile: CodexInvocationProfile::reviewer_default(),
+            },
+            ReviewerInvocationProfile::Claude {
+                profile: ClaudeInvocationProfile::reviewer_default(),
+            },
+        ];
+
+        for developer in developers {
+            for reviewer in reviewers.clone() {
+                let temp = tempfile::tempdir().unwrap();
+                let repository = initialize_repository(temp.path());
+                let locks = private_directory(&temp.path().join("locks"));
+                let mut supervisor = open_supervisor(
+                    temp.path(),
+                    &repository,
+                    "normal",
+                    "run-role-combination",
+                    &locks,
+                );
+                let profiles = SessionInvocationProfiles {
+                    developer: developer.clone(),
+                    reviewer,
+                    ..SessionInvocationProfiles::default()
+                };
+                let developer_adapter = profiles.developer_adapter_name();
+                let reviewer_adapter = profiles.reviewer_adapter_name();
+                supervisor.sources.profiles = Some(profiles);
+                supervisor
+                    .replace_plan(0, developer_adapter, reviewer_adapter, vec![task("one", 1)])
+                    .unwrap();
+                assert_eq!(supervisor.state, SessionState::AwaitingApproval);
+            }
+        }
     }
 
     fn poll_until(
@@ -3072,7 +3173,7 @@ sys.stdout.write(json.dumps({
         .unwrap();
         assert_eq!(
             sources.codex_auth_source,
-            Some(fs::canonicalize(codex_auth).unwrap())
+            Some(fs::canonicalize(&codex_auth).unwrap())
         );
         assert_eq!(
             sources.claude_auth_source,
@@ -3090,8 +3191,35 @@ sys.stdout.write(json.dumps({
             },
             ..SessionInvocationProfiles::default()
         };
-        let sources = SessionRuntimeSources::capture(parent_values, runtime, codex_only).unwrap();
+        let sources =
+            SessionRuntimeSources::capture(parent_values, runtime.clone(), codex_only).unwrap();
         assert_eq!(sources.claude_auth_source, None);
+
+        fs::set_permissions(&claude_auth, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&codex_auth, fs::Permissions::from_mode(0o666)).unwrap();
+        let claude_only = SessionInvocationProfiles {
+            developer: DeveloperInvocationProfile::Claude {
+                profile: ClaudeInvocationProfile::developer_default(),
+            },
+            reviewer: ReviewerInvocationProfile::Claude {
+                profile: ClaudeInvocationProfile::reviewer_default(),
+            },
+            ..SessionInvocationProfiles::default()
+        };
+        let parent_values = BTreeMap::from([
+            ("HOME".into(), text(&home)),
+            ("CODEX_HOME".into(), text(&codex_home)),
+            ("CLAUDE_CONFIG_DIR".into(), text(&claude_home)),
+            ("CARGO_HOME".into(), text(&cargo_home)),
+            ("RUSTUP_HOME".into(), text(&rustup_home)),
+            ("PATH".into(), "/usr/bin:/bin".into()),
+        ]);
+        let sources = SessionRuntimeSources::capture(parent_values, runtime, claude_only).unwrap();
+        assert_eq!(sources.codex_auth_source, None);
+        assert_eq!(
+            sources.claude_auth_source,
+            Some(fs::canonicalize(&claude_auth).unwrap())
+        );
     }
 
     #[test]

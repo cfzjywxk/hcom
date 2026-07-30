@@ -34,11 +34,12 @@ recovers after the foreground invocation exits.
 
 ## Session-frozen native profiles
 
-The launcher reads typed Architect, Codex developer, and Codex-or-Claude
-reviewer profiles once from `$HCOM_DIR/config.toml`. Only model,
-reasoning/effort, Codex sandbox/approval, Claude skip-permissions, and the
-reviewer adapter are configurable. Raw argv, prompt, resume/fork, working
-directory, schema/output, MCP, hook, plugin, and delegation fields are not.
+The launcher reads typed Architect, developer, and reviewer profiles once from
+`$HCOM_DIR/config.toml`. Codex or Claude can be selected independently for
+either worker role. Only adapter, model, reasoning/effort, Codex
+sandbox/approval, and Claude skip-permissions are configurable. Raw argv,
+prompt, resume/fork, working directory, schema/output, MCP, hook, plugin, and
+delegation fields are not.
 
 The sanitized effective profiles have a canonical SHA-256 hash. The configured
 adapter pair is enforced by the Architect tool schema, bridge, and supervisor;

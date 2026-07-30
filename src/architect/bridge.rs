@@ -18,6 +18,10 @@ use crate::control_api::supervisor::ControlPaths;
 use crate::control_api::{CallerAuth, ControlRequest, ControlResponse};
 use crate::worker::ExecutableIdentity;
 use crate::worker::contract::validate_native_session_id;
+use crate::worker::profile::{
+    CLAUDE_DEVELOPER_ADAPTER, CLAUDE_REVIEWER_ADAPTER, CODEX_DEVELOPER_ADAPTER,
+    CODEX_REVIEWER_ADAPTER,
+};
 use crate::worker::sandbox::INSIDE_WORKSPACE;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -240,12 +244,13 @@ fn validate_bridge_configuration(configuration: &BridgeConfiguration) -> Result<
         Some(0o700),
     )?;
     configuration.relay_executable.revalidate()?;
-    if configuration.developer_adapter != "codex-developer-0.145.0"
-        || !matches!(
-            configuration.reviewer_adapter.as_str(),
-            "codex-reviewer-0.145.0" | "claude-reviewer-2.1.220"
-        )
-    {
+    if !matches!(
+        configuration.developer_adapter.as_str(),
+        CODEX_DEVELOPER_ADAPTER | CLAUDE_DEVELOPER_ADAPTER
+    ) || !matches!(
+        configuration.reviewer_adapter.as_str(),
+        CODEX_REVIEWER_ADAPTER | CLAUDE_REVIEWER_ADAPTER
+    ) {
         bail!("architect bridge received an unknown session-frozen worker adapter");
     }
     let paths = ControlPaths::new(&configuration.run_root, &configuration.lock_root)?;
@@ -1762,6 +1767,11 @@ mod tests {
             reviewer_adapter: "claude-reviewer-2.1.220".into(),
         };
         validate_bridge_configuration(&configuration).unwrap();
+
+        let mut alternate_roles = configuration.clone();
+        alternate_roles.developer_adapter = CLAUDE_DEVELOPER_ADAPTER.into();
+        alternate_roles.reviewer_adapter = CODEX_REVIEWER_ADAPTER.into();
+        validate_bridge_configuration(&alternate_roles).unwrap();
 
         let mut drifted = configuration.clone();
         drifted.control_socket_path = root.join("other.sock");

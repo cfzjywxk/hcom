@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const CODEX_DEVELOPER_ADAPTER: &str = "codex-developer-0.145.0";
+pub const CLAUDE_DEVELOPER_ADAPTER: &str = "claude-developer-2.1.220";
 pub const CODEX_REVIEWER_ADAPTER: &str = "codex-reviewer-0.145.0";
 pub const CLAUDE_REVIEWER_ADAPTER: &str = "claude-reviewer-2.1.220";
 
@@ -125,12 +126,16 @@ pub struct ClaudeInvocationProfile {
 }
 
 impl ClaudeInvocationProfile {
-    pub fn reviewer_default() -> Self {
+    pub fn developer_default() -> Self {
         Self {
             model: DEFAULT_CLAUDE_MODEL.into(),
             effort: DEFAULT_REASONING.into(),
             dangerously_skip_permissions: true,
         }
+    }
+
+    pub fn reviewer_default() -> Self {
+        Self::developer_default()
     }
 
     pub fn validate(&self, label: &str) -> Result<()> {
@@ -151,6 +156,57 @@ impl ClaudeInvocationProfile {
             "default-permissions"
         };
         format!("native={native};outer={outer}")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "adapter", rename_all = "lowercase", deny_unknown_fields)]
+pub enum DeveloperInvocationProfile {
+    Codex {
+        #[serde(flatten)]
+        profile: CodexInvocationProfile,
+    },
+    Claude {
+        #[serde(flatten)]
+        profile: ClaudeInvocationProfile,
+    },
+}
+
+impl DeveloperInvocationProfile {
+    pub fn adapter_name(&self) -> &'static str {
+        match self {
+            Self::Codex { .. } => CODEX_DEVELOPER_ADAPTER,
+            Self::Claude { .. } => CLAUDE_DEVELOPER_ADAPTER,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::Codex { profile } => profile.validate("Codex developer"),
+            Self::Claude { profile } => profile.validate("Claude developer"),
+        }
+    }
+
+    pub fn codex(&self) -> Option<&CodexInvocationProfile> {
+        match self {
+            Self::Codex { profile } => Some(profile),
+            Self::Claude { .. } => None,
+        }
+    }
+
+    pub fn claude(&self) -> Option<&ClaudeInvocationProfile> {
+        match self {
+            Self::Claude { profile } => Some(profile),
+            Self::Codex { .. } => None,
+        }
+    }
+}
+
+impl Default for DeveloperInvocationProfile {
+    fn default() -> Self {
+        Self::Codex {
+            profile: CodexInvocationProfile::developer_default(),
+        }
     }
 }
 
@@ -209,19 +265,19 @@ impl Default for ReviewerInvocationProfile {
 #[serde(deny_unknown_fields)]
 pub struct SessionInvocationProfiles {
     pub architect: CodexInvocationProfile,
-    pub developer: CodexInvocationProfile,
+    pub developer: DeveloperInvocationProfile,
     pub reviewer: ReviewerInvocationProfile,
 }
 
 impl SessionInvocationProfiles {
     pub fn validate(&self) -> Result<()> {
         self.architect.validate("architect")?;
-        self.developer.validate("Codex developer")?;
+        self.developer.validate()?;
         self.reviewer.validate()
     }
 
     pub fn developer_adapter_name(&self) -> &'static str {
-        CODEX_DEVELOPER_ADAPTER
+        self.developer.adapter_name()
     }
 
     pub fn reviewer_adapter_name(&self) -> &'static str {
@@ -229,7 +285,7 @@ impl SessionInvocationProfiles {
     }
 
     pub fn canonical_hash(&self) -> String {
-        let encoded = serde_json::to_vec(&("hcom-session-invocation-profiles-v1", self))
+        let encoded = serde_json::to_vec(&("hcom-session-invocation-profiles-v2", self))
             .expect("typed invocation profiles are serializable");
         let digest = Sha256::digest(encoded);
         let mut output = String::with_capacity(digest.len() * 2);
@@ -245,7 +301,7 @@ impl Default for SessionInvocationProfiles {
     fn default() -> Self {
         Self {
             architect: CodexInvocationProfile::architect_default(),
-            developer: CodexInvocationProfile::developer_default(),
+            developer: DeveloperInvocationProfile::default(),
             reviewer: ReviewerInvocationProfile::default(),
         }
     }
@@ -297,7 +353,11 @@ mod tests {
         let profiles = SessionInvocationProfiles::default();
         profiles.validate().unwrap();
         assert_eq!(profiles.architect.sandbox, CodexSandbox::ReadOnly);
-        assert_eq!(profiles.developer.sandbox, CodexSandbox::DangerFullAccess);
+        assert_eq!(
+            profiles.developer.codex().unwrap().sandbox,
+            CodexSandbox::DangerFullAccess
+        );
+        assert_eq!(profiles.developer_adapter_name(), CODEX_DEVELOPER_ADAPTER);
         assert_eq!(profiles.reviewer_adapter_name(), CLAUDE_REVIEWER_ADAPTER);
         assert!(
             profiles
@@ -322,7 +382,19 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_toml_is_adapter_tagged_and_hash_binds_every_option() {
+    fn worker_toml_is_adapter_tagged_and_hash_binds_every_option() {
+        let developer: DeveloperInvocationProfile = toml::from_str(
+            r#"
+adapter = "claude"
+model = "opus"
+effort = "xhigh"
+dangerously_skip_permissions = true
+"#,
+        )
+        .unwrap();
+        assert_eq!(developer.adapter_name(), CLAUDE_DEVELOPER_ADAPTER);
+        developer.validate().unwrap();
+
         let claude: ReviewerInvocationProfile = toml::from_str(
             r#"
 adapter = "claude"
@@ -349,11 +421,14 @@ ask_for_approval = "never"
         codex.validate().unwrap();
 
         let left = SessionInvocationProfiles {
+            developer,
             reviewer: claude,
             ..SessionInvocationProfiles::default()
         };
         let mut right = left.clone();
-        right.developer.reasoning_effort = "max".into();
+        right.developer = DeveloperInvocationProfile::Codex {
+            profile: CodexInvocationProfile::developer_default(),
+        };
         assert_ne!(left.canonical_hash(), right.canonical_hash());
     }
 
