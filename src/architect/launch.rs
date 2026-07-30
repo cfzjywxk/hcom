@@ -1066,21 +1066,33 @@ impl ProtectedDirectoryIdentity {
         let link = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {label} {}", path.display()));
+            }
         };
         if link.file_type().is_symlink() || !link.is_dir() {
-            bail!("{label} must be a real directory when present");
+            bail!(
+                "{label} {} must be a real directory when present",
+                path.display()
+            );
         }
         let canonical = fs::canonicalize(path)?;
         if canonical != path {
-            bail!("{label} must already use its canonical path");
+            bail!(
+                "{label} {} must already use its canonical path",
+                path.display()
+            );
         }
         let metadata = fs::metadata(path)?;
         // SAFETY: geteuid has no preconditions.
         if metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.permissions().mode() & 0o022 != 0
+            || metadata.permissions().mode() & 0o002 != 0
         {
-            bail!("{label} must be current-user owned and not writable by others");
+            bail!(
+                "{label} {} must be current-user owned and not world-writable",
+                path.display()
+            );
         }
         Ok(Some(Self {
             path: canonical,
@@ -1096,7 +1108,10 @@ impl ProtectedDirectoryIdentity {
 
     fn revalidate(&self, label: &str) -> Result<()> {
         if Self::capture_if_present(&self.path, label)?.as_ref() != Some(self) {
-            bail!("{label} identity drifted before architect launch");
+            bail!(
+                "{label} {} identity drifted before architect launch",
+                self.path.display()
+            );
         }
         Ok(())
     }
@@ -2162,6 +2177,14 @@ mod tests {
             fs::create_dir(directory).unwrap();
             fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
         }
+        for directory in [
+            &custom_hcom,
+            &home.join(".hcom"),
+            &home.join(".codex"),
+            &home.join(".claude"),
+        ] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o775)).unwrap();
+        }
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -2188,6 +2211,17 @@ mod tests {
             output.status,
             String::from_utf8_lossy(&output.stderr)
         );
+        let unsafe_root = root.join("world-writable-control");
+        fs::create_dir(&unsafe_root).unwrap();
+        fs::set_permissions(&unsafe_root, fs::Permissions::from_mode(0o777)).unwrap();
+        let error =
+            match ProtectedDirectoryIdentity::capture_if_present(&unsafe_root, "test control root")
+            {
+                Ok(_) => panic!("world-writable control root was accepted"),
+                Err(error) => error.to_string(),
+            };
+        assert!(error.contains(&unsafe_root.to_string_lossy().into_owned()));
+        assert!(error.contains("not world-writable"));
     }
 
     #[test]
@@ -2649,7 +2683,9 @@ mod tests {
             .tempdir_in("/var/tmp")
             .unwrap();
         let external_source = fs::canonicalize(external_temp.path()).unwrap();
-        let control_home = external_source.join("home");
+        // Put the protected roots under the writable project to pin the
+        // load-bearing writable-parent/readonly-child mount precedence.
+        let control_home = repository.clone();
         let live_hcom = control_home.join(".hcom");
         let parent_codex = control_home.join(".codex");
         let parent_claude = control_home.join(".claude");
@@ -2681,7 +2717,6 @@ mod tests {
             &codex_home,
             &cargo_bin_source,
             &rustup_home_source,
-            &control_home,
             &live_hcom,
             &parent_codex,
             &parent_claude,
@@ -2690,6 +2725,9 @@ mod tests {
         ] {
             fs::create_dir(path).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for path in [&live_hcom, &parent_codex, &parent_claude] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o775)).unwrap();
         }
         fs::write(
             external_source.join("source.txt"),
