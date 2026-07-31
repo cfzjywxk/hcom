@@ -133,9 +133,10 @@ limit unless the formats have the same shape.
 
 Codex 0.145 places `aggregated_output` inside an
 `item.completed`/`command_execution` event. That one known event may exceed
-128 KiB while complete stdout remains within 1 MiB. The parser ignores that
-field without copying it into evidence, diagnostics, results, or review
-summaries, while still validating:
+128 KiB while complete stdout remains within 1 MiB. The field must be a JSON
+string, and the serialized event after excluding only that raw value must
+remain within 128 KiB. The parser borrows the raw value without copying it into
+evidence, diagnostics, results, or review summaries, while still validating:
 
 - event ordering and exactly one initial native session;
 - exact resume session equality;
@@ -146,9 +147,10 @@ summaries, while still validating:
 - the successful terminal event.
 
 No other oversized event is accepted. A large command event must contain the
-known `aggregated_output` field; an unrelated oversized unknown field does not
-qualify. Aggregate, event-count, and per-event-shape overflow have distinct
-sanitized diagnostics and never include raw provider payload.
+known `aggregated_output` string, and unrelated unknown fields cannot account
+for bytes above the ordinary event bound. Aggregate, event-count, and
+per-event-shape overflow have distinct sanitized diagnostics and never include
+raw provider payload.
 
 Structured check claims require exact successful command evidence from the
 same turn. A displayed `/bin/bash -c` or `/bin/bash -lc` wrapper may

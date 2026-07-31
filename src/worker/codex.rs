@@ -42,7 +42,7 @@ pub const GIT_EXECUTABLE: &str = "/usr/bin/git";
 pub const GIT_VERSION: &str = "git version 2.43.0";
 
 const ADAPTER_NAME: &str = "codex-developer-0.145.0";
-const ADAPTER_CONTRACT_VERSION: u32 = 6;
+const ADAPTER_CONTRACT_VERSION: u32 = 7;
 const OUTER_POLICY: &str = "bubblewrap-0.9.0-host-path-developer-repo-rw-v1";
 const MAX_CODEX_EVENTS: usize = 4096;
 pub(super) const MAX_CODEX_EVENT_BYTES: usize = 128 * 1024;
@@ -1247,21 +1247,34 @@ struct ThreadStartedEvent {
 }
 
 #[derive(Deserialize)]
-struct ItemEvent {
+struct ItemEvent<'a> {
     #[serde(rename = "type")]
     _kind: String,
-    item: CodexItem,
+    #[serde(borrow)]
+    item: CodexItem<'a>,
 }
 
 #[derive(Deserialize)]
-struct CodexItem {
+struct CodexItem<'a> {
     id: String,
     #[serde(rename = "type")]
     kind: String,
     command: Option<String>,
-    aggregated_output: Option<serde::de::IgnoredAny>,
+    #[serde(borrow)]
+    aggregated_output: Option<&'a serde_json::value::RawValue>,
     exit_code: Option<i32>,
     status: Option<String>,
+}
+
+fn large_command_output_is_only_oversized_value(line: &str, item: &CodexItem<'_>) -> bool {
+    let Some(output) = item.aggregated_output else {
+        return false;
+    };
+    let raw = output.get();
+    let trimmed = raw.trim();
+    trimmed.starts_with('"')
+        && trimmed.ends_with('"')
+        && line.len().saturating_sub(raw.len()) <= MAX_CODEX_EVENT_BYTES
 }
 
 pub(super) fn parse_codex_turn(control: &TurnControl, stdout: &[u8]) -> Result<CodexTurnEvidence> {
@@ -1293,9 +1306,9 @@ pub(super) fn parse_codex_turn(control: &TurnControl, stdout: &[u8]) -> Result<C
         validate_text("Codex event type", &header.kind, 128, false)?;
         let oversized_event = line.len() > MAX_CODEX_EVENT_BYTES;
         // Codex 0.145 places a command's aggregate output in the same
-        // item.completed object as the bounded command/status evidence. Serde
-        // skips that unneeded field while the aggregate stream cap still
-        // bounds parsing; every other event retains the smaller shape cap.
+        // item.completed object as the bounded command/status evidence. Borrow
+        // its raw range so only that known string may account for bytes above
+        // the event bound; the aggregate stream cap still bounds parsing.
         if oversized_event && header.kind != "item.completed" {
             bail!("Codex JSONL event exceeds its per-event shape bound");
         }
@@ -1340,7 +1353,7 @@ pub(super) fn parse_codex_turn(control: &TurnControl, stdout: &[u8]) -> Result<C
                 if oversized_event
                     && (header.kind != "item.completed"
                         || event.item.kind != "command_execution"
-                        || event.item.aggregated_output.is_none())
+                        || !large_command_output_is_only_oversized_value(line, &event.item))
                 {
                     bail!("Codex JSONL event exceeds its per-event shape bound");
                 }
@@ -2062,6 +2075,52 @@ mod tests {
             "Codex JSONL event exceeds its per-event shape bound"
         );
         assert!(!format!("{error:#}").contains(private_payload));
+
+        let private_payload = "misattributed-field-private-payload";
+        let oversized_misattributed_command = codex_transcript(
+            "native-codex-misattributed",
+            &serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "command-1",
+                    "type": "command_execution",
+                    "command": "cargo test --quiet",
+                    "aggregated_output": "short",
+                    "padding": format!(
+                        "{private_payload}{}",
+                        "d".repeat(MAX_CODEX_EVENT_BYTES)
+                    ),
+                    "exit_code": 0,
+                    "status": "completed"
+                }
+            }),
+        );
+        let error = codex_parse_error(&control(None), &oversized_misattributed_command);
+        assert_eq!(
+            error.to_string(),
+            "Codex JSONL event exceeds its per-event shape bound"
+        );
+        assert!(!format!("{error:#}").contains(private_payload));
+
+        let oversized_non_string_output = codex_transcript(
+            "native-codex-non-string-output",
+            &serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "command-1",
+                    "type": "command_execution",
+                    "command": "cargo test --quiet",
+                    "aggregated_output": ["e".repeat(MAX_CODEX_EVENT_BYTES)],
+                    "exit_code": 0,
+                    "status": "completed"
+                }
+            }),
+        );
+        let error = codex_parse_error(&control(None), &oversized_non_string_output);
+        assert_eq!(
+            error.to_string(),
+            "Codex JSONL event exceeds its per-event shape bound"
+        );
     }
 
     #[test]
