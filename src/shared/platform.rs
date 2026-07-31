@@ -142,7 +142,9 @@ pub fn shorten_path_max(path: &str, max_width: usize) -> String {
 /// Uses the same env vars as HcomContext::from_env() for tool detection.
 /// For code that already has an HcomContext, prefer `ctx.is_inside_ai_tool()`.
 pub fn is_inside_ai_tool() -> bool {
-    let env = std::env::vars().collect();
+    let env = std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
     crate::shared::tool_detection::detect_tool(&env) != crate::tool::Tool::Adhoc
         || std::env::var("HCOM_LAUNCHED").ok().as_deref() == Some("1")
 }
@@ -151,7 +153,9 @@ pub fn is_inside_ai_tool() -> bool {
 ///
 /// Uses the same env vars as HcomContext::from_env() for tool detection.
 pub fn detect_current_tool_from_env() -> &'static str {
-    let env = std::env::vars().collect();
+    let env = std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
     crate::shared::tool_detection::detect_tool(&env).as_str()
 }
 

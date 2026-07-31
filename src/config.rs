@@ -62,7 +62,9 @@ impl Config {
     fn from_env() -> Self {
         use std::env;
 
-        let env_map: HashMap<String, String> = env::vars().collect();
+        let env_map: HashMap<String, String> = env::vars_os()
+            .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+            .collect();
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let (hcom_dir, _) = paths::resolve_hcom_dir_from_env(&env_map, &cwd);
 

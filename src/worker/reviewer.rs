@@ -55,9 +55,9 @@ const GIT_VERSION: &str = "git version 2.43.0";
 const CODEX_ADAPTER_NAME: &str = "codex-reviewer-0.145.0";
 const CLAUDE_ADAPTER_NAME: &str = "claude-reviewer-2.1.220";
 const CLAUDE_DEVELOPER_ADAPTER_NAME: &str = "claude-developer-2.1.220";
-const CODEX_ADAPTER_CONTRACT_VERSION: u32 = 4;
-const CLAUDE_ADAPTER_CONTRACT_VERSION: u32 = 4;
-const CLAUDE_DEVELOPER_ADAPTER_CONTRACT_VERSION: u32 = 2;
+const CODEX_ADAPTER_CONTRACT_VERSION: u32 = 5;
+const CLAUDE_ADAPTER_CONTRACT_VERSION: u32 = 5;
+const CLAUDE_DEVELOPER_ADAPTER_CONTRACT_VERSION: u32 = 3;
 const REVIEWER_OUTER_POLICY: &str = "bubblewrap-0.9.0-host-path-reviewer-ro-v1";
 const DEVELOPER_OUTER_POLICY: &str = "bubblewrap-0.9.0-host-path-developer-repo-rw-v1";
 const CODEX_RESULT_SCHEMA_FILE: &str = "codex-reviewer-result-schema.json";
@@ -1037,6 +1037,7 @@ fn reviewer_capabilities(
         native_session_mode,
         result_transport,
         features: vec![
+            "complete-parent-environment-v1".into(),
             "exact-resume".into(),
             sandbox_feature.into(),
             "workspace-attestation".into(),
@@ -1101,6 +1102,7 @@ fn claude_developer_descriptor(invocation: &ClaudeInvocationProfile) -> Result<A
             native_session_mode: NativeSessionMode::Preassigned,
             result_transport: ResultTransport::Envelope,
             features: vec![
+                "complete-parent-environment-v1".into(),
                 "exact-resume".into(),
                 "host-git-evidence".into(),
                 "native-add-dir-task-repository".into(),
@@ -1139,15 +1141,14 @@ fn path_string(label: &str, path: &Path) -> Result<String> {
 }
 
 fn policy_with_required(extra: &[&str]) -> Result<EnvironmentPolicy> {
-    let mut inherited = EnvironmentPolicy::baseline().inherited_names;
-    inherited.extend(extra.iter().map(|name| (*name).to_owned()));
-    inherited.sort();
-    inherited.dedup();
+    let mut overrides: Vec<_> = extra.iter().map(|name| (*name).to_owned()).collect();
+    overrides.sort();
+    overrides.dedup();
     let mut required = vec!["PATH".into()];
     required.extend(extra.iter().map(|name| (*name).to_owned()));
     required.sort();
     required.dedup();
-    EnvironmentPolicy::new(inherited, required)
+    EnvironmentPolicy::new(overrides, required)
 }
 
 fn validate_developer_control(control: &TurnControl) -> Result<()> {

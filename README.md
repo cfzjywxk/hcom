@@ -143,6 +143,17 @@ caches remain writable. See [the Architect user guide](docs/architect.md) for
 the complete schema, all four Codex/Claude role combinations, parent-terminal
 login inheritance, and path-preserving sandbox invariants.
 
+The Architect and every session task worker inherit the complete environment
+of the process that started `hcom architect`, captured once without a name
+allowlist. Arbitrary and secret-shaped names, upper/lower-case pairs, empty
+values, and non-UTF-8 OS strings are preserved. hcom then replaces only the
+role-local values required by the isolation contract: private native
+configuration, HOME/temp/XDG/cache paths where applicable, private
+`HCOM_DIR`, and worker run/task identity. Ordinary hcom work terminals likewise
+inherit the parent OS environment directly, then replace hcom-owned and
+new-terminal identity. Raw inherited values remain in memory, are never
+printed or persisted, and participate in artifact redaction.
+
 Before starting, the Architect must display every task's repository root,
 branch, and start HEAD together with the exact plan version and hash. An
 explicit follow/execute/implement request for a named existing plan may

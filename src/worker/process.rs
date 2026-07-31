@@ -744,7 +744,7 @@ mod tests {
     use super::*;
     use crate::artifact::{ArtifactRoot, ArtifactScope};
     use crate::worker::environment::{
-        EnvironmentPolicy, ExecutionEnvironmentLease, WorkerEnvironmentIdentity,
+        EnvironmentPolicy, ExecutionEnvironmentLease, ParentEnvironment, WorkerEnvironmentIdentity,
     };
     use crate::worker::fake::FakeWorkerAdapter;
     use crate::worker::{ExecutableIdentity, TurnControl, WorkerAdapter, prepare_create_turn};
@@ -790,6 +790,15 @@ mod tests {
         discovered: bool,
         prompt: Vec<u8>,
     ) -> (tempfile::TempDir, RunningWorker, FakeWorkerAdapter, Vec<u8>) {
+        spawn_fake_mode_with_prompt_and_environment(body, discovered, prompt, lease("epoch-1"))
+    }
+
+    fn spawn_fake_mode_with_prompt_and_environment(
+        body: &str,
+        discovered: bool,
+        prompt: Vec<u8>,
+        environment: ExecutionEnvironmentLease,
+    ) -> (tempfile::TempDir, RunningWorker, FakeWorkerAdapter, Vec<u8>) {
         let temp = tempfile::tempdir().unwrap();
         let workspace = fs::canonicalize(temp.path()).unwrap();
         let executable = fake_script(&temp, body);
@@ -818,7 +827,6 @@ mod tests {
         fs::create_dir(&artifact_root_path).unwrap();
         fs::set_permissions(&artifact_root_path, fs::Permissions::from_mode(0o700)).unwrap();
         let root = ArtifactRoot::open(fs::canonicalize(artifact_root_path).unwrap()).unwrap();
-        let environment = lease("epoch-1");
         let attempt = ArtifactAttempt::create(
             &root,
             ArtifactScope {
@@ -849,6 +857,61 @@ mod tests {
             .spawn(WorkerRole::Developer, prepared, &materialized, attempt)
             .unwrap();
         (temp, worker, adapter, prompt)
+    }
+
+    #[test]
+    fn spawned_worker_receives_complete_parent_environment_and_identity_overlays() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw_name = OsString::from("RAW_PARENT_VALUE");
+        let raw_value = OsString::from_vec(b"value-\xfe".to_vec());
+        let parent = ParentEnvironment::from_os(vec![
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (
+                OsString::from("ARBITRARY_PARENT_VALUE"),
+                OsString::from("arbitrary-value"),
+            ),
+            (
+                OsString::from("SERVICE_ACCESS_TOKEN"),
+                OsString::from("secret-shaped-value"),
+            ),
+            (OsString::from("EMPTY_PARENT_VALUE"), OsString::new()),
+            (
+                OsString::from("HCOM_WORKER_ROLE"),
+                OsString::from("wrong-parent-role"),
+            ),
+            (raw_name, raw_value),
+        ]);
+        let environment = ExecutionEnvironmentLease::capture_complete(
+            "lease-complete-parent",
+            "epoch-1",
+            &EnvironmentPolicy::baseline(),
+            &parent,
+            Vec::new(),
+        )
+        .unwrap();
+        let (_temp, worker, adapter, _prompt) = spawn_fake_mode_with_prompt_and_environment(
+            r#"
+python3 -c 'import os; assert os.environ["ARBITRARY_PARENT_VALUE"] == "arbitrary-value"; assert os.environ["SERVICE_ACCESS_TOKEN"] == "secret-shaped-value"; assert os.environ["EMPTY_PARENT_VALUE"] == ""; assert os.environ["HCOM_WORKER_ROLE"] == "developer"; assert os.environb[b"RAW_PARENT_VALUE"] == b"value-\xfe"'
+sed -n '1,$p' >/dev/null
+printf '%s' '{"session_id":"native-1","role":"developer","result":{"decision":"blocked","summary":"complete environment","head_revision":null,"commits":[],"checks":[],"questions":[],"risks":[],"changed_paths":[]}}'
+"#,
+            false,
+            b"bounded private prompt".to_vec(),
+            environment,
+        );
+        let completion = worker.wait(|_| Ok(HeartbeatControl::Continue)).unwrap();
+        assert_eq!(completion.exit.termination, WorkerTermination::Exited);
+        assert_eq!(
+            completion.exit.code,
+            Some(0),
+            "worker stderr: {}",
+            String::from_utf8_lossy(completion.artifacts.stderr())
+        );
+        adapter
+            .extract_result(&developer_control(false), &completion.artifacts)
+            .unwrap();
     }
 
     #[test]

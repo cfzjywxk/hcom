@@ -225,9 +225,34 @@ native config directories for each worker. An all-Claude session does not
 require or inspect Codex credentials; an all-Codex session does not require or
 inspect Claude credentials. hcom does not copy credentials into its database
 or config, synthesize a login directory, or derive login from another window.
-Upper- and lower-case proxy variables are also captured from the starting
-terminal. `HCOM_DIR` changes hcom state/config only; it does not redirect Codex
-or Claude login state.
+
+The process that starts `hcom architect` also supplies one complete,
+session-frozen OS environment snapshot to the Architect and every developer
+and reviewer. There is no inheritance allowlist: unknown names,
+secret-shaped names, both cases of proxy variables, empty values, and
+non-UTF-8 names or values are retained exactly. hcom does not normalize proxy
+names or reconstruct values from another process.
+
+After copying that snapshot, hcom applies only these role-local replacements:
+
+- the Architect gets a private `HCOM_DIR`, private selected native config,
+  private temp/runtime paths, and Claude-private XDG/control flags when Claude
+  is selected;
+- every worker gets its private HOME, selected native config, temp/runtime,
+  generated cache paths, pinned Cargo/Rustup roots, and exact
+  `HCOM_WORKER_ROLE`/`HCOM_RUN_ID`/`HCOM_TASK_ID`; Claude workers also get their
+  private XDG paths and fixed noninteractive control flags;
+- ordinary hcom work terminals replace hcom-owned launch/identity variables
+  and terminal-pane identity while directly inheriting every other parent OS
+  entry.
+
+Those replacements take precedence over same-named parent entries. All other
+entries remain byte-for-byte unchanged. An inherited path value does not grant
+filesystem access by itself: the Architect and worker mount contracts below
+remain authoritative. Raw environment values stay in session memory, are not
+printed or persisted, and meaningful UTF-8 values are included in artifact
+redaction. `HCOM_DIR` changes hcom state/config only; it does not redirect
+Codex or Claude login state.
 
 ## Fixed safety boundaries
 
@@ -257,8 +282,13 @@ Profile configuration changes native CLI policy, not the outer containment:
 - task-worker namespaces mount only the exact project/repository paths, pinned
   system/toolchain inputs, and private per-role state; they do not mount the
   host root or the user's unrelated HOME contents;
-- no worker receives a TTY, hcom control socket, sibling session root, host
-  runtime contents, or push credential;
+- no worker receives a TTY, hcom control socket, sibling session root, or host
+  runtime contents; native credential/config directories remain read-only,
+  while the complete parent environment may itself contain caller-provided
+  token, SSH-agent, or other credential variables;
+- hcom never invents a push credential or performs a push. Complete
+  environment inheritance is deliberately not a credential-reduction
+  boundary;
 - Codex delegation, hooks, plugins, apps, and arbitrary MCP servers remain
   disabled for session workers;
 - when a task repository differs from the project directory, hcom declares it

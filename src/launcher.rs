@@ -280,7 +280,12 @@ pub fn build_launch_env(
     // A wrapped tool is a normal child process: inherit the caller's complete
     // environment. Only hcom-owned identity/marker variables are replaced
     // below, and explicit hcom config/env overrides are applied afterward.
-    let base: HashMap<String, String> = std::env::vars().collect();
+    // Keep the UTF-8 subset here for script exports. The terminal/process
+    // launcher itself inherits the original OS environment directly, so
+    // entries with non-UTF-8 names or values survive without lossy conversion.
+    let base: HashMap<String, String> = std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
     let strip = match regime {
         LaunchEnvRegime::RunHere => run_here_env_strip_set(),
         LaunchEnvRegime::HumanShell | LaunchEnvRegime::ContaminatedParent => env_strip_set(),

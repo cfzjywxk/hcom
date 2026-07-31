@@ -112,9 +112,12 @@ manifest exposes only:
 - the canonical checkout read-write for the developer or read-only for the
   reviewer.
 
-No host root, control socket, registration socket, relay socket, TTY, push
-credential, interactive hcom identity, or sibling worker/session root is
-mounted. The reviewer write probe is required to fail with `EROFS`.
+No host root, control socket, registration socket, relay socket, TTY,
+interactive hcom identity, or sibling worker/session root is mounted. Native
+credential/config directories are read-only. The complete parent environment
+may itself contain caller-provided credentials; hcom does not filter those
+variables, invent credentials, or perform a push. The reviewer write probe is
+required to fail with `EROFS`.
 
 Executable, toolchain, repository/Git administration, auth file, mount target,
 runtime, and private-directory identities are captured and revalidated.
@@ -123,15 +126,19 @@ paths, atomic sealed files, hashes, redaction, and role/turn/session bindings.
 
 ## Environment and proxy inheritance
 
-The parent captures a closed environment allowlist once for this invocation.
-All present upper- and lower-case `https_proxy`, `http_proxy`, `all_proxy`, and
-`no_proxy` names are inherited with their exact names and values. They are not
-normalized, reconstructed, persisted, or recovered from another process.
+The current parent captures the complete OS environment once for the
+invocation, without a name allowlist. Unknown and secret-shaped names,
+upper/lower-case pairs, empty values, and non-UTF-8 OS strings are inherited
+exactly. Values are not normalized, reconstructed, persisted, or recovered
+from another process.
 
-Workers receive isolated generated HOME, native config, temp, runtime, XDG, and
-Rust paths plus role/run/task markers. Unknown environment names are rejected.
-Environment descriptors persist names and a hash, never raw proxy credentials;
-artifact redaction covers raw values and proxy userinfo.
+Workers then receive explicit role-local replacements for isolated HOME,
+native config, temp, runtime, XDG/cache and Rust paths plus role/run/task
+markers. These replacements win over same-named parent entries; all other
+entries remain unchanged. Environment descriptors persist encoded names and a
+hash, never raw values; artifact redaction covers meaningful UTF-8 inherited
+values and proxy userinfo. This complete-inheritance contract supersedes the
+original Phase 8 closed-allowlist design.
 
 ## Verification boundary
 

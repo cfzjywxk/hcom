@@ -1170,17 +1170,7 @@ pub fn create_powershell_script(
     Ok(())
 }
 
-/// Build clean env for terminal launcher subprocesses.
-///
-/// Replaces hcom-owned identity and marker vars. A newly created terminal must
-/// establish its own terminal identity, so only terminal-context vars are also
-/// removed from the terminal-launcher process.
-fn get_launcher_env() -> HashMap<String, String> {
-    #[cfg(test)]
-    let _env_read = crate::hooks::test_helpers::process_env_read();
-    get_launcher_env_from(std::env::vars())
-}
-
+#[cfg(test)]
 fn get_launcher_env_from<I>(vars: I) -> HashMap<String, String>
 where
     I: IntoIterator<Item = (String, String)>,
@@ -1200,6 +1190,20 @@ where
     vars.into_iter()
         .filter(|(k, _)| !strip.contains(k.as_str()))
         .collect()
+}
+
+/// Keep the launcher's complete native parent environment, including entries
+/// that cannot be represented as UTF-8, while replacing only hcom-owned and
+/// outer-pane identity that the target work terminal must establish itself.
+fn configure_terminal_launcher_environment(command: &mut Command) {
+    for name in hcom_owned_marker_vars()
+        .into_iter()
+        .chain(HCOM_IDENTITY_VARS.iter().copied())
+        .chain(TERMINAL_CONTEXT_VARS.iter().copied())
+        .chain(std::iter::once("HCOM_LAUNCHED_PRESET"))
+    {
+        command.env_remove(name);
+    }
 }
 
 /// Inputs to terminal command template substitution.
@@ -1671,9 +1675,6 @@ fn validate_terminal_launch_output(
 }
 
 fn spawn_terminal_process(argv: &[String], inside_ai_tool: bool) -> Result<(bool, String)> {
-    let launcher_env = get_launcher_env();
-    let env_vec: Vec<(String, String)> = launcher_env.into_iter().collect();
-
     #[cfg(windows)]
     if argv.first().is_some_and(|arg| {
         Path::new(arg)
@@ -1685,10 +1686,10 @@ fn spawn_terminal_process(argv: &[String], inside_ai_tool: bool) -> Result<(bool
 
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        Command::new(&argv[0])
+        let mut command = Command::new(&argv[0]);
+        configure_terminal_launcher_environment(&mut command);
+        command
             .args(&argv[1..])
-            .env_clear()
-            .envs(env_vec.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1709,10 +1710,10 @@ fn spawn_terminal_process(argv: &[String], inside_ai_tool: bool) -> Result<(bool
         let launch_dir = paths::hcom_path(&[paths::LAUNCH_DIR]);
         fs::create_dir_all(&launch_dir).ok();
 
-        let child = Command::new(&argv[0])
+        let mut command = Command::new(&argv[0]);
+        configure_terminal_launcher_environment(&mut command);
+        let child = command
             .args(&argv[1..])
-            .env_clear()
-            .envs(env_vec.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -1740,10 +1741,10 @@ fn spawn_terminal_process(argv: &[String], inside_ai_tool: bool) -> Result<(bool
         Ok((true, captured))
     } else {
         // Normal case: wait for terminal launcher to complete
-        let output = Command::new(&argv[0])
+        let mut command = Command::new(&argv[0]);
+        configure_terminal_launcher_environment(&mut command);
+        let output = command
             .args(&argv[1..])
-            .env_clear()
-            .envs(env_vec.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .output()
             .context("Failed to run terminal launcher")?;
 
@@ -1945,8 +1946,6 @@ pub fn launch_terminal(
 
     // Run in current terminal (blocking)
     if run_here {
-        // Build full env (config + shell)
-        let full_env = build_full_env(&final_env);
         if let Some(dir) = cwd {
             std::env::set_current_dir(dir).ok();
         }
@@ -1958,7 +1957,9 @@ pub fn launch_terminal(
         } else {
             Command::new(resolve_bash_command())
         };
-        cmd.arg(script_file).env_clear().envs(&full_env);
+        cmd.arg(script_file)
+            .env_remove("HCOM_TERMINAL")
+            .envs(&final_env);
         let err = crate::sys::process::exec_replace(cmd);
         bail!("exec failed: {}", err);
     }
@@ -2179,11 +2180,14 @@ pub fn launch_terminal(
 
 /// Build the child env by overlaying explicit hcom launch values on the exact
 /// parent environment.
+#[cfg(test)]
 fn build_full_env(config_env: &HashMap<String, String>) -> HashMap<String, String> {
     #[cfg(test)]
     let _env_read = crate::hooks::test_helpers::process_env_read();
     let mut full = config_env.clone();
-    for (k, v) in std::env::vars() {
+    for (k, v) in std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+    {
         if k == "HCOM_TERMINAL" {
             continue;
         }
@@ -2516,6 +2520,10 @@ mod tests {
     use super::*;
     use serial_test::serial;
     #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
+    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
 
     fn shellify(argv: &[&str]) -> Vec<String> {
@@ -2710,6 +2718,43 @@ mod tests {
             Some("thread-1")
         );
         assert_eq!(env.get("PATH").map(String::as_str), Some("/bin"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_launcher_preserves_complete_raw_parent_except_terminal_identity() {
+        let mut command = Command::new("/usr/bin/python3");
+        command
+            .arg("-c")
+            .arg(
+                r#"import os
+assert os.environ["ARBITRARY_PARENT_VALUE"] == "arbitrary-value"
+assert os.environ["SERVICE_ACCESS_TOKEN"] == "secret-shaped-value"
+assert os.environ["EMPTY_PARENT_VALUE"] == ""
+assert os.environb[b"RAW_\xff_NAME"] == b"value-\xfe"
+assert "HCOM_PROCESS_ID" not in os.environ
+assert os.environ["TERM"] == "parent-terminal"
+assert "TERMINATOR_UUID" not in os.environ
+"#,
+            )
+            .env_clear()
+            .env("ARBITRARY_PARENT_VALUE", "arbitrary-value")
+            .env("SERVICE_ACCESS_TOKEN", "secret-shaped-value")
+            .env("EMPTY_PARENT_VALUE", "")
+            .env("HCOM_PROCESS_ID", "parent-process")
+            .env("TERM", "parent-terminal")
+            .env("TERMINATOR_UUID", "parent-pane")
+            .env(
+                OsString::from_vec(b"RAW_\xff_NAME".to_vec()),
+                OsString::from_vec(b"value-\xfe".to_vec()),
+            );
+        configure_terminal_launcher_environment(&mut command);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "terminal environment helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

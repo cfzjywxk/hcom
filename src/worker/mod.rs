@@ -24,7 +24,8 @@ pub use contract::{
 };
 pub use environment::{
     EnvironmentLeaseDescriptor, EnvironmentPolicy, ExactEnvironmentRequirement,
-    ExecutionEnvironmentLease, MaterializedWorkerEnvironment, WorkerEnvironmentIdentity,
+    ExecutionEnvironmentLease, MaterializedWorkerEnvironment, ParentEnvironment,
+    WorkerEnvironmentIdentity,
 };
 #[cfg(target_os = "linux")]
 pub use process::{

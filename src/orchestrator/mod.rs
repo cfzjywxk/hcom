@@ -15,7 +15,7 @@ use crate::worker::contract::{
     WorkerProfile,
 };
 use crate::worker::environment::{
-    EnvironmentPolicy, ExecutionEnvironmentLease, WorkerEnvironmentIdentity,
+    EnvironmentPolicy, ExecutionEnvironmentLease, ParentEnvironment, WorkerEnvironmentIdentity,
 };
 use crate::worker::process::{
     HeartbeatControl, ProcessCompletion, ProcessRunner, WorkerExit, WorkerTermination,
@@ -65,7 +65,7 @@ pub(crate) struct SessionStartup {
 
 #[derive(Clone)]
 pub(crate) struct SessionRuntimeSources {
-    parent_values: BTreeMap<String, String>,
+    parent_environment: ParentEnvironment,
     codex_auth_source: Option<PathBuf>,
     claude_auth_source: Option<PathBuf>,
     cargo_bin_source: PathBuf,
@@ -87,23 +87,27 @@ struct WorkerEnvironmentPaths {
 
 impl SessionRuntimeSources {
     pub(crate) fn capture(
-        parent_values: BTreeMap<String, String>,
+        parent_environment: impl Into<ParentEnvironment>,
         host_runtime_dir: PathBuf,
         profiles: SessionInvocationProfiles,
     ) -> Result<Self> {
         profiles.validate()?;
-        let home = parent_values
-            .get("HOME")
+        let parent_environment = parent_environment.into();
+        let home = parent_environment
+            .unicode("HOME")?
+            .filter(|value| !value.is_empty())
             .map(PathBuf::from)
-            .ok_or_else(|| anyhow!("session worker environment requires parent HOME"))?;
+            .ok_or_else(|| anyhow!("session worker environment requires non-empty parent HOME"))?;
         let host_runtime_dir =
             canonical_private_directory(&host_runtime_dir, "host XDG runtime directory")?;
-        let codex_home = parent_values
-            .get("CODEX_HOME")
+        let codex_home = parent_environment
+            .unicode("CODEX_HOME")?
+            .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".codex"));
-        let claude_home = parent_values
-            .get("CLAUDE_CONFIG_DIR")
+        let claude_home = parent_environment
+            .unicode("CLAUDE_CONFIG_DIR")?
+            .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".claude"));
         let uses_codex =
@@ -131,13 +135,15 @@ impl SessionRuntimeSources {
         } else {
             None
         };
-        let cargo_bin_source = parent_values
-            .get("CARGO_HOME")
+        let cargo_bin_source = parent_environment
+            .unicode("CARGO_HOME")?
+            .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".cargo"))
             .join("bin");
-        let rustup_home_source = parent_values
-            .get("RUSTUP_HOME")
+        let rustup_home_source = parent_environment
+            .unicode("RUSTUP_HOME")?
+            .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".rustup"));
         let cargo_bin_source =
@@ -145,7 +151,7 @@ impl SessionRuntimeSources {
         let rustup_home_source =
             canonical_readable_directory(&rustup_home_source, "Rust rustup source")?;
         Ok(Self {
-            parent_values,
+            parent_environment,
             codex_auth_source,
             claude_auth_source,
             cargo_bin_source,
@@ -158,7 +164,7 @@ impl SessionRuntimeSources {
     #[cfg(test)]
     pub(crate) fn fake(path: &Path) -> Self {
         Self {
-            parent_values: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
+            parent_environment: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]).into(),
             codex_auth_source: None,
             claude_auth_source: None,
             cargo_bin_source: path.to_owned(),
@@ -183,16 +189,12 @@ impl SessionRuntimeSources {
             CLAUDE_REVIEWER_ADAPTER => ClaudeReviewerAdapter::environment_policy()?,
             _ => EnvironmentPolicy::baseline(),
         };
-        let mut values: BTreeMap<String, String> = policy
-            .inherited_names
-            .iter()
-            .filter_map(|name| {
-                self.parent_values
-                    .get(name)
-                    .map(|value| (name.clone(), value.clone()))
-            })
-            .collect();
+        let cargo_home = self
+            .cargo_bin_source
+            .parent()
+            .ok_or_else(|| anyhow!("Rust cargo-bin source has no parent"))?;
         let overrides = [
+            ("CARGO_HOME", path_value("worker Cargo home", cargo_home)?),
             ("HOME", path_value("worker private HOME", &paths.home)?),
             (
                 "TMPDIR",
@@ -233,21 +235,26 @@ impl SessionRuntimeSources {
                     &paths.temp.join("python-pycache"),
                 )?,
             ),
+            (
+                "RUSTUP_HOME",
+                path_value("worker Rustup home", &self.rustup_home_source)?,
+            ),
             ("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1".to_owned()),
             ("CLAUDE_CODE_DISABLE_FAST_MODE", "1".to_owned()),
             ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".to_owned()),
             ("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION", "false".to_owned()),
         ];
-        for (name, value) in overrides {
-            if policy.inherited_names.iter().any(|allowed| allowed == name) {
-                values.insert(name.into(), value);
-            }
-        }
-        let lease = ExecutionEnvironmentLease::capture(
+        let overrides = overrides
+            .into_iter()
+            .filter(|(name, _)| policy.override_names.iter().any(|allowed| allowed == name))
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect();
+        let lease = ExecutionEnvironmentLease::capture_complete(
             format!("lease-{}", Uuid::new_v4()),
             epoch,
             &policy,
-            values.into_iter().collect(),
+            &self.parent_environment,
+            overrides,
         )
         .with_context(|| format!("failed to capture worker environment for {run_id}/{task_id}"))?;
         if matches!(adapter, CLAUDE_DEVELOPER_ADAPTER | CLAUDE_REVIEWER_ADAPTER) {
@@ -3645,10 +3652,11 @@ sys.stdout.write(json.dumps({
     }
 
     #[test]
-    fn session_worker_source_preserves_every_present_proxy_name_and_value() {
+    fn session_worker_source_preserves_complete_parent_environment() {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
         let mut sources = SessionRuntimeSources::fake(&root);
+        let mut parent_values = BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]);
         for (name, value) in [
             ("HTTPS_PROXY", "http://upper.invalid"),
             ("https_proxy", "http://lower.invalid"),
@@ -3658,9 +3666,13 @@ sys.stdout.write(json.dumps({
             ("all_proxy", "socks5://lower.invalid"),
             ("NO_PROXY", "UPPER.internal"),
             ("no_proxy", "lower.internal"),
+            ("ARBITRARY_PARENT_VALUE", "arbitrary-value"),
+            ("SERVICE_ACCESS_TOKEN", "secret-shaped-value"),
+            ("EMPTY_PARENT_VALUE", ""),
         ] {
-            sources.parent_values.insert(name.into(), value.into());
+            parent_values.insert(name.into(), value.into());
         }
+        sources.parent_environment = ParentEnvironment::from_unicode(parent_values);
         let paths = WorkerEnvironmentPaths {
             home: root.clone(),
             native_config: root.clone(),
@@ -3690,7 +3702,6 @@ sys.stdout.write(json.dumps({
                 },
             )
             .unwrap();
-        let values: BTreeMap<_, _> = materialized.iter().collect();
         for (name, value) in [
             ("HTTPS_PROXY", "http://upper.invalid"),
             ("https_proxy", "http://lower.invalid"),
@@ -3700,8 +3711,14 @@ sys.stdout.write(json.dumps({
             ("all_proxy", "socks5://lower.invalid"),
             ("NO_PROXY", "UPPER.internal"),
             ("no_proxy", "lower.internal"),
+            ("ARBITRARY_PARENT_VALUE", "arbitrary-value"),
+            ("SERVICE_ACCESS_TOKEN", "secret-shaped-value"),
+            ("EMPTY_PARENT_VALUE", ""),
         ] {
-            assert_eq!(values.get(name), Some(&value));
+            assert_eq!(
+                materialized.get(std::ffi::OsStr::new(name)),
+                Some(std::ffi::OsStr::new(value))
+            );
         }
     }
 
@@ -3800,6 +3817,94 @@ sys.stdout.write(json.dumps({
         assert_eq!(
             sources.claude_auth_source,
             Some(fs::canonicalize(&claude_auth).unwrap())
+        );
+    }
+
+    #[test]
+    fn empty_optional_parent_paths_fall_back_without_filtering_unowned_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let home = private_directory(&root.join("home"));
+        let claude_home = private_directory(&home.join(".claude"));
+        let cargo_home = private_directory(&home.join(".cargo"));
+        private_directory(&cargo_home.join("bin"));
+        let rustup_home = private_directory(&home.join(".rustup"));
+        let runtime = private_directory(&root.join("runtime"));
+        let auth = claude_home.join(".credentials.json");
+        fs::write(
+            &auth,
+            b"{\"claudeAiOauth\":{\"accessToken\":\"claude-test\"}}",
+        )
+        .unwrap();
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
+        let parent = BTreeMap::from([
+            ("HOME".into(), home.to_string_lossy().into_owned()),
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("CODEX_HOME".into(), String::new()),
+            ("CLAUDE_CONFIG_DIR".into(), String::new()),
+            ("CARGO_HOME".into(), String::new()),
+            ("RUSTUP_HOME".into(), String::new()),
+        ]);
+        let profiles = SessionInvocationProfiles {
+            developer: DeveloperInvocationProfile::Claude {
+                profile: ClaudeInvocationProfile::developer_default(),
+            },
+            reviewer: ReviewerInvocationProfile::Claude {
+                profile: ClaudeInvocationProfile::reviewer_default(),
+            },
+            ..SessionInvocationProfiles::default()
+        };
+        let sources =
+            SessionRuntimeSources::capture(parent, runtime, profiles).expect("empty means unset");
+        assert_eq!(
+            sources.claude_auth_source,
+            Some(fs::canonicalize(&auth).unwrap())
+        );
+        let paths = WorkerEnvironmentPaths {
+            home: root.join("worker-home"),
+            native_config: root.join("worker-home/.claude"),
+            temp: root.join("worker-tmp"),
+            runtime: root.join("worker-runtime"),
+            xdg_config: root.join("worker-xdg-config"),
+            xdg_state: root.join("worker-xdg-state"),
+            xdg_cache: root.join("worker-xdg-cache"),
+            xdg_data: root.join("worker-xdg-data"),
+        };
+        let lease = sources
+            .environment_for(
+                CLAUDE_DEVELOPER_ADAPTER,
+                "epoch-empty-parent-paths",
+                "run-empty-parent-paths",
+                "task-empty-parent-paths",
+                &paths,
+            )
+            .unwrap();
+        let materialized = lease
+            .materialize(
+                "epoch-empty-parent-paths",
+                &WorkerEnvironmentIdentity {
+                    role: WorkerRole::Developer,
+                    run_id: "run-empty-parent-paths".into(),
+                    task_id: "task-empty-parent-paths".into(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            materialized.get(std::ffi::OsStr::new("CODEX_HOME")),
+            Some(std::ffi::OsStr::new(""))
+        );
+        assert_eq!(
+            materialized.get(std::ffi::OsStr::new("CLAUDE_CONFIG_DIR")),
+            Some(paths.native_config.as_os_str())
+        );
+        assert_eq!(
+            materialized.get(std::ffi::OsStr::new("CARGO_HOME")),
+            Some(cargo_home.as_os_str())
+        );
+        assert_eq!(
+            materialized.get(std::ffi::OsStr::new("RUSTUP_HOME")),
+            Some(rustup_home.as_os_str())
         );
     }
 

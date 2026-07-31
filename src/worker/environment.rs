@@ -4,56 +4,94 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 
-const MAX_ENVIRONMENT_ENTRIES: usize = 64;
+const MAX_POLICY_ENTRIES: usize = 64;
 const MAX_ENVIRONMENT_VALUE_BYTES: usize = 16 * 1024;
 // Substring redaction cannot safely treat low-entropy operational atoms such
 // as "1" or "false" as secrets: doing so corrupts otherwise valid structured
 // worker output (for example `task1.txt`) and makes every ordinary occurrence
-// indistinguishable from an environment leak. Secret-shaped environment names
-// are rejected by the closed lease policy, while meaningful inherited values
-// (including complete proxy URLs) remain above this floor and are redacted.
+// indistinguishable from an environment leak. Complete parent inheritance may
+// include secret-shaped names, so every meaningful UTF-8 parent value remains
+// part of the redaction inventory.
 const MIN_ENVIRONMENT_REDACTION_BYTES: usize = 8;
 
-const BASELINE_INHERITABLE_NAMES: &[&str] = &[
-    "ALL_PROXY",
-    "HTTPS_PROXY",
-    "HTTP_PROXY",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "NO_PROXY",
-    "PATH",
-    "SSL_CERT_DIR",
-    "SSL_CERT_FILE",
-    "TZ",
-    "all_proxy",
-    "http_proxy",
-    "https_proxy",
-    "no_proxy",
-];
+#[derive(Clone)]
+pub struct ParentEnvironment {
+    values: BTreeMap<OsString, OsString>,
+}
+
+impl ParentEnvironment {
+    pub fn capture_current() -> Self {
+        Self {
+            values: std::env::vars_os().collect(),
+        }
+    }
+
+    pub fn from_unicode(values: BTreeMap<String, String>) -> Self {
+        Self {
+            values: values
+                .into_iter()
+                .map(|(name, value)| (name.into(), value.into()))
+                .collect(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_os(values: Vec<(OsString, OsString)>) -> Self {
+        Self {
+            values: values.into_iter().collect(),
+        }
+    }
+
+    pub fn unicode(&self, name: &str) -> Result<Option<&str>> {
+        self.values
+            .get(OsStr::new(name))
+            .map(|value| {
+                value
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("parent environment value {name} is not UTF-8"))
+            })
+            .transpose()
+    }
+
+    fn values(&self) -> &BTreeMap<OsString, OsString> {
+        &self.values
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
+        self.values
+            .iter()
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str()))
+    }
+}
+
+impl From<BTreeMap<String, String>> for ParentEnvironment {
+    fn from(values: BTreeMap<String, String>) -> Self {
+        Self::from_unicode(values)
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentPolicy {
-    pub inherited_names: Vec<String>,
+    /// Exact names hcom may replace after cloning the complete parent snapshot.
+    pub override_names: Vec<String>,
+    /// UTF-8 names that must be present and non-empty after those replacements.
     pub required_names: Vec<String>,
 }
 
 impl EnvironmentPolicy {
     pub fn baseline() -> Self {
         Self {
-            inherited_names: BASELINE_INHERITABLE_NAMES
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect(),
+            override_names: Vec::new(),
             required_names: vec!["PATH".into()],
         }
     }
 
-    pub fn new(inherited_names: Vec<String>, required_names: Vec<String>) -> Result<Self> {
+    pub fn new(override_names: Vec<String>, required_names: Vec<String>) -> Result<Self> {
         let policy = Self {
-            inherited_names,
+            override_names,
             required_names,
         };
         policy.validate()?;
@@ -61,15 +99,10 @@ impl EnvironmentPolicy {
     }
 
     pub fn validate(&self) -> Result<()> {
-        validate_environment_names("inherited environment", &self.inherited_names)?;
+        validate_environment_names("worker environment overrides", &self.override_names)?;
         validate_environment_names("required environment", &self.required_names)?;
+        validate_case_unique("worker environment overrides", &self.override_names)?;
         validate_case_unique("required environment", &self.required_names)?;
-        let inherited: BTreeSet<_> = self.inherited_names.iter().map(String::as_str).collect();
-        for name in &self.required_names {
-            if !inherited.contains(name.as_str()) {
-                bail!("required environment names must be inherited");
-            }
-        }
         Ok(())
     }
 }
@@ -89,19 +122,21 @@ impl EnvironmentLeaseDescriptor {
         validate_opaque_id("environment lease id", &self.lease_id)?;
         validate_opaque_id("environment supervisor epoch", &self.supervisor_epoch)?;
         validate_sha256("environment hash", &self.environment_hash)?;
-        validate_environment_names("inherited environment", &self.inherited_names)?;
         validate_environment_names("required environment", &self.required_names)?;
-        validate_case_unique("captured environment", &self.inherited_names)?;
         validate_case_unique("required environment", &self.required_names)?;
-        EnvironmentPolicy {
-            inherited_names: self.inherited_names.clone(),
-            required_names: self.required_names.clone(),
+        if self.inherited_names.len() > u16::MAX as usize
+            || !self
+                .inherited_names
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        {
+            bail!("inherited environment descriptor is invalid");
         }
-        .validate()?;
         let inherited: BTreeSet<_> = self.inherited_names.iter().map(String::as_str).collect();
         if self
             .required_names
             .iter()
+            .map(|name| environment_name_descriptor(OsStr::new(name)))
             .any(|name| !inherited.contains(name.as_str()))
         {
             bail!("lease descriptor required names must be inherited");
@@ -121,7 +156,7 @@ impl EnvironmentLeaseDescriptor {
 #[derive(Clone)]
 pub struct ExecutionEnvironmentLease {
     descriptor: EnvironmentLeaseDescriptor,
-    values: BTreeMap<String, String>,
+    values: BTreeMap<OsString, OsString>,
     redaction_values: Vec<String>,
 }
 
@@ -132,32 +167,38 @@ impl ExecutionEnvironmentLease {
         policy: &EnvironmentPolicy,
         values: Vec<(String, String)>,
     ) -> Result<Self> {
+        Self::capture_complete(
+            lease_id,
+            supervisor_epoch,
+            policy,
+            &ParentEnvironment::from_unicode(values.into_iter().collect()),
+            Vec::new(),
+        )
+    }
+
+    pub fn capture_complete(
+        lease_id: impl Into<String>,
+        supervisor_epoch: impl Into<String>,
+        policy: &EnvironmentPolicy,
+        parent: &ParentEnvironment,
+        overrides: Vec<(String, String)>,
+    ) -> Result<Self> {
         policy.validate()?;
-        if values.len() > MAX_ENVIRONMENT_ENTRIES {
-            bail!("environment lease exceeds its bounded entry count");
-        }
-        let approved: BTreeSet<_> = policy.inherited_names.iter().map(String::as_str).collect();
-        let mut captured = BTreeMap::new();
-        let mut captured_casefolded: BTreeMap<String, String> = BTreeMap::new();
-        for (name, value) in values {
+        let approved: BTreeSet<_> = policy.override_names.iter().map(String::as_str).collect();
+        let mut captured = parent.values().clone();
+        for (name, value) in overrides {
             validate_environment_name(&name)?;
             if !approved.contains(name.as_str()) {
-                bail!("environment name {name} is outside the closed lease policy");
+                bail!("environment override {name} is outside the role-local policy");
             }
             validate_environment_value(&name, &value)?;
-            let folded = name.to_ascii_uppercase();
-            if let Some(existing) = captured_casefolded.get(&folded)
-                && !allowed_proxy_case_pair(existing, &name)
-            {
-                bail!("environment lease contains a case-ambiguous name");
-            }
-            captured_casefolded.insert(folded, name.clone());
-            if captured.insert(name, value).is_some() {
-                bail!("environment lease contains a duplicate name");
-            }
+            captured.insert(name.into(), value.into());
         }
         for required in &policy.required_names {
-            if captured.get(required).is_none_or(|value| value.is_empty()) {
+            if captured
+                .get(OsStr::new(required))
+                .is_none_or(|value| value.is_empty())
+            {
                 bail!("environment lease is missing a non-empty required name {required}");
             }
         }
@@ -170,7 +211,7 @@ impl ExecutionEnvironmentLease {
             lease_id,
             supervisor_epoch,
             environment_hash: environment_hash(&captured),
-            inherited_names: captured.keys().cloned().collect(),
+            inherited_names: inherited_environment_names(&captured),
             required_names: policy.required_names.clone(),
         };
         descriptor.validate()?;
@@ -197,15 +238,21 @@ impl ExecutionEnvironmentLease {
         }
         let mut values = self.values.clone();
         values.insert(
-            "HCOM_WORKER_ROLE".into(),
+            OsString::from("HCOM_WORKER_ROLE"),
             match identity.role {
                 WorkerRole::Developer => "developer",
                 WorkerRole::Reviewer => "reviewer",
             }
             .into(),
         );
-        values.insert("HCOM_RUN_ID".into(), identity.run_id.clone());
-        values.insert("HCOM_TASK_ID".into(), identity.task_id.clone());
+        values.insert(
+            OsString::from("HCOM_RUN_ID"),
+            identity.run_id.clone().into(),
+        );
+        values.insert(
+            OsString::from("HCOM_TASK_ID"),
+            identity.task_id.clone().into(),
+        );
         Ok(MaterializedWorkerEnvironment { values })
     }
 
@@ -213,7 +260,7 @@ impl ExecutionEnvironmentLease {
         SecretRedactor::from_values(
             self.values
                 .values()
-                .map(String::as_str)
+                .filter_map(|value| value.to_str())
                 .chain(self.redaction_values.iter().map(String::as_str)),
         )
     }
@@ -230,7 +277,7 @@ impl ExecutionEnvironmentLease {
 }
 
 pub(crate) fn validate_secret_redaction_values(values: &[String]) -> Result<()> {
-    if values.len() > MAX_ENVIRONMENT_ENTRIES {
+    if values.len() > MAX_POLICY_ENTRIES {
         bail!("secret redaction inventory exceeds its bounded entry count");
     }
     for value in values {
@@ -259,14 +306,14 @@ impl WorkerEnvironmentIdentity {
 }
 
 pub struct MaterializedWorkerEnvironment {
-    values: BTreeMap<String, String>,
+    values: BTreeMap<OsString, OsString>,
 }
 
 impl MaterializedWorkerEnvironment {
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
         self.values
             .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str()))
     }
 
     pub(crate) fn require_exact(&self, requirements: &[ExactEnvironmentRequirement]) -> Result<()> {
@@ -277,11 +324,21 @@ impl MaterializedWorkerEnvironment {
                 bail!("exact environment requirements must use unique canonical order");
             }
             previous = Some(requirement.name.as_str());
-            if self.values.get(&requirement.name) != Some(&requirement.value) {
+            if self
+                .values
+                .get(OsStr::new(&requirement.name))
+                .map(OsString::as_os_str)
+                != Some(OsStr::new(&requirement.value))
+            {
                 bail!("materialized worker environment does not match its exact path contract");
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get(&self, name: &OsStr) -> Option<&OsStr> {
+        self.values.get(name).map(OsString::as_os_str)
     }
 }
 
@@ -376,7 +433,7 @@ impl SecretRedactor {
 }
 
 fn validate_environment_names(label: &str, names: &[String]) -> Result<()> {
-    if names.len() > MAX_ENVIRONMENT_ENTRIES {
+    if names.len() > MAX_POLICY_ENTRIES {
         bail!("{label} exceeds its bounded entry count");
     }
     let mut unique = BTreeSet::new();
@@ -396,9 +453,7 @@ fn validate_case_unique(label: &str, names: &[String]) -> Result<()> {
     let mut casefolded: BTreeMap<String, String> = BTreeMap::new();
     for name in names {
         let folded = name.to_ascii_uppercase();
-        if let Some(existing) = casefolded.get(&folded)
-            && !allowed_proxy_case_pair(existing, name)
-        {
+        if casefolded.contains_key(&folded) {
             bail!("{label} names must not be case-ambiguous");
         }
         casefolded.insert(folded, name.clone());
@@ -406,24 +461,9 @@ fn validate_case_unique(label: &str, names: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn allowed_proxy_case_pair(left: &str, right: &str) -> bool {
-    const PAIRS: &[(&str, &str)] = &[
-        ("all_proxy", "ALL_PROXY"),
-        ("http_proxy", "HTTP_PROXY"),
-        ("https_proxy", "HTTPS_PROXY"),
-        ("no_proxy", "NO_PROXY"),
-    ];
-    PAIRS.iter().any(|(lower, upper)| {
-        (left == *lower && right == *upper) || (left == *upper && right == *lower)
-    })
-}
-
 fn validate_environment_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > 128
-        || name.starts_with("HCOM_")
-        || is_runtime_identity_marker(name)
-        || is_secret_shaped(name)
         || !name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
@@ -431,39 +471,6 @@ fn validate_environment_name(name: &str) -> Result<()> {
         bail!("environment name is forbidden or malformed");
     }
     Ok(())
-}
-
-fn is_runtime_identity_marker(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    matches!(
-        upper.as_str(),
-        "COLORTERM" | "STY" | "TERM" | "TERM_PROGRAM" | "TMUX" | "WINDOWID"
-    ) || upper.contains("_AGENT_")
-        || upper.ends_with("_AGENT")
-        || upper.ends_with("_SESSION")
-        || upper.ends_with("_SESSION_ID")
-        || upper.ends_with("_THREAD_ID")
-        || upper.contains("ARCHITECT")
-        || upper.contains("CHAIN")
-        || upper.contains("HANDOFF")
-}
-
-fn is_secret_shaped(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    [
-        "TOKEN",
-        "SECRET",
-        "PASSWORD",
-        "PASSWD",
-        "COOKIE",
-        "API_KEY",
-        "APIKEY",
-        "AUTH",
-        "BEARER",
-        "CREDENTIAL",
-    ]
-    .iter()
-    .any(|fragment| upper.contains(fragment))
 }
 
 fn validate_environment_value(name: &str, value: &str) -> Result<()> {
@@ -482,12 +489,28 @@ fn validate_environment_value(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn environment_hash(values: &BTreeMap<String, String>) -> String {
+fn inherited_environment_names(values: &BTreeMap<OsString, OsString>) -> Vec<String> {
+    let mut names: Vec<_> = values
+        .keys()
+        .map(|name| environment_name_descriptor(name))
+        .collect();
+    names.sort();
+    names
+}
+
+fn environment_name_descriptor(name: &OsStr) -> String {
+    match name.to_str() {
+        Some(name) => format!("utf8:{name}"),
+        None => format!("bytes:{}", hex_bytes(name.as_encoded_bytes())),
+    }
+}
+
+fn environment_hash(values: &BTreeMap<OsString, OsString>) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"hcom-worker-environment-lease-v1\0");
+    hasher.update(b"hcom-worker-environment-lease-v2\0");
     for (name, value) in values {
-        hash_field(&mut hasher, name.as_bytes());
-        hash_field(&mut hasher, value.as_bytes());
+        hash_field(&mut hasher, name.as_encoded_bytes());
+        hash_field(&mut hasher, value.as_encoded_bytes());
     }
     hex_bytes(&hasher.finalize())
 }
@@ -557,45 +580,66 @@ mod tests {
     }
 
     #[test]
-    fn closed_policy_rejects_unknown_secret_and_identity_names() {
-        let policy = EnvironmentPolicy::baseline();
-        for name in [
-            "UNAPPROVED",
-            "SERVICE_TOKEN",
-            "HCOM_AGENT",
-            "FAKE_AGENT",
-            "FAKE_SESSION_ID",
-            "ARCHITECT_BINDING",
-            "CHAIN_ID",
-            "HANDOFF_ID",
-            "TERM_PROGRAM",
+    fn complete_parent_environment_accepts_unknown_secret_identity_and_empty_values() {
+        let parent = ParentEnvironment::from_unicode(BTreeMap::from([
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("UNAPPROVED".into(), "arbitrary-value".into()),
+            ("SERVICE_TOKEN".into(), "secret-shaped-value".into()),
+            ("HCOM_AGENT".into(), "parent-agent".into()),
+            ("TERM_PROGRAM".into(), "parent-terminal".into()),
+            ("EMPTY_VALUE".into(), String::new()),
+        ]));
+        let lease = ExecutionEnvironmentLease::capture_complete(
+            "lease-1",
+            "epoch-1",
+            &EnvironmentPolicy::baseline(),
+            &parent,
+            Vec::new(),
+        )
+        .unwrap();
+        let materialized = lease
+            .materialize(
+                "epoch-1",
+                &WorkerEnvironmentIdentity {
+                    role: WorkerRole::Developer,
+                    run_id: "run-1".into(),
+                    task_id: "task-1".into(),
+                },
+            )
+            .unwrap();
+
+        for (name, value) in [
+            ("UNAPPROVED", "arbitrary-value"),
+            ("SERVICE_TOKEN", "secret-shaped-value"),
+            ("HCOM_AGENT", "parent-agent"),
+            ("TERM_PROGRAM", "parent-terminal"),
+            ("EMPTY_VALUE", ""),
         ] {
-            assert!(
-                ExecutionEnvironmentLease::capture(
-                    "lease-1",
-                    "epoch-1",
-                    &policy,
-                    vec![
-                        ("PATH".into(), "/usr/bin".into()),
-                        (name.into(), "sentinel".into())
-                    ],
-                )
-                .is_err(),
-                "{name} unexpectedly entered the lease"
+            assert_eq!(
+                materialized.get(OsStr::new(name)),
+                Some(OsStr::new(value)),
+                "{name} did not survive complete inheritance"
             );
         }
-        assert!(
-            ExecutionEnvironmentLease::capture(
-                "lease-1",
-                "epoch-1",
-                &policy,
-                vec![
-                    ("PATH".into(), "/usr/bin".into()),
-                    ("PATH".into(), "/bin".into())
-                ],
-            )
-            .is_err()
-        );
+    }
+
+    #[test]
+    fn complete_parent_environment_is_not_limited_by_override_policy_size() {
+        let mut values = BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]);
+        for index in 0..128 {
+            values.insert(format!("PARENT_VALUE_{index:03}"), format!("value-{index}"));
+        }
+        let parent = ParentEnvironment::from_unicode(values);
+        let lease = ExecutionEnvironmentLease::capture_complete(
+            "lease-many-parent-values",
+            "epoch-1",
+            &EnvironmentPolicy::baseline(),
+            &parent,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(lease.descriptor().inherited_names.len(), 129);
     }
 
     #[test]
@@ -623,47 +667,44 @@ mod tests {
                 },
             )
             .unwrap();
-        let values: BTreeMap<_, _> = materialized.iter().collect();
-        assert_eq!(values["HTTPS_PROXY"], "http://upper.invalid");
-        assert_eq!(values["https_proxy"], "http://lower.invalid");
-        assert_eq!(values["HTTP_PROXY"], "http://upper-http.invalid");
-        assert_eq!(values["http_proxy"], "http://lower-http.invalid");
         assert_eq!(
-            lease.descriptor().inherited_names,
-            vec![
-                "HTTPS_PROXY",
-                "HTTP_PROXY",
-                "PATH",
-                "http_proxy",
-                "https_proxy"
-            ]
+            materialized.get(OsStr::new("HTTPS_PROXY")),
+            Some(OsStr::new("http://upper.invalid"))
+        );
+        assert_eq!(
+            materialized.get(OsStr::new("https_proxy")),
+            Some(OsStr::new("http://lower.invalid"))
+        );
+        assert_eq!(
+            materialized.get(OsStr::new("HTTP_PROXY")),
+            Some(OsStr::new("http://upper-http.invalid"))
+        );
+        assert_eq!(
+            materialized.get(OsStr::new("http_proxy")),
+            Some(OsStr::new("http://lower-http.invalid"))
+        );
+        assert_eq!(lease.descriptor().inherited_names.len(), 5);
+        assert!(
+            lease
+                .descriptor()
+                .inherited_names
+                .contains(&environment_name_descriptor(OsStr::new("PATH")))
         );
     }
 
     #[test]
-    fn non_proxy_case_ambiguity_still_fails_closed() {
-        let policy = EnvironmentPolicy::new(
-            vec!["FOO".into(), "PATH".into(), "foo".into()],
-            vec!["PATH".into()],
-        )
-        .unwrap();
+    fn role_local_override_policy_rejects_case_ambiguity() {
         assert!(
-            ExecutionEnvironmentLease::capture(
-                "lease-case-conflict",
-                "epoch-1",
-                &policy,
-                vec![
-                    ("PATH".into(), "/usr/bin".into()),
-                    ("FOO".into(), "upper".into()),
-                    ("foo".into(), "lower".into()),
-                ],
+            EnvironmentPolicy::new(
+                vec!["FOO".into(), "PATH".into(), "foo".into()],
+                vec!["PATH".into()],
             )
             .is_err()
         );
     }
 
     #[test]
-    fn explicit_generated_roots_can_be_pinned_without_open_inheritance() {
+    fn explicit_generated_roots_override_complete_parent_without_filtering_it() {
         let names = vec![
             "FAKE_CONFIG_ROOT".into(),
             "HOME".into(),
@@ -672,22 +713,50 @@ mod tests {
             "XDG_RUNTIME_DIR".into(),
         ];
         let policy = EnvironmentPolicy::new(names.clone(), names).unwrap();
-        let values = vec![
+        let parent = ParentEnvironment::from_unicode(BTreeMap::from([
+            ("HOME".into(), "/parent/home".into()),
+            ("PATH".into(), "/usr/bin".into()),
+            ("UNLISTED".into(), "must-enter".into()),
+        ]));
+        let overrides = vec![
             ("FAKE_CONFIG_ROOT".into(), "/private/config".into()),
             ("HOME".into(), "/private/home".into()),
             ("PATH".into(), "/usr/bin".into()),
             ("TMPDIR".into(), "/private/tmp".into()),
             ("XDG_RUNTIME_DIR".into(), "/private/runtime".into()),
         ];
-        let lease =
-            ExecutionEnvironmentLease::capture("lease-1", "epoch-1", &policy, values.clone())
-                .unwrap();
+        let lease = ExecutionEnvironmentLease::capture_complete(
+            "lease-1", "epoch-1", &policy, &parent, overrides,
+        )
+        .unwrap();
         assert_eq!(lease.descriptor().required_names, policy.required_names);
-
-        let mut unexpected = values;
-        unexpected.push(("UNLISTED".into(), "must-not-enter".into()));
+        let materialized = lease
+            .materialize(
+                "epoch-1",
+                &WorkerEnvironmentIdentity {
+                    role: WorkerRole::Developer,
+                    run_id: "run-1".into(),
+                    task_id: "task-1".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            materialized.get(OsStr::new("UNLISTED")),
+            Some(OsStr::new("must-enter"))
+        );
+        assert_eq!(
+            materialized.get(OsStr::new("HOME")),
+            Some(OsStr::new("/private/home"))
+        );
         assert!(
-            ExecutionEnvironmentLease::capture("lease-2", "epoch-1", &policy, unexpected,).is_err()
+            ExecutionEnvironmentLease::capture_complete(
+                "lease-2",
+                "epoch-1",
+                &policy,
+                &parent,
+                vec![("NOT_AN_OVERRIDE".into(), "rejected".into())],
+            )
+            .is_err()
         );
     }
 
@@ -714,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn materialization_adds_only_closed_worker_identity_markers() {
+    fn materialization_overrides_only_worker_identity_markers() {
         let lease = fixture_lease("http://proxy.invalid:8080");
         let materialized = lease
             .materialize(
@@ -726,12 +795,18 @@ mod tests {
                 },
             )
             .unwrap();
-        let values: BTreeMap<_, _> = materialized.iter().collect();
-        assert_eq!(values["HCOM_WORKER_ROLE"], "reviewer");
-        assert_eq!(values["HCOM_RUN_ID"], "run-1");
-        assert_eq!(values["HCOM_TASK_ID"], "task-2");
-        assert!(!values.contains_key("HCOM_AGENT"));
-        assert!(!values.contains_key("TERM_PROGRAM"));
+        assert_eq!(
+            materialized.get(OsStr::new("HCOM_WORKER_ROLE")),
+            Some(OsStr::new("reviewer"))
+        );
+        assert_eq!(
+            materialized.get(OsStr::new("HCOM_RUN_ID")),
+            Some(OsStr::new("run-1"))
+        );
+        assert_eq!(
+            materialized.get(OsStr::new("HCOM_TASK_ID")),
+            Some(OsStr::new("task-2"))
+        );
     }
 
     #[test]
@@ -863,7 +938,7 @@ mod tests {
         assert!(
             materialized
                 .iter()
-                .any(|(name, value)| name == "HTTPS_PROXY" && value.is_empty())
+                .any(|(name, value)| name == OsStr::new("HTTPS_PROXY") && value.is_empty())
         );
         assert!(
             ExecutionEnvironmentLease::capture(
@@ -900,7 +975,8 @@ mod tests {
         assert!(
             materialized
                 .iter()
-                .all(|(_, value)| !value.contains("session-access-token-v1"))
+                .filter_map(|(_, value)| value.to_str())
+                .all(|value| !value.contains("session-access-token-v1"))
         );
         let redacted = lease
             .redactor()
@@ -913,6 +989,48 @@ mod tests {
             fixture_lease("http://proxy.invalid:8080")
                 .with_secret_redaction_values(vec!["short".into()])
                 .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_parent_environment_preserves_non_utf8_name_and_value_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw_name = OsString::from_vec(b"RAW_\xff_NAME".to_vec());
+        let raw_value = OsString::from_vec(b"value-\xfe".to_vec());
+        let parent = ParentEnvironment::from_os(vec![
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (raw_name.clone(), raw_value.clone()),
+        ]);
+        let lease = ExecutionEnvironmentLease::capture_complete(
+            "lease-non-utf8",
+            "epoch-1",
+            &EnvironmentPolicy::baseline(),
+            &parent,
+            Vec::new(),
+        )
+        .unwrap();
+        let materialized = lease
+            .materialize(
+                "epoch-1",
+                &WorkerEnvironmentIdentity {
+                    role: WorkerRole::Developer,
+                    run_id: "run-1".into(),
+                    task_id: "task-1".into(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            materialized.get(raw_name.as_os_str()),
+            Some(raw_value.as_os_str())
+        );
+        assert!(
+            lease
+                .descriptor()
+                .inherited_names
+                .contains(&environment_name_descriptor(raw_name.as_os_str()))
         );
     }
 }

@@ -42,7 +42,7 @@ pub const GIT_EXECUTABLE: &str = "/usr/bin/git";
 pub const GIT_VERSION: &str = "git version 2.43.0";
 
 const ADAPTER_NAME: &str = "codex-developer-0.145.0";
-const ADAPTER_CONTRACT_VERSION: u32 = 4;
+const ADAPTER_CONTRACT_VERSION: u32 = 5;
 const OUTER_POLICY: &str = "bubblewrap-0.9.0-host-path-developer-repo-rw-v1";
 const MAX_CODEX_EVENTS: usize = 4096;
 const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -118,25 +118,20 @@ impl CodexDeveloperAdapter {
     }
 
     pub fn environment_policy() -> Result<EnvironmentPolicy> {
-        let mut inherited = EnvironmentPolicy::baseline().inherited_names;
-        inherited.extend(
-            [
-                "CARGO_HOME",
-                "CODEX_HOME",
-                "HOME",
-                "PATH",
-                "PYTHONPYCACHEPREFIX",
-                "RUSTUP_HOME",
-                "TMPDIR",
-                "XDG_RUNTIME_DIR",
-            ]
-            .into_iter()
-            .map(str::to_owned),
-        );
-        inherited.sort();
-        inherited.dedup();
+        let overrides = [
+            "CARGO_HOME",
+            "CODEX_HOME",
+            "HOME",
+            "PYTHONPYCACHEPREFIX",
+            "RUSTUP_HOME",
+            "TMPDIR",
+            "XDG_RUNTIME_DIR",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
         EnvironmentPolicy::new(
-            inherited,
+            overrides,
             vec![
                 "CARGO_HOME".into(),
                 "CODEX_HOME".into(),
@@ -506,6 +501,7 @@ fn developer_descriptor(invocation: &CodexInvocationProfile) -> Result<AdapterDe
             native_session_mode: NativeSessionMode::Discovered,
             result_transport: ResultTransport::FinalFile,
             features: vec![
+                "complete-parent-environment-v1".into(),
                 "exact-resume".into(),
                 "host-git-evidence".into(),
                 "native-add-dir-task-repository".into(),

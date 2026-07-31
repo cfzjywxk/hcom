@@ -11,7 +11,6 @@ use crate::control_api::registration::{
 };
 use crate::control_api::supervisor::{ControlPaths, SessionSupervisorEndpoint};
 use crate::orchestrator::SessionRuntimeSources;
-use crate::worker::ExecutableIdentity;
 use crate::worker::codex::{
     BWRAP_EXECUTABLE, BWRAP_VERSION, CODEX_DEVELOPER_CLI_VERSION, CODEX_DEVELOPER_EXECUTABLE,
     DISABLED_CODEX_FEATURES,
@@ -23,6 +22,7 @@ use crate::worker::profile::{
 };
 use crate::worker::reviewer::{CLAUDE_REVIEWER_CLI_VERSION, CLAUDE_REVIEWER_EXECUTABLE};
 use crate::worker::sandbox::{HostRootAccess, HostRootContract, HostRootMounts};
+use crate::worker::{ExecutableIdentity, ParentEnvironment};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -107,7 +107,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
     let control_paths = ControlPaths::new(&run_root, &lock_root)?;
     let run_id = format!("run-{}", random_hex(16)?);
     let runtime_sources = SessionRuntimeSources::capture(
-        native_environment.control_environment.clone(),
+        native_environment.parent_environment.clone(),
         native_environment.runtime_home.clone(),
         loaded.profiles.clone(),
     )?;
@@ -1130,12 +1130,12 @@ fn capture_architect_protected_roots(
     // Keep this path resolution aligned with paths::resolve_hcom_dir_from_env;
     // the architect module is also compiled by the standalone component crate,
     // where the retained-product paths module is intentionally unavailable.
-    let active_hcom = match read_unicode_environment("HCOM_DIR")? {
+    let active_hcom = match environment.parent_environment.unicode("HCOM_DIR")? {
         Some(value) if !value.is_empty() => {
             let expanded = if value.starts_with('~') {
                 value.replacen('~', path_text("architect parent HOME", &home)?, 1)
             } else {
-                value
+                value.to_owned()
             };
             let path = PathBuf::from(expanded);
             if path.is_relative() {
@@ -1348,7 +1348,7 @@ fn validate_path_isolation(
 }
 
 struct ArchitectEnvironment {
-    values: BTreeMap<String, String>,
+    parent_environment: ParentEnvironment,
     control_environment: BTreeMap<String, String>,
     runtime_home: PathBuf,
     cargo_bin_source: PathBuf,
@@ -1357,13 +1357,15 @@ struct ArchitectEnvironment {
 
 impl ArchitectEnvironment {
     fn capture() -> Result<Self> {
+        let parent_environment = ParentEnvironment::capture_current();
         let state_home = explicit_directory("XDG_STATE_HOME", dirs::state_dir)?;
         let config_home = explicit_directory("XDG_CONFIG_HOME", dirs::config_dir)?;
-        let runtime_home = std::env::var_os("XDG_RUNTIME_DIR")
+        let runtime_home = parent_environment
+            .unicode("XDG_RUNTIME_DIR")?
             .map(PathBuf::from)
             .ok_or_else(|| anyhow::anyhow!("XDG_RUNTIME_DIR is required"))?;
         let runtime_home = canonical_private_runtime(&runtime_home)?;
-        let mut control_environment = BTreeMap::new();
+        let mut control_environment: BTreeMap<String, String> = BTreeMap::new();
         control_environment.insert(
             "XDG_STATE_HOME".into(),
             path_text("XDG state home", &state_home)?.into(),
@@ -1376,7 +1378,6 @@ impl ArchitectEnvironment {
             "XDG_RUNTIME_DIR".into(),
             path_text("XDG runtime home", &runtime_home)?.into(),
         );
-        let mut values = BTreeMap::new();
         for name in [
             "ALL_PROXY",
             "COLORTERM",
@@ -1396,17 +1397,20 @@ impl ArchitectEnvironment {
             "https_proxy",
             "no_proxy",
         ] {
-            if let Some(value) = read_unicode_environment(name)? {
-                validate_environment_value(name, &value)?;
-                values.insert(name.into(), value);
+            if let Some(value) = parent_environment.unicode(name)? {
+                validate_environment_value(name, value)?;
+                control_environment.insert(name.into(), value.into());
             }
         }
-        if values.get("PATH").is_none_or(|value| value.is_empty())
-            || values.get("TERM").is_none_or(|value| value.is_empty())
+        if control_environment
+            .get("PATH")
+            .is_none_or(|value| value.is_empty())
+            || control_environment
+                .get("TERM")
+                .is_none_or(|value| value.is_empty())
         {
             bail!("architect environment requires PATH and TERM");
         }
-        control_environment.extend(values.clone());
         for name in [
             "HOME",
             "CARGO_HOME",
@@ -1414,10 +1418,10 @@ impl ArchitectEnvironment {
             "CODEX_HOME",
             "CLAUDE_CONFIG_DIR",
         ] {
-            if let Some(value) = read_unicode_environment(name)? {
-                validate_environment_value(name, &value)?;
+            if let Some(value) = parent_environment.unicode(name)? {
+                validate_environment_value(name, value)?;
                 if name == "HOME" || !value.is_empty() {
-                    control_environment.insert(name.into(), value);
+                    control_environment.insert(name.into(), value.into());
                 }
             }
         }
@@ -1432,17 +1436,19 @@ impl ArchitectEnvironment {
                 .get("HOME")
                 .expect("checked architect parent HOME"),
         );
-        let cargo_bin_source = std::env::var_os("CARGO_HOME")
+        let cargo_bin_source = parent_environment
+            .unicode("CARGO_HOME")?
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| parent_home.join(".cargo"))
             .join("bin");
-        let rustup_home_source = std::env::var_os("RUSTUP_HOME")
+        let rustup_home_source = parent_environment
+            .unicode("RUSTUP_HOME")?
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| parent_home.join(".rustup"));
         Ok(Self {
-            values,
+            parent_environment,
             control_environment,
             runtime_home,
             cargo_bin_source,
@@ -1455,7 +1461,7 @@ impl ArchitectEnvironment {
         paths: &ArchitectLaunchPaths,
         adapter: ArchitectAdapter,
     ) -> Result<BTreeMap<String, String>> {
-        let mut values = self.values.clone();
+        let mut values = BTreeMap::new();
         let home = self
             .control_environment
             .get("HOME")
@@ -1565,16 +1571,6 @@ fn validate_environment_value(name: &str, value: &str) -> Result<()> {
         bail!("architect environment value {name} is invalid");
     }
     Ok(())
-}
-
-fn read_unicode_environment(name: &str) -> Result<Option<String>> {
-    std::env::var_os(name)
-        .map(|value| {
-            value
-                .into_string()
-                .map_err(|_| anyhow::anyhow!("architect environment value {name} is not UTF-8"))
-        })
-        .transpose()
 }
 
 struct BridgeChild {
@@ -1704,7 +1700,6 @@ impl ArchitectSandbox {
             host_root_access: HostRootAccess::ReadWrite,
             masked_dirs: &masked_dirs,
         })?;
-        argv.push("--clearenv".into());
         for (name, value) in environment.sandbox_values(&self.paths, self.adapter)? {
             argv.extend(["--setenv".into(), name, value]);
         }
@@ -1757,7 +1752,10 @@ fn spawn_blocked_architect(
         profile,
         preassigned_native_session_id,
     )?;
-    command.args(&argv).env_clear();
+    command
+        .args(&argv)
+        .env_clear()
+        .envs(environment.parent_environment.iter());
     // SAFETY: pre_exec only clears CLOEXEC on the two owned launch-control
     // descriptors before exec.
     unsafe {
@@ -2145,8 +2143,10 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::worker::profile::CodexInvocationProfile;
+    use std::ffi::OsString;
     use std::io::Read;
     use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::net::UnixListener;
     use std::os::unix::process::CommandExt;
 
@@ -2162,7 +2162,10 @@ mod tests {
             return;
         };
         let environment = ArchitectEnvironment::capture().unwrap();
-        assert_eq!(environment.values.get("COLORTERM"), Some(&String::new()));
+        assert_eq!(
+            environment.parent_environment.unicode("COLORTERM").unwrap(),
+            Some("")
+        );
         assert_eq!(
             environment.control_environment.get("COLORTERM"),
             Some(&String::new())
@@ -2640,13 +2643,7 @@ mod tests {
             ],
         };
         let environment = ArchitectEnvironment {
-            values: [
-                ("LANG".into(), "C.UTF-8".into()),
-                ("PATH".into(), "/usr/bin:/bin".into()),
-                ("TERM".into(), "xterm-256color".into()),
-            ]
-            .into_iter()
-            .collect(),
+            parent_environment: ParentEnvironment::capture_current(),
             control_environment: BTreeMap::from([(
                 "HOME".into(),
                 control_home.to_string_lossy().into_owned(),
@@ -2860,8 +2857,20 @@ if not all(os.isatty(fd) for fd in (0, 1, 2)):
     raise SystemExit(32)
 if select.select([0], [], [], 0)[0]:
     raise SystemExit(33)
+if os.environ.get("ARBITRARY_PARENT_VALUE") != "arbitrary-value":
+    raise SystemExit(67)
+if os.environ.get("SERVICE_ACCESS_TOKEN") != "secret-shaped-value":
+    raise SystemExit(68)
+if os.environ.get("EMPTY_PARENT_VALUE") != "":
+    raise SystemExit(69)
+if os.environb.get(b"RAW_\xff_NAME") != b"value-\xfe":
+    raise SystemExit(70)
 if os.environ.get("HCOM_DIR") != {isolated_hcom_state}:
     raise SystemExit(34)
+if os.environ.get("CODEX_HOME") != {isolated_codex_home}:
+    raise SystemExit(71)
+if os.environ.get("HOME") != {isolated_parent_home}:
+    raise SystemExit(72)
 with open({write_probe}, "x", encoding="utf-8") as output:
     output.write("architect project write\n")
 
@@ -2919,6 +2928,8 @@ with open({report}, "w", encoding="utf-8") as output:
             expected_args = serde_json::to_string(&expected_args).unwrap(),
             isolated_hcom_state =
                 serde_json::to_string(&state.join("hcom").to_string_lossy()).unwrap(),
+            isolated_codex_home = serde_json::to_string(&codex_home).unwrap(),
+            isolated_parent_home = serde_json::to_string(&control_home).unwrap(),
             write_probe = serde_json::to_string(&repository.join("architect-write-probe")).unwrap(),
             external_source = serde_json::to_string(&external_source.join("source.txt")).unwrap(),
             external_write_probe = serde_json::to_string(&external_write_probe).unwrap(),
@@ -2960,7 +2971,16 @@ with open({report}, "w", encoding="utf-8") as output:
             .env("XDG_RUNTIME_DIR", &host_runtime)
             .env("XDG_STATE_HOME", root.join("xdg-state"))
             .env("CARGO_HOME", root.join("cargo"))
-            .env("RUSTUP_HOME", &rustup_home_source);
+            .env("RUSTUP_HOME", &rustup_home_source)
+            .env("ARBITRARY_PARENT_VALUE", "arbitrary-value")
+            .env("SERVICE_ACCESS_TOKEN", "secret-shaped-value")
+            .env("EMPTY_PARENT_VALUE", "")
+            .env("HCOM_DIR", "parent-hcom-state")
+            .env("CODEX_HOME", "parent-codex-home")
+            .env(
+                OsString::from_vec(b"RAW_\xff_NAME".to_vec()),
+                OsString::from_vec(b"value-\xfe".to_vec()),
+            );
         // SAFETY: these are async-signal-safe session, terminal, and
         // descriptor operations in the disposable child before exec.
         unsafe {

@@ -118,7 +118,9 @@ impl HcomContext {
         #[cfg(test)]
         let _env_read = crate::hooks::test_helpers::process_env_read();
         use std::io::IsTerminal;
-        let env: HashMap<String, String> = env::vars().collect();
+        let env: HashMap<String, String> = env::vars_os()
+            .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+            .collect();
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let mut ctx = Self::from_env(&env, cwd);
         ctx.stdin_is_tty = std::io::stdin().is_terminal();

@@ -678,7 +678,10 @@ fn launch_new_terminal() -> i32 {
 
     // Pass through HCOM env vars
     let mut env_vars = HashMap::new();
-    for (k, v) in env::vars() {
+    for (k, v) in env::vars_os() {
+        let (Ok(k), Ok(v)) = (k.into_string(), v.into_string()) else {
+            continue;
+        };
         if k.starts_with("HCOM_") {
             env_vars.insert(k, v);
         }
