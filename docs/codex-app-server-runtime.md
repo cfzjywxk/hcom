@@ -106,3 +106,29 @@ Finding paths, when present, are normalized repository-relative paths.
 Both outcomes have a 64 KiB encoded bound plus field/count bounds enforced in
 Rust after deny-unknown deserialization. Provider output cannot supply Git
 authority; the Supervisor observes repository state separately.
+
+## Pure SupervisorCore
+
+`SupervisorCore::reduce(event)` is a transactional deterministic reducer. Every
+mutating event carries the exact session version, advances it once on success,
+and returns an ordered effect list ending in `PublishStatus`. Rejection leaves
+the core unchanged. `StatusRequested` is a pure read: it returns no effect and
+does not advance the version.
+
+The core owns:
+
+- exact plan version/hash and ordered task binding;
+- one current task and one pending or active operation;
+- fresh cross-task logical session identities and same-task reuse;
+- globally at-most-once completion tokens;
+- Developer completion recovery, review rounds, and terminal task ordering;
+- normalized repository checkpoints and final Reviewer Git equality;
+- closed status snapshots and stable bounded domain errors.
+
+It does not own filesystem, Git, process, clock, network, terminal, or provider
+transport I/O. The P1 matrix has explicit rows for all 84
+`SessionState × SupervisorEventKind` combinations and all 56
+`TaskState × relevant lifecycle event` combinations. Ordered pure journeys
+cover one/two task completion, different and shared repositories,
+request-changes/re-review, exact review exhaustion, safe completion recovery,
+identity/duplicate/race failures, and all closed plan/task bounds.
