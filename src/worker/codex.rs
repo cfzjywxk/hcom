@@ -42,14 +42,46 @@ pub const GIT_EXECUTABLE: &str = "/usr/bin/git";
 pub const GIT_VERSION: &str = "git version 2.43.0";
 
 const ADAPTER_NAME: &str = "codex-developer-0.145.0";
-const ADAPTER_CONTRACT_VERSION: u32 = 5;
+const ADAPTER_CONTRACT_VERSION: u32 = 6;
 const OUTER_POLICY: &str = "bubblewrap-0.9.0-host-path-developer-repo-rw-v1";
 const MAX_CODEX_EVENTS: usize = 4096;
+pub(super) const MAX_CODEX_EVENT_BYTES: usize = 128 * 1024;
+pub(super) const MAX_CODEX_JSONL_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_DURATION: Duration = Duration::from_secs(30);
+// Keep these inventories and their runtime-option coverage tests in sync with
+// docs/codex-adapter-contract.md.
+pub(super) const CODEX_EXEC_HELP_REQUIREMENTS: &[&str] = &[
+    "resume",
+    "--config",
+    "--disable",
+    "--strict-config",
+    "--model",
+    "--sandbox",
+    "--skip-git-repo-check",
+    "--cd",
+    "--add-dir",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--output-schema",
+    "--json",
+    "--output-last-message",
+];
+pub(super) const CODEX_RESUME_HELP_REQUIREMENTS: &[&str] = &[
+    "--config",
+    "--disable",
+    "--strict-config",
+    "--model",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--output-schema",
+    "--json",
+    "--output-last-message",
+];
 const CODEX_RESULT_SCHEMA_FILE: &str = "codex-developer-result-schema.json";
 const CODEX_FINAL_FILE: &str = "native-final.partial";
 const CODEX_AUTH_FILE: &str = "auth.json";
+pub(super) const CODEX_JSONL_EVENT_BOUND_CAPABILITY: &str = "codex-jsonl-large-command-output-v1";
 
 pub(crate) const DISABLED_CODEX_FEATURES: &[&str] = &[
     "apps",
@@ -280,7 +312,7 @@ impl CodexDeveloperAdapter {
                 OutputDeclaration {
                     kind: NativeOutputKind::StdoutEnvelope,
                     relative_path: "native.stdout.partial".into(),
-                    max_bytes: 1024 * 1024,
+                    max_bytes: MAX_CODEX_JSONL_BYTES,
                     output_argument: None,
                 },
                 OutputDeclaration {
@@ -309,32 +341,17 @@ fn validate_codex_developer_invocation(invocation: &CodexInvocationProfile) -> R
 }
 
 fn validate_codex_exec_cli(path: &Path) -> Result<()> {
+    validate_codex_worker_cli(path, "Codex developer CLI")
+}
+
+pub(super) fn validate_codex_worker_cli(path: &Path, label: &str) -> Result<()> {
     let mut command = Command::new(path);
     command.args(["exec", "--help"]).env_clear();
     let output = run_bounded_command(command, 128 * 1024)?;
     if !output.status.success() || !output.stderr.is_empty() {
-        bail!("Codex developer CLI capability probe failed");
+        bail!("{label} capability probe failed");
     }
-    validate_cli_help_contract(
-        "Codex developer CLI",
-        &output.stdout,
-        &[
-            "resume",
-            "--config",
-            "--disable",
-            "--strict-config",
-            "--model",
-            "--sandbox",
-            "--skip-git-repo-check",
-            "--cd",
-            "--add-dir",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--output-schema",
-            "--json",
-            "--output-last-message",
-        ],
-    )?;
+    validate_cli_help_contract(label, &output.stdout, CODEX_EXEC_HELP_REQUIREMENTS)?;
 
     // `--sandbox` belongs to the `exec` parent in Codex 0.145. Keep it before
     // `resume`; the resume subcommand does not declare that option itself.
@@ -344,22 +361,12 @@ fn validate_codex_exec_cli(path: &Path) -> Result<()> {
         .env_clear();
     let output = run_bounded_command(resume, 128 * 1024)?;
     if !output.status.success() || !output.stderr.is_empty() {
-        bail!("Codex developer resume CLI capability probe failed");
+        bail!("{label} resume capability probe failed");
     }
     validate_cli_help_contract(
-        "Codex developer resume CLI",
+        &format!("{label} resume"),
         &output.stdout,
-        &[
-            "--config",
-            "--disable",
-            "--strict-config",
-            "--model",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--output-schema",
-            "--json",
-            "--output-last-message",
-        ],
+        CODEX_RESUME_HELP_REQUIREMENTS,
     )
 }
 
@@ -502,6 +509,7 @@ fn developer_descriptor(invocation: &CodexInvocationProfile) -> Result<AdapterDe
             result_transport: ResultTransport::FinalFile,
             features: vec![
                 "complete-parent-environment-v1".into(),
+                CODEX_JSONL_EVENT_BOUND_CAPABILITY.into(),
                 "exact-resume".into(),
                 "host-git-evidence".into(),
                 "native-add-dir-task-repository".into(),
@@ -1251,6 +1259,7 @@ struct CodexItem {
     #[serde(rename = "type")]
     kind: String,
     command: Option<String>,
+    aggregated_output: Option<serde::de::IgnoredAny>,
     exit_code: Option<i32>,
     status: Option<String>,
 }
@@ -1260,8 +1269,11 @@ pub(super) fn parse_codex_turn(control: &TurnControl, stdout: &[u8]) -> Result<C
     if stdout.is_empty() {
         bail!("Codex JSONL does not match a session worker turn");
     }
+    if stdout.len() > MAX_CODEX_JSONL_BYTES {
+        bail!("Codex JSONL aggregate output exceeds its hard bound");
+    }
     let text = std::str::from_utf8(stdout).context("Codex JSONL is not UTF-8")?;
-    validate_text("Codex JSONL", text, 1024 * 1024, true)?;
+    validate_text("Codex JSONL", text, MAX_CODEX_JSONL_BYTES, true)?;
     let mut session = None;
     let mut turn_started = false;
     let mut turn_completed = false;
@@ -1270,8 +1282,8 @@ pub(super) fn parse_codex_turn(control: &TurnControl, stdout: &[u8]) -> Result<C
     let mut failed_commands = BTreeSet::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         event_count += 1;
-        if event_count > MAX_CODEX_EVENTS || line.len() > 128 * 1024 {
-            bail!("Codex JSONL exceeds its bounded event shape");
+        if event_count > MAX_CODEX_EVENTS {
+            bail!("Codex JSONL event count exceeds its hard bound");
         }
         if turn_completed {
             bail!("Codex JSONL contains events after its terminal event");
@@ -1279,6 +1291,14 @@ pub(super) fn parse_codex_turn(control: &TurnControl, stdout: &[u8]) -> Result<C
         let header: EventHeader =
             serde_json::from_str(line).context("Codex JSONL event header is malformed")?;
         validate_text("Codex event type", &header.kind, 128, false)?;
+        let oversized_event = line.len() > MAX_CODEX_EVENT_BYTES;
+        // Codex 0.145 places a command's aggregate output in the same
+        // item.completed object as the bounded command/status evidence. Serde
+        // skips that unneeded field while the aggregate stream cap still
+        // bounds parsing; every other event retains the smaller shape cap.
+        if oversized_event && header.kind != "item.completed" {
+            bail!("Codex JSONL event exceeds its per-event shape bound");
+        }
         match header.kind.as_str() {
             "thread.started" => {
                 if event_count != 1 || session.is_some() || turn_started {
@@ -1317,6 +1337,13 @@ pub(super) fn parse_codex_turn(control: &TurnControl, stdout: &[u8]) -> Result<C
                     serde_json::from_str(line).context("Codex item event is malformed")?;
                 validate_text("Codex item id", &event.item.id, 256, false)?;
                 validate_text("Codex item type", &event.item.kind, 128, false)?;
+                if oversized_event
+                    && (header.kind != "item.completed"
+                        || event.item.kind != "command_execution"
+                        || event.item.aggregated_output.is_none())
+                {
+                    bail!("Codex JSONL event exceeds its per-event shape bound");
+                }
                 if matches!(
                     event.item.kind.as_str(),
                     "mcp_tool_call" | "collab_tool_call"
@@ -1811,6 +1838,68 @@ mod tests {
         }
     }
 
+    fn codex_transcript(session: &str, event: &serde_json::Value) -> Vec<u8> {
+        let mut stdout = format!(
+            "{{\"type\":\"thread.started\",\"thread_id\":\"{session}\"}}\n\
+             {{\"type\":\"turn.started\"}}\n"
+        )
+        .into_bytes();
+        serde_json::to_writer(&mut stdout, event).unwrap();
+        stdout.extend_from_slice(b"\n{\"type\":\"turn.completed\"}\n");
+        stdout
+    }
+
+    fn codex_command_transcript(session: &str, command: &str, output: &str) -> Vec<u8> {
+        codex_transcript(
+            session,
+            &serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "command-1",
+                    "type": "command_execution",
+                    "command": command,
+                    "aggregated_output": output,
+                    "exit_code": 0,
+                    "status": "completed"
+                }
+            }),
+        )
+    }
+
+    fn codex_parse_error(control: &TurnControl, stdout: &[u8]) -> anyhow::Error {
+        match parse_codex_turn(control, stdout) {
+            Ok(_) => panic!("Codex JSONL was unexpectedly accepted"),
+            Err(error) => error,
+        }
+    }
+
+    fn assert_closed_codex_worker_config_argv(argv: &[String]) {
+        for option in [
+            "--json",
+            "--strict-config",
+            "--skip-git-repo-check",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--output-schema",
+            "--output-last-message",
+        ] {
+            assert!(
+                argv.iter().any(|argument| argument == option),
+                "missing closed Codex worker option {option}"
+            );
+        }
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["--config", "mcp_servers={}"])
+        );
+        for feature in DISABLED_CODEX_FEATURES {
+            assert!(
+                argv.windows(2).any(|pair| pair == ["--disable", *feature]),
+                "missing closed Codex feature {feature}"
+            );
+        }
+    }
+
     #[test]
     fn jsonl_requires_one_exact_session_and_successful_terminal_event() {
         let stdout = concat!(
@@ -1864,6 +1953,176 @@ mod tests {
             assert!(parse_codex_turn(&control(None), invalid.as_bytes()).is_err());
         }
         assert!(parse_codex_turn(&control(Some("native-other")), stdout.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn jsonl_accepts_large_ignored_command_output_for_create_and_exact_resume() {
+        let command = "cargo test --quiet --all-targets";
+        let ignored_output = "x".repeat(MAX_CODEX_EVENT_BYTES + 64 * 1024);
+        let stdout = codex_command_transcript("native-codex-large", command, &ignored_output);
+        let command_event_len = stdout.split(|byte| *byte == b'\n').nth(2).unwrap().len();
+        assert!(command_event_len > MAX_CODEX_EVENT_BYTES);
+        assert!(stdout.len() < MAX_CODEX_JSONL_BYTES);
+
+        for turn in [control(None), control(Some("native-codex-large"))] {
+            let evidence = parse_codex_turn(&turn, &stdout).unwrap();
+            assert_eq!(evidence.native_session_id, "native-codex-large");
+            assert_eq!(
+                evidence.completed_commands,
+                BTreeSet::from([command.to_owned()])
+            );
+            assert!(evidence.failed_commands.is_empty());
+        }
+    }
+
+    #[test]
+    fn jsonl_reports_sanitized_distinct_aggregate_count_and_event_shape_bounds() {
+        let aggregate = codex_command_transcript(
+            "native-codex-aggregate",
+            "cargo test --quiet",
+            &"a".repeat(MAX_CODEX_JSONL_BYTES),
+        );
+        assert!(aggregate.len() > MAX_CODEX_JSONL_BYTES);
+        let error = codex_parse_error(&control(None), &aggregate);
+        assert_eq!(
+            error.to_string(),
+            "Codex JSONL aggregate output exceeds its hard bound"
+        );
+
+        let mut too_many = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"native-codex-count\"}\n",
+            "{\"type\":\"turn.started\"}\n"
+        )
+        .to_owned();
+        for _ in 2..MAX_CODEX_EVENTS {
+            too_many.push_str("{\"type\":\"heartbeat\"}\n");
+        }
+        let private_payload = "count-bound-private-payload";
+        too_many.push_str(&format!(
+            "{{\"type\":\"heartbeat\",\"payload\":\"{private_payload}\"}}\n"
+        ));
+        let error = codex_parse_error(&control(None), too_many.as_bytes());
+        assert_eq!(
+            error.to_string(),
+            "Codex JSONL event count exceeds its hard bound"
+        );
+        assert!(!format!("{error:#}").contains(private_payload));
+
+        let private_payload = "event-bound-private-payload";
+        let oversized_non_command = codex_transcript(
+            "native-codex-event",
+            &serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "message-1",
+                    "type": "agent_message",
+                    "text": format!(
+                        "{private_payload}{}",
+                        "b".repeat(MAX_CODEX_EVENT_BYTES)
+                    )
+                }
+            }),
+        );
+        assert!(
+            oversized_non_command
+                .split(|byte| *byte == b'\n')
+                .nth(2)
+                .unwrap()
+                .len()
+                > MAX_CODEX_EVENT_BYTES
+        );
+        let error = codex_parse_error(&control(None), &oversized_non_command);
+        assert_eq!(
+            error.to_string(),
+            "Codex JSONL event exceeds its per-event shape bound"
+        );
+        assert!(!format!("{error:#}").contains(private_payload));
+
+        let private_payload = "unknown-field-private-payload";
+        let oversized_unknown_command = codex_transcript(
+            "native-codex-unknown",
+            &serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "command-1",
+                    "type": "command_execution",
+                    "command": "cargo test --quiet",
+                    "padding": format!(
+                        "{private_payload}{}",
+                        "c".repeat(MAX_CODEX_EVENT_BYTES)
+                    ),
+                    "exit_code": 0,
+                    "status": "completed"
+                }
+            }),
+        );
+        let error = codex_parse_error(&control(None), &oversized_unknown_command);
+        assert_eq!(
+            error.to_string(),
+            "Codex JSONL event exceeds its per-event shape bound"
+        );
+        assert!(!format!("{error:#}").contains(private_payload));
+    }
+
+    #[test]
+    fn jsonl_large_event_exception_does_not_relax_semantic_field_bounds() {
+        let valid_command = serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "id": "command-1",
+                "type": "command_execution",
+                "command": "cargo test --quiet",
+                "exit_code": 0,
+                "status": "completed"
+            }
+        });
+        let cases = [
+            (
+                serde_json::json!({"type": "t".repeat(129)}),
+                "Codex event type",
+            ),
+            (
+                {
+                    let mut event = valid_command.clone();
+                    event["item"]["id"] = serde_json::Value::String("i".repeat(257));
+                    event
+                },
+                "Codex item id",
+            ),
+            (
+                {
+                    let mut event = valid_command.clone();
+                    event["item"]["type"] = serde_json::Value::String("t".repeat(129));
+                    event
+                },
+                "Codex item type",
+            ),
+            (
+                {
+                    let mut event = valid_command.clone();
+                    event["item"]["status"] = serde_json::Value::String("s".repeat(129));
+                    event
+                },
+                "Codex item status",
+            ),
+            (
+                {
+                    let mut event = valid_command;
+                    event["item"]["command"] = serde_json::Value::String("c".repeat(4097));
+                    event
+                },
+                "Codex command event",
+            ),
+        ];
+
+        for (event, expected_label) in cases {
+            let stdout = codex_transcript("native-codex-semantic", &event);
+            let error = codex_parse_error(&control(None), &stdout);
+            assert!(
+                format!("{error:#}").contains(expected_label),
+                "missing sanitized semantic label {expected_label}: {error:#}"
+            );
+        }
     }
 
     #[test]
@@ -1943,6 +2202,70 @@ mod tests {
         if path.exists() {
             validate_codex_exec_cli(path).unwrap();
         }
+    }
+
+    #[test]
+    fn worker_cli_help_requirements_cover_every_runtime_option() {
+        fn declared_output_options(command: &CommandSpec) -> BTreeSet<String> {
+            let mut options = BTreeSet::new();
+            match &command.schema_transport {
+                SchemaTransport::None => {}
+                SchemaTransport::InlineArgument { flag, .. } => {
+                    options.insert(flag.clone());
+                }
+                SchemaTransport::File { argument, .. } => {
+                    options.insert(argument.clone());
+                }
+            }
+            for output in &command.expected_outputs {
+                if let Some(argument) = &output.output_argument {
+                    options.insert(argument.clone());
+                }
+            }
+            options
+        }
+
+        let fixture = Fixture::new();
+        let adapter = fixture.adapter();
+        let create = adapter.build_create(&control(None)).unwrap();
+        let resume = adapter
+            .build_resume("native-codex-1", &control(Some("native-codex-1")))
+            .unwrap();
+        for command in [&create, &resume] {
+            let mut options = command
+                .fixed_argv
+                .iter()
+                .filter(|argument| argument.starts_with("--"))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            options.extend(declared_output_options(command));
+            for option in options {
+                assert!(
+                    CODEX_EXEC_HELP_REQUIREMENTS.contains(&option.as_str()),
+                    "runtime option {option} is absent from the exec capability probe"
+                );
+            }
+        }
+
+        let resume_index = resume
+            .fixed_argv
+            .iter()
+            .position(|argument| argument == "resume")
+            .unwrap();
+        let mut resume_options = resume.fixed_argv[resume_index + 2..]
+            .iter()
+            .filter(|argument| argument.starts_with("--"))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        resume_options.extend(declared_output_options(&resume));
+        for option in resume_options {
+            assert!(
+                CODEX_RESUME_HELP_REQUIREMENTS.contains(&option.as_str()),
+                "runtime resume option {option} is absent from the resume capability probe"
+            );
+        }
+        assert!(CODEX_EXEC_HELP_REQUIREMENTS.contains(&"resume"));
+        assert!(CODEX_EXEC_HELP_REQUIREMENTS.contains(&"--add-dir"));
     }
 
     #[test]
@@ -2032,13 +2355,22 @@ mod tests {
             profile.policy,
             CodexInvocationProfile::developer_default().effective_policy(OUTER_POLICY)
         );
+        assert_eq!(profile.adapter_contract_version, ADAPTER_CONTRACT_VERSION);
         assert_eq!(profile.native_session_mode, NativeSessionMode::Discovered);
+        assert!(
+            profile
+                .capability
+                .features
+                .iter()
+                .any(|feature| feature == CODEX_JSONL_EVENT_BOUND_CAPABILITY)
+        );
 
         let prompt = b"private task body sentinel phase-five";
         let create_control = fixture.control(None);
         let create =
             prepare_create_turn(&adapter, &profile, &create_control, prompt.to_vec()).unwrap();
         let argv = create.command().materialized_control_argv();
+        assert_closed_codex_worker_config_argv(&argv);
         assert_eq!(argv.last().map(String::as_str), Some("-"));
         assert!(argv.iter().any(|argument| argument == "--die-with-parent"));
         assert!(argv.iter().any(|argument| argument == "--unshare-pid"));
@@ -2124,6 +2456,7 @@ mod tests {
         )
         .unwrap();
         let resume_argv = resume.command().materialized_control_argv();
+        assert_closed_codex_worker_config_argv(&resume_argv);
         assert_eq!(resume_argv.last().map(String::as_str), Some("-"));
         assert!(
             resume_argv

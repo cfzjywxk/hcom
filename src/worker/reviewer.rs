@@ -1,8 +1,9 @@
 //! Exact-version no-TUI Codex reviewers and Claude developer/reviewer adapters.
 
 use super::codex::{
-    DISABLED_CODEX_FEATURES, developer_result_schema, observe_codex_record, parse_codex_turn,
-    parse_git_commits, parse_nul_paths, validate_codex_worker_stderr,
+    CODEX_JSONL_EVENT_BOUND_CAPABILITY, DISABLED_CODEX_FEATURES, MAX_CODEX_JSONL_BYTES,
+    developer_result_schema, observe_codex_record, parse_codex_turn, parse_git_commits,
+    parse_nul_paths, validate_codex_worker_cli, validate_codex_worker_stderr,
 };
 use super::contract::{
     AdapterCapabilities, AdapterDescriptor, CommandSpec, ExecutableIdentity, NativeArtifacts,
@@ -55,7 +56,7 @@ const GIT_VERSION: &str = "git version 2.43.0";
 const CODEX_ADAPTER_NAME: &str = "codex-reviewer-0.145.0";
 const CLAUDE_ADAPTER_NAME: &str = "claude-reviewer-2.1.220";
 const CLAUDE_DEVELOPER_ADAPTER_NAME: &str = "claude-developer-2.1.220";
-const CODEX_ADAPTER_CONTRACT_VERSION: u32 = 5;
+const CODEX_ADAPTER_CONTRACT_VERSION: u32 = 6;
 const CLAUDE_ADAPTER_CONTRACT_VERSION: u32 = 5;
 const CLAUDE_DEVELOPER_ADAPTER_CONTRACT_VERSION: u32 = 3;
 const REVIEWER_OUTER_POLICY: &str = "bubblewrap-0.9.0-host-path-reviewer-ro-v1";
@@ -256,7 +257,7 @@ impl CodexReviewerAdapter {
                 OutputDeclaration {
                     kind: NativeOutputKind::StdoutEnvelope,
                     relative_path: "native.stdout.partial".into(),
-                    max_bytes: 1024 * 1024,
+                    max_bytes: MAX_CODEX_JSONL_BYTES,
                     output_argument: None,
                 },
                 OutputDeclaration {
@@ -855,57 +856,7 @@ impl ClaudeReviewerAdapter {
 }
 
 fn validate_codex_reviewer_cli(path: &Path) -> Result<()> {
-    let mut command = Command::new(path);
-    command.args(["exec", "--help"]).env_clear();
-    let output = run_bounded_command(command, 128 * 1024)?;
-    if !output.status.success() || !output.stderr.is_empty() {
-        bail!("Codex reviewer CLI capability probe failed");
-    }
-    validate_cli_help_contract(
-        "Codex reviewer CLI",
-        &output.stdout,
-        &[
-            "resume",
-            "--config",
-            "--disable",
-            "--strict-config",
-            "--model",
-            "--sandbox",
-            "--skip-git-repo-check",
-            "--cd",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--output-schema",
-            "--json",
-            "--output-last-message",
-        ],
-    )?;
-
-    // `--sandbox` is an `exec` parent option, so prove the exact ordering used
-    // for same-task resume rather than relying on the create-only help surface.
-    let mut resume = Command::new(path);
-    resume
-        .args(["exec", "--sandbox", "read-only", "resume", "--help"])
-        .env_clear();
-    let output = run_bounded_command(resume, 128 * 1024)?;
-    if !output.status.success() || !output.stderr.is_empty() {
-        bail!("Codex reviewer resume CLI capability probe failed");
-    }
-    validate_cli_help_contract(
-        "Codex reviewer resume CLI",
-        &output.stdout,
-        &[
-            "--config",
-            "--disable",
-            "--strict-config",
-            "--model",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--output-schema",
-            "--json",
-            "--output-last-message",
-        ],
-    )
+    validate_codex_worker_cli(path, "Codex reviewer CLI")
 }
 
 fn validate_claude_cli(path: &Path) -> Result<()> {
@@ -1056,6 +1007,9 @@ fn codex_reviewer_descriptor(invocation: &CodexInvocationProfile) -> Result<Adap
     capabilities
         .features
         .push("native-add-dir-task-repository".into());
+    capabilities
+        .features
+        .push(CODEX_JSONL_EVENT_BOUND_CAPABILITY.into());
     AdapterDescriptor::new(
         CODEX_ADAPTER_NAME,
         CODEX_ADAPTER_CONTRACT_VERSION,
@@ -2284,6 +2238,9 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::artifact::{ArtifactAttempt, ArtifactRoot, ArtifactScope};
+    use crate::worker::codex::{
+        CODEX_EXEC_HELP_REQUIREMENTS, CODEX_RESUME_HELP_REQUIREMENTS, MAX_CODEX_EVENT_BYTES,
+    };
     use crate::worker::environment::{ExecutionEnvironmentLease, WorkerEnvironmentIdentity};
     use crate::worker::{
         HeartbeatControl, NativeSessionBinding, ProcessRunner, WorkerAdapter, prepare_create_turn,
@@ -3320,6 +3277,13 @@ mod tests {
                 .iter()
                 .any(|feature| feature == "outer-bwrap-host-path-reviewer-ro-v1")
         );
+        assert!(
+            codex_profile
+                .capability
+                .features
+                .iter()
+                .any(|feature| feature == CODEX_JSONL_EVENT_BOUND_CAPABILITY)
+        );
         assert_eq!(
             codex_profile.native_session_mode,
             NativeSessionMode::Discovered
@@ -3334,6 +3298,17 @@ mod tests {
         );
         let prepared =
             prepare_create_turn(&codex, &codex_profile, &codex_create, prompt.to_vec()).unwrap();
+        for option in prepared
+            .command()
+            .fixed_argv
+            .iter()
+            .filter(|argument| argument.starts_with("--"))
+        {
+            assert!(
+                CODEX_EXEC_HELP_REQUIREMENTS.contains(&option.as_str()),
+                "reviewer runtime option {option} is absent from the shared exec capability probe"
+            );
+        }
         assert_closed_codex_argv(
             &prepared.command().materialized_control_argv(),
             &fixture,
@@ -3381,7 +3356,23 @@ mod tests {
             prompt.to_vec(),
         )
         .unwrap();
+        let resume_index = prepared
+            .command()
+            .fixed_argv
+            .iter()
+            .position(|argument| argument == "resume")
+            .unwrap();
+        for option in prepared.command().fixed_argv[resume_index + 2..]
+            .iter()
+            .filter(|argument| argument.starts_with("--"))
+        {
+            assert!(
+                CODEX_RESUME_HELP_REQUIREMENTS.contains(&option.as_str()),
+                "reviewer resume option {option} is absent from the shared resume capability probe"
+            );
+        }
         let argv = prepared.command().materialized_control_argv();
+        assert_closed_codex_argv(&argv, &fixture, prompt);
         assert!(
             argv.windows(2)
                 .any(|pair| pair == ["resume", "native-codex-reviewer-1"])
@@ -3715,6 +3706,72 @@ mod tests {
     }
 
     #[test]
+    fn codex_reviewer_accepts_large_ignored_command_output_and_keeps_head_validation() {
+        let fixture = Fixture::new();
+        let codex = fixture.codex_adapter();
+        let control = fixture.control(
+            "task-codex-large-output",
+            "logical-codex-large-output",
+            None,
+            1,
+            1,
+            &fixture.first_head,
+        );
+        let command = "cargo test --quiet --all-targets";
+        let event = serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "id": "check-1",
+                "type": "command_execution",
+                "command": command,
+                "aggregated_output": "x".repeat(MAX_CODEX_EVENT_BYTES + 64 * 1024),
+                "exit_code": 0,
+                "status": "completed"
+            }
+        });
+        let mut stdout = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"native-codex-reviewer-large\"}\n",
+            "{\"type\":\"turn.started\"}\n"
+        )
+        .as_bytes()
+        .to_vec();
+        serde_json::to_writer(&mut stdout, &event).unwrap();
+        stdout.extend_from_slice(b"\n{\"type\":\"turn.completed\"}\n");
+        assert!(stdout.split(|byte| *byte == b'\n').nth(2).unwrap().len() > MAX_CODEX_EVENT_BYTES);
+        assert!(stdout.len() < MAX_CODEX_JSONL_BYTES);
+        let result = serde_json::json!({
+            "decision": "lgtm",
+            "summary": "the exact bounded review passed",
+            "findings": [],
+            "checks": [{
+                "command": command,
+                "status": "passed",
+                "summary": "quiet checks passed"
+            }]
+        });
+        let artifacts = NativeArtifacts::new(
+            WorkerRole::Reviewer,
+            stdout,
+            vec![],
+            Some(serde_json::to_vec(&result).unwrap()),
+        )
+        .unwrap();
+
+        let native = codex.extract_result(&control, &artifacts).unwrap();
+        assert_eq!(native.native_session_id(), "native-codex-reviewer-large");
+
+        let stale_head = fixture.control(
+            "task-codex-large-output",
+            "logical-codex-large-output",
+            None,
+            1,
+            1,
+            &fixture.second_head,
+        );
+        assert!(codex.extract_result(&stale_head, &artifacts).is_err());
+    }
+
+    #[test]
     fn strict_native_results_reject_wrong_model_session_semantics_and_check_claims() {
         let fixture = Fixture::new();
         let claude = fixture.claude_adapter();
@@ -3992,6 +4049,24 @@ mod tests {
     fn assert_closed_codex_argv(argv: &[String], fixture: &Fixture, prompt: &[u8]) {
         assert!(argv.iter().any(|argument| argument == "--die-with-parent"));
         assert!(argv.iter().any(|argument| argument == "--unshare-pid"));
+        for option in [
+            "--json",
+            "--strict-config",
+            "--skip-git-repo-check",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--output-schema",
+            "--output-last-message",
+        ] {
+            assert!(
+                argv.iter().any(|argument| argument == option),
+                "missing closed Codex reviewer option {option}"
+            );
+        }
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["--config", "mcp_servers={}"])
+        );
         assert!(
             argv.windows(2)
                 .any(|pair| pair == ["--sandbox", "danger-full-access"])
@@ -4000,7 +4075,12 @@ mod tests {
             argv.windows(2)
                 .any(|pair| pair == ["--model", CODEX_REVIEWER_MODEL])
         );
-        assert!(argv.windows(2).any(|pair| pair == ["--disable", "hooks"]));
+        for feature in DISABLED_CODEX_FEATURES {
+            assert!(
+                argv.windows(2).any(|pair| pair == ["--disable", *feature]),
+                "missing closed Codex reviewer feature {feature}"
+            );
+        }
         assert!(!argv.iter().any(|argument| argument == "--new-session"));
         assert!(!argv.iter().any(|argument| argument == "--last"));
         assert!(!argv.iter().any(|argument| argument == "--ephemeral"));

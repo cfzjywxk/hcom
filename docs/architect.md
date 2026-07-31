@@ -211,6 +211,11 @@ configured developer/reviewer adapter and the profile hash are bound into the
 plan hash. Editing `config.toml` later cannot change a running session; start a
 new `hcom architect` invocation to pick up changes.
 
+Maintainers changing Codex arguments, isolated configuration, JSONL parsing,
+or size bounds must also follow the
+[Codex adapter maintenance contract](codex-adapter-contract.md), including its
+create/resume and developer/reviewer test matrix.
+
 ## Login and environment inheritance
 
 Native login sources are derived from the terminal that starts the Architect,

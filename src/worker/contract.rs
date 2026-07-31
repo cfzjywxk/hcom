@@ -1149,6 +1149,51 @@ mod tests {
     }
 
     #[test]
+    fn transport_size_bounds_are_independent_and_fail_closed() {
+        assert!(validate_prompt(&vec![b'p'; MAX_PROMPT_BYTES]).is_ok());
+        assert!(validate_prompt(&vec![b'p'; MAX_PROMPT_BYTES + 1]).is_err());
+
+        let max_item = "a".repeat(MAX_ARG_BYTES);
+        assert!(validate_argv("test argv", std::slice::from_ref(&max_item)).is_ok());
+        assert!(validate_argv("test argv", &[format!("{max_item}a")]).is_err());
+
+        let max_aggregate = vec![max_item; MAX_ARGV_BYTES / MAX_ARG_BYTES];
+        assert!(validate_argv("test argv", &max_aggregate).is_ok());
+        let mut oversized_aggregate = max_aggregate;
+        oversized_aggregate.push("a".into());
+        assert!(validate_argv("test argv", &oversized_aggregate).is_err());
+        assert!(
+            validate_argv(
+                "test argv",
+                &vec!["a".into(); super::super::validation::MAX_ITEMS + 1]
+            )
+            .is_err()
+        );
+
+        let max_schema = format!(
+            r#"{{"x":"{}"}}"#,
+            "s".repeat(MAX_SCHEMA_BYTES - r#"{"x":""}"#.len())
+        );
+        assert_eq!(max_schema.len(), MAX_SCHEMA_BYTES);
+        assert!(validate_json_schema(max_schema.as_bytes()).is_ok());
+        let oversized_schema = format!(
+            r#"{{"x":"{}"}}"#,
+            "s".repeat(MAX_SCHEMA_BYTES - r#"{"x":""}"#.len() + 1)
+        );
+        assert!(validate_json_schema(oversized_schema.as_bytes()).is_err());
+
+        assert!(
+            NativeArtifacts::new(
+                WorkerRole::Developer,
+                vec![0; MAX_NATIVE_STREAM_BYTES],
+                vec![0; MAX_NATIVE_STREAM_BYTES],
+                Some(vec![0; super::super::result::MAX_RESULT_BYTES]),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn native_artifact_inputs_are_bounded_before_adapter_parsing() {
         assert!(
             NativeArtifacts::new(
