@@ -68,9 +68,9 @@ turn when the human explicitly directs it to
 follow or execute a named existing detailed plan/specification/current_todo;
 analysis or drafting alone still waits for approval. hcom validates the exact
 version/hash and confirmation bit, not OS-level keyboard provenance. When
-[architect.reviewer] is absent, the reviewer uses the selected architect
-adapter and the same effective model and reasoning/effort. An explicit
-[architect.reviewer] table takes priority.
+[architect.reviewer] is absent, the reviewer is always Claude opus/xhigh with
+dangerously-skip-permissions, independent of the selected Architect and its
+TOML or CLI overrides. An explicit [architect.reviewer] table takes priority.
 
 Only typed profile fields are accepted; arbitrary native argv is not. The
 effective sanitized profiles and their SHA-256 hash are printed at startup and

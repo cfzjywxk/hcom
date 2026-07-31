@@ -51,14 +51,16 @@ Without profile configuration, the command selects these effective defaults:
 
 | Command | Architect | Developer | Reviewer |
 |---|---|---|---|
-| `hcom architect codex` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, approvals `never` | Codex `gpt-5.6-sol`, `xhigh` | Codex `gpt-5.6-sol`, `xhigh` |
+| `hcom architect codex` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, approvals `never` | Codex `gpt-5.6-sol`, `xhigh` | Claude `opus`, `xhigh`, skip permissions |
 | `hcom architect claude` | Claude `opus`, `xhigh`, skip permissions | Codex `gpt-5.6-sol`, `xhigh` | Claude `opus`, `xhigh` |
 
 The developer remains independently configurable and keeps its own built-in
-profile. When `[architect.reviewer]` is absent, the reviewer follows the
-selected architect adapter and its effective model and reasoning/effort,
-including `[architect.profile]` and command-line overrides. Supplying an
-explicit `[architect.reviewer]` table disables that inheritance.
+profile. When `[architect.reviewer]` is absent, the reviewer always uses
+Claude `opus` with `xhigh` effort and
+`dangerously_skip_permissions = true`. The selected Architect,
+`[architect.profile]`, and Architect command-line overrides do not change that
+implicit reviewer. Supplying an explicit `[architect.reviewer]` table replaces
+the built-in reviewer default.
 
 The Codex Architect does not copy the parent `CODEX_HOME`: that would also
 import unrelated native configuration and control surfaces. Its private

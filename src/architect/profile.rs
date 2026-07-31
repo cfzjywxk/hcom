@@ -15,7 +15,6 @@ pub(super) struct LoadedInvocationProfiles {
     pub profiles: SessionInvocationProfiles,
     pub config_path: PathBuf,
     pub loaded_from_file: bool,
-    pub reviewer_explicit: bool,
 }
 
 #[derive(Deserialize)]
@@ -39,7 +38,6 @@ pub(super) fn load_invocation_profiles(
                 profiles,
                 config_path: path.to_owned(),
                 loaded_from_file: false,
-                reviewer_explicit: false,
             });
         }
         Err(error) => {
@@ -98,7 +96,6 @@ pub(super) fn load_invocation_profiles(
         .parse()
         .context("architect profile configuration is malformed TOML")?;
     let mut profiles = SessionInvocationProfiles::for_architect(architect_adapter);
-    let mut reviewer_explicit = false;
     if let Some(value) = document.get("architect") {
         let configured: ArchitectToml = value
             .clone()
@@ -123,18 +120,13 @@ pub(super) fn load_invocation_profiles(
         }
         if let Some(reviewer) = configured.reviewer {
             profiles.reviewer = reviewer;
-            reviewer_explicit = true;
         }
-    }
-    if !reviewer_explicit {
-        profiles.inherit_reviewer_from_architect();
     }
     profiles.validate()?;
     Ok(LoadedInvocationProfiles {
         profiles,
         config_path: path.to_owned(),
         loaded_from_file: true,
-        reviewer_explicit,
     })
 }
 
@@ -162,15 +154,18 @@ mod tests {
             load_invocation_profiles(&temp.path().join("missing.toml"), ArchitectAdapter::Codex)
                 .unwrap();
         assert!(!loaded.loaded_from_file);
-        assert!(!loaded.reviewer_explicit);
         assert_eq!(
             loaded.profiles.architect.codex().unwrap().sandbox,
             CodexSandbox::DangerFullAccess
         );
         assert_eq!(
             loaded.profiles.reviewer_adapter_name(),
-            CODEX_REVIEWER_ADAPTER
+            CLAUDE_REVIEWER_ADAPTER
         );
+        let reviewer = loaded.profiles.reviewer.claude().unwrap();
+        assert_eq!(reviewer.model, "opus");
+        assert_eq!(reviewer.effort, "xhigh");
+        assert!(reviewer.dangerously_skip_permissions);
     }
 
     #[test]
@@ -183,8 +178,52 @@ mod tests {
         let reviewer = loaded.profiles.reviewer.claude().unwrap();
         assert_eq!(architect.model, "opus");
         assert_eq!(architect.effort, "xhigh");
-        assert_eq!(reviewer.model, architect.model);
-        assert_eq!(reviewer.effort, architect.effort);
+        assert_eq!(
+            loaded.profiles.reviewer_adapter_name(),
+            CLAUDE_REVIEWER_ADAPTER
+        );
+        assert_eq!(reviewer.model, "opus");
+        assert_eq!(reviewer.effort, "xhigh");
+        assert!(reviewer.dangerously_skip_permissions);
+    }
+
+    #[test]
+    fn existing_config_without_reviewer_uses_claude_opus_xhigh_for_both_architects() {
+        let (_temp, path) = write_config(
+            r#"
+[terminal]
+active = "default"
+"#,
+        );
+        for adapter in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
+            let loaded = load_invocation_profiles(&path, adapter).unwrap();
+            assert!(loaded.loaded_from_file);
+            let reviewer = loaded.profiles.reviewer.claude().unwrap();
+            assert_eq!(reviewer.model, "opus");
+            assert_eq!(reviewer.effort, "xhigh");
+            assert!(reviewer.dangerously_skip_permissions);
+        }
+    }
+
+    #[test]
+    fn codex_architect_toml_override_does_not_change_the_implicit_reviewer() {
+        let (_temp, path) = write_config(
+            r#"
+[architect.profile]
+model = "gpt-5.6-sol-configured"
+reasoning_effort = "max"
+sandbox = "danger-full-access"
+ask_for_approval = "never"
+"#,
+        );
+        let loaded = load_invocation_profiles(&path, ArchitectAdapter::Codex).unwrap();
+        let architect = loaded.profiles.architect.codex().unwrap();
+        let reviewer = loaded.profiles.reviewer.claude().unwrap();
+        assert_eq!(architect.model, "gpt-5.6-sol-configured");
+        assert_eq!(architect.reasoning_effort, "max");
+        assert_eq!(reviewer.model, "opus");
+        assert_eq!(reviewer.effort, "xhigh");
+        assert!(reviewer.dangerously_skip_permissions);
     }
 
     #[test]
@@ -216,7 +255,6 @@ dangerously_skip_permissions = true
         );
         let loaded = load_invocation_profiles(&path, ArchitectAdapter::Codex).unwrap();
         assert!(loaded.loaded_from_file);
-        assert!(loaded.reviewer_explicit);
         assert_eq!(
             loaded.profiles.architect.codex().unwrap().reasoning_effort,
             "max"
@@ -282,15 +320,17 @@ sandbox = "danger-full-access"
 ask_for_approval = "never"
 "#,
         );
-        let loaded = load_invocation_profiles(&path, ArchitectAdapter::Codex).unwrap();
-        assert_eq!(
-            loaded.profiles.developer_adapter_name(),
-            CODEX_DEVELOPER_ADAPTER
-        );
-        assert_eq!(
-            loaded.profiles.reviewer_adapter_name(),
-            CODEX_REVIEWER_ADAPTER
-        );
+        for architect_adapter in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
+            let loaded = load_invocation_profiles(&path, architect_adapter).unwrap();
+            assert_eq!(
+                loaded.profiles.developer_adapter_name(),
+                CODEX_DEVELOPER_ADAPTER
+            );
+            assert_eq!(
+                loaded.profiles.reviewer_adapter_name(),
+                CODEX_REVIEWER_ADAPTER
+            );
+        }
     }
 
     #[test]
@@ -310,15 +350,17 @@ effort = "xhigh"
 dangerously_skip_permissions = true
 "#,
         );
-        let loaded = load_invocation_profiles(&path, ArchitectAdapter::Codex).unwrap();
-        assert_eq!(
-            loaded.profiles.developer_adapter_name(),
-            CLAUDE_DEVELOPER_ADAPTER
-        );
-        assert_eq!(
-            loaded.profiles.reviewer_adapter_name(),
-            CLAUDE_REVIEWER_ADAPTER
-        );
+        for architect_adapter in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
+            let loaded = load_invocation_profiles(&path, architect_adapter).unwrap();
+            assert_eq!(
+                loaded.profiles.developer_adapter_name(),
+                CLAUDE_DEVELOPER_ADAPTER
+            );
+            assert_eq!(
+                loaded.profiles.reviewer_adapter_name(),
+                CLAUDE_REVIEWER_ADAPTER
+            );
+        }
     }
 
     #[test]
@@ -333,14 +375,16 @@ sandbox = "danger-full-access"
 ask_for_approval = "never"
 "#,
         );
-        let loaded = load_invocation_profiles(&path, ArchitectAdapter::Codex).unwrap();
-        assert_eq!(
-            loaded.profiles.reviewer_adapter_name(),
-            CODEX_REVIEWER_ADAPTER
-        );
-        let reviewer = loaded.profiles.reviewer.codex().unwrap();
-        assert_eq!(reviewer.reasoning_effort, "max");
-        assert_eq!(reviewer.sandbox, CodexSandbox::DangerFullAccess);
+        for architect_adapter in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
+            let loaded = load_invocation_profiles(&path, architect_adapter).unwrap();
+            assert_eq!(
+                loaded.profiles.reviewer_adapter_name(),
+                CODEX_REVIEWER_ADAPTER
+            );
+            let reviewer = loaded.profiles.reviewer.codex().unwrap();
+            assert_eq!(reviewer.reasoning_effort, "max");
+            assert_eq!(reviewer.sandbox, CodexSandbox::DangerFullAccess);
+        }
     }
 
     #[test]
@@ -402,9 +446,8 @@ dangerously_skip_permissions = false
         assert_eq!(architect.model, "sonnet");
         assert_eq!(architect.effort, "max");
         assert!(!architect.dangerously_skip_permissions);
-        assert_eq!(reviewer.model, "sonnet");
-        assert_eq!(reviewer.effort, "max");
+        assert_eq!(reviewer.model, "opus");
+        assert_eq!(reviewer.effort, "xhigh");
         assert!(reviewer.dangerously_skip_permissions);
-        assert!(!loaded.reviewer_explicit);
     }
 }

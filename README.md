@@ -119,8 +119,9 @@ in the same turn. A request only to analyze, discuss, summarize, or draft does
 not; an explicit instruction not to start always wins. The supervisor validates
 the exact plan version/hash and required confirmation bit, but does not
 independently attest an OS-level human keystroke. Unless
-`[architect.reviewer]` is configured explicitly, the reviewer follows the
-selected architect adapter and those effective model/effort settings.
+`[architect.reviewer]` is configured explicitly, the reviewer always uses
+Claude `opus` with `xhigh` effort and skipped native permission prompts,
+independent of the selected Architect and its profile overrides.
 
 The Codex Architect's private per-run `CODEX_HOME` records the exact invocation
 directory as native `untrusted`. This avoids a repeated first-use folder-trust

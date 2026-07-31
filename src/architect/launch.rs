@@ -89,10 +89,9 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
             profiles: SessionInvocationProfiles::for_architect(architect_adapter),
             config_path: PathBuf::from("<built-in defaults>"),
             loaded_from_file: false,
-            reviewer_explicit: false,
         },
     };
-    apply_architect_cli_overrides(&args, &mut loaded.profiles, loaded.reviewer_explicit)?;
+    apply_architect_cli_overrides(&args, &mut loaded.profiles)?;
     validate_foreground_terminal()?;
 
     let project_root = canonical_project_directory(&std::env::current_dir()?)?;
@@ -481,7 +480,6 @@ impl Drop for SessionSupervisorThread {
 fn apply_architect_cli_overrides(
     args: &ArchitectArgs,
     profiles: &mut SessionInvocationProfiles,
-    reviewer_explicit: bool,
 ) -> Result<()> {
     let adapter = ArchitectAdapter::parse(&args.adapter)?;
     if profiles.architect.adapter() != adapter {
@@ -534,9 +532,6 @@ fn apply_architect_cli_overrides(
                 profile.effort.clone_from(effort);
             }
         }
-    }
-    if !reviewer_explicit {
-        profiles.inherit_reviewer_from_architect();
     }
     profiles.validate()
 }
@@ -2407,20 +2402,23 @@ mod tests {
         .unwrap();
         let mut profiles = SessionInvocationProfiles::default();
         let developer_before = profiles.developer.clone();
-        apply_architect_cli_overrides(&args, &mut profiles, false).unwrap();
+        let reviewer_before = profiles.reviewer.clone();
+        apply_architect_cli_overrides(&args, &mut profiles).unwrap();
         let architect = profiles.architect.codex().unwrap();
         assert_eq!(architect.model, "gpt-5.6-sol-cli");
         assert_eq!(architect.reasoning_effort, "max");
         assert_eq!(architect.sandbox, CodexSandbox::DangerFullAccess);
         assert_eq!(architect.approval_policy, CodexApprovalPolicy::Never);
         assert_eq!(profiles.developer, developer_before);
-        let reviewer = profiles.reviewer.codex().unwrap();
-        assert_eq!(reviewer.model, architect.model);
-        assert_eq!(reviewer.reasoning_effort, architect.reasoning_effort);
+        assert_eq!(profiles.reviewer, reviewer_before);
+        let reviewer = profiles.reviewer.claude().unwrap();
+        assert_eq!(reviewer.model, "opus");
+        assert_eq!(reviewer.effort, "xhigh");
+        assert!(reviewer.dangerously_skip_permissions);
     }
 
     #[test]
-    fn claude_cli_overrides_flow_to_an_implicit_reviewer_only() {
+    fn claude_cli_overrides_do_not_change_the_implicit_reviewer() {
         let args = ArchitectArgs::try_parse_from([
             "hcom architect",
             "claude",
@@ -2432,24 +2430,27 @@ mod tests {
         .unwrap();
         let mut profiles = SessionInvocationProfiles::for_architect(ArchitectAdapter::Claude);
         let developer_before = profiles.developer.clone();
-        apply_architect_cli_overrides(&args, &mut profiles, false).unwrap();
+        let reviewer_before = profiles.reviewer.clone();
+        apply_architect_cli_overrides(&args, &mut profiles).unwrap();
         let architect = profiles.architect.claude().unwrap();
         let reviewer = profiles.reviewer.claude().unwrap();
         assert_eq!(architect.model, "sonnet");
         assert_eq!(architect.effort, "max");
-        assert_eq!(reviewer.model, architect.model);
-        assert_eq!(reviewer.effort, architect.effort);
+        assert_eq!(profiles.reviewer, reviewer_before);
+        assert_eq!(reviewer.model, "opus");
+        assert_eq!(reviewer.effort, "xhigh");
+        assert!(reviewer.dangerously_skip_permissions);
         assert_eq!(profiles.developer, developer_before);
 
         let invalid =
             ArchitectArgs::try_parse_from(["hcom architect", "claude", "--reasoning", "xhigh"])
                 .unwrap();
-        assert!(apply_architect_cli_overrides(&invalid, &mut profiles, false).is_err());
+        assert!(apply_architect_cli_overrides(&invalid, &mut profiles).is_err());
     }
 
     #[test]
-    fn explicit_reviewer_is_not_replaced_by_architect_cli_overrides() {
-        let args = ArchitectArgs::try_parse_from([
+    fn explicit_reviewers_are_not_replaced_by_architect_cli_overrides() {
+        let codex_args = ArchitectArgs::try_parse_from([
             "hcom architect",
             "codex",
             "--model",
@@ -2458,15 +2459,59 @@ mod tests {
             "max",
         ])
         .unwrap();
-        let mut profiles = SessionInvocationProfiles {
+        let mut codex_profiles = SessionInvocationProfiles {
             reviewer: ReviewerInvocationProfile::Claude {
-                profile: crate::worker::profile::ClaudeInvocationProfile::reviewer_default(),
+                profile: crate::worker::profile::ClaudeInvocationProfile {
+                    model: "sonnet".into(),
+                    effort: "low".into(),
+                    dangerously_skip_permissions: false,
+                },
             },
             ..SessionInvocationProfiles::default()
         };
-        let reviewer_before = profiles.reviewer.clone();
-        apply_architect_cli_overrides(&args, &mut profiles, true).unwrap();
-        assert_eq!(profiles.reviewer, reviewer_before);
+        let reviewer_before = codex_profiles.reviewer.clone();
+        apply_architect_cli_overrides(&codex_args, &mut codex_profiles).unwrap();
+        assert_eq!(codex_profiles.reviewer, reviewer_before);
+
+        let claude_args = ArchitectArgs::try_parse_from([
+            "hcom architect",
+            "claude",
+            "--model",
+            "sonnet",
+            "--effort",
+            "max",
+        ])
+        .unwrap();
+        let mut claude_profiles = SessionInvocationProfiles {
+            reviewer: ReviewerInvocationProfile::Codex {
+                profile: CodexInvocationProfile {
+                    model: "gpt-5.6-sol-reviewer".into(),
+                    reasoning_effort: "low".into(),
+                    sandbox: CodexSandbox::WorkspaceWrite,
+                    approval_policy: CodexApprovalPolicy::OnRequest,
+                },
+            },
+            ..SessionInvocationProfiles::for_architect(ArchitectAdapter::Claude)
+        };
+        let reviewer_before = claude_profiles.reviewer.clone();
+        apply_architect_cli_overrides(&claude_args, &mut claude_profiles).unwrap();
+        assert_eq!(claude_profiles.reviewer, reviewer_before);
+    }
+
+    #[test]
+    fn startup_summary_reports_the_claude_reviewer_default_for_both_architects() {
+        for adapter in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
+            let profiles = SessionInvocationProfiles::for_architect(adapter);
+            let mut output = Vec::new();
+            write_profile_summary(&mut output, &profiles).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(
+                output.contains(
+                    "reviewer profile: claude model=opus effort=xhigh dangerously_skip_permissions=true"
+                ),
+                "summary={output}"
+            );
+        }
     }
 
     #[test]

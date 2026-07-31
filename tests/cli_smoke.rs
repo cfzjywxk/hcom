@@ -441,6 +441,13 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
         "stdout={stdout}"
     );
     assert!(
+        stdout.contains(
+            "reviewer is always Claude opus/xhigh with\n\
+             dangerously-skip-permissions"
+        ),
+        "stdout={stdout}"
+    );
+    assert!(
         stdout.contains("native")
             && stdout.contains("untrusted, avoiding")
             && stdout.contains("repeated folder-trust prompt")

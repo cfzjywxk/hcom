@@ -365,32 +365,11 @@ impl SessionInvocationProfiles {
                 profile: ClaudeInvocationProfile::architect_default(),
             },
         };
-        let mut profiles = Self {
+        Self {
             architect,
             developer: DeveloperInvocationProfile::default(),
             reviewer: ReviewerInvocationProfile::default(),
-        };
-        profiles.inherit_reviewer_from_architect();
-        profiles
-    }
-
-    pub fn inherit_reviewer_from_architect(&mut self) {
-        self.reviewer = match &self.architect {
-            ArchitectInvocationProfile::Codex { profile } => {
-                let mut reviewer = CodexInvocationProfile::reviewer_default();
-                reviewer.model.clone_from(&profile.model);
-                reviewer
-                    .reasoning_effort
-                    .clone_from(&profile.reasoning_effort);
-                ReviewerInvocationProfile::Codex { profile: reviewer }
-            }
-            ArchitectInvocationProfile::Claude { profile } => {
-                let mut reviewer = ClaudeInvocationProfile::reviewer_default();
-                reviewer.model.clone_from(&profile.model);
-                reviewer.effort.clone_from(&profile.effort);
-                ReviewerInvocationProfile::Claude { profile: reviewer }
-            }
-        };
+        }
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -485,23 +464,25 @@ mod tests {
             "xhigh"
         );
         assert_eq!(profiles.developer_adapter_name(), CODEX_DEVELOPER_ADAPTER);
-        assert_eq!(profiles.reviewer_adapter_name(), CODEX_REVIEWER_ADAPTER);
-        let reviewer = profiles.reviewer.codex().unwrap();
-        assert_eq!(reviewer.model, architect.model);
-        assert_eq!(reviewer.reasoning_effort, architect.reasoning_effort);
+        assert_eq!(profiles.reviewer_adapter_name(), CLAUDE_REVIEWER_ADAPTER);
+        let reviewer = profiles.reviewer.claude().unwrap();
+        assert_eq!(reviewer.model, "opus");
+        assert_eq!(reviewer.effort, "xhigh");
+        assert!(reviewer.dangerously_skip_permissions);
         assert_eq!(profiles.canonical_hash().len(), 64);
     }
 
     #[test]
-    fn claude_architect_defaults_to_opus_xhigh_with_matching_reviewer() {
+    fn claude_architect_uses_the_independent_claude_reviewer_default() {
         let profiles = SessionInvocationProfiles::for_architect(ArchitectAdapter::Claude);
         profiles.validate().unwrap();
         let architect = profiles.architect.claude().unwrap();
         let reviewer = profiles.reviewer.claude().unwrap();
         assert_eq!(architect.model, "opus");
         assert_eq!(architect.effort, "xhigh");
-        assert_eq!(reviewer.model, architect.model);
-        assert_eq!(reviewer.effort, architect.effort);
+        assert_eq!(profiles.reviewer_adapter_name(), CLAUDE_REVIEWER_ADAPTER);
+        assert_eq!(reviewer.model, "opus");
+        assert_eq!(reviewer.effort, "xhigh");
         assert!(reviewer.dangerously_skip_permissions);
     }
 
