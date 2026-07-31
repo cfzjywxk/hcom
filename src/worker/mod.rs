@@ -7,12 +7,14 @@ pub mod codex;
 pub mod contract;
 pub mod environment;
 pub mod fake;
+pub mod fake_runtime;
 #[cfg(target_os = "linux")]
 pub mod process;
 pub mod profile;
 pub mod result;
 #[cfg(target_os = "linux")]
 pub mod reviewer;
+pub mod runtime;
 #[cfg(target_os = "linux")]
 pub(crate) mod sandbox;
 
@@ -31,6 +33,15 @@ pub use environment::{
 pub use process::{
     HeartbeatControl, ProcessCompletion, ProcessIdentity, ProcessRunner, RunningWorker, WorkerExit,
     WorkerTermination,
+};
+pub use runtime::{
+    AppServerWorkerProfiles, DeveloperOutcomeStatus, DeveloperOutcomeV1, OutcomeContract,
+    ReviewFindingSeverity, ReviewFindingV1, ReviewerOutcomeV1, ReviewerVerdict, RoleSessionSpec,
+    RuntimeApprovalPolicy, RuntimeContractIdentity, RuntimeError, RuntimeFailureClass,
+    RuntimeOutcome, RuntimeProfile, RuntimeProvider, RuntimeSandbox, RuntimeSessionKey,
+    RuntimeTelemetry, RuntimeThreadProfileFields, RuntimeTurnKey, RuntimeTurnPoll,
+    RuntimeTurnProfileFields, RuntimeTurnPurpose, RuntimeTurnSpec, SanitizedRuntimeFailure,
+    TaskWorkerRuntime,
 };
 
 /// Unit tests create temporary executables while other test threads are

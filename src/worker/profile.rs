@@ -372,6 +372,28 @@ impl SessionInvocationProfiles {
         }
     }
 
+    /// Built-in profiles for the Codex App Server task-runtime lane.
+    ///
+    /// This is intentionally separate from [`Self::for_architect`] while the
+    /// released CLI worker path is retained. Production selects this resolver
+    /// only when the App Server integration phase is enabled.
+    pub fn for_codex_app_server_lane(adapter: ArchitectAdapter) -> Result<Self> {
+        if adapter != ArchitectAdapter::Codex {
+            bail!("the Codex App Server task-runtime lane requires a Codex architect");
+        }
+        Ok(Self {
+            architect: ArchitectInvocationProfile::Codex {
+                profile: CodexInvocationProfile::architect_default(),
+            },
+            developer: DeveloperInvocationProfile::Codex {
+                profile: CodexInvocationProfile::developer_default(),
+            },
+            reviewer: ReviewerInvocationProfile::Codex {
+                profile: CodexInvocationProfile::reviewer_default(),
+            },
+        })
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.architect.validate()?;
         self.developer.validate()?;
@@ -484,6 +506,31 @@ mod tests {
         assert_eq!(reviewer.model, "opus");
         assert_eq!(reviewer.effort, "xhigh");
         assert!(reviewer.dangerously_skip_permissions);
+    }
+
+    #[test]
+    fn codex_app_server_lane_defaults_both_workers_to_exact_codex_profiles() {
+        let profiles =
+            SessionInvocationProfiles::for_codex_app_server_lane(ArchitectAdapter::Codex).unwrap();
+        profiles.validate().unwrap();
+        assert_eq!(profiles.developer_adapter_name(), CODEX_DEVELOPER_ADAPTER);
+        assert_eq!(profiles.reviewer_adapter_name(), CODEX_REVIEWER_ADAPTER);
+        assert_eq!(
+            profiles.developer.codex().unwrap(),
+            profiles.reviewer.codex().unwrap()
+        );
+        assert_eq!(
+            profiles.developer.codex().unwrap(),
+            &CodexInvocationProfile {
+                model: "gpt-5.6-sol".into(),
+                reasoning_effort: "xhigh".into(),
+                sandbox: CodexSandbox::DangerFullAccess,
+                approval_policy: CodexApprovalPolicy::Never,
+            }
+        );
+        assert!(
+            SessionInvocationProfiles::for_codex_app_server_lane(ArchitectAdapter::Claude).is_err()
+        );
     }
 
     #[test]

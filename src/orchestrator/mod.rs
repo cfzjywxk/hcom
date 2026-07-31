@@ -1,5 +1,7 @@
 //! Foreground, in-memory task supervisor for one `hcom arch` invocation.
 
+pub mod core;
+
 use crate::artifact::{
     ArtifactAttempt, ArtifactRoot, ArtifactScope, ManifestMetadata, TurnManifest,
 };
