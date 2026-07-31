@@ -1,4 +1,4 @@
-//! Foreground, in-memory task supervisor for one `hcom architect` invocation.
+//! Foreground, in-memory task supervisor for one `hcom arch` invocation.
 
 use crate::artifact::{
     ArtifactAttempt, ArtifactRoot, ArtifactScope, ManifestMetadata, TurnManifest,
@@ -292,6 +292,7 @@ pub(crate) struct SessionMetrics {
     pub(crate) developer_spawns: u64,
     pub(crate) reviewer_spawns: u64,
     pub(crate) worker_retries: u64,
+    pub(crate) developer_recoveries: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,6 +304,7 @@ pub(crate) struct SpawnAudit {
     pub(crate) turn_sequence: u32,
     pub(crate) attempt: u32,
     pub(crate) resume: bool,
+    pub(crate) developer_recovery: bool,
     pub(crate) workspace_cwd: PathBuf,
     pub(crate) prompt_in_argv: bool,
 }
@@ -344,6 +346,7 @@ struct TaskRuntime {
     developer: WorkerSession,
     reviewer: WorkerSession,
     last_review: Option<ReviewerResult>,
+    developer_recovery: Option<DeveloperRecoveryCheckpoint>,
     outcome_detail: Option<String>,
 }
 
@@ -358,6 +361,7 @@ impl TaskRuntime {
             developer: WorkerSession::fresh(),
             reviewer: WorkerSession::fresh(),
             last_review: None,
+            developer_recovery: None,
             outcome_detail: None,
         }
     }
@@ -375,6 +379,27 @@ impl TaskRuntime {
             WorkerRole::Reviewer => &mut self.reviewer,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeveloperCheckoutState {
+    branch: String,
+    head: String,
+    dirty_paths: Vec<String>,
+    state_hash: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeveloperRecoveryCause {
+    UncommittedChanges,
+    InvalidCompletionResult,
+    InterruptedWithUncommittedChanges,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeveloperRecoveryCheckpoint {
+    cause: DeveloperRecoveryCause,
+    checkout: DeveloperCheckoutState,
 }
 
 #[derive(Clone)]
@@ -660,7 +685,9 @@ impl SessionSupervisor {
             bail!("approved worker adapter failed its authentication readiness gate");
         }
         for repository in self.repositories.values() {
-            repository.require_current_exact()?;
+            repository
+                .require_current_exact()
+                .context("task repository drifted between plan binding and run start")?;
         }
         let first = self
             .tasks
@@ -834,10 +861,22 @@ impl SessionSupervisor {
             .head_revision
             .clone()
             .unwrap_or_else(|| base_revision.clone());
-        self.repositories
+        let developer_recovery = (role == WorkerRole::Developer)
+            .then(|| task.developer_recovery.clone())
+            .flatten();
+        let repository = self
+            .repositories
             .get(Path::new(&task.spec.repository_root))
-            .ok_or_else(|| anyhow!("task repository disappeared"))?
-            .require_exact(&expected_head)?;
+            .ok_or_else(|| anyhow!("task repository disappeared"))?;
+        if let Some(checkpoint) = &developer_recovery {
+            repository
+                .repository
+                .require_developer_recovery_checkpoint(checkpoint)?;
+        } else {
+            repository.require_exact(&expected_head).context(
+                "external concurrent drift changed the task repository before worker start",
+            )?;
+        }
 
         let (turn_sequence, attempt, review_round, must_resume) = match retry {
             Some(retry) => (
@@ -864,6 +903,9 @@ impl SessionSupervisor {
         let native_session_id = session.native_session_id.clone();
         if must_resume && native_session_id.is_none() {
             bail!("resume retry lost its exact native session");
+        }
+        if developer_recovery.is_some() && !must_resume {
+            bail!("developer recovery lost its exact resume requirement");
         }
         let scope = ArtifactScope {
             run_id: self.startup.run_id.clone(),
@@ -929,6 +971,7 @@ impl SessionSupervisor {
             turn_sequence,
             attempt,
             resume: must_resume,
+            developer_recovery: developer_recovery.is_some(),
             workspace_cwd: prepared.command().workspace_cwd.clone(),
             prompt_in_argv: argv
                 .iter()
@@ -1048,6 +1091,16 @@ impl SessionSupervisor {
             Ok(completion) => completion,
             Err(error) => {
                 self.completion_gate.abandon(&active.token);
+                match self.try_schedule_developer_recovery(
+                    &active,
+                    active.control.native_session_id.as_deref(),
+                    false,
+                    true,
+                ) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(recovery_error) => return Err(recovery_error),
+                }
                 self.schedule_runtime_retry(&active, None, None)?;
                 let _ = error;
                 return Ok(());
@@ -1057,10 +1110,22 @@ impl SessionSupervisor {
             || completion.exit.code != Some(0)
             || completion.exit.signal.is_some()
         {
-            let observed = observe_native_session(active.adapter.as_ref(), &completion);
+            let observed = match observe_native_session(active.adapter.as_ref(), &completion) {
+                Ok(observed) => observed,
+                Err(error) => {
+                    self.completion_gate.abandon(&active.token);
+                    self.needs_human("worker output contained ambiguous native session identities");
+                    return Err(error).context("worker session observation was ambiguous");
+                }
+            };
             let failure_detail =
                 terminal_process_failure(&completion.exit, completion.artifacts.stderr());
             self.completion_gate.abandon(&active.token);
+            match self.try_schedule_developer_recovery(&active, observed.as_deref(), false, true) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => return Err(error),
+            }
             self.schedule_runtime_retry(
                 &active,
                 observed.as_deref(),
@@ -1068,16 +1133,77 @@ impl SessionSupervisor {
             )?;
             return Ok(());
         }
-        let native = active
+        let native = match active
             .adapter
             .extract_result(&active.control, &completion.artifacts)
-            .context("worker result failed its exact adapter contract")?;
+        {
+            Ok(native) => native,
+            Err(error) => {
+                let observed = if active.role == WorkerRole::Developer {
+                    match observe_native_session(active.adapter.as_ref(), &completion) {
+                        Ok(observed) => observed,
+                        Err(observation_error) => {
+                            self.completion_gate.abandon(&active.token);
+                            self.needs_human(
+                                "developer result was invalid and its native session identity \
+was ambiguous",
+                            );
+                            return Err(observation_error)
+                                .context("developer recovery session observation was ambiguous");
+                        }
+                    }
+                } else {
+                    None
+                };
+                match self.try_schedule_developer_recovery(
+                    &active,
+                    observed.as_deref(),
+                    true,
+                    false,
+                ) {
+                    Ok(true) => {
+                        self.completion_gate.abandon(&active.token);
+                        return Ok(());
+                    }
+                    Ok(false) => {
+                        return Err(error)
+                            .context("worker result failed its exact adapter contract");
+                    }
+                    Err(recovery_error) => {
+                        self.completion_gate.abandon(&active.token);
+                        return Err(recovery_error);
+                    }
+                }
+            }
+        };
         if native.role() != active.role {
             self.completion_gate.abandon(&active.token);
             self.needs_human("worker returned the wrong role");
             bail!("worker result role mismatch")
         }
         self.bind_native_session(active.task_index, active.role, native.native_session_id())?;
+        if matches!(
+            &native,
+            NativeResult::Developer { result, .. }
+                if result.decision == DeveloperDecision::Completed
+        ) {
+            match self.try_schedule_developer_recovery(
+                &active,
+                Some(native.native_session_id()),
+                false,
+                false,
+            ) {
+                Ok(true) => {
+                    self.completion_gate.abandon(&active.token);
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    self.completion_gate.abandon(&active.token);
+                    return Err(error);
+                }
+            }
+        }
         let result_json = match &native {
             NativeResult::Developer { result, .. } => result.canonical_json()?,
             NativeResult::Reviewer { result, .. } => result.canonical_json()?,
@@ -1129,7 +1255,21 @@ impl SessionSupervisor {
         if !self.completion_gate.accept(&active.token) {
             bail!("duplicate or late worker completion was rejected");
         }
-        self.apply_native_result(&active, native)
+        let developer_native_session =
+            (active.role == WorkerRole::Developer).then(|| native.native_session_id().to_owned());
+        match self.apply_native_result(&active, native) {
+            Ok(()) => Ok(()),
+            Err(error) => match self.try_schedule_developer_recovery(
+                &active,
+                developer_native_session.as_deref(),
+                true,
+                false,
+            ) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(error),
+                Err(recovery_error) => Err(recovery_error),
+            },
+        }
     }
 
     fn apply_native_result(&mut self, active: &ActiveTurn, native: NativeResult) -> Result<()> {
@@ -1175,6 +1315,7 @@ impl SessionSupervisor {
                 repository.current_head.clone_from(&head);
                 let task = &mut self.tasks[active.task_index];
                 task.developer.turn_sequence = active.turn_sequence;
+                task.developer_recovery = None;
                 task.head_revision = Some(head);
                 task.state = TaskState::Reviewing;
                 self.retry = None;
@@ -1521,16 +1662,35 @@ impl SessionSupervisor {
             task: &'a TaskDraft,
             base_revision: &'a str,
             head_revision: Option<&'a str>,
+            recovery_head: Option<&'a str>,
+            uncommitted_paths: Option<&'a [String]>,
             review_round: u32,
             max_review_rounds: u8,
             prior_review: Option<&'a ReviewerResult>,
             requirements: &'static [&'static str],
         }
         let task = &self.tasks[task_index];
-        let turn_phase = match (role, task.last_review.as_ref()) {
-            (WorkerRole::Developer, None) => "initial_development",
-            (WorkerRole::Developer, Some(_)) => "fix_after_request_changes",
-            (WorkerRole::Reviewer, _) => "independent_review",
+        let turn_phase = match (
+            role,
+            task.developer_recovery
+                .as_ref()
+                .map(|checkpoint| checkpoint.cause),
+            task.last_review.as_ref(),
+        ) {
+            (WorkerRole::Developer, Some(DeveloperRecoveryCause::UncommittedChanges), _) => {
+                "recover_uncommitted_developer_result"
+            }
+            (WorkerRole::Developer, Some(DeveloperRecoveryCause::InvalidCompletionResult), _) => {
+                "recover_invalid_developer_result"
+            }
+            (
+                WorkerRole::Developer,
+                Some(DeveloperRecoveryCause::InterruptedWithUncommittedChanges),
+                _,
+            ) => "recover_interrupted_developer_result",
+            (WorkerRole::Developer, None, None) => "initial_development",
+            (WorkerRole::Developer, None, Some(_)) => "fix_after_request_changes",
+            (WorkerRole::Reviewer, _, _) => "independent_review",
         };
         let prompt = Prompt {
             contract: "hcom-session-worker-turn-v1",
@@ -1545,13 +1705,65 @@ impl SessionSupervisor {
                 .as_deref()
                 .ok_or_else(|| anyhow!("task prompt lost base revision"))?,
             head_revision: task.head_revision.as_deref(),
+            recovery_head: task
+                .developer_recovery
+                .as_ref()
+                .map(|checkpoint| checkpoint.checkout.head.as_str()),
+            uncommitted_paths: task
+                .developer_recovery
+                .as_ref()
+                .filter(|checkpoint| !checkpoint.checkout.dirty_paths.is_empty())
+                .map(|checkpoint| checkpoint.checkout.dirty_paths.as_slice()),
             review_round,
             max_review_rounds: task.spec.max_review_rounds,
             prior_review: (role == WorkerRole::Developer)
                 .then_some(task.last_review.as_ref())
                 .flatten(),
-            requirements: match role {
-                WorkerRole::Developer if task.last_review.is_none() => &[
+            requirements: match (
+                role,
+                task.developer_recovery
+                    .as_ref()
+                    .map(|checkpoint| checkpoint.cause),
+            ) {
+                (WorkerRole::Developer, Some(DeveloperRecoveryCause::UncommittedChanges)) => &[
+                    "The previous developer process exited successfully but left uncommitted changes confined to the approved allowed paths. This is exactly one automatic exact-session recovery turn before needs_human.",
+                    "Continue from the existing repository state and preserve the current bounded diff. Do not stash, discard, reset, checkout, restore, rebase, merge, or overwrite it.",
+                    "Inspect the existing changes, finish the approved task, and correct only issues within the original objective and allowed paths.",
+                    "Never claim, simulate, anticipate, or perform reviewer work.",
+                    "Do not start, invoke, delegate to, or wait for any sub-agent or reviewer.",
+                    "Run every required check and report each command under its exact approved string.",
+                    "For a completed result, commits must list every commit in chronological base_revision..HEAD order, and changed_paths must list the complete union over that same full task range.",
+                    "Commit the bounded work and return a clean HEAD that fast-forwards the exact task base and any prior reviewed HEAD.",
+                    "Do not push, install, expand scope, or modify files outside the approved allowed paths.",
+                ],
+                (WorkerRole::Developer, Some(DeveloperRecoveryCause::InvalidCompletionResult)) => {
+                    &[
+                        "The previous developer process exited, but its completion result failed exact validation while the repository remained within the approved branch, history, and path scope. This is exactly one automatic exact-session recovery turn before needs_human.",
+                        "Continue the same native session from the exact recovery_head. Inspect the existing repository state; preserve any correct bounded work and do not reset, rebase, merge, or discard it.",
+                        "Finish any missing approved work, run every required check, commit any remaining bounded changes, and return one valid completed result.",
+                        "Never claim, simulate, anticipate, or perform reviewer work.",
+                        "Do not start, invoke, delegate to, or wait for any sub-agent or reviewer.",
+                        "Report every required check under its exact approved command string.",
+                        "Commits must list every commit in chronological base_revision..HEAD order, and changed_paths must list the complete union over that same full task range.",
+                        "Return a clean HEAD that fast-forwards the exact task base and any prior reviewed HEAD.",
+                        "Do not push, install, expand scope, or modify files outside the approved allowed paths.",
+                    ]
+                }
+                (
+                    WorkerRole::Developer,
+                    Some(DeveloperRecoveryCause::InterruptedWithUncommittedChanges),
+                ) => &[
+                    "The previous developer process was interrupted after leaving uncommitted changes confined to the approved allowed paths. This is exactly one automatic exact-session recovery turn before needs_human.",
+                    "Continue the same native session from the exact recovery_head and preserve the current bounded diff. Do not stash, discard, reset, checkout, restore, rebase, merge, or overwrite it.",
+                    "Inspect the existing changes, finish the approved task, and correct only issues within the original objective and allowed paths.",
+                    "Never claim, simulate, anticipate, or perform reviewer work.",
+                    "Do not start, invoke, delegate to, or wait for any sub-agent or reviewer.",
+                    "Run every required check and report each command under its exact approved string.",
+                    "For a completed result, commits must list every commit in chronological base_revision..HEAD order, and changed_paths must list the complete union over that same full task range.",
+                    "Commit the bounded work and return a clean HEAD that fast-forwards the exact task base and any prior reviewed HEAD.",
+                    "Do not push, install, expand scope, or modify files outside the approved allowed paths.",
+                ],
+                (WorkerRole::Developer, None) if task.last_review.is_none() => &[
                     "This is exactly one initial developer turn; stop after completing and committing only the current developer stage.",
                     "The native CLI starts in project_root for context. Apply code changes only in repository_root; use absolute paths or git -C repository_root as needed.",
                     "There has been no reviewer turn. Never claim, simulate, anticipate, or perform reviewer work.",
@@ -1563,7 +1775,7 @@ impl SessionSupervisor {
                     "Return a clean committed HEAD that fast-forwards the exact task base.",
                     "Do not push, install, reset, rebase, merge, or expand scope.",
                 ],
-                WorkerRole::Developer => &[
+                (WorkerRole::Developer, None) => &[
                     "This is exactly one resumed developer turn after the prior reviewer request_changes.",
                     "The native CLI remains in project_root for context. Apply fixes only in repository_root; use absolute paths or git -C repository_root as needed.",
                     "Address only the supplied prior_review findings within the approved task and allowed paths.",
@@ -1575,7 +1787,7 @@ impl SessionSupervisor {
                     "Commit the bounded fix and return a clean HEAD that fast-forwards both the task base and prior reviewed HEAD.",
                     "Do not push, install, reset, rebase, merge, or expand scope.",
                 ],
-                WorkerRole::Reviewer => &[
+                (WorkerRole::Reviewer, _) => &[
                     "This is exactly one independent reviewer turn; review only the exact bound HEAD, task, history, and acceptance criteria.",
                     "The native CLI starts in project_root for context. Inspect the exact repository_root without changing it.",
                     "Keep the canonical repository source and Git state unchanged. Run checks directly against repository_root; do not copy the source checkout elsewhere.",
@@ -1616,6 +1828,144 @@ impl SessionSupervisor {
                 Ok(())
             }
         }
+    }
+
+    fn try_schedule_developer_recovery(
+        &mut self,
+        active: &ActiveTurn,
+        observed_native_session: Option<&str>,
+        allow_clean: bool,
+        process_failed: bool,
+    ) -> Result<bool> {
+        if active.role != WorkerRole::Developer {
+            return Ok(false);
+        }
+        let task = &self.tasks[active.task_index];
+        let base = task
+            .base_revision
+            .as_deref()
+            .ok_or_else(|| anyhow!("developer recovery lost the task base"))?;
+        let turn_start_head = task.head_revision.as_deref().unwrap_or(base);
+        let repository_root = Path::new(&task.spec.repository_root);
+        let repository = self
+            .repositories
+            .get(repository_root)
+            .ok_or_else(|| anyhow!("developer recovery repository disappeared"))?;
+        let existing_recovery = task.developer_recovery.is_some();
+        let checkpoint = match repository.repository.inspect_developer_recovery(
+            &repository.branch,
+            base,
+            turn_start_head,
+            &task.spec.allowed_paths,
+            allow_clean || (process_failed && existing_recovery),
+        ) {
+            Ok(Some(checkout)) => DeveloperRecoveryCheckpoint {
+                cause: if process_failed && !checkout.dirty_paths.is_empty() {
+                    DeveloperRecoveryCause::InterruptedWithUncommittedChanges
+                } else if checkout.dirty_paths.is_empty() {
+                    DeveloperRecoveryCause::InvalidCompletionResult
+                } else {
+                    DeveloperRecoveryCause::UncommittedChanges
+                },
+                checkout,
+            },
+            Ok(None) => return Ok(false),
+            Err(error) => {
+                self.needs_human(&truncate_status_detail(format!(
+                    "developer checkout is not eligible for automatic recovery: {error}"
+                )));
+                return Err(error).context("developer checkout recovery gate rejected the result");
+            }
+        };
+        if existing_recovery && !process_failed {
+            let detail = if checkpoint.checkout.dirty_paths.is_empty() {
+                "developer still returned an invalid completion result after the automatic \
+exact-session recovery"
+                    .into()
+            } else {
+                format!(
+                    "developer still failed completion validation after the automatic \
+exact-session recovery; uncommitted paths: {}",
+                    checkpoint.checkout.dirty_paths.join(", ")
+                )
+            };
+            self.needs_human(&truncate_status_detail(detail));
+            return Ok(true);
+        }
+        if let Some(native_session_id) = observed_native_session
+            && let Err(error) = self.bind_native_session(
+                active.task_index,
+                WorkerRole::Developer,
+                native_session_id,
+            )
+        {
+            self.needs_human(
+                "developer checkout was recoverable, but its exact native session identity \
+changed",
+            );
+            return Err(error).context("developer recovery session identity mismatch");
+        }
+        if self.tasks[active.task_index]
+            .developer
+            .native_session_id
+            .is_none()
+        {
+            self.needs_human(
+                "developer checkout was recoverable, but its exact native session identity could \
+not be proven",
+            );
+            return Ok(true);
+        }
+        if existing_recovery {
+            let task = &mut self.tasks[active.task_index];
+            task.outcome_detail = Some(truncate_status_detail(format!(
+                "developer recovery process was interrupted; its exact-session retry will \
+preserve the current bounded checkout state{}",
+                if checkpoint.checkout.dirty_paths.is_empty() {
+                    String::new()
+                } else {
+                    format!(" for: {}", checkpoint.checkout.dirty_paths.join(", "))
+                }
+            )));
+            task.developer_recovery = Some(checkpoint);
+            self.bump_version()?;
+            return Ok(false);
+        }
+        let next_sequence = active
+            .turn_sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("developer recovery turn sequence overflow"))?;
+        let task = &mut self.tasks[active.task_index];
+        task.developer.turn_sequence = active.turn_sequence;
+        task.outcome_detail = Some(truncate_status_detail(match checkpoint.cause {
+            DeveloperRecoveryCause::UncommittedChanges => format!(
+                "developer left uncommitted allowed-path changes; automatic exact-session \
+recovery scheduled for: {}",
+                checkpoint.checkout.dirty_paths.join(", ")
+            ),
+            DeveloperRecoveryCause::InvalidCompletionResult => {
+                "developer completion result failed validation while the checkout remained \
+in scope; automatic exact-session recovery scheduled"
+                    .into()
+            }
+            DeveloperRecoveryCause::InterruptedWithUncommittedChanges => format!(
+                "developer process was interrupted with uncommitted allowed-path changes; \
+automatic exact-session recovery scheduled for: {}",
+                checkpoint.checkout.dirty_paths.join(", ")
+            ),
+        }));
+        task.developer_recovery = Some(checkpoint);
+        self.retry = Some(RetryTurn {
+            task_index: active.task_index,
+            role: WorkerRole::Developer,
+            turn_sequence: next_sequence,
+            next_attempt: 1,
+            review_round: active.review_round,
+            must_resume: true,
+        });
+        self.metrics.developer_recoveries = self.metrics.developer_recoveries.saturating_add(1);
+        self.bump_version()?;
+        Ok(true)
     }
 
     fn schedule_spawn_retry(
@@ -1742,7 +2092,7 @@ impl Drop for SessionSupervisor {
 fn observe_native_session(
     adapter: &dyn WorkerAdapter,
     completion: &ProcessCompletion,
-) -> Option<String> {
+) -> Result<Option<String>> {
     let mut records = Vec::new();
     records.push(completion.artifacts.stdout());
     records.extend(
@@ -1762,7 +2112,10 @@ fn observe_native_session(
             }
         }
     }
-    (observed.len() == 1).then(|| observed.into_iter().next().expect("one observed session"))
+    if observed.len() > 1 {
+        bail!("worker output contains multiple native session identities");
+    }
+    Ok(observed.into_iter().next())
 }
 
 struct CanonicalRepository {
@@ -1896,7 +2249,7 @@ impl CanonicalRepository {
                 .context("unsafe canonical checkout object directory")?,
         };
         repository.reject_indirections()?;
-        repository.require_clean()?;
+        repository.require_clean_start()?;
         Ok(repository)
     }
 
@@ -1951,6 +2304,26 @@ impl CanonicalRepository {
         Ok(())
     }
 
+    fn require_clean_start(&self) -> Result<()> {
+        let runner = GitRunner {
+            git: &self.git,
+            root: &self.root,
+        };
+        if !runner
+            .success(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?
+            .is_empty()
+        {
+            bail!("task repository is dirty before plan start");
+        }
+        if !runner
+            .success(&["for-each-ref", "--format=%(refname)", "refs/replace/"])?
+            .is_empty()
+        {
+            bail!("task repository contains replacement refs before plan start");
+        }
+        Ok(())
+    }
+
     fn require_exact(&self, branch: &str, head: &str) -> Result<()> {
         self.revalidate_identity()?;
         self.require_clean()?;
@@ -1959,6 +2332,204 @@ impl CanonicalRepository {
         }
         self.revalidate_identity()?;
         self.require_clean()
+    }
+
+    fn inspect_developer_recovery(
+        &self,
+        branch: &str,
+        base: &str,
+        turn_start_head: &str,
+        allowed_paths: &[String],
+        allow_clean: bool,
+    ) -> Result<Option<DeveloperCheckoutState>> {
+        let checkpoint = self.stable_developer_checkout_state()?;
+        if checkpoint.dirty_paths.is_empty() && !allow_clean {
+            return Ok(None);
+        }
+        if checkpoint.branch != branch {
+            bail!("developer changed the canonical checkout branch");
+        }
+        let runner = GitRunner {
+            git: &self.git,
+            root: &self.root,
+        };
+        for (label, ancestor) in [
+            ("task base", base),
+            ("same-task turn-start HEAD", turn_start_head),
+        ] {
+            let relation =
+                runner.run(&["merge-base", "--is-ancestor", ancestor, &checkpoint.head])?;
+            if relation.status.code() != Some(0) || !relation.stderr.is_empty() {
+                bail!("developer rewrote or diverged from the exact {label}");
+            }
+        }
+        require_changed_paths_in_scope(&checkpoint.dirty_paths, allowed_paths).context(
+            "developer left uncommitted changes outside the explicitly approved task scope",
+        )?;
+        let range = format!("{base}..{}", checkpoint.head);
+        let committed_paths = parse_nul_paths(&runner.success(&[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            &range,
+            "--",
+        ])?)?;
+        require_changed_paths_in_scope(&committed_paths, allowed_paths)
+            .context("developer committed changes outside the explicitly approved task scope")?;
+        Ok(Some(checkpoint))
+    }
+
+    fn require_developer_recovery_checkpoint(
+        &self,
+        expected: &DeveloperRecoveryCheckpoint,
+    ) -> Result<()> {
+        let current = self.stable_developer_checkout_state()?;
+        if current != expected.checkout {
+            bail!(
+                "external concurrent drift changed the developer checkout after its recovery \
+checkpoint"
+            );
+        }
+        Ok(())
+    }
+
+    fn stable_developer_checkout_state(&self) -> Result<DeveloperCheckoutState> {
+        let first = self.capture_developer_checkout_state()?;
+        let second = self.capture_developer_checkout_state()?;
+        if first != second {
+            bail!("external concurrent drift changed the developer checkout while it was observed");
+        }
+        Ok(second)
+    }
+
+    fn capture_developer_checkout_state(&self) -> Result<DeveloperCheckoutState> {
+        self.revalidate_identity()?;
+        let runner = GitRunner {
+            git: &self.git,
+            root: &self.root,
+        };
+        if !runner
+            .success(&["for-each-ref", "--format=%(refname)", "refs/replace/"])?
+            .is_empty()
+        {
+            bail!("developer repository contains replacement refs");
+        }
+        let branch = self.branch()?;
+        let head = self.head()?;
+        let status =
+            runner.success(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
+        let conflicts = runner.success(&[
+            "diff",
+            "--name-only",
+            "-z",
+            "--diff-filter=U",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--",
+        ])?;
+        if !conflicts.is_empty() {
+            bail!("developer left unresolved index conflicts");
+        }
+        let mut dirty_paths = parse_nul_paths(&runner.success(&[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "HEAD",
+            "--",
+        ])?)?;
+        dirty_paths.extend(parse_nul_paths(&runner.success(&[
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+        ])?)?);
+        dirty_paths.sort();
+        dirty_paths.dedup();
+        if status.is_empty() != dirty_paths.is_empty() {
+            bail!("developer checkout has an unsupported or unstable dirty-state shape");
+        }
+
+        let index = if dirty_paths.is_empty() {
+            Vec::new()
+        } else {
+            let mut indexed_arguments = vec![
+                "ls-files".to_owned(),
+                "--stage".to_owned(),
+                "-z".to_owned(),
+                "--".to_owned(),
+            ];
+            indexed_arguments.extend(dirty_paths.iter().cloned());
+            let indexed_arguments: Vec<_> = indexed_arguments.iter().map(String::as_str).collect();
+            runner.success(&indexed_arguments)?
+        };
+
+        let mut hashed_paths = Vec::new();
+        let mut file_evidence = Vec::new();
+        for path in &dirty_paths {
+            let metadata = match fs::symlink_metadata(self.root.join(path)) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    file_evidence.push((path.clone(), 0, 0, None));
+                    continue;
+                }
+                Err(error) => return Err(error).context("failed to inspect developer dirty path"),
+            };
+            if !(metadata.file_type().is_file() || metadata.file_type().is_symlink()) {
+                bail!("developer dirty state contains an unsupported non-file path");
+            }
+            hashed_paths.push(path.clone());
+            file_evidence.push((
+                path.clone(),
+                metadata.permissions().mode(),
+                metadata.len(),
+                Some(String::new()),
+            ));
+        }
+        if !hashed_paths.is_empty() {
+            let mut hash_arguments = vec![
+                "hash-object".to_owned(),
+                "--no-filters".to_owned(),
+                "--".to_owned(),
+            ];
+            hash_arguments.extend(hashed_paths.iter().cloned());
+            let hash_arguments: Vec<_> = hash_arguments.iter().map(String::as_str).collect();
+            let hashes = runner.success(&hash_arguments)?;
+            let hashes: Vec<_> = std::str::from_utf8(&hashes)?.lines().collect();
+            if hashes.len() != hashed_paths.len() {
+                bail!("developer dirty-state content hashes have an invalid shape");
+            }
+            let mut next_hash = 0usize;
+            for (_, _, _, hash) in &mut file_evidence {
+                let Some(hash) = hash else {
+                    continue;
+                };
+                validate_git_oid("developer dirty path content hash", hashes[next_hash])?;
+                hash.push_str(hashes[next_hash]);
+                next_hash += 1;
+            }
+        }
+        let state_hash = sha256_hex(&serde_json::to_vec(&(
+            "hcom-developer-recovery-checkpoint-v1",
+            &branch,
+            &head,
+            &status,
+            &index,
+            &file_evidence,
+        ))?);
+        self.revalidate_identity()?;
+        Ok(DeveloperCheckoutState {
+            branch,
+            head,
+            dirty_paths,
+            state_hash,
+        })
     }
 
     fn validate_developer_completion(
@@ -2609,6 +3180,9 @@ if "--session-id" in arguments:
 elif "--resume" in arguments:
     session_id = arguments[arguments.index("--resume") + 1]
     invocation = "resume"
+elif "--output-file" in arguments:
+    session_id = f"native-discovered-{task}-{role}"
+    invocation = "create"
 else:
     raise SystemExit(93)
 
@@ -2634,6 +3208,8 @@ with open(os.path.join(root, "audit.ndjson"), "a", encoding="utf-8") as output:
         "invocation": invocation,
         "count": count,
         "stdin_is_tty": os.isatty(0),
+        "turn_phase": prompt["turn_phase"],
+        "uncommitted_paths": prompt.get("uncommitted_paths"),
     }, separators=(",", ":")) + "\n")
 
 if behavior == "crash-once" and task == "one" and role == "developer" and count == 1:
@@ -2647,26 +3223,49 @@ if role == "developer":
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-    path = f"{task}.txt"
+    leave_dirty = (
+        (behavior == "dirty-once" and count == 1)
+        or (behavior == "dirty-twice" and count <= 2)
+        or (behavior == "dirty-crash-once" and count == 1)
+        or (behavior == "dirty-recovery-crash-once" and count <= 2)
+        or (behavior == "dirty-out-of-scope" and count == 1)
+        or (behavior == "malformed-result-dirty" and count == 1)
+        or (behavior == "missing-result-dirty" and count == 1)
+        or (behavior == "unobservable-result-dirty" and count == 1)
+        or (behavior == "ambiguous-result-dirty" and count == 1)
+    )
+    path = "outside.txt" if behavior == "dirty-out-of-scope" else f"{task}.txt"
     with open(path, "a", encoding="utf-8") as output:
         output.write(f"{invocation}-{count}\n")
-    subprocess.run(
-        ["/usr/bin/git", "add", "--", path],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    subprocess.run(
-        [
-            "/usr/bin/git",
-            "-c", "user.name=Phase 8 Fake",
-            "-c", "user.email=phase8-fake@example.invalid",
-            "commit", "-m", f"{task} developer turn {count}",
-        ],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    if (
+        (behavior == "dirty-crash-once" and count == 1)
+        or (behavior == "dirty-recovery-crash-once" and count == 2)
+    ):
+        if "--output-file" in arguments:
+            sys.stdout.write(json.dumps({
+                "type": "session_started",
+                "session_id": session_id,
+            }, separators=(",", ":")))
+            sys.stdout.flush()
+        raise SystemExit(42)
+    if not leave_dirty:
+        subprocess.run(
+            ["/usr/bin/git", "add", "--", path],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            [
+                "/usr/bin/git",
+                "-c", "user.name=Phase 8 Fake",
+                "-c", "user.email=phase8-fake@example.invalid",
+                "commit", "-m", f"{task} developer turn {count}",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     head = subprocess.check_output(
         ["/usr/bin/git", "rev-parse", "HEAD"], text=True
     ).strip()
@@ -2691,11 +3290,11 @@ if role == "developer":
         "summary": f"completed {task} turn {count}",
         "head_revision": head,
         "commits": commits,
-        "checks": [{
-            "command": "fake deterministic check",
-            "status": "passed",
-            "summary": "the deterministic fake worker completed its approved check",
-        }],
+        "checks": [] if behavior == "invalid-check-once" and count == 1 else [{
+                "command": "fake deterministic check",
+                "status": "passed",
+                "summary": "the deterministic fake worker completed its approved check",
+            }],
         "questions": [],
         "risks": [],
         "changed_paths": sorted(changed),
@@ -2703,7 +3302,19 @@ if role == "developer":
 else:
     if behavior == "slow-review":
         time.sleep(1.0)
-    request_changes = task == "one" and (behavior == "exhaust" or count == 1)
+    request_changes = (
+        task == "one"
+        and behavior not in (
+            "dirty-once",
+            "dirty-twice",
+            "dirty-crash-once",
+            "dirty-recovery-crash-once",
+            "invalid-check-once",
+            "malformed-result-dirty",
+            "missing-result-dirty",
+        )
+        and (behavior == "exhaust" or count == 1)
+    )
     if request_changes:
         result = {
             "decision": "request_changes",
@@ -2729,11 +3340,49 @@ else:
             }],
         }
 
-sys.stdout.write(json.dumps({
+envelope = json.dumps({
     "session_id": session_id,
     "role": role,
     "result": result,
-}, separators=(",", ":")))
+}, separators=(",", ":"))
+if "--output-file" in arguments:
+    output_file = arguments[arguments.index("--output-file") + 1]
+    if not (
+        behavior == "missing-result-dirty"
+        and role == "developer"
+        and count == 1
+    ):
+        with open(output_file, "w", encoding="utf-8") as output:
+            output.write(
+                "{" if (
+                    behavior in (
+                        "malformed-result-dirty",
+                        "unobservable-result-dirty",
+                        "ambiguous-result-dirty",
+                    )
+                    and role == "developer"
+                    and count == 1
+                ) else envelope
+            )
+    if behavior == "ambiguous-result-dirty" and role == "developer" and count == 1:
+        for observed_session in (session_id, "native-discovered-other-developer"):
+            sys.stdout.write(json.dumps({
+                "type": "session_started",
+                "session_id": observed_session,
+            }, separators=(",", ":")) + "\n")
+    elif behavior == "unobservable-result-dirty" and role == "developer" and count == 1:
+        sys.stdout.write(json.dumps({
+            "type": "activity",
+            "activity": "turn",
+            "message": "completed",
+        }, separators=(",", ":")))
+    else:
+        sys.stdout.write(json.dumps({
+            "type": "session_started",
+            "session_id": session_id,
+        }, separators=(",", ":")))
+else:
+    sys.stdout.write(envelope)
 "#;
 
     fn task(key: &str, max_review_rounds: u8) -> TaskDraft {
@@ -2831,8 +3480,42 @@ sys.stdout.write(json.dumps({
         .unwrap()
     }
 
+    fn open_discovered_supervisor(
+        root: &Path,
+        repository: &Path,
+        behavior: &str,
+        run_name: &str,
+        lock_root: &Path,
+    ) -> SessionSupervisor {
+        let executable = write_fake_worker(root, behavior);
+        let adapter =
+            Arc::new(FakeWorkerAdapter::discovered(executable, repository.to_owned()).unwrap());
+        let mut adapters = WorkerAdapterRegistry::default();
+        adapters.register(adapter).unwrap();
+        let run_root = private_directory(&root.join(run_name));
+        let toolchain = private_directory(&root.join(format!("{run_name}-toolchain")));
+        SessionSupervisor::open_with(
+            "run-test".into(),
+            repository.to_owned(),
+            run_root,
+            lock_root.to_owned(),
+            SessionRuntimeSources::fake(&toolchain),
+            adapters,
+            ProcessRunner::new(Duration::from_millis(10), Duration::from_millis(100)).unwrap(),
+        )
+        .unwrap()
+    }
+
     fn approve(supervisor: &mut SessionSupervisor, mut tasks: Vec<TaskDraft>) {
-        for task in &mut tasks {
+        approve_with_adapter(supervisor, &mut tasks, "fake-envelope");
+    }
+
+    fn approve_with_adapter(
+        supervisor: &mut SessionSupervisor,
+        tasks: &mut [TaskDraft],
+        adapter: &str,
+    ) {
+        for task in tasks.iter_mut() {
             task.repository_root = supervisor
                 .startup()
                 .project_root
@@ -2840,7 +3523,7 @@ sys.stdout.write(json.dumps({
                 .into_owned();
         }
         let (plan_version, plan_hash) = supervisor
-            .replace_plan(0, "fake-envelope", "fake-envelope", tasks)
+            .replace_plan(0, adapter, adapter, tasks.to_vec())
             .unwrap();
         assert_eq!(supervisor.snapshot().state, SessionState::AwaitingApproval);
         supervisor
@@ -3386,6 +4069,52 @@ sys.stdout.write(json.dumps({
                     .contains("never report only the current resumed turn delta"))
         );
 
+        supervisor.tasks[0].developer_recovery = Some(DeveloperRecoveryCheckpoint {
+            cause: DeveloperRecoveryCause::UncommittedChanges,
+            checkout: DeveloperCheckoutState {
+                branch: "master".into(),
+                head: supervisor.tasks[0].base_revision.clone().unwrap(),
+                dirty_paths: vec!["one.txt".into()],
+                state_hash: "checkpoint".into(),
+            },
+        });
+        let recovery: serde_json::Value = serde_json::from_slice(
+            &supervisor
+                .build_turn_prompt(0, WorkerRole::Developer, 1)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            recovery["turn_phase"],
+            "recover_uncommitted_developer_result"
+        );
+        assert_eq!(
+            recovery["uncommitted_paths"],
+            serde_json::json!(["one.txt"])
+        );
+        assert!(recovery["prior_review"].is_object());
+        assert!(
+            recovery["requirements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|requirement| requirement
+                    .as_str()
+                    .unwrap()
+                    .contains("preserve the current bounded diff"))
+        );
+        assert!(
+            recovery["requirements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|requirement| requirement
+                    .as_str()
+                    .unwrap()
+                    .contains("Do not stash, discard, reset"))
+        );
+        supervisor.tasks[0].developer_recovery = None;
+
         let reviewer: serde_json::Value = serde_json::from_slice(
             &supervisor
                 .build_turn_prompt(0, WorkerRole::Reviewer, 1)
@@ -3479,6 +4208,418 @@ sys.stdout.write(json.dumps({
     }
 
     #[test]
+    fn interrupted_developer_with_allowed_dirty_paths_gets_exact_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let repository = initialize_repository(&root);
+        let locks = private_directory(&root.join("locks"));
+        let mut supervisor =
+            open_discovered_supervisor(&root, &repository, "dirty-crash-once", "run", &locks);
+        let mut tasks = vec![task("one", 2)];
+        approve_with_adapter(&mut supervisor, &mut tasks, "fake-final-file");
+        poll_until(&mut supervisor, |supervisor| {
+            supervisor.snapshot().state.is_terminal()
+        });
+
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, SessionState::Completed, "{snapshot:?}");
+        assert_eq!(supervisor.metrics().developer_recoveries, 1);
+        assert_eq!(supervisor.metrics().worker_retries, 0);
+        let developer: Vec<_> = supervisor
+            .spawn_audit()
+            .iter()
+            .filter(|spawn| spawn.role == WorkerRole::Developer)
+            .collect();
+        assert_eq!(developer.len(), 2, "{:?}", supervisor.spawn_audit());
+        assert_eq!(developer[0].turn_sequence, 1);
+        assert_eq!(developer[1].turn_sequence, 2);
+        assert_eq!(developer[0].native_session_id, None);
+        assert_eq!(
+            developer[1].native_session_id.as_deref(),
+            Some("native-discovered-one-developer")
+        );
+        assert!(!developer[0].resume);
+        assert!(developer[1].resume);
+        assert!(developer[1].developer_recovery);
+        let audit = fs::read_to_string(root.join("audit.ndjson")).unwrap();
+        assert!(
+            audit.contains(r#""turn_phase":"recover_interrupted_developer_result""#),
+            "{audit}"
+        );
+        assert_eq!(
+            String::from_utf8(git(&repository, &["status", "--porcelain=v1"])).unwrap(),
+            ""
+        );
+        drop(supervisor);
+        drop(temp);
+    }
+
+    #[test]
+    fn interrupted_recovery_refreshes_the_checkpoint_before_bounded_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let repository = initialize_repository(&root);
+        let locks = private_directory(&root.join("locks"));
+        let mut supervisor = open_supervisor(
+            &root,
+            &repository,
+            "dirty-recovery-crash-once",
+            "run",
+            &locks,
+        );
+        approve(&mut supervisor, vec![task("one", 2)]);
+        poll_until(&mut supervisor, |supervisor| {
+            supervisor.snapshot().state.is_terminal()
+        });
+
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, SessionState::Completed, "{snapshot:?}");
+        assert_eq!(supervisor.metrics().developer_recoveries, 1);
+        assert_eq!(supervisor.metrics().worker_retries, 1);
+        let developer: Vec<_> = supervisor
+            .spawn_audit()
+            .iter()
+            .filter(|spawn| spawn.role == WorkerRole::Developer)
+            .collect();
+        assert_eq!(developer.len(), 3, "{:?}", supervisor.spawn_audit());
+        assert_eq!(
+            developer
+                .iter()
+                .map(|spawn| (spawn.turn_sequence, spawn.attempt))
+                .collect::<Vec<_>>(),
+            vec![(1, 1), (2, 1), (2, 2)]
+        );
+        assert!(developer[1].resume);
+        assert!(developer[2].resume);
+        assert!(developer[1].developer_recovery);
+        assert!(developer[2].developer_recovery);
+        assert_eq!(
+            String::from_utf8(git(&repository, &["status", "--porcelain=v1"])).unwrap(),
+            ""
+        );
+        drop(supervisor);
+        drop(temp);
+    }
+
+    #[test]
+    fn uncommitted_allowed_paths_resume_the_exact_developer_before_review() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let repository = initialize_repository(&root);
+        let locks = private_directory(&root.join("locks"));
+        let mut supervisor = open_supervisor(&root, &repository, "dirty-once", "run", &locks);
+        approve(&mut supervisor, vec![task("one", 2)]);
+        poll_until(&mut supervisor, |supervisor| {
+            supervisor.snapshot().state.is_terminal()
+        });
+
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, SessionState::Completed, "{snapshot:?}");
+        assert_eq!(snapshot.tasks[0].state, TaskState::Lgtm);
+        assert_eq!(supervisor.metrics().developer_recoveries, 1);
+        let developer: Vec<_> = supervisor
+            .spawn_audit()
+            .iter()
+            .filter(|spawn| spawn.role == WorkerRole::Developer)
+            .collect();
+        assert_eq!(developer.len(), 2, "{:?}", supervisor.spawn_audit());
+        assert_eq!(
+            developer[0].logical_session_id,
+            developer[1].logical_session_id
+        );
+        assert_eq!(
+            developer[0].native_session_id,
+            developer[1].native_session_id
+        );
+        assert_eq!(developer[0].turn_sequence, 1);
+        assert_eq!(developer[1].turn_sequence, 2);
+        assert_eq!(developer[0].attempt, 1);
+        assert_eq!(developer[1].attempt, 1);
+        assert!(!developer[0].resume);
+        assert!(developer[1].resume);
+        assert!(!developer[0].developer_recovery);
+        assert!(developer[1].developer_recovery);
+        assert_eq!(
+            supervisor
+                .spawn_audit()
+                .iter()
+                .position(|spawn| spawn.role == WorkerRole::Reviewer),
+            Some(2),
+            "reviewer must start only after the recovery returned a committed clean HEAD"
+        );
+        assert_eq!(
+            String::from_utf8(git(&repository, &["status", "--porcelain=v1"])).unwrap(),
+            ""
+        );
+        drop(supervisor);
+        drop(temp);
+    }
+
+    #[test]
+    fn invalid_clean_completion_result_gets_one_exact_session_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let repository = initialize_repository(&root);
+        let locks = private_directory(&root.join("locks"));
+        let mut supervisor =
+            open_supervisor(&root, &repository, "invalid-check-once", "run", &locks);
+        approve(&mut supervisor, vec![task("one", 2)]);
+        poll_until(&mut supervisor, |supervisor| {
+            supervisor.snapshot().state.is_terminal()
+        });
+
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, SessionState::Completed, "{snapshot:?}");
+        assert_eq!(supervisor.metrics().developer_recoveries, 1);
+        let developer: Vec<_> = supervisor
+            .spawn_audit()
+            .iter()
+            .filter(|spawn| spawn.role == WorkerRole::Developer)
+            .collect();
+        assert_eq!(developer.len(), 2);
+        assert!(!developer[0].resume);
+        assert!(developer[1].resume);
+        assert_eq!(
+            developer[0].native_session_id,
+            developer[1].native_session_id
+        );
+        let audit = fs::read_to_string(root.join("audit.ndjson")).unwrap();
+        assert!(
+            audit.contains(r#""turn_phase":"recover_invalid_developer_result""#),
+            "{audit}"
+        );
+        assert_eq!(
+            String::from_utf8(git(&repository, &["status", "--porcelain=v1"])).unwrap(),
+            ""
+        );
+        drop(supervisor);
+        drop(temp);
+    }
+
+    #[test]
+    fn invalid_or_missing_result_with_dirty_paths_recovers_after_session_binding() {
+        for behavior in ["malformed-result-dirty", "missing-result-dirty"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(temp.path()).unwrap();
+            let repository = initialize_repository(&root);
+            let locks = private_directory(&root.join("locks"));
+            let mut supervisor =
+                open_discovered_supervisor(&root, &repository, behavior, "run", &locks);
+            let mut tasks = vec![task("one", 2)];
+            approve_with_adapter(&mut supervisor, &mut tasks, "fake-final-file");
+            poll_until(&mut supervisor, |supervisor| {
+                supervisor.snapshot().state.is_terminal()
+            });
+
+            let snapshot = supervisor.snapshot();
+            assert_eq!(
+                snapshot.state,
+                SessionState::Completed,
+                "behavior={behavior} {snapshot:?}"
+            );
+            assert!(snapshot.tasks[0].developer_session_bound);
+            assert_eq!(supervisor.metrics().developer_recoveries, 1);
+            let developer: Vec<_> = supervisor
+                .spawn_audit()
+                .iter()
+                .filter(|spawn| spawn.role == WorkerRole::Developer)
+                .collect();
+            assert_eq!(developer.len(), 2);
+            assert_eq!(developer[0].native_session_id, None);
+            assert_eq!(
+                developer[1].native_session_id.as_deref(),
+                Some("native-discovered-one-developer")
+            );
+            assert!(developer[1].resume);
+            let audit = fs::read_to_string(root.join("audit.ndjson")).unwrap();
+            assert_eq!(
+                audit
+                    .lines()
+                    .filter(|line| line.contains(r#""role":"developer""#)
+                        && line.contains(r#""session_id":"native-discovered-one-developer""#))
+                    .count(),
+                2,
+                "behavior={behavior} {audit}"
+            );
+            drop(supervisor);
+            drop(temp);
+        }
+    }
+
+    #[test]
+    fn uncommitted_result_without_proven_session_identity_needs_human() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let repository = initialize_repository(&root);
+        let locks = private_directory(&root.join("locks"));
+        let mut supervisor = open_discovered_supervisor(
+            &root,
+            &repository,
+            "unobservable-result-dirty",
+            "run",
+            &locks,
+        );
+        let mut tasks = vec![task("one", 2)];
+        approve_with_adapter(&mut supervisor, &mut tasks, "fake-final-file");
+        poll_until(&mut supervisor, |supervisor| {
+            supervisor.snapshot().state == SessionState::NeedsHuman
+        });
+
+        let snapshot = supervisor.snapshot();
+        assert_eq!(supervisor.metrics().developer_recoveries, 0);
+        assert_eq!(supervisor.metrics().developer_spawns, 1);
+        assert_eq!(supervisor.metrics().reviewer_spawns, 0);
+        assert!(!snapshot.tasks[0].developer_session_bound);
+        assert!(
+            snapshot.terminal_detail.as_deref().is_some_and(
+                |detail| detail.contains("exact native session identity could not be proven")
+            ),
+            "{snapshot:?}"
+        );
+        drop(supervisor);
+        drop(temp);
+    }
+
+    #[test]
+    fn conflicting_discovered_session_identities_block_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let repository = initialize_repository(&root);
+        let locks = private_directory(&root.join("locks"));
+        let mut supervisor =
+            open_discovered_supervisor(&root, &repository, "ambiguous-result-dirty", "run", &locks);
+        let mut tasks = vec![task("one", 2)];
+        approve_with_adapter(&mut supervisor, &mut tasks, "fake-final-file");
+        poll_until(&mut supervisor, |supervisor| {
+            supervisor.snapshot().state == SessionState::NeedsHuman
+        });
+
+        let snapshot = supervisor.snapshot();
+        assert_eq!(supervisor.metrics().developer_recoveries, 0);
+        assert!(!snapshot.tasks[0].developer_session_bound);
+        assert!(
+            snapshot
+                .terminal_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("native session identity was ambiguous")),
+            "{snapshot:?}"
+        );
+        drop(supervisor);
+        drop(temp);
+    }
+
+    #[test]
+    fn a_second_uncommitted_result_stops_after_one_exact_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let repository = initialize_repository(&root);
+        let locks = private_directory(&root.join("locks"));
+        let mut supervisor = open_supervisor(&root, &repository, "dirty-twice", "run", &locks);
+        approve(&mut supervisor, vec![task("one", 2)]);
+        poll_until(&mut supervisor, |supervisor| {
+            supervisor.snapshot().state == SessionState::NeedsHuman
+        });
+
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.tasks[0].state, TaskState::NeedsHuman);
+        assert_eq!(supervisor.metrics().developer_recoveries, 1);
+        assert_eq!(
+            supervisor
+                .spawn_audit()
+                .iter()
+                .filter(|spawn| spawn.role == WorkerRole::Developer)
+                .count(),
+            2
+        );
+        assert!(
+            supervisor
+                .spawn_audit()
+                .iter()
+                .all(|spawn| spawn.role != WorkerRole::Reviewer)
+        );
+        assert!(
+            snapshot
+                .terminal_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains(
+                    "after the automatic exact-session recovery"
+                )),
+            "{snapshot:?}"
+        );
+        drop(supervisor);
+        drop(temp);
+    }
+
+    #[test]
+    fn uncommitted_out_of_scope_path_stops_without_recovery_or_review() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let repository = initialize_repository(&root);
+        let locks = private_directory(&root.join("locks"));
+        let mut supervisor =
+            open_supervisor(&root, &repository, "dirty-out-of-scope", "run", &locks);
+        approve(&mut supervisor, vec![task("one", 2)]);
+        poll_until(&mut supervisor, |supervisor| {
+            supervisor.snapshot().state == SessionState::NeedsHuman
+        });
+
+        let snapshot = supervisor.snapshot();
+        assert_eq!(supervisor.metrics().developer_recoveries, 0);
+        assert_eq!(supervisor.metrics().reviewer_spawns, 0);
+        assert!(
+            snapshot
+                .terminal_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("outside the explicitly approved task scope")),
+            "{snapshot:?}"
+        );
+        drop(supervisor);
+        drop(temp);
+    }
+
+    #[test]
+    fn external_drift_after_recovery_checkpoint_stops_before_resume() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let repository = initialize_repository(&root);
+        let locks = private_directory(&root.join("locks"));
+        let mut supervisor = open_supervisor(&root, &repository, "dirty-once", "run", &locks);
+        approve(&mut supervisor, vec![task("one", 2)]);
+        poll_until(&mut supervisor, |supervisor| {
+            supervisor.active.is_none()
+                && supervisor.retry.is_some()
+                && supervisor.tasks[0].developer_recovery.is_some()
+        });
+        assert!(
+            supervisor.snapshot().tasks[0]
+                .outcome_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("uncommitted allowed-path changes"))
+        );
+
+        let mut contents = fs::read_to_string(repository.join("one.txt")).unwrap();
+        contents.push_str("external concurrent edit\n");
+        fs::write(repository.join("one.txt"), contents).unwrap();
+        poll_until(&mut supervisor, |supervisor| {
+            supervisor.snapshot().state == SessionState::NeedsHuman
+        });
+
+        let snapshot = supervisor.snapshot();
+        assert_eq!(supervisor.metrics().developer_recoveries, 1);
+        assert_eq!(supervisor.metrics().developer_spawns, 1);
+        assert_eq!(supervisor.metrics().reviewer_spawns, 0);
+        assert!(
+            snapshot
+                .terminal_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("external concurrent drift")),
+            "{snapshot:?}"
+        );
+        drop(supervisor);
+        drop(temp);
+    }
+
+    #[test]
     fn reviewer_head_drift_stops_the_run_and_rejects_the_old_verdict() {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
@@ -3558,10 +4699,12 @@ sys.stdout.write(json.dumps({
         );
         let mut dirty_task = task("dirty", 1);
         dirty_task.repository_root = dirty_repository.to_string_lossy().into_owned();
+        let error = dirty
+            .replace_plan(0, "fake-envelope", "fake-envelope", vec![dirty_task])
+            .unwrap_err();
         assert!(
-            dirty
-                .replace_plan(0, "fake-envelope", "fake-envelope", vec![dirty_task])
-                .is_err()
+            format!("{error:#}").contains("task repository is dirty before plan start"),
+            "{error:#}"
         );
 
         let lock_temp = tempfile::tempdir().unwrap();

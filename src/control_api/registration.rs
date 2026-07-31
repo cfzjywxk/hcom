@@ -1,7 +1,7 @@
 //! Private launch-registration protocol for the architect control bridge.
 //!
 //! This socket is never mounted into an architect or worker sandbox. It carries
-//! launch/process binding material between the foreground `hcom architect`
+//! launch/process binding material between the foreground `hcom arch`
 //! launcher, the separately spawned bridge, and the in-process session
 //! supervisor; it is not an MCP or public task-action surface.
 

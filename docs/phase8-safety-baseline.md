@@ -2,14 +2,14 @@
 
 Status: active for the minimal Phase 8 product.
 
-This document describes the safety boundary implemented by `hcom architect`.
+This document describes the safety boundary implemented by `hcom arch`.
 One foreground invocation owns one in-memory ordered task run. It does not
 create a project, persistent scheduler, daemon, recovery store, standalone
 repository, object-transfer lane, or final-apply operation.
 
 ## Lifetime and input ownership
 
-`hcom architect` launches one blank interactive architect and waits for the
+`hcom arch` launches one blank interactive architect and waits for the
 human's first input. The launcher does not pass a prompt argument, write to the
 architect's stdin, inject a PTY event, paste text, or submit Enter.
 
@@ -66,17 +66,23 @@ The supervisor:
 3. holds a nonblocking current-user runtime `flock` keyed by the checkout
    device/inode so renaming the live directory cannot create a second lock;
 4. permits exactly one live worker;
-5. accepts a developer result only when the checkout is clean, remains on the
-   starting branch, names a committed HEAD, fast-forwards the exact task base,
-   and does not rewrite the previous same-task turn HEAD;
-6. recomputes the exact commit list and changed-path list, rejects paths outside
+5. before starting a reviewer, requires the checkout to be clean, on the
+   starting branch, at a committed HEAD that fast-forwards the exact task base
+   without rewriting the previous same-task turn HEAD;
+6. when a developer process exits with only allowed-path uncommitted changes,
+   is interrupted after making such changes, or has another invalid/missing
+   completion result while branch/history/path scope remain safe, performs one
+   automatic exact-session developer recovery turn to finish checks, commit,
+   and return a valid result; it never sends that dirty checkout to a reviewer;
+7. recomputes the exact commit list and changed-path list, rejects paths outside
    the approved task allowlist, and requires every approved check to be reported
    passed by both a completed developer and an LGTM reviewer;
-7. binds a reviewer turn to the exact observed clean HEAD and revalidates it
+8. binds a reviewer turn to the exact observed clean HEAD and revalidates it
    while the reviewer runs and before applying the verdict;
-8. uses the exact reviewed HEAD as the next task's base;
-9. stops in `needs_human` on branch, HEAD, worktree, Git identity, replacement
-   ref, graft, alternate, or result drift.
+9. uses the exact reviewed HEAD as the next task's base;
+10. stops in `needs_human` on out-of-scope changes, branch/HEAD rewrite,
+    external drift, uncertain native-session identity, unsafe Git identity or
+    indirection, or a second invalid result after the bounded recovery.
 
 The supervisor never resets, rebases, merges, checks out, force-cleans, pushes,
 installs, or applies a final patch. A reviewed developer commit is already in
@@ -90,9 +96,11 @@ terminal outcome live only in parent memory.
 
 Every task receives fresh developer and reviewer logical sessions. A native
 session ID may not cross a task or role. `request_changes` resumes the exact
-same task-bound developer and reviewer sessions. Worker crashes have a fixed
-small attempt limit; once a native session exists, every retry must be an exact
-resume. Ambiguous or missing session evidence stops the queue.
+same task-bound developer and reviewer sessions. A recoverable developer
+completion error also resumes only that exact task-bound developer, once,
+before the run becomes terminal. Worker crashes have a fixed small attempt
+limit; once a native session exists, every retry must be an exact resume.
+Ambiguous or missing session evidence stops the queue.
 
 A completion token is accepted at most once. Duplicate and late completions
 cannot clear or advance another active turn. `review_exhausted` is distinct from

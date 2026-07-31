@@ -37,10 +37,6 @@ pub fn help_text() -> &'static str {
   hcom arch codex [architect-profile-options]
   hcom arch claude [architect-profile-options]
 
-Compatibility alias:
-  hcom architect codex [architect-profile-options]
-  hcom architect claude [architect-profile-options]
-
 Launch one blank, foreground Codex or Claude architect with capability-bound
 in-memory session-task tools. The invocation's exact current directory is the
 project context seen by the Architect and every task worker. It does not need
@@ -91,9 +87,14 @@ canonical project/source/Git view remains read-only, while its session-private
 HOME, temporary directory, and generated language caches remain writable. Each
 authorized task names the exact canonical Git root discovered by the Architect
 from project documentation. Developer tasks commit directly there; hcom has no
-repository-root allowlist. Concurrent Architect or external drift can stop the
-run after a partial developer commit, without reset, rebase, merge, or final
-apply. The parent owns all worker lifetime and no run is recovered after exit.
+repository-root allowlist. An in-scope uncommitted developer result gets one
+exact-session recovery before review; out-of-scope changes, rewrite, external
+drift, or uncertain session identity stop the run without reset, rebase, merge,
+or final apply. The parent owns all worker lifetime and no run is recovered
+after exit. After dispatch, the Architect should check worker status only every
+3 to 5 minutes unless the human asks or immediate intervention is required;
+the foreground supervisor monitors lifecycle internally without model calls,
+so short-cadence polling only wastes Architect requests and tokens.
 
 See docs/architect.md for the complete TOML schema and examples."#
 }

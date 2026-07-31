@@ -46,7 +46,7 @@ const MAX_BWRAP_INFO_BYTES: usize = 4096;
 
 #[derive(Parser)]
 #[command(
-    name = "hcom architect",
+    name = "hcom arch",
     disable_help_flag = true,
     disable_version_flag = true
 )]
@@ -79,12 +79,8 @@ fn create_private_session_runtime() -> Result<tempfile::TempDir> {
 }
 
 pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32> {
-    let command_name = match argv.first().map(String::as_str) {
-        Some("arch") => "hcom arch",
-        _ => "hcom architect",
-    };
     let args = ArchitectArgs::try_parse_from(
-        std::iter::once(command_name.to_owned()).chain(argv.iter().skip(1).cloned()),
+        std::iter::once("hcom arch".to_owned()).chain(argv.iter().skip(1).cloned()),
     )?;
     let architect_adapter = ArchitectAdapter::parse(&args.adapter)?;
     let mut loaded = match config_path {
@@ -596,18 +592,18 @@ fn validate_foreground_terminal() -> Result<()> {
     for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
         // SAFETY: isatty only inspects an integer descriptor.
         if unsafe { libc::isatty(fd) } != 1 {
-            bail!("hcom architect requires stdin/stdout/stderr on a real terminal");
+            bail!("hcom arch requires stdin/stdout/stderr on a real terminal");
         }
     }
     let birth = process_birth_identity(std::process::id())?;
     if !process_owns_foreground_tty(std::process::id(), &birth)? {
-        bail!("hcom architect must be launched by the foreground terminal process group");
+        bail!("hcom arch must be launched by the foreground terminal process group");
     }
     let stdin = fs::metadata("/proc/self/fd/0")?;
     let stdout = fs::metadata("/proc/self/fd/1")?;
     let stderr = fs::metadata("/proc/self/fd/2")?;
     if stdin.rdev() != stdout.rdev() || stdin.rdev() != stderr.rdev() {
-        bail!("hcom architect requires one exact foreground terminal");
+        bail!("hcom arch requires one exact foreground terminal");
     }
     Ok(())
 }
@@ -2392,7 +2388,7 @@ mod tests {
     #[test]
     fn explicit_architect_cli_overrides_toml_profile_only() {
         let args = ArchitectArgs::try_parse_from([
-            "hcom architect",
+            "hcom arch",
             "codex",
             "--model",
             "gpt-5.6-sol-cli",
@@ -2424,7 +2420,7 @@ mod tests {
     #[test]
     fn claude_cli_overrides_do_not_change_the_implicit_reviewer() {
         let args = ArchitectArgs::try_parse_from([
-            "hcom architect",
+            "hcom arch",
             "claude",
             "--model",
             "sonnet",
@@ -2447,15 +2443,14 @@ mod tests {
         assert_eq!(profiles.developer, developer_before);
 
         let invalid =
-            ArchitectArgs::try_parse_from(["hcom architect", "claude", "--reasoning", "xhigh"])
-                .unwrap();
+            ArchitectArgs::try_parse_from(["hcom arch", "claude", "--reasoning", "xhigh"]).unwrap();
         assert!(apply_architect_cli_overrides(&invalid, &mut profiles).is_err());
     }
 
     #[test]
     fn explicit_reviewers_are_not_replaced_by_architect_cli_overrides() {
         let codex_args = ArchitectArgs::try_parse_from([
-            "hcom architect",
+            "hcom arch",
             "codex",
             "--model",
             "gpt-5.6-sol-cli",
@@ -2478,7 +2473,7 @@ mod tests {
         assert_eq!(codex_profiles.reviewer, reviewer_before);
 
         let claude_args = ArchitectArgs::try_parse_from([
-            "hcom architect",
+            "hcom arch",
             "claude",
             "--model",
             "sonnet",

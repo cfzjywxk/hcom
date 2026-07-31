@@ -395,15 +395,15 @@ fn top_level_help_preserves_retained_commands_and_omits_stale_commands() {
             "missing retained command {retained}: stdout={stdout}"
         );
     }
-    for stale in ["handoff", "chain", "project"] {
+    for stale in ["architect", "handoff", "chain", "project"] {
         assert!(
             !commands.contains(&stale),
             "stale top-level command {stale} remains: stdout={stdout}"
         );
     }
     assert!(
-        stdout.contains("alias: architect"),
-        "top-level help must preserve the architect compatibility alias: stdout={stdout}"
+        !stdout.contains("alias: architect"),
+        "top-level help must not advertise the removed architect alias: stdout={stdout}"
     );
 }
 
@@ -428,6 +428,32 @@ fn stale_top_level_commands_are_unknown_without_opening_v24_state() {
     }
 }
 
+#[test]
+fn removed_architect_forms_are_unknown_without_opening_v24_state() {
+    let h = Hcom::new();
+    let db_path = h.path().join("hcom.db");
+    assert!(!db_path.exists());
+
+    for argv in [
+        vec!["architect"],
+        vec!["architect", "--help"],
+        vec!["architect", "codex"],
+        vec!["architect", "claude"],
+    ] {
+        let (code, stdout, stderr) = h.run(argv.clone());
+        assert_ne!(code, 0, "argv={argv:?} stdout={stdout} stderr={stderr}");
+        assert!(stdout.is_empty(), "argv={argv:?} stdout={stdout}");
+        assert!(
+            stderr.contains("Unknown command 'architect'"),
+            "argv={argv:?} stderr={stderr}"
+        );
+        assert!(
+            !db_path.exists(),
+            "removed architect command must not initialize v24 state: argv={argv:?}"
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn architect_help_is_additive_and_does_not_open_v24_state() {
@@ -435,48 +461,45 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     let db_path = h.path().join("hcom.db");
     assert!(!db_path.exists());
 
-    for command in ["arch", "architect"] {
-        let (code, stdout, stderr) = h.run([command, "--help"]);
-        assert_eq!(code, 0, "command={command} stdout={stdout} stderr={stderr}");
-        assert!(stdout.contains("hcom arch codex"), "stdout={stdout}");
-        assert!(stdout.contains("hcom arch claude"), "stdout={stdout}");
-        assert!(stdout.contains("hcom architect codex"), "stdout={stdout}");
-        assert!(stdout.contains("hcom architect claude"), "stdout={stdout}");
-        assert!(stdout.contains("gpt-5.6-sol/xhigh"), "stdout={stdout}");
-        assert!(stdout.contains("Claude opus/xhigh"), "stdout={stdout}");
-        assert!(
-            stdout.contains("built-in developer is Codex gpt-5.6-sol/xhigh"),
-            "stdout={stdout}"
-        );
-        assert!(
-            stdout.contains(
-                "reviewer is always Claude opus/xhigh with\n\
-                 dangerously-skip-permissions"
-            ),
-            "stdout={stdout}"
-        );
-        assert!(
-            stdout.contains("native")
-                && stdout.contains("untrusted, avoiding")
-                && stdout.contains("repeated folder-trust prompt")
-                && stdout.contains("does not override the")
-                && stdout.contains("danger-full-access/never profile"),
-            "stdout={stdout}"
-        );
-        assert!(!stdout.contains("--repo"), "stdout={stdout}");
-        assert!(!stdout.contains("--project"), "stdout={stdout}");
-        assert!(stdout.contains("session-task tools"), "stdout={stdout}");
-        assert!(
-            stdout.contains("exact current directory"),
-            "stdout={stdout}"
-        );
-        assert!(stdout.contains("canonical Git root"), "stdout={stdout}");
-        assert!(stdout.contains("$HCOM_DIR/config.toml"), "stdout={stdout}");
-        assert!(stdout.contains("[architect.profile]"), "stdout={stdout}");
-        assert!(stdout.contains("[architect.developer]"), "stdout={stdout}");
-        assert!(stdout.contains("[architect.reviewer]"), "stdout={stdout}");
-        assert!(stdout.contains("--ask-for-approval"), "stdout={stdout}");
-    }
+    let (code, stdout, stderr) = h.run(["arch", "--help"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("hcom arch codex"), "stdout={stdout}");
+    assert!(stdout.contains("hcom arch claude"), "stdout={stdout}");
+    assert!(!stdout.contains("hcom architect"), "stdout={stdout}");
+    assert!(stdout.contains("gpt-5.6-sol/xhigh"), "stdout={stdout}");
+    assert!(stdout.contains("Claude opus/xhigh"), "stdout={stdout}");
+    assert!(
+        stdout.contains("built-in developer is Codex gpt-5.6-sol/xhigh"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "reviewer is always Claude opus/xhigh with\n\
+             dangerously-skip-permissions"
+        ),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("native")
+            && stdout.contains("untrusted, avoiding")
+            && stdout.contains("repeated folder-trust prompt")
+            && stdout.contains("does not override the")
+            && stdout.contains("danger-full-access/never profile"),
+        "stdout={stdout}"
+    );
+    assert!(!stdout.contains("--repo"), "stdout={stdout}");
+    assert!(!stdout.contains("--project"), "stdout={stdout}");
+    assert!(stdout.contains("session-task tools"), "stdout={stdout}");
+    assert!(
+        stdout.contains("exact current directory"),
+        "stdout={stdout}"
+    );
+    assert!(stdout.contains("canonical Git root"), "stdout={stdout}");
+    assert!(stdout.contains("$HCOM_DIR/config.toml"), "stdout={stdout}");
+    assert!(stdout.contains("[architect.profile]"), "stdout={stdout}");
+    assert!(stdout.contains("[architect.developer]"), "stdout={stdout}");
+    assert!(stdout.contains("[architect.reviewer]"), "stdout={stdout}");
+    assert!(stdout.contains("--ask-for-approval"), "stdout={stdout}");
     assert!(
         !db_path.exists(),
         "session architect help must not initialize retained v24 state"
@@ -491,14 +514,11 @@ fn architect_help_does_not_read_or_repair_malformed_v24_state() {
     let malformed = b"not-a-retained-sqlite-database";
     std::fs::write(&db_path, malformed).unwrap();
 
-    for command in ["arch", "architect"] {
-        let (code, stdout, stderr) = h.run([command, "--help"]);
-        assert_eq!(code, 0, "command={command} stdout={stdout} stderr={stderr}");
-        assert!(stdout.contains("hcom arch codex"), "stdout={stdout}");
-        assert!(stdout.contains("hcom arch claude"), "stdout={stdout}");
-        assert!(stdout.contains("hcom architect codex"), "stdout={stdout}");
-        assert!(stdout.contains("hcom architect claude"), "stdout={stdout}");
-    }
+    let (code, stdout, stderr) = h.run(["arch", "--help"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("hcom arch codex"), "stdout={stdout}");
+    assert!(stdout.contains("hcom arch claude"), "stdout={stdout}");
+    assert!(!stdout.contains("hcom architect"), "stdout={stdout}");
     assert_eq!(
         std::fs::read(&db_path).unwrap(),
         malformed,
@@ -510,36 +530,25 @@ fn architect_help_does_not_read_or_repair_malformed_v24_state() {
 #[test]
 fn architect_rejects_the_removed_repository_argument() {
     let h = Hcom::new();
-    for command in ["arch", "architect"] {
-        let (code, stdout, stderr) =
-            h.run([command, "codex", "--repo", h.workspace.to_str().unwrap()]);
-        assert_ne!(code, 0, "command={command} stdout={stdout} stderr={stderr}");
-        assert!(stdout.is_empty(), "stdout={stdout}");
-        assert!(stderr.contains("--repo"), "stderr={stderr}");
-        assert!(
-            stderr.contains(&format!("Usage: hcom {command}")),
-            "stderr={stderr}"
-        );
-    }
+    let (code, stdout, stderr) = h.run(["arch", "codex", "--repo", h.workspace.to_str().unwrap()]);
+    assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.is_empty(), "stdout={stdout}");
+    assert!(stderr.contains("--repo"), "stderr={stderr}");
+    assert!(stderr.contains("Usage: hcom arch"), "stderr={stderr}");
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn architect_refuses_pipe_stdio_before_opening_either_state_lane() {
     let h = Hcom::new();
-    for command in ["arch", "architect"] {
-        for adapter in ["codex", "claude"] {
-            let (code, stdout, stderr) = h.run([command, adapter]);
-            assert_ne!(
-                code, 0,
-                "command={command} adapter={adapter} stdout={stdout} stderr={stderr}"
-            );
-            assert!(stdout.is_empty(), "stdout={stdout}");
-            assert!(
-                stderr.contains("requires stdin/stdout/stderr on a real terminal"),
-                "stderr={stderr}"
-            );
-        }
+    for adapter in ["codex", "claude"] {
+        let (code, stdout, stderr) = h.run(["arch", adapter]);
+        assert_ne!(code, 0, "adapter={adapter} stdout={stdout} stderr={stderr}");
+        assert!(stdout.is_empty(), "stdout={stdout}");
+        assert!(
+            stderr.contains("requires stdin/stdout/stderr on a real terminal"),
+            "stderr={stderr}"
+        );
     }
     assert!(!h.path().join("hcom.db").exists());
     assert!(

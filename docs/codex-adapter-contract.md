@@ -1,8 +1,7 @@
 # Codex adapter maintenance contract
 
 This is the maintainer checklist for the pinned Codex 0.145 integration used by
-`hcom arch` (or its `hcom architect` compatibility alias) and no-TUI session
-workers. It records which native arguments
+`hcom arch` and no-TUI session workers. It records which native arguments
 and configuration hcom owns, where size bounds are enforced, and which tests
 must change with the contract.
 
@@ -109,6 +108,20 @@ declared role-local overrides, no TTY, and the reviewed bubblewrap policy.
 `mcp_servers={}`, ignored user config/rules, and the closed disabled-feature
 inventory prevent parent/project capabilities from entering a worker.
 
+Developer completion recovery is supervisor-owned and adapter-neutral. If a
+process leaves only allowed-path uncommitted changes, is interrupted after
+making such changes, or returns an invalid/missing completion result while
+branch/history/path scope remain safe, the supervisor performs one
+exact-session resume before `needs_human`. For a discovered Codex session, the
+`thread.started` observation must prove exactly one native session ID; missing
+or conflicting identity stops recovery. A nonzero final-file worker keeps its
+bounded stdout/stderr available for that observation and does not require a
+success-only result file; an existing result file is still securely ingested
+and an unsafe file shape remains an error. The recovery checkpoint fingerprints
+HEAD, branch, status, index evidence, file modes/sizes, and dirty-file content,
+and is revalidated before resume. Reviewer startup still requires a clean
+committed exact HEAD.
+
 ## Artifact and JSONL bounds
 
 Bounds are layered. A transport limit must not be reused as a semantic-field
@@ -174,6 +187,7 @@ or multi-command normalization.
 | JSONL aggregate/event/semantic bounds | `jsonl_accepts_large_ignored_command_output_for_create_and_exact_resume`, `jsonl_reports_sanitized_distinct_aggregate_count_and_event_shape_bounds`, `jsonl_large_event_exception_does_not_relax_semantic_field_bounds` |
 | reviewer parser path and exact HEAD | `codex_reviewer_accepts_large_ignored_command_output_and_keeps_head_validation` |
 | strict result/check and Git evidence | `completed_result_requires_exact_git_and_current_turn_check_evidence`, `resumed_completed_result_requires_the_full_task_range_not_only_the_turn_delta`, `strict_native_results_reject_wrong_model_session_semantics_and_check_claims` |
+| developer completion recovery | `orchestrator::tests::uncommitted_allowed_paths_resume_the_exact_developer_before_review`, `invalid_clean_completion_result_gets_one_exact_session_recovery`, `invalid_or_missing_result_with_dirty_paths_recovers_after_session_binding`, `interrupted_developer_with_allowed_dirty_paths_gets_exact_recovery`, `interrupted_recovery_refreshes_the_checkpoint_before_bounded_retry`, `uncommitted_result_without_proven_session_identity_needs_human`, `conflicting_discovered_session_identities_block_recovery`, `external_drift_after_recovery_checkpoint_stops_before_resume`, `worker::process::tests::nonzero_final_file_worker_preserves_streams_without_requiring_a_result_file` |
 | executable/auth/config/environment drift | `exact_discovery_rejects_version_mismatch_and_external_git_admin_paths`, `auth_quota_session_result_and_identity_drift_fail_closed`, `revision_git_identity_tool_auth_and_environment_drift_fail_closed` |
 
 The standard gate is:

@@ -5,8 +5,7 @@ Architect can maintain project plans and coordination records. After the human
 either directs the Architect to follow a named existing detailed plan or later
 approves a newly drafted plan, the same foreground parent starts one fresh no-TUI
 developer and reviewer per task. State exists only in memory and the whole run
-stops when the parent terminal exits. `hcom architect` remains an equivalent
-compatibility alias.
+stops when the parent terminal exits.
 
 ## Start
 
@@ -35,6 +34,23 @@ Repositories are validated and locked when the typed plan is proposed. After
 execution authorization, the developer commits directly to the repository for
 that task. There is no final apply, reset, rebase, merge, push, install, or
 persistent recovery.
+
+The committed clean HEAD is the default handoff point to a reviewer, not a
+requirement attributed to the human. If a developer process exits after
+leaving only allowed-path uncommitted changes, hcom automatically exact-resumes
+that same developer once to preserve the diff, finish the required checks, and
+commit it. The reviewer is not started until the resulting HEAD is clean and
+exactly bound. Out-of-scope changes, branch/HEAD rewrite, external drift, or an
+unprovable native-session identity still stop at `needs_human`.
+
+Worker monitoring does not require Architect model calls. After dispatching a
+developer or reviewer, the Architect waits 3–5 minutes before the first
+`session_status` call and between later calls unless the human explicitly asks
+for status or immediate intervention is required. It does not poll every
+30 seconds, and it stops polling as soon as a returned state is terminal or
+`needs_human`. The in-process supervisor continues its lightweight lifecycle,
+exit, cancellation, and repository-drift checks independently; this cadence
+changes only model-facing status requests.
 
 The architect starts with an empty input buffer. hcom does not provide a prompt
 argument, write stdin, inject a key, or submit Enter. The human owns the first
@@ -314,7 +330,11 @@ Profile configuration changes native CLI policy, not the outer containment:
   applies to both the project workspace and the task repository, while the
   outer mount still keeps the project read-only;
 - one task gets fresh developer/reviewer sessions, while request-changes
-  resumes only the exact sessions already bound to that task.
+  resumes only the exact sessions already bound to that task;
+- a developer completion that leaves an in-scope dirty worktree or an invalid
+  result on otherwise safe repository state gets one automatic exact-session
+  recovery turn before `needs_human`; recovery never uses a fresh fallback,
+  and reviewer startup still requires a committed clean HEAD.
 
 Whole-host read-write is intentionally broad Architect authority and is much
 broader than the task-worker view. Do not start an Architect on untrusted
@@ -325,11 +345,12 @@ and unrelated application state remain writable. Before
 Once a task repository is bound, the Architect must not modify it concurrently.
 This is an instruction plus drift detection, not a dynamic filesystem
 exclusion: an Architect write inside the task's allowed path scope during a
-developer turn can be swept into the developer commit. Other drift may be
-detected only after the developer has committed, moving the run to
-`needs_human` and leaving that partial commit on the real branch; hcom never
-resets or rebases it. Coordination files outside bound task repositories can
-continue to be updated.
+developer turn is not attributable from Git state alone and can be swept into
+the developer commit. hcom fingerprints a recoverable post-turn checkout and
+revalidates it before exact resume; a later change is treated as external
+concurrent drift and moves the run to `needs_human`. hcom never resets or
+rebases the real branch. Coordination files outside bound task repositories
+can continue to be updated.
 
 The Architect selects each `repository_root` from the human-named plan and
 attests that the same message authorized execution. hcom validates canonical

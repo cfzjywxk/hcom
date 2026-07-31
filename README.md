@@ -98,7 +98,10 @@ hcom
 in-memory, ordered task supervisor. Each approved task gets a fresh no-TUI
 developer and reviewer; Codex or Claude can be selected independently for
 either role. Same-task review changes resume only that task's exact native
-sessions. The existing `hcom architect` spelling remains a compatibility alias.
+sessions. If a developer exits with only allowed-path uncommitted changes,
+the supervisor exact-resumes that developer once to finish checks and commit
+before starting the reviewer; it does not terminate the whole run merely
+because the first developer result forgot the commit.
 
 ```bash
 cd /path/to/project
@@ -173,6 +176,12 @@ host-path allowlist. Live hcom state, parent Codex/Claude configuration, and
 the launching hcom binary are overlaid read-only, and hcom commands inside the
 Architect use private per-run state. Other same-user host files remain
 writable.
+
+After a developer or reviewer is dispatched, the foreground supervisor
+monitors it without Architect model calls. Unless the human requests status or
+immediate intervention is required, the Architect waits 3–5 minutes before
+the first status check and between later checks; it does not poll every
+30 seconds. A terminal or `needs_human` result ends polling.
 
 ---
 

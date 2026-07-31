@@ -42,14 +42,8 @@ const COMMANDS: &[&str] = &[
     "update",
 ];
 
-const ARCHITECT_COMMANDS: &[&str] = &["arch", "architect"];
-
 fn is_command(name: &str) -> bool {
     COMMANDS.contains(&name)
-}
-
-fn is_architect_command(name: &str) -> bool {
-    ARCHITECT_COMMANDS.contains(&name)
 }
 
 fn is_launch_tool(name: &str) -> bool {
@@ -320,7 +314,7 @@ pub fn resolve_action(argv: &[String]) -> Action {
     // Find the first non-flag token in stripped args
     let cmd_token = stripped.first().map(|s| s.as_str()).unwrap_or("");
 
-    if is_architect_command(cmd_token) {
+    if cmd_token == "arch" {
         return Action::Architect {
             args: argv.to_vec(),
         };
@@ -592,7 +586,7 @@ pub fn dispatch() -> anyhow::Result<()> {
                 return Ok(());
             }
             if flags.name.is_some() || flags.go {
-                anyhow::bail!("hcom architect does not accept retained interactive global flags");
+                anyhow::bail!("hcom arch does not accept retained interactive global flags");
             }
             let exit_code =
                 hcom::architect::run_cli_with_config(&stripped, &crate::paths::config_toml_path())?;
@@ -1083,14 +1077,24 @@ mod tests {
     }
 
     #[test]
-    fn architect_commands_route_to_the_same_lane_without_rewriting_argv() {
-        for command in ARCHITECT_COMMANDS {
-            let args = sv(&[command, "codex", "--model", "gpt-5.6-sol"]);
-            assert_eq!(
-                resolve_action(&args),
-                Action::Architect { args: args.clone() }
-            );
-        }
+    fn arch_routes_to_the_isolated_lane_without_rewriting_argv() {
+        let args = sv(&["arch", "codex", "--model", "gpt-5.6-sol"]);
+        assert_eq!(
+            resolve_action(&args),
+            Action::Architect { args: args.clone() }
+        );
+    }
+
+    #[test]
+    fn removed_architect_command_routes_to_the_unknown_command_lane() {
+        let args = sv(&["architect", "codex"]);
+        assert_eq!(
+            resolve_action(&args),
+            Action::Command {
+                cmd: "architect".to_owned(),
+                args: args.clone(),
+            }
+        );
     }
 
     // ── Hook detection ──────────────────────────────────────────────────

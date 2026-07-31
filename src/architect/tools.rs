@@ -53,10 +53,10 @@ fn tool_description(action: ActionName) -> &'static str {
             "Draft or replace the bounded ordered task plan. Read the current project documentation first and set each task's repository_root to that task's real absolute canonical Git top level; it need not equal or live under the project directory. You must faithfully select the repository identified by the named source plan: hcom validates its Git identity and state but has no configured host-path allowlist. You may create or update architecture plans, current_todo, and discussion records before this call. If such an artifact is inside a task repository, leave that repository clean and committed before binding it; after this call, do not modify a bound task repository yourself. That exclusion is enforced by drift checks, not a second filesystem sandbox: an in-scope concurrent write could be included in a developer commit, while other drift may stop only after the developer has committed and leave that partial commit for the human. This call never starts a worker. Enumerate every returned task binding to the human with ordinal, task_key, repository_root, branch, and start HEAD (base_revision), then present the exact plan version and exact plan hash. Do not abbreviate or omit a writable repository binding. If the human's current message explicitly directs you to follow, implement, execute, proceed with, or complete a named existing detailed plan, specification, or current_todo (including an instruction meaning \"按照 current_todo\" or \"按照 <named plan> 推进完成开发\"), that message authorizes starting the faithfully derived plan in this same turn after you present these bindings; otherwise wait for a later explicit approval. An explicit instruction not to start always wins."
         }
         ActionName::SessionApproveAndStart => {
-            "Start the exact draft only with explicit human execution authorization in this architect conversation. Authorization is valid either when the human approves the complete displayed task binding list (ordinal, task_key, repository_root, branch, and start HEAD/base_revision) with its plan version and plan hash, or when the human's current message explicitly directs you to follow, implement, execute, proceed with, or complete a named existing detailed plan, specification, or current_todo (including an instruction meaning \"按照 current_todo\" or \"按照 <named plan> 推进完成开发\") and this draft faithfully derives from that source. In the latter case, present the complete returned bindings, plan version, and plan hash, then call this tool in the same turn without requiring a second human reply. A request only to read, analyze, discuss, summarize, draft, or update a plan is not execution authorization. An explicit instruction not to start always wins. Never infer authorization from vague continuation language or from the existence of a plan."
+            "Start the exact draft only with explicit human execution authorization in this architect conversation. Authorization is valid either when the human approves the complete displayed task binding list (ordinal, task_key, repository_root, branch, and start HEAD/base_revision) with its plan version and plan hash, or when the human's current message explicitly directs you to follow, implement, execute, proceed with, or complete a named existing detailed plan, specification, or current_todo (including an instruction meaning \"按照 current_todo\" or \"按照 <named plan> 推进完成开发\") and this draft faithfully derives from that source. In the latter case, present the complete returned bindings, plan version, and plan hash, then call this tool in the same turn without requiring a second human reply. A request only to read, analyze, discuss, summarize, draft, or update a plan is not execution authorization. An explicit instruction not to start always wins. Never infer authorization from vague continuation language or from the existence of a plan. When this call returns a running worker, do not immediately poll session_status and never poll on a roughly 30-second cadence. The foreground supervisor monitors the worker without model calls; unless the human asks for status or immediate intervention is required, wait 180 to 300 seconds before the first status check and between later checks."
         }
         ActionName::SessionStatus => {
-            "Read the sanitized in-memory status of this foreground architect run."
+            "Read the sanitized in-memory status of this foreground architect run. This tool is not a keepalive: the foreground supervisor monitors worker lifecycle internally without Architect model calls. While a developer or reviewer is running, do not poll on a roughly 30-second cadence. Unless the human explicitly asks for status or immediate intervention is required, wait at least 180 seconds and normally 180 to 300 seconds after dispatch and between status calls. Prefer one native wait or sleep over repeated tool calls so Architect requests and tokens are not wasted. Once a returned state is terminal or needs_human, stop polling."
         }
         ActionName::SessionCancel => {
             "Cancel this foreground run at an exact version only after the human requests cancellation."
@@ -451,5 +451,29 @@ mod tests {
             approve_tool["inputSchema"]["properties"]["approval_confirmed"]["const"],
             true
         );
+    }
+
+    #[test]
+    fn worker_status_contract_uses_low_frequency_model_polling() {
+        let tools = tool_definitions("codex-developer-0.145.0", "claude-reviewer-2.1.220");
+        let approve = tools
+            .iter()
+            .find(|tool| tool["name"] == "session_approve_and_start")
+            .unwrap()["description"]
+            .as_str()
+            .unwrap();
+        let status = tools
+            .iter()
+            .find(|tool| tool["name"] == "session_status")
+            .unwrap()["description"]
+            .as_str()
+            .unwrap();
+        for description in [approve, status] {
+            assert!(description.contains("30-second cadence"));
+            assert!(description.contains("180 to 300 seconds"));
+        }
+        assert!(status.contains("not a keepalive"));
+        assert!(status.contains("requests and tokens"));
+        assert!(status.contains("stop polling"));
     }
 }

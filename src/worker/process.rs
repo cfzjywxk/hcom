@@ -435,12 +435,19 @@ impl RunningWorker {
             .take()
             .filter(|_| termination == WorkerTermination::Exited)
         {
-            Some((relative_path, _, max_bytes)) => Some(
-                self.attempt
+            Some((relative_path, _, max_bytes)) => {
+                let attempt = self
+                    .attempt
                     .as_ref()
-                    .expect("spawned worker owns artifact attempt")
-                    .ingest_native_final(&relative_path, max_bytes as u64)?,
-            ),
+                    .expect("spawned worker owns artifact attempt");
+                match fs::symlink_metadata(attempt.directory_path().join(&relative_path)) {
+                    Ok(_) => Some(attempt.ingest_native_final(&relative_path, max_bytes as u64)?),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(error).context("failed to inspect native final output");
+                    }
+                }
+            }
             None => None,
         };
         let attempt = self
@@ -1045,6 +1052,26 @@ printf '%s' '{"session_id":"native-discovered-1","role":"developer","result":{"d
             fs::read(final_path).unwrap(),
             completion.artifacts.final_output().unwrap()
         );
+    }
+
+    #[test]
+    fn nonzero_final_file_worker_preserves_streams_without_requiring_a_result_file() {
+        let (_temp, worker, _adapter, _prompt) = spawn_discovered_fake(
+            r#"
+sed -n '1,$p' >/dev/null
+printf '%s' '{"type":"session_started","session_id":"native-discovered-1"}'
+exit 42
+"#,
+        );
+        let completion = worker.wait(|_| Ok(HeartbeatControl::Continue)).unwrap();
+        assert_eq!(completion.exit.termination, WorkerTermination::Exited);
+        assert_eq!(completion.exit.code, Some(42));
+        assert_eq!(completion.exit.signal, None);
+        assert_eq!(
+            completion.artifacts.stdout(),
+            br#"{"type":"session_started","session_id":"native-discovered-1"}"#
+        );
+        assert_eq!(completion.artifacts.final_output(), None);
     }
 
     #[test]
