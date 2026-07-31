@@ -31,6 +31,55 @@ pub struct ProcessIdentity {
     pub process_birth: String,
 }
 
+pub(crate) struct ProcessGroupBinding {
+    pidfd: OwnedFd,
+    identity: ProcessIdentity,
+}
+
+impl ProcessGroupBinding {
+    pub(crate) fn capture(child: &mut Child) -> Result<Self> {
+        let spawned_pid = child.id();
+        let identity = match capture_process_identity(spawned_pid) {
+            Ok(identity) => identity,
+            Err(error) => {
+                terminate_spawn_failure(child, spawned_pid);
+                return Err(error).context("failed to bind spawned process identity");
+            }
+        };
+        let pidfd = match open_pidfd(identity.pid) {
+            Ok(pidfd) => pidfd,
+            Err(error) => {
+                terminate_spawn_failure(child, identity.process_group);
+                return Err(error).context("failed to bind spawned process pidfd");
+            }
+        };
+        Ok(Self { pidfd, identity })
+    }
+
+    pub(crate) fn terminate_and_reap(&self, child: &mut Child, grace: Duration) -> Result<()> {
+        if !pidfd_is_ready(&self.pidfd)? && process_identity_is_live(&self.identity)? {
+            signal_owned_group(&self.identity, libc::SIGTERM)?;
+            let deadline = Instant::now() + grace;
+            while !pidfd_is_ready(&self.pidfd)? && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if !pidfd_is_ready(&self.pidfd)? && process_identity_is_live(&self.identity)? {
+                signal_owned_group(&self.identity, libc::SIGKILL)?;
+            }
+        }
+        let kill_deadline = Instant::now() + grace;
+        while !pidfd_is_ready(&self.pidfd)? && Instant::now() < kill_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !pidfd_is_ready(&self.pidfd)? {
+            bail!("owned process group did not exit after SIGKILL");
+        }
+        let _ = settle_descendants_after_leader_exit(&self.identity, grace)?;
+        child.wait()?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeartbeatControl {
     Continue,
@@ -606,6 +655,9 @@ fn settle_descendants_after_leader_exit(
     signal_owned_group(identity, libc::SIGTERM)?;
     if !wait_for_owned_descendants(identity, grace)? {
         signal_owned_group(identity, libc::SIGKILL)?;
+        if !wait_for_owned_descendants(identity, grace)? {
+            bail!("owned worker descendants did not exit after SIGKILL");
+        }
     }
     Ok(true)
 }
@@ -729,7 +781,7 @@ fn signal_owned_group(identity: &ProcessIdentity, signal: i32) -> Result<()> {
     Ok(())
 }
 
-fn configure_worker_child(expected_parent: u32) -> std::io::Result<()> {
+pub(crate) fn configure_worker_child(expected_parent: u32) -> std::io::Result<()> {
     // SAFETY: prctl, getppid, getpid, and setsid have no pointer arguments here.
     unsafe {
         if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {

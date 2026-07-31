@@ -923,7 +923,11 @@ impl RuntimeError {
     fn bounded(code: RuntimeErrorCode, detail: impl Into<String>) -> Self {
         let mut detail = detail.into().replace(['\r', '\n'], " ");
         if detail.len() > MAX_RUNTIME_DIAGNOSTIC_BYTES {
-            detail.truncate(MAX_RUNTIME_DIAGNOSTIC_BYTES);
+            let mut boundary = MAX_RUNTIME_DIAGNOSTIC_BYTES;
+            while !detail.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            detail.truncate(boundary);
         }
         Self { code, detail }
     }
@@ -1372,6 +1376,55 @@ mod tests {
         ] {
             assert!(OutcomeContract::ReviewerV1.parse(missing).is_err());
         }
+    }
+
+    #[test]
+    fn encoded_outcome_accepts_exactly_64_kib_and_rejects_one_byte_more() {
+        let mut outcome = DeveloperOutcomeV1 {
+            status: DeveloperOutcomeStatus::Blocked,
+            summary: String::new(),
+            questions: (0..MAX_OUTCOME_QUESTIONS)
+                .map(|index| format!("q{index}"))
+                .collect(),
+        };
+        let empty_len = serde_json::to_vec(&outcome).unwrap().len();
+        let mut remaining = MAX_RUNTIME_OUTCOME_BYTES - empty_len;
+        for (value, limit) in std::iter::once((&mut outcome.summary, MAX_OUTCOME_SUMMARY_CHARS))
+            .chain(
+                outcome
+                    .questions
+                    .iter_mut()
+                    .map(|question| (question, MAX_OUTCOME_QUESTION_CHARS)),
+            )
+        {
+            let available_chars = limit - value.chars().count();
+            let four_byte_chars = (remaining / 4).min(available_chars);
+            value.push_str(&"🦀".repeat(four_byte_chars));
+            remaining -= four_byte_chars * 4;
+            let one_byte_chars = remaining.min(available_chars - four_byte_chars);
+            value.push_str(&"x".repeat(one_byte_chars));
+            remaining -= one_byte_chars;
+        }
+        assert_eq!(remaining, 0);
+        let exact = serde_json::to_vec(&outcome).unwrap();
+        assert_eq!(exact.len(), MAX_RUNTIME_OUTCOME_BYTES);
+        assert!(
+            OutcomeContract::DeveloperV1.parse(&exact).is_ok(),
+            "an exactly 64 KiB encoded outcome must be accepted"
+        );
+
+        outcome.questions.last_mut().unwrap().push('x');
+        let oversized = serde_json::to_vec(&outcome).unwrap();
+        assert_eq!(oversized.len(), MAX_RUNTIME_OUTCOME_BYTES + 1);
+        assert!(OutcomeContract::DeveloperV1.parse(&oversized).is_err());
+    }
+
+    #[test]
+    fn runtime_error_truncation_is_utf8_safe() {
+        let error = RuntimeError::internal("🦀".repeat(MAX_RUNTIME_DIAGNOSTIC_BYTES));
+        assert!(error.detail.len() <= MAX_RUNTIME_DIAGNOSTIC_BYTES);
+        assert!(error.detail.is_char_boundary(error.detail.len()));
+        assert!(error.detail.chars().all(|character| character == '🦀'));
     }
 
     #[test]
