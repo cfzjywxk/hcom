@@ -1,19 +1,20 @@
 # Architect and in-session task workers
 
-`hcom architect` starts one blank, foreground Codex or Claude architect. The
+`hcom arch` starts one blank, foreground Codex or Claude architect. The
 Architect can maintain project plans and coordination records. After the human
 either directs the Architect to follow a named existing detailed plan or later
 approves a newly drafted plan, the same foreground parent starts one fresh no-TUI
 developer and reviewer per task. State exists only in memory and the whole run
-stops when the parent terminal exits.
+stops when the parent terminal exits. `hcom architect` remains an equivalent
+compatibility alias.
 
 ## Start
 
 ```bash
 cd /path/to/project
-hcom architect codex
+hcom arch codex
 # or
-hcom architect claude
+hcom arch claude
 ```
 
 The exact current directory is the project directory. It must be an existing
@@ -51,8 +52,8 @@ Without profile configuration, the command selects these effective defaults:
 
 | Command | Architect | Developer | Reviewer |
 |---|---|---|---|
-| `hcom architect codex` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, approvals `never` | Codex `gpt-5.6-sol`, `xhigh` | Claude `opus`, `xhigh`, skip permissions |
-| `hcom architect claude` | Claude `opus`, `xhigh`, skip permissions | Codex `gpt-5.6-sol`, `xhigh` | Claude `opus`, `xhigh`, skip permissions |
+| `hcom arch codex` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, approvals `never` | Codex `gpt-5.6-sol`, `xhigh` | Claude `opus`, `xhigh`, skip permissions |
+| `hcom arch claude` | Claude `opus`, `xhigh`, skip permissions | Codex `gpt-5.6-sol`, `xhigh` | Claude `opus`, `xhigh`, skip permissions |
 
 The developer remains independently configurable and keeps its own built-in
 profile. When `[architect.reviewer]` is absent, the reviewer always uses
@@ -191,7 +192,7 @@ result schema, output path, or delegation feature.
 Precedence for the interactive architect is:
 
 ```text
-built-in defaults < config.toml < explicit hcom architect options
+built-in defaults < config.toml < explicit hcom arch options
 ```
 
 The explicit options are `--model`, `--reasoning`, `--sandbox`, and
@@ -209,7 +210,7 @@ The parent reads and validates the file once before it starts the Architect.
 It prints the sanitized effective profiles and a SHA-256 profile hash. The
 configured developer/reviewer adapter and the profile hash are bound into the
 plan hash. Editing `config.toml` later cannot change a running session; start a
-new `hcom architect` invocation to pick up changes.
+new `hcom arch` invocation to pick up changes.
 
 Maintainers changing Codex arguments, isolated configuration, JSONL parsing,
 or size bounds must also follow the
@@ -233,7 +234,7 @@ require or inspect Codex credentials; an all-Codex session does not require or
 inspect Claude credentials. hcom does not copy credentials into its database
 or config, synthesize a login directory, or derive login from another window.
 
-The process that starts `hcom architect` also supplies one complete,
+The process that starts `hcom arch` also supplies one complete,
 session-frozen OS environment snapshot to the Architect and every developer
 and reviewer. There is no inheritance allowlist: unknown names,
 secret-shaped names, both cases of proxy variables, empty values, and

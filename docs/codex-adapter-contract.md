@@ -1,7 +1,8 @@
 # Codex adapter maintenance contract
 
 This is the maintainer checklist for the pinned Codex 0.145 integration used by
-`hcom architect` and no-TUI session workers. It records which native arguments
+`hcom arch` (or its `hcom architect` compatibility alias) and no-TUI session
+workers. It records which native arguments
 and configuration hcom owns, where size bounds are enforced, and which tests
 must change with the contract.
 

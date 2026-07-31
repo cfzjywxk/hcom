@@ -79,8 +79,12 @@ fn create_private_session_runtime() -> Result<tempfile::TempDir> {
 }
 
 pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32> {
+    let command_name = match argv.first().map(String::as_str) {
+        Some("arch") => "hcom arch",
+        _ => "hcom architect",
+    };
     let args = ArchitectArgs::try_parse_from(
-        std::iter::once("hcom architect".to_owned()).chain(argv.iter().skip(1).cloned()),
+        std::iter::once(command_name.to_owned()).chain(argv.iter().skip(1).cloned()),
     )?;
     let architect_adapter = ArchitectAdapter::parse(&args.adapter)?;
     let mut loaded = match config_path {

@@ -94,16 +94,16 @@ hcom
 
 ## Foreground architect
 
-`hcom architect` runs one blank interactive Codex or Claude architect and an
+`hcom arch` runs one blank interactive Codex or Claude architect and an
 in-memory, ordered task supervisor. Each approved task gets a fresh no-TUI
 developer and reviewer; Codex or Claude can be selected independently for
 either role. Same-task review changes resume only that task's exact native
-sessions.
+sessions. The existing `hcom architect` spelling remains a compatibility alias.
 
 ```bash
 cd /path/to/project
-hcom architect codex
-# or: hcom architect claude
+hcom arch codex
+# or: hcom arch claude
 ```
 
 Codex defaults to `gpt-5.6-sol` with `xhigh` reasoning,
@@ -145,7 +145,7 @@ the complete schema, all four Codex/Claude role combinations, parent-terminal
 login inheritance, and path-preserving sandbox invariants.
 
 The Architect and every session task worker inherit the complete environment
-of the process that started `hcom architect`, captured once without a name
+of the process that started `hcom arch`, captured once without a name
 allowlist. Arbitrary and secret-shaped names, upper/lower-case pairs, empty
 values, and non-UTF-8 OS strings are preserved. hcom then replaces only the
 role-local values required by the isolation contract: private native

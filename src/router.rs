@@ -42,8 +42,14 @@ const COMMANDS: &[&str] = &[
     "update",
 ];
 
+const ARCHITECT_COMMANDS: &[&str] = &["arch", "architect"];
+
 fn is_command(name: &str) -> bool {
     COMMANDS.contains(&name)
+}
+
+fn is_architect_command(name: &str) -> bool {
+    ARCHITECT_COMMANDS.contains(&name)
 }
 
 fn is_launch_tool(name: &str) -> bool {
@@ -314,7 +320,7 @@ pub fn resolve_action(argv: &[String]) -> Action {
     // Find the first non-flag token in stripped args
     let cmd_token = stripped.first().map(|s| s.as_str()).unwrap_or("");
 
-    if cmd_token == "architect" {
+    if is_architect_command(cmd_token) {
         return Action::Architect {
             args: argv.to_vec(),
         };
@@ -1074,6 +1080,17 @@ mod tests {
                 args: sv(&["claude", "--arg1"])
             }
         );
+    }
+
+    #[test]
+    fn architect_commands_route_to_the_same_lane_without_rewriting_argv() {
+        for command in ARCHITECT_COMMANDS {
+            let args = sv(&[command, "codex", "--model", "gpt-5.6-sol"]);
+            assert_eq!(
+                resolve_action(&args),
+                Action::Architect { args: args.clone() }
+            );
+        }
     }
 
     // ── Hook detection ──────────────────────────────────────────────────

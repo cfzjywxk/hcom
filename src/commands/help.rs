@@ -886,6 +886,7 @@ fn format_entries(entries: &[HelpEntry]) -> Vec<String> {
 /// tail must include every released spec name plus public aliases (e.g. `agy`).
 /// The `command_names_covers_released_tools` test guards against drift.
 pub const COMMAND_NAMES: &[&str] = &[
+    "arch",
     "architect",
     "send",
     "review",
@@ -966,7 +967,7 @@ Launch:\n\
   hcom kill <name(s)|tag:T|all>         Kill + close terminal pane\n\
 \n\
 Commands:\n\
-  architect    Launch a blank in-memory session-task architect\n\
+  arch         Launch a blank in-memory session-task architect (alias: architect)\n\
   send         Send message to your buddies\n\
   review       Review/fix/re-review until LGTM or a round limit\n\
   listen       Block until message or event arrives\n\
@@ -1086,7 +1087,7 @@ pub fn get_command_help(name: &str) -> String {
     }
 
     let entries: Option<&[HelpEntry]> = match name {
-        "architect" => return hcom::architect::help_text().to_owned(),
+        "arch" | "architect" => return hcom::architect::help_text().to_owned(),
         "list" => Some(LIST_HELP),
         "send" => Some(SEND_HELP),
         "review" => Some(REVIEW_HELP),
@@ -1200,6 +1201,8 @@ mod tests {
     #[test]
     fn all_commands_have_help() {
         let commands = [
+            "arch",
+            "architect",
             "send",
             "review",
             "list",

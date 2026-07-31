@@ -34,6 +34,10 @@ pub fn run_cli_with_config(args: &[String], config_path: &Path) -> Result<i32> {
 pub fn help_text() -> &'static str {
     r#"Usage:
   cd <project-directory>
+  hcom arch codex [architect-profile-options]
+  hcom arch claude [architect-profile-options]
+
+Compatibility alias:
   hcom architect codex [architect-profile-options]
   hcom architect claude [architect-profile-options]
 

@@ -21,7 +21,7 @@ pub mod architect {
     }
 
     pub fn help_text() -> &'static str {
-        "Usage:\n  hcom architect\n\nhcom architect is supported only on Linux."
+        "Usage:\n  hcom arch\n  hcom architect\n\nhcom arch is supported only on Linux."
     }
 }
 pub mod control_api;
