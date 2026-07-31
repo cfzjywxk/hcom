@@ -125,6 +125,14 @@ The core owns:
 - normalized repository checkpoints and final Reviewer Git equality;
 - closed status snapshots and stable bounded domain errors.
 
+`TurnFailed` retains the complete provider-neutral
+`SanitizedRuntimeFailure`, including its retryability bit. Only a retryable
+Developer contract failure (the missing/invalid structured-final-result case)
+may request `DeveloperRecoveryPreflight`; identity, branch, ancestry and the
+changed-path allowlist must pass before the core schedules one
+`DeveloperCompletionRecovery` turn on the same logical session. A second such
+failure, every non-retryable failure and every Reviewer failure fails closed.
+
 It does not own filesystem, Git, process, clock, network, terminal, or provider
 transport I/O. The P1 matrix has explicit rows for all 84
 `SessionState × SupervisorEventKind` combinations and all 56

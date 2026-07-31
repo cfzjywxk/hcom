@@ -11,6 +11,7 @@ use crate::control_api::{
 use crate::worker::runtime::{
     DeveloperOutcomeStatus, DeveloperOutcomeV1, ReviewerOutcomeV1, ReviewerVerdict,
     RuntimeFailureClass, RuntimeOutcome, RuntimeSessionKey, RuntimeTurnKey, RuntimeTurnPurpose,
+    SanitizedRuntimeFailure,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -111,6 +112,7 @@ pub struct TaskRepositoryBinding {
 pub enum RepositoryCheckpoint {
     TaskStart,
     DeveloperCompletion,
+    DeveloperRecoveryPreflight,
     ReviewerPreflight,
     ReviewerPostflight,
 }
@@ -197,8 +199,7 @@ pub enum SupervisorEvent {
         session: RuntimeSessionKey,
         turn: RuntimeTurnKey,
         completion_token: String,
-        class: RuntimeFailureClass,
-        detail: String,
+        failure: SanitizedRuntimeFailure,
     },
     RepositoryObserved {
         expected_version: u64,
@@ -720,8 +721,7 @@ impl SupervisorCore {
                 session,
                 turn,
                 completion_token,
-                class,
-                detail,
+                failure,
                 ..
             } => self.turn_failed(
                 task_ordinal,
@@ -729,8 +729,7 @@ impl SupervisorCore {
                 session,
                 turn,
                 &completion_token,
-                class,
-                &detail,
+                failure,
             ),
             SupervisorEvent::RepositoryObserved {
                 task_ordinal,
@@ -1075,16 +1074,39 @@ impl SupervisorCore {
         session: RuntimeSessionKey,
         turn: RuntimeTurnKey,
         completion_token: &str,
-        class: RuntimeFailureClass,
-        detail: &str,
+        failure: SanitizedRuntimeFailure,
     ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
         self.require_running_task(task_ordinal)?;
-        validate_single_line("runtime failure detail", detail, MAX_CORE_DIAGNOSTIC_BYTES)?;
+        validate_single_line(
+            "runtime failure detail",
+            &failure.detail,
+            MAX_CORE_DIAGNOSTIC_BYTES,
+        )?;
         let active =
             self.take_matching_active(task_ordinal, role, session, turn, completion_token)?;
         self.accepted_completion_tokens
             .insert(active.completion_token);
-        let (session_state, task_state, terminal_detail) = match class {
+
+        if role == WorkerRole::Developer
+            && failure.class == RuntimeFailureClass::Contract
+            && failure.retryable
+        {
+            if self.tasks[task_ordinal].recovery_used {
+                return self.terminalize_current(
+                    SessionState::NeedsHuman,
+                    TaskState::NeedsHuman,
+                    "developer completion result remained invalid after one recovery",
+                    Vec::new(),
+                );
+            }
+            return self.schedule_repository(
+                task_ordinal,
+                RepositoryCheckpoint::DeveloperRecoveryPreflight,
+                None,
+            );
+        }
+
+        let (session_state, task_state, terminal_detail) = match failure.class {
             RuntimeFailureClass::Canceled => (
                 SessionState::Failed,
                 TaskState::Failed,
@@ -1145,6 +1167,14 @@ impl SupervisorCore {
                     ));
                 };
                 self.handle_developer_repository(task_ordinal, observation, outcome)
+            }
+            RepositoryCheckpoint::DeveloperRecoveryPreflight => {
+                if pending.outcome.is_some() {
+                    return Err(SupervisorError::invariant(
+                        "developer recovery preflight unexpectedly carried an outcome",
+                    ));
+                }
+                self.handle_developer_recovery_preflight(task_ordinal, observation)
             }
             RepositoryCheckpoint::ReviewerPreflight => {
                 if pending.outcome.is_some() {
@@ -1309,6 +1339,57 @@ impl SupervisorCore {
         task.recovery_used = true;
         task.recovery_checkpoint = Some(observation);
         task.last_developer_outcome = Some(outcome);
+        task.outcome_detail = Some("developer completion recovery in progress".into());
+        self.schedule_turn(
+            task_ordinal,
+            WorkerRole::Developer,
+            RuntimeTurnPurpose::DeveloperCompletionRecovery,
+            session,
+        )
+    }
+
+    fn handle_developer_recovery_preflight(
+        &mut self,
+        task_ordinal: usize,
+        observation: RepositoryObservation,
+    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        if self.tasks[task_ordinal].state != TaskState::Developing {
+            return Err(SupervisorError::invalid_transition(
+                "developer recovery checkpoint requires a developing task",
+            ));
+        }
+        let expected = self.tasks[task_ordinal].expected_repository.clone();
+        if observation.repository_root != expected.repository_root
+            || observation.identity_hash != expected.identity_hash
+            || observation.branch != expected.branch
+            || !observation.head_descends_from_expected
+        {
+            return self.terminalize_current(
+                SessionState::NeedsHuman,
+                TaskState::NeedsHuman,
+                "developer repository identity, branch, or history drifted",
+                Vec::new(),
+            );
+        }
+        if !self.changed_paths_allowed(task_ordinal, &observation.changed_paths) {
+            return self.terminalize_current(
+                SessionState::NeedsHuman,
+                TaskState::NeedsHuman,
+                "developer changed paths outside the task allowlist",
+                Vec::new(),
+            );
+        }
+        if self.tasks[task_ordinal].recovery_used {
+            return Err(SupervisorError::invariant(
+                "developer recovery preflight arrived after the recovery budget was consumed",
+            ));
+        }
+        let session = self.tasks[task_ordinal]
+            .developer_session
+            .ok_or_else(|| SupervisorError::invariant("developer session disappeared"))?;
+        let task = &mut self.tasks[task_ordinal];
+        task.recovery_used = true;
+        task.recovery_checkpoint = Some(observation);
         task.outcome_detail = Some("developer completion recovery in progress".into());
         self.schedule_turn(
             task_ordinal,
@@ -1948,6 +2029,11 @@ impl SupervisorCore {
                     task.state == TaskState::Developing
                         && self.runtime_open == Some(pending.task_ordinal)
                 }
+                (RepositoryCheckpoint::DeveloperRecoveryPreflight, None) => {
+                    task.state == TaskState::Developing
+                        && !task.recovery_used
+                        && self.runtime_open == Some(pending.task_ordinal)
+                }
                 (RepositoryCheckpoint::ReviewerPreflight, None) => {
                     task.state == TaskState::Reviewing
                         && self.runtime_open == Some(pending.task_ordinal)
@@ -2173,6 +2259,18 @@ mod tests {
         })
     }
 
+    fn runtime_failure(
+        class: RuntimeFailureClass,
+        retryable: bool,
+        detail: impl Into<String>,
+    ) -> SanitizedRuntimeFailure {
+        SanitizedRuntimeFailure {
+            class,
+            detail: detail.into(),
+            retryable,
+        }
+    }
+
     fn lgtm() -> RuntimeOutcome {
         RuntimeOutcome::Reviewer(ReviewerOutcomeV1 {
             verdict: ReviewerVerdict::Lgtm,
@@ -2315,6 +2413,24 @@ mod tests {
             outcome,
         })
         .unwrap()
+    }
+
+    fn fail_turn_event(
+        core: &SupervisorCore,
+        active: ActiveIdentity,
+        class: RuntimeFailureClass,
+        retryable: bool,
+        detail: impl Into<String>,
+    ) -> SupervisorEvent {
+        SupervisorEvent::TurnFailed {
+            expected_version: core.version(),
+            task_ordinal: active.task,
+            role: active.role,
+            session: active.session,
+            turn: active.turn,
+            completion_token: active.token.into(),
+            failure: runtime_failure(class, retryable, detail),
+        }
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -2670,8 +2786,11 @@ mod tests {
             session: developer.session,
             turn: developer.turn,
             completion_token: developer.token.into(),
-            class: RuntimeFailureClass::Canceled,
-            detail: "unexpected provider cancellation".into(),
+            failure: runtime_failure(
+                RuntimeFailureClass::Canceled,
+                false,
+                "unexpected provider cancellation",
+            ),
         })
         .unwrap();
         core
@@ -2867,8 +2986,7 @@ mod tests {
                 session: RuntimeSessionKey::from_counter(1).unwrap(),
                 turn: RuntimeTurnKey::from_counter(1).unwrap(),
                 completion_token: "active".into(),
-                class: RuntimeFailureClass::Process,
-                detail: "provider exited".into(),
+                failure: runtime_failure(RuntimeFailureClass::Process, false, "provider exited"),
             },
             SupervisorEventKind::RepositoryObserved => SupervisorEvent::RepositoryObserved {
                 expected_version: core.version(),
@@ -3046,8 +3164,11 @@ mod tests {
                                 session: RuntimeSessionKey::from_counter(2).unwrap(),
                                 turn: RuntimeTurnKey::from_counter(2).unwrap(),
                                 completion_token: "reviewer".into(),
-                                class: RuntimeFailureClass::Process,
-                                detail: "exit".into(),
+                                failure: runtime_failure(
+                                    RuntimeFailureClass::Process,
+                                    false,
+                                    "exit",
+                                ),
                             },
                             SupervisorEventKind::Timeout => SupervisorEvent::Timeout {
                                 expected_version: core.version(),
@@ -3916,6 +4037,227 @@ mod tests {
     }
 
     #[test]
+    fn runtime_failure_retryability_matrix_is_role_exact_and_transactional() {
+        for (role, retryable) in [
+            (WorkerRole::Developer, false),
+            (WorkerRole::Developer, true),
+            (WorkerRole::Reviewer, false),
+            (WorkerRole::Reviewer, true),
+        ] {
+            let (mut core, repository, active) = match role {
+                WorkerRole::Developer => active_core(),
+                WorkerRole::Reviewer => active_reviewer_core(2),
+            };
+
+            let mut rejected = fail_turn_event(
+                &core,
+                active,
+                RuntimeFailureClass::Contract,
+                retryable,
+                "typed final outcome was missing or invalid",
+            );
+            if let SupervisorEvent::TurnFailed {
+                completion_token, ..
+            } = &mut rejected
+            {
+                *completion_token = "wrong-token".into();
+            }
+            let before = core.clone();
+            let error = core.reduce(rejected).unwrap_err();
+            assert_eq!(error.code, SupervisorErrorCode::InvalidIdentity);
+            assert_eq!(
+                core, before,
+                "{role:?} retryable={retryable} rejection mutated the core"
+            );
+
+            let effects = core
+                .reduce(fail_turn_event(
+                    &core,
+                    active,
+                    RuntimeFailureClass::Contract,
+                    retryable,
+                    "typed final outcome was missing or invalid",
+                ))
+                .unwrap();
+            if role == WorkerRole::Developer && retryable {
+                assert_eq!(
+                    effects,
+                    vec![
+                        SupervisorEffect::ObserveRepository {
+                            task_ordinal: 0,
+                            checkpoint: RepositoryCheckpoint::DeveloperRecoveryPreflight,
+                        },
+                        SupervisorEffect::PublishStatus,
+                    ]
+                );
+                assert_eq!(core.session_state(), SessionState::Running);
+                assert!(!core.tasks[0].recovery_used);
+
+                let safe_dirty = developer_observation(&repository, '1', false, &["src/lib.rs"]);
+                assert_eq!(
+                    observe(
+                        &mut core,
+                        0,
+                        RepositoryCheckpoint::DeveloperRecoveryPreflight,
+                        safe_dirty,
+                    ),
+                    vec![
+                        SupervisorEffect::StartTurn {
+                            task_ordinal: 0,
+                            role: WorkerRole::Developer,
+                            purpose: RuntimeTurnPurpose::DeveloperCompletionRecovery,
+                            session: active.session,
+                        },
+                        SupervisorEffect::PublishStatus,
+                    ]
+                );
+                let snapshot = core.snapshot();
+                assert_eq!(snapshot.state, SessionState::Running);
+                assert_eq!(snapshot.current_task_ordinal, Some(0));
+                assert_eq!(
+                    snapshot.tasks[0].outcome_detail.as_deref(),
+                    Some("developer completion recovery in progress")
+                );
+                assert!(core.tasks[0].recovery_used);
+                assert_eq!(core.tasks[0].developer_session, Some(active.session));
+
+                let recovery_turn = RuntimeTurnKey::from_counter(20).unwrap();
+                start_turn(
+                    &mut core,
+                    0,
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::DeveloperCompletionRecovery,
+                    active.session,
+                    recovery_turn,
+                    "retryable-recovery",
+                );
+                let recovery = ActiveIdentity {
+                    task: 0,
+                    role: WorkerRole::Developer,
+                    session: active.session,
+                    turn: recovery_turn,
+                    token: "retryable-recovery",
+                };
+                assert_eq!(
+                    core.reduce(fail_turn_event(
+                        &core,
+                        recovery,
+                        RuntimeFailureClass::Contract,
+                        true,
+                        "typed final outcome was invalid again",
+                    ))
+                    .unwrap(),
+                    vec![
+                        SupervisorEffect::CloseTaskRuntime { task_ordinal: 0 },
+                        SupervisorEffect::FinishSession {
+                            state: SessionState::NeedsHuman,
+                            detail:
+                                "developer completion result remained invalid after one recovery"
+                                    .into(),
+                        },
+                        SupervisorEffect::PublishStatus,
+                    ]
+                );
+                assert_eq!(
+                    core.snapshot().terminal_detail.as_deref(),
+                    Some("developer completion result remained invalid after one recovery")
+                );
+            } else {
+                assert_eq!(
+                    effects,
+                    vec![
+                        SupervisorEffect::CloseTaskRuntime { task_ordinal: 0 },
+                        SupervisorEffect::FinishSession {
+                            state: SessionState::NeedsHuman,
+                            detail: "worker runtime contract failed".into(),
+                        },
+                        SupervisorEffect::PublishStatus,
+                    ]
+                );
+                let snapshot = core.snapshot();
+                assert_eq!(snapshot.state, SessionState::NeedsHuman);
+                assert_eq!(
+                    snapshot.terminal_detail.as_deref(),
+                    Some("worker runtime contract failed")
+                );
+                assert_eq!(
+                    snapshot.tasks[0].outcome_detail.as_deref(),
+                    Some("worker runtime contract failed")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retryable_developer_failure_requires_safe_repository_evidence() {
+        let base = observation("/repo", '1');
+        let mut identity_drift = developer_observation(&base, '1', false, &["src/lib.rs"]);
+        identity_drift.identity_hash = "2".repeat(64);
+        let mut branch_drift = developer_observation(&base, '1', false, &["src/lib.rs"]);
+        branch_drift.branch = "other".into();
+        let mut history_drift = developer_observation(&base, '2', true, &["src/lib.rs"]);
+        history_drift.head_descends_from_expected = false;
+        let outside_allowlist = developer_observation(&base, '1', false, &["outside/secret.txt"]);
+
+        for (repository, expected) in [
+            (
+                identity_drift,
+                "developer repository identity, branch, or history drifted",
+            ),
+            (
+                branch_drift,
+                "developer repository identity, branch, or history drifted",
+            ),
+            (
+                history_drift,
+                "developer repository identity, branch, or history drifted",
+            ),
+            (
+                outside_allowlist,
+                "developer changed paths outside the task allowlist",
+            ),
+        ] {
+            let (mut core, _base, active) = active_core();
+            assert_eq!(
+                core.reduce(fail_turn_event(
+                    &core,
+                    active,
+                    RuntimeFailureClass::Contract,
+                    true,
+                    "typed final outcome was missing",
+                ))
+                .unwrap(),
+                vec![
+                    SupervisorEffect::ObserveRepository {
+                        task_ordinal: 0,
+                        checkpoint: RepositoryCheckpoint::DeveloperRecoveryPreflight,
+                    },
+                    SupervisorEffect::PublishStatus,
+                ]
+            );
+            assert_eq!(
+                observe(
+                    &mut core,
+                    0,
+                    RepositoryCheckpoint::DeveloperRecoveryPreflight,
+                    repository,
+                ),
+                vec![
+                    SupervisorEffect::CloseTaskRuntime { task_ordinal: 0 },
+                    SupervisorEffect::FinishSession {
+                        state: SessionState::NeedsHuman,
+                        detail: expected.into(),
+                    },
+                    SupervisorEffect::PublishStatus,
+                ]
+            );
+            assert_eq!(core.session_state(), SessionState::NeedsHuman);
+            assert!(!core.tasks[0].recovery_used);
+            assert_eq!(core.snapshot().terminal_detail.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
     fn completion_identity_ordering_and_at_most_once_are_transactional() {
         let (core, _base, active) = active_core();
         let wrong_events = [
@@ -4162,8 +4504,7 @@ mod tests {
                     session: active.session,
                     turn: active.turn,
                     completion_token: active.token.into(),
-                    class: RuntimeFailureClass::Process,
-                    detail: "late exit".into(),
+                    failure: runtime_failure(RuntimeFailureClass::Process, false, "late exit",),
                 })
                 .unwrap_err()
                 .code,
@@ -4179,8 +4520,7 @@ mod tests {
                 session: active.session,
                 turn: active.turn,
                 completion_token: active.token.into(),
-                class: RuntimeFailureClass::Process,
-                detail: "exit".into(),
+                failure: runtime_failure(RuntimeFailureClass::Process, false, "exit"),
             })
             .unwrap();
         assert_eq!(failure_first.session_state(), SessionState::NeedsHuman);
@@ -4644,8 +4984,7 @@ mod tests {
                 session: active.session,
                 turn: active.turn,
                 completion_token: active.token.into(),
-                class,
-                detail: "RAW_SECRET_PROVIDER_DETAIL".into(),
+                failure: runtime_failure(class, false, "RAW_SECRET_PROVIDER_DETAIL"),
             })
             .unwrap();
             let snapshot = core.snapshot();
@@ -5016,29 +5355,40 @@ mod tests {
                 "cancel reason length {length}"
             );
         }
-        for (length, accepted) in [
-            (0, false),
-            (1, true),
-            (1023, true),
-            (1024, true),
-            (1025, false),
-        ] {
-            let (mut core, _base, active) = active_core();
-            assert_eq!(
-                core.reduce(SupervisorEvent::TurnFailed {
-                    expected_version: core.version(),
-                    task_ordinal: 0,
-                    role: WorkerRole::Developer,
-                    session: active.session,
-                    turn: active.turn,
-                    completion_token: active.token.into(),
-                    class: RuntimeFailureClass::Process,
-                    detail: "d".repeat(length),
-                })
-                .is_ok(),
-                accepted,
-                "runtime failure detail length {length}"
-            );
+        for role in [WorkerRole::Developer, WorkerRole::Reviewer] {
+            for retryable in [false, true] {
+                for (length, accepted) in [
+                    (0, false),
+                    (1, true),
+                    (1023, true),
+                    (1024, true),
+                    (1025, false),
+                ] {
+                    let (mut core, _repository, active) = match role {
+                        WorkerRole::Developer => active_core(),
+                        WorkerRole::Reviewer => active_reviewer_core(2),
+                    };
+                    let before = core.clone();
+                    let event = fail_turn_event(
+                        &core,
+                        active,
+                        RuntimeFailureClass::Contract,
+                        retryable,
+                        "d".repeat(length),
+                    );
+                    assert_eq!(
+                        core.reduce(event).is_ok(),
+                        accepted,
+                        "{role:?} retryable={retryable} runtime failure detail length {length}"
+                    );
+                    if !accepted {
+                        assert_eq!(
+                            core, before,
+                            "{role:?} retryable={retryable} invalid bound mutated the core"
+                        );
+                    }
+                }
+            }
         }
 
         for (length, accepted) in [(511, true), (512, true), (513, false)] {
