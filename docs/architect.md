@@ -249,10 +249,20 @@ After copying that snapshot, hcom applies only these role-local replacements:
 Those replacements take precedence over same-named parent entries. All other
 entries remain byte-for-byte unchanged. An inherited path value does not grant
 filesystem access by itself: the Architect and worker mount contracts below
-remain authoritative. Raw environment values stay in session memory, are not
-printed or persisted, and meaningful UTF-8 values are included in artifact
-redaction. `HCOM_DIR` changes hcom state/config only; it does not redirect
-Codex or Claude login state.
+remain authoritative. Hcom neither enumerates nor persists the complete
+environment as a name/value inventory. Artifact redaction is derived only from
+secret-shaped environment names, URI userinfo, adapter-declared secrets, and
+the private prompt. Ordinary PWD, PATH, shell, locale, and workdir evidence
+remains readable and admissible in structured results. `HCOM_DIR` changes hcom
+state/config only; it does not redirect Codex or Claude login state.
+
+Complete inheritance may carry marker-shaped values such as `HCOM_AGENT`,
+terminal IDs, or stale outer-session names. They remain plain data: worker
+namespaces expose no retained hcom state/control socket or interactive TTY, the
+Architect receives a private `HCOM_DIR`, and supervisor-owned role/run/task
+identity always wins. Values used to resolve HOME/native config/toolchain or
+other mount paths must be valid UTF-8 and fail closed before spawn otherwise;
+unrelated non-UTF-8 names and values remain byte-exact.
 
 ## Fixed safety boundaries
 

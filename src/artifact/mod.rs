@@ -1181,7 +1181,7 @@ fn hex_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::environment::EnvironmentPolicy;
+    use crate::worker::environment::{EnvironmentPolicy, ParentEnvironment};
     use crate::worker::result::{
         CheckResult, CheckStatus, CommitSummary, DeveloperDecision, FindingSeverity,
         ReviewDecision, ReviewFinding,
@@ -1349,7 +1349,10 @@ mod tests {
             "lease-boundary",
             "epoch-1",
             &EnvironmentPolicy::baseline(),
-            vec![("PATH".into(), secret.into())],
+            vec![
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("SERVICE_TOKEN".into(), secret.into()),
+            ],
         )
         .unwrap();
         let attempt = ArtifactAttempt::create(&root, scope(), &environment, TEST_PROMPT).unwrap();
@@ -1622,6 +1625,64 @@ mod tests {
         assert_eq!(
             fs::read(attempt.artifact_path(ArtifactKind::Result)).unwrap(),
             canonical
+        );
+    }
+
+    #[test]
+    fn operational_parent_environment_does_not_redact_worker_evidence_or_result() {
+        let (_temp, root) = fixture_root();
+        let repository = "/home/example/work/project";
+        let environment = ExecutionEnvironmentLease::capture_complete(
+            "lease-real-shell-shape",
+            "epoch-1",
+            &EnvironmentPolicy::baseline(),
+            &ParentEnvironment::from_unicode(BTreeMap::from([
+                ("LANG".into(), "en_US.UTF-8".into()),
+                ("OLDPWD".into(), "/home/example/work".into()),
+                ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
+                ("PWD".into(), repository.into()),
+                (
+                    "SERVICE_ACCESS_TOKEN".into(),
+                    "service-access-token-value".into(),
+                ),
+                ("SHELL".into(), "/bin/bash".into()),
+            ])),
+            Vec::new(),
+        )
+        .unwrap();
+        let attempt = ArtifactAttempt::create(&root, scope(), &environment, TEST_PROMPT).unwrap();
+        let banner = format!(
+            "workdir={repository} shell=/bin/bash locale=en_US.UTF-8 parent=/home/example/work"
+        );
+        let mut stdout = attempt
+            .start_native_stream(ArtifactKind::NativeStdout, 1024)
+            .unwrap();
+        stdout.write_chunk(banner.as_bytes()).unwrap();
+        stdout.finish().unwrap();
+        assert_eq!(
+            fs::read_to_string(attempt.artifact_path(ArtifactKind::NativeStdout)).unwrap(),
+            banner
+        );
+
+        let mut result: DeveloperResult = serde_json::from_slice(&result_json()).unwrap();
+        result.summary = format!("updated {repository}/src/lib.rs while preserving #!/bin/bash");
+        result.risks = vec!["verified with en_US.UTF-8 from /home/example/work".into()];
+        let canonical = result.canonical_json().unwrap();
+        attempt.write_result_json(&canonical).unwrap();
+        assert_eq!(
+            fs::read(attempt.artifact_path(ArtifactKind::Result)).unwrap(),
+            canonical
+        );
+
+        let mut secret_scope = scope();
+        secret_scope.attempt = 2;
+        let secret_attempt =
+            ArtifactAttempt::create(&root, secret_scope, &environment, TEST_PROMPT).unwrap();
+        result.summary = "leaked service-access-token-value".into();
+        assert!(
+            secret_attempt
+                .write_result_json(&result.canonical_json().unwrap())
+                .is_err()
         );
     }
 }

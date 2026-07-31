@@ -2162,9 +2162,11 @@ fn run_bounded_command(mut command: Command, cap: usize) -> Result<BoundedComman
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .context("failed to spawn bounded reviewer helper")?;
+    #[cfg(test)]
+    let child = super::spawn_test_command_with_etxtbsy_retry(&mut command);
+    #[cfg(not(test))]
+    let child = command.spawn();
+    let mut child = child.context("failed to spawn bounded reviewer helper")?;
     let Some(stdout) = child.stdout.take() else {
         terminate_and_reap(&mut child);
         bail!("bounded reviewer helper stdout pipe is unavailable");
@@ -4163,7 +4165,6 @@ fi
 [ ! -t 0 ] && [ ! -t 1 ] && [ ! -t 2 ]
 [ "${HCOM_WORKER_ROLE-}" = reviewer ]
 [ -n "${HCOM_RUN_ID-}" ] && [ -n "${HCOM_TASK_ID-}" ]
-[ -z "${HCOM_AGENT-}" ] && [ -z "${TERM-}" ] && [ -z "${STY-}" ]
 [ -n "${HOME-}" ] && [ -n "${CODEX_HOME-}" ] && [ -n "${TMPDIR-}" ]
 case "${HOME-}" in /*) ;; *) exit 91 ;; esac
 case "${CODEX_HOME-}" in /*) ;; *) exit 92 ;; esac
@@ -4221,7 +4222,6 @@ fi
 [ ! -t 0 ] && [ ! -t 1 ] && [ ! -t 2 ]
 [ "${HCOM_WORKER_ROLE-}" = reviewer ] || [ "${HCOM_WORKER_ROLE-}" = developer ]
 [ -n "${HCOM_RUN_ID-}" ] && [ -n "${HCOM_TASK_ID-}" ]
-[ -z "${HCOM_AGENT-}" ] && [ -z "${TERM-}" ] && [ -z "${STY-}" ]
 [ -n "${HOME-}" ] && [ -n "${CLAUDE_CONFIG_DIR-}" ] && [ -n "${TMPDIR-}" ]
 case "${HOME-}" in /*) ;; *) exit 91 ;; esac
 case "${CLAUDE_CONFIG_DIR-}" in /*) ;; *) exit 92 ;; esac

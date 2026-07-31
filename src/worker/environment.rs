@@ -11,9 +11,7 @@ const MAX_ENVIRONMENT_VALUE_BYTES: usize = 16 * 1024;
 // Substring redaction cannot safely treat low-entropy operational atoms such
 // as "1" or "false" as secrets: doing so corrupts otherwise valid structured
 // worker output (for example `task1.txt`) and makes every ordinary occurrence
-// indistinguishable from an environment leak. Complete parent inheritance may
-// include secret-shaped names, so every meaningful UTF-8 parent value remains
-// part of the redaction inventory.
+// indistinguishable from an environment leak.
 const MIN_ENVIRONMENT_REDACTION_BYTES: usize = 8;
 
 #[derive(Clone)]
@@ -257,12 +255,27 @@ impl ExecutionEnvironmentLease {
     }
 
     pub(crate) fn redactor(&self) -> SecretRedactor {
-        SecretRedactor::from_values(
-            self.values
-                .values()
-                .filter_map(|value| value.to_str())
-                .chain(self.redaction_values.iter().map(String::as_str)),
-        )
+        // Complete inheritance and secret containment are deliberately
+        // separate contracts. Operational values such as PWD, SHELL, LANG and
+        // PATH are expected to appear in native banners and result summaries;
+        // treating every inherited value as a secret rejects otherwise valid
+        // turns. Only secret-shaped names contribute their complete value.
+        // Credentials embedded in URI userinfo are collected independently so
+        // proxy/database URLs remain protected without hiding the whole URL.
+        let mut sensitive = BTreeSet::new();
+        for (name, value) in &self.values {
+            let Some(value) = value.to_str() else {
+                continue;
+            };
+            if is_secret_shaped_environment_name(name) {
+                collect_sensitive_value(value, &mut sensitive);
+            }
+            collect_proxy_credentials(value, &mut sensitive);
+        }
+        for value in &self.redaction_values {
+            collect_sensitive_value(value, &mut sensitive);
+        }
+        SecretRedactor::from_sensitive_values(sensitive)
     }
 
     pub(crate) fn with_secret_redaction_values(mut self, values: Vec<String>) -> Result<Self> {
@@ -378,14 +391,7 @@ pub(crate) struct SecretRedactor {
 }
 
 impl SecretRedactor {
-    pub(crate) fn from_values<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
-        let mut sensitive = BTreeSet::new();
-        for value in values {
-            if value.len() >= MIN_ENVIRONMENT_REDACTION_BYTES {
-                sensitive.insert(value.to_owned());
-                collect_proxy_credentials(value, &mut sensitive);
-            }
-        }
+    fn from_sensitive_values(sensitive: BTreeSet<String>) -> Self {
         let mut sensitive_values: Vec<_> = sensitive.into_iter().collect();
         sensitive_values.sort_by_key(|value| std::cmp::Reverse(value.len()));
         let replacement = redaction_replacement(&sensitive_values);
@@ -515,6 +521,50 @@ fn environment_hash(values: &BTreeMap<OsString, OsString>) -> String {
     hex_bytes(&hasher.finalize())
 }
 
+fn is_secret_shaped_environment_name(name: &OsStr) -> bool {
+    let upper = name.to_string_lossy().to_ascii_uppercase();
+    let tokens: Vec<_> = upper
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    if tokens.iter().any(|token| {
+        matches!(
+            *token,
+            "APIKEY"
+                | "ASKPASS"
+                | "AUTH"
+                | "AUTHTOKEN"
+                | "AUTHORIZATION"
+                | "BEARER"
+                | "COOKIE"
+                | "CREDENTIAL"
+                | "CREDENTIALS"
+                | "JWT"
+                | "PASSWORD"
+                | "PASSPHRASE"
+                | "PASSWD"
+                | "SECRET"
+                | "TOKEN"
+                | "WEBHOOK"
+        )
+    }) {
+        return true;
+    }
+    tokens.windows(2).any(|pair| {
+        matches!(
+            pair,
+            ["API", "KEY"] | ["ACCESS", "KEY"] | ["PRIVATE", "KEY"] | ["CONNECTION", "STRING"]
+        )
+    }) || (tokens.last() == Some(&"KEY")
+        && tokens.get(tokens.len().saturating_sub(2)) != Some(&"PUBLIC"))
+}
+
+fn collect_sensitive_value(value: &str, sensitive: &mut BTreeSet<String>) {
+    if value.len() >= MIN_ENVIRONMENT_REDACTION_BYTES {
+        sensitive.insert(value.to_owned());
+    }
+}
+
 fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
@@ -528,16 +578,10 @@ fn collect_proxy_credentials(value: &str, sensitive: &mut BTreeSet<String>) {
     let Some((userinfo, _)) = authority.rsplit_once('@') else {
         return;
     };
-    if userinfo.len() >= MIN_ENVIRONMENT_REDACTION_BYTES {
-        sensitive.insert(userinfo.to_owned());
-    }
+    collect_sensitive_value(userinfo, sensitive);
     if let Some((username, password)) = userinfo.split_once(':') {
-        if username.len() >= MIN_ENVIRONMENT_REDACTION_BYTES {
-            sensitive.insert(username.to_owned());
-        }
-        if password.len() >= MIN_ENVIRONMENT_REDACTION_BYTES {
-            sensitive.insert(password.to_owned());
-        }
+        collect_sensitive_value(username, sensitive);
+        collect_sensitive_value(password, sensitive);
     }
 }
 
@@ -872,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn short_low_entropy_operational_values_are_not_substring_secrets() {
+    fn operational_environment_values_are_not_substring_secrets() {
         let names = vec![
             "CLAUDE_CODE_DISABLE_FAST_MODE".into(),
             "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION".into(),
@@ -898,7 +942,7 @@ mod tests {
             redactor.redact("Round 1 reviewed task1.txt; false is a fixed CLI flag"),
             "Round 1 reviewed task1.txt; false is a fixed CLI flag"
         );
-        assert!(redactor.would_redact("PATH was /usr/bin:/bin"));
+        assert!(!redactor.would_redact("PATH was /usr/bin:/bin"));
 
         let prompt_redactor = redactor.with_value("fix it");
         assert!(
@@ -906,6 +950,44 @@ mod tests {
                 .redact("model echoed: fix it")
                 .contains("fix it")
         );
+    }
+
+    #[test]
+    fn secret_name_detection_uses_tokens_without_matching_operational_author_names() {
+        for name in [
+            "SERVICE_ACCESS_TOKEN",
+            "OPENAI_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "SSH_AUTH_SOCK",
+            "GIT_ASKPASS",
+            "DATABASE_PASSWORD",
+            "CI_JOB_JWT",
+            "SLACK_WEBHOOK_URL",
+            "APP_SIGNING_KEY",
+            "AZURE_STORAGE_CONNECTION_STRING",
+        ] {
+            assert!(
+                is_secret_shaped_environment_name(OsStr::new(name)),
+                "{name} should be secret-shaped"
+            );
+        }
+        for name in [
+            "PWD",
+            "OLDPWD",
+            "SHELL",
+            "LANG",
+            "LC_ALL",
+            "PATH",
+            "HOME",
+            "GIT_AUTHOR_NAME",
+            "TERM_PROGRAM",
+            "SSH_PUBLIC_KEY",
+        ] {
+            assert!(
+                !is_secret_shaped_environment_name(OsStr::new(name)),
+                "{name} should remain operational"
+            );
+        }
     }
 
     #[test]

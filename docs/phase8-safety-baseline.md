@@ -136,9 +136,18 @@ Workers then receive explicit role-local replacements for isolated HOME,
 native config, temp, runtime, XDG/cache and Rust paths plus role/run/task
 markers. These replacements win over same-named parent entries; all other
 entries remain unchanged. Environment descriptors persist encoded names and a
-hash, never raw values; artifact redaction covers meaningful UTF-8 inherited
-values and proxy userinfo. This complete-inheritance contract supersedes the
-original Phase 8 closed-allowlist design.
+hash, never raw values; hcom does not otherwise enumerate or persist the
+complete environment as a name/value inventory. Artifact redaction is a
+separate, narrower inventory: values from secret-shaped names, URI userinfo,
+adapter-declared secrets, and the private prompt. Ordinary PWD, PATH, shell,
+locale, and workdir evidence is not redacted. This complete-inheritance
+contract supersedes the original Phase 8 closed-allowlist design.
+
+Inherited hcom/terminal marker-shaped values are inert without a mounted
+retained state/control socket or interactive TTY; supervisor-owned worker
+identity overrides any parent copy. Path-defining values needed to construct a
+private override or mount must be valid UTF-8 and fail closed before spawn
+otherwise. Unrelated non-UTF-8 entries remain byte-exact.
 
 ## Verification boundary
 

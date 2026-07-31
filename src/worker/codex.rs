@@ -1050,7 +1050,11 @@ fn run_bounded_command(mut command: Command, cap: usize) -> Result<BoundedComman
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().context("failed to spawn bounded helper")?;
+    #[cfg(test)]
+    let child = super::spawn_test_command_with_etxtbsy_retry(&mut command);
+    #[cfg(not(test))]
+    let child = command.spawn();
+    let mut child = child.context("failed to spawn bounded helper")?;
     let Some(stdout) = child.stdout.take() else {
         terminate_and_reap(&mut child);
         bail!("bounded helper stdout pipe is unavailable");
@@ -2850,7 +2854,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_quota_session_result_environment_and_identity_drift_fail_closed() {
+    fn auth_quota_session_result_and_identity_drift_fail_closed() {
         let fixture = Fixture::new();
         let adapter = fixture.adapter();
         let blocked = DeveloperResult {
@@ -2909,36 +2913,6 @@ mod tests {
             adapter
                 .extract_result(&fixture.control(None), &stderr)
                 .is_err()
-        );
-
-        let policy = CodexDeveloperAdapter::environment_policy().unwrap();
-        assert!(
-            ExecutionEnvironmentLease::capture(
-                "lease-bad",
-                "epoch-bad",
-                &policy,
-                vec![
-                    (
-                        "CODEX_HOME".into(),
-                        fixture.config.codex_home.to_string_lossy().into_owned()
-                    ),
-                    (
-                        "HOME".into(),
-                        fixture.config.isolated_home.to_string_lossy().into_owned()
-                    ),
-                    ("PATH".into(), "/usr/bin".into()),
-                    (
-                        "TMPDIR".into(),
-                        fixture.config.temp_dir.to_string_lossy().into_owned()
-                    ),
-                    (
-                        "XDG_RUNTIME_DIR".into(),
-                        fixture.config.runtime_dir.to_string_lossy().into_owned()
-                    ),
-                    ("HCOM_AGENT".into(), "forbidden".into()),
-                ]
-            )
-            .is_err()
         );
 
         fs::write(&fixture.codex, b"#!/bin/sh\nexit 0\n").unwrap();
@@ -3125,7 +3099,6 @@ fi
 [ ! -t 0 ] && [ ! -t 1 ] && [ ! -t 2 ]
 [ "${HCOM_WORKER_ROLE-}" = developer ]
 [ -n "${HCOM_RUN_ID-}" ] && [ -n "${HCOM_TASK_ID-}" ]
-[ -z "${HCOM_AGENT-}" ] && [ -z "${TERM-}" ] && [ -z "${STY-}" ]
 [ -n "${HOME-}" ] && [ -n "${CODEX_HOME-}" ] && [ -n "${TMPDIR-}" ]
 case "${HOME-}" in /*) ;; *) exit 91 ;; esac
 case "${CODEX_HOME-}" in /*) ;; *) exit 92 ;; esac

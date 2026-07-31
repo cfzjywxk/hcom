@@ -151,8 +151,17 @@ role-local values required by the isolation contract: private native
 configuration, HOME/temp/XDG/cache paths where applicable, private
 `HCOM_DIR`, and worker run/task identity. Ordinary hcom work terminals likewise
 inherit the parent OS environment directly, then replace hcom-owned and
-new-terminal identity. Raw inherited values remain in memory, are never
-printed or persisted, and participate in artifact redaction.
+new-terminal identity. Hcom neither enumerates nor persists the complete
+environment as a name/value inventory. Artifact containment is intentionally
+narrower than inheritance: it redacts values carried by secret-shaped names,
+URI userinfo, adapter-declared secrets, and the private turn prompt without
+hiding ordinary PWD, PATH, shell, or locale evidence.
+
+Inherited marker-shaped values such as `HCOM_AGENT` do not grant hcom control
+authority: workers still receive no control socket, retained state mount, or
+interactive TTY. Path-defining values that hcom must resolve for a private
+override or mount must be valid UTF-8 and otherwise fail before spawn; unrelated
+non-UTF-8 entries remain byte-exact.
 
 Before starting, the Architect must display every task's repository root,
 branch, and start HEAD together with the exact plan version and hash. An
