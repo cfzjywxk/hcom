@@ -1,9 +1,16 @@
-# Codex adapter maintenance contract
+# Retained Codex CLI adapter maintenance contract
 
 This is the maintainer checklist for the pinned Codex 0.145 integration used by
-`hcom arch` and no-TUI session workers. It records which native arguments
+the blank Codex Architect, existing interactive hcom products, and retained
+CLI task workers behind `hcom arch claude`. It records which native arguments
 and configuration hcom owns, where size bounds are enforced, and which tests
 must change with the contract.
+
+`hcom arch codex` does not use this CLI `exec`/JSONL/final-file adapter for its
+background Developer or Reviewer. Those roles use one task-local Codex App
+Server 0.146 process and are governed by
+[codex-app-server-runtime.md](codex-app-server-runtime.md). The two contracts
+coexist; changing or removing one must not silently alter the other.
 
 The user-facing profile syntax remains in [architect.md](architect.md). This
 document is normative for implementation changes: do not infer compatibility
@@ -18,9 +25,10 @@ from one successful `--help` command, role, or turn mode.
 - Reasoning effort is one of `none`, `minimal`, `low`, `medium`, `high`,
   `xhigh`, or `max`.
 - Sandbox is `read-only`, `workspace-write`, or `danger-full-access`. A
-  developer cannot use `read-only`, because completion must write and commit.
-  A reviewer remains outer-filesystem read-only even if native Codex is
-  configured more broadly.
+  retained CLI Developer cannot use `read-only`, because completion must write
+  and commit. A retained CLI Reviewer remains outer-filesystem read-only even
+  if native Codex is configured more broadly. App Server Reviewers are
+  deliberately writable and use an exact post-turn Git invariant instead.
 - Approval policy is `untrusted`, `on-request`, or `never`. Workers have no
   interactive approval channel; hcom never answers a native prompt for the
   human.
@@ -65,7 +73,7 @@ Parent Codex configuration and the exact auth source are read-only. Explicit
 CLI sandbox/approval options remain authoritative. Unrelated native notices
 are not hidden.
 
-## Worker create/resume invocation
+## Retained CLI worker create/resume invocation
 
 Developer and reviewer use one closed Codex `exec` shape. Shared probes live in
 `CODEX_EXEC_HELP_REQUIREMENTS` and `CODEX_RESUME_HELP_REQUIREMENTS`; adding a

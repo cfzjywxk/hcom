@@ -469,14 +469,28 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     assert!(stdout.contains("gpt-5.6-sol/xhigh"), "stdout={stdout}");
     assert!(stdout.contains("Claude opus/xhigh"), "stdout={stdout}");
     assert!(
-        stdout.contains("built-in developer is Codex gpt-5.6-sol/xhigh"),
+        stdout.contains("codex-app-server-0.146.0 process per task"),
         "stdout={stdout}"
     );
     assert!(
         stdout.contains(
-            "reviewer is always Claude opus/xhigh with\n\
-             dangerously-skip-permissions"
+            "Developer and Reviewer both\n\
+             default to Codex gpt-5.6-sol/xhigh with danger-full-access/never"
         ),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "Claude workers are unsupported and fail closed.\n\
+             `hcom arch claude` retains the existing CLI-worker lane"
+        ),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "Reviewer receives the same writable task envelope as its\n\
+             Developer"
+        ) && stdout.contains("Git\nevidence is exactly unchanged"),
         "stdout={stdout}"
     );
     assert!(

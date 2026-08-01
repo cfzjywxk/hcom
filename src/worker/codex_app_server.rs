@@ -1062,9 +1062,7 @@ impl TaskWorkerRuntime for CodexAppServerRuntime {
                 return Err(error);
             }
         };
-        if self.native_turn_ids.len() >= MAX_TASK_NATIVE_TURNS {
-            let error =
-                RuntimeError::invalid_transition("Codex App Server task exceeded 64 native turns");
+        if let Err(error) = validate_native_turn_capacity(self.native_turn_ids.len()) {
             let _ = self.shutdown();
             return Err(error);
         }
@@ -1468,6 +1466,15 @@ fn validate_native_id(value: &str) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+fn validate_native_turn_capacity(existing_turns: usize) -> Result<(), RuntimeError> {
+    if existing_turns >= MAX_TASK_NATIVE_TURNS {
+        return Err(RuntimeError::invalid_transition(
+            "Codex App Server task exceeded 64 native turns",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_native_text(value: &str, label: &str) -> Result<(), RuntimeError> {
     if value.is_empty() || value.contains(['\r', '\n', '\0']) {
         return Err(RuntimeError::invalid_contract(format!(
@@ -1759,15 +1766,25 @@ where
         .stdin(Stdio::null())
         .output()
         .map_err(|_| RuntimeError::internal("failed to run Codex contract preflight"))?;
-    if !output.status.success()
-        || output.stdout.len() > MAX_PREFLIGHT_OUTPUT_BYTES
-        || output.stderr.len() > MAX_PREFLIGHT_OUTPUT_BYTES
-    {
+    validate_preflight_stream_bounds(output.stdout.len(), output.stderr.len())?;
+    if !output.status.success() {
         return Err(RuntimeError::invalid_contract(format!(
             "Codex {label} preflight failed or exceeded its bound"
         )));
     }
     Ok(output.stdout)
+}
+
+fn validate_preflight_stream_bounds(
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+) -> Result<(), RuntimeError> {
+    if stdout_bytes > MAX_PREFLIGHT_OUTPUT_BYTES || stderr_bytes > MAX_PREFLIGHT_OUTPUT_BYTES {
+        return Err(RuntimeError::invalid_contract(
+            "Codex App Server preflight output exceeded 2 MiB",
+        ));
+    }
+    Ok(())
 }
 
 fn trim_single_line(bytes: &[u8]) -> Option<&str> {
@@ -2076,6 +2093,35 @@ mod tests {
             CODEX_APP_SERVER_SCHEMA_CANONICAL_SHA256
         );
         preflight.revalidate().unwrap();
+    }
+
+    #[test]
+    fn native_id_turn_inventory_and_preflight_output_bounds_are_exact() {
+        for (bytes, accepted) in [
+            (MAX_NATIVE_ID_BYTES - 1, true),
+            (MAX_NATIVE_ID_BYTES, true),
+            (MAX_NATIVE_ID_BYTES + 1, false),
+        ] {
+            assert_eq!(validate_native_id(&"n".repeat(bytes)).is_ok(), accepted);
+        }
+        for (existing_turns, accepted) in [
+            (MAX_TASK_NATIVE_TURNS - 1, true),
+            (MAX_TASK_NATIVE_TURNS, false),
+            (MAX_TASK_NATIVE_TURNS + 1, false),
+        ] {
+            assert_eq!(
+                validate_native_turn_capacity(existing_turns).is_ok(),
+                accepted
+            );
+        }
+        for (bytes, accepted) in [
+            (MAX_PREFLIGHT_OUTPUT_BYTES - 1, true),
+            (MAX_PREFLIGHT_OUTPUT_BYTES, true),
+            (MAX_PREFLIGHT_OUTPUT_BYTES + 1, false),
+        ] {
+            assert_eq!(validate_preflight_stream_bounds(bytes, 0).is_ok(), accepted);
+            assert_eq!(validate_preflight_stream_bounds(0, bytes).is_ok(), accepted);
+        }
     }
 
     #[test]

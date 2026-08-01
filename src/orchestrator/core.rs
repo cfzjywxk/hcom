@@ -344,6 +344,49 @@ pub enum SupervisorEffect {
     PublishStatus,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SupervisorEffectKind {
+    OpenTaskRuntime,
+    OpenRoleSession,
+    StartTurn,
+    ObserveRepository,
+    InterruptTurn,
+    CloseTaskRuntime,
+    FinishSession,
+    PublishStatus,
+}
+
+#[cfg(test)]
+impl SupervisorEffectKind {
+    const ALL: [Self; 8] = [
+        Self::OpenTaskRuntime,
+        Self::OpenRoleSession,
+        Self::StartTurn,
+        Self::ObserveRepository,
+        Self::InterruptTurn,
+        Self::CloseTaskRuntime,
+        Self::FinishSession,
+        Self::PublishStatus,
+    ];
+}
+
+#[cfg(test)]
+impl SupervisorEffect {
+    fn kind(&self) -> SupervisorEffectKind {
+        match self {
+            Self::OpenTaskRuntime { .. } => SupervisorEffectKind::OpenTaskRuntime,
+            Self::OpenRoleSession { .. } => SupervisorEffectKind::OpenRoleSession,
+            Self::StartTurn { .. } => SupervisorEffectKind::StartTurn,
+            Self::ObserveRepository { .. } => SupervisorEffectKind::ObserveRepository,
+            Self::InterruptTurn { .. } => SupervisorEffectKind::InterruptTurn,
+            Self::CloseTaskRuntime { .. } => SupervisorEffectKind::CloseTaskRuntime,
+            Self::FinishSession { .. } => SupervisorEffectKind::FinishSession,
+            Self::PublishStatus => SupervisorEffectKind::PublishStatus,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupervisorErrorCode {
     VersionMismatch,
@@ -3437,6 +3480,48 @@ mod tests {
     }
 
     #[test]
+    fn every_effect_kind_has_a_real_core_production_path() {
+        let mut observed = BTreeSet::new();
+        let mut record = |effects: Vec<SupervisorEffect>| {
+            observed.extend(effects.iter().map(SupervisorEffect::kind));
+        };
+
+        let (mut core, base) = bound_core();
+        record(authorize(&mut core));
+        record(observe(&mut core, 0, RepositoryCheckpoint::TaskStart, base));
+        record(open_runtime(&mut core, 0));
+        let session = RuntimeSessionKey::from_counter(1).unwrap();
+        record(open_session(&mut core, 0, WorkerRole::Developer, session));
+        let turn = RuntimeTurnKey::from_counter(1).unwrap();
+        record(start_turn(
+            &mut core,
+            0,
+            WorkerRole::Developer,
+            RuntimeTurnPurpose::InitialDevelopment,
+            session,
+            turn,
+            "effect-inventory",
+        ));
+        record(
+            core.reduce(SupervisorEvent::Timeout {
+                expected_version: core.version(),
+                task_ordinal: 0,
+                role: WorkerRole::Developer,
+                session,
+                turn,
+                completion_token: "effect-inventory".into(),
+            })
+            .unwrap(),
+        );
+
+        assert_eq!(
+            observed,
+            BTreeSet::from(SupervisorEffectKind::ALL),
+            "every effect variant must have an exercised production path"
+        );
+    }
+
+    #[test]
     fn task_transition_inventory_covers_every_state_and_rejects_terminal_lifecycle() {
         let mut observed_states = BTreeSet::new();
         let mut edges = BTreeSet::new();
@@ -5112,7 +5197,11 @@ mod tests {
             );
         }
 
-        for length in [MAX_CORE_DIAGNOSTIC_BYTES, MAX_CORE_DIAGNOSTIC_BYTES + 1] {
+        for length in [
+            MAX_CORE_DIAGNOSTIC_BYTES - 1,
+            MAX_CORE_DIAGNOSTIC_BYTES,
+            MAX_CORE_DIAGNOSTIC_BYTES + 1,
+        ] {
             let (mut core, _base) = authorized_core();
             let before = core.clone();
             let result = core.reduce(SupervisorEvent::DriverFailed {
@@ -5123,7 +5212,7 @@ mod tests {
                     detail: "x".repeat(length),
                 },
             });
-            if length == MAX_CORE_DIAGNOSTIC_BYTES {
+            if length <= MAX_CORE_DIAGNOSTIC_BYTES {
                 result.unwrap();
                 assert_eq!(core.session_state(), SessionState::NeedsHuman);
             } else {

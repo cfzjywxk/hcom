@@ -96,12 +96,14 @@ hcom
 
 `hcom arch` runs one blank interactive Codex or Claude architect and an
 in-memory, ordered task supervisor. Each approved task gets a fresh no-TUI
-developer and reviewer; Codex or Claude can be selected independently for
-either role. Same-task review changes resume only that task's exact native
-sessions. If a developer exits with only allowed-path uncommitted changes,
-the supervisor exact-resumes that developer once to finish checks and commit
-before starting the reviewer; it does not terminate the whole run merely
-because the first developer result forgot the commit.
+developer and reviewer. `hcom arch codex` uses one no-TTY Codex App Server
+process per task, with fresh Codex Developer and Reviewer threads; same-task
+review changes resume those exact threads. `hcom arch claude` retains the
+existing Codex/Claude CLI-worker lane. If a developer exits with only
+allowed-path uncommitted changes, the supervisor exact-resumes that developer
+once to finish checks and commit before starting the reviewer; it does not
+terminate the whole run merely because the first developer result forgot the
+commit.
 
 ```bash
 cd /path/to/project
@@ -109,22 +111,21 @@ hcom arch codex
 # or: hcom arch claude
 ```
 
-Codex defaults to `gpt-5.6-sol` with `xhigh` reasoning,
-`danger-full-access`, and approval policy `never`; Claude defaults to `opus`
-with `xhigh` effort and skipped native permission prompts. The independent
-built-in developer defaults to Codex `gpt-5.6-sol` with `xhigh` reasoning.
-The isolated,
-capability-bound session-control MCP server is approved for the invocation, so
-it does not add a second approval dialog. A human request that explicitly says
-to follow or execute a named existing detailed plan, specification, or
-`current_todo` authorizes the Architect to derive the typed plan and start it
-in the same turn. A request only to analyze, discuss, summarize, or draft does
-not; an explicit instruction not to start always wins. The supervisor validates
-the exact plan version/hash and required confirmation bit, but does not
-independently attest an OS-level human keystroke. Unless
-`[architect.reviewer]` is configured explicitly, the reviewer always uses
-Claude `opus` with `xhigh` effort and skipped native permission prompts,
-independent of the selected Architect and its profile overrides.
+The Codex Architect, Developer, and Reviewer all default to
+`gpt-5.6-sol` with `xhigh` reasoning, `danger-full-access`, and approval policy
+`never`. The App Server lane accepts only Codex worker profiles with
+`danger-full-access`/`never`; Claude workers fail closed. The retained
+`hcom arch claude` lane defaults to a Claude `opus`/`xhigh` Architect, a Codex
+`gpt-5.6-sol`/`xhigh` Developer, and a Claude `opus`/`xhigh` Reviewer with
+skipped native permission prompts. The isolated, capability-bound
+session-control MCP server is approved for the invocation, so it does not add
+a second approval dialog. A human request that explicitly says to follow or
+execute a named existing detailed plan, specification, or `current_todo`
+authorizes the Architect to derive the typed plan and start it in the same
+turn. A request only to analyze, discuss, summarize, or draft does not; an
+explicit instruction not to start always wins. The supervisor validates the
+exact plan version/hash and required confirmation bit, but does not
+independently attest an OS-level human keystroke.
 
 The Codex Architect's private per-run `CODEX_HOME` records the exact invocation
 directory as native `untrusted`. This avoids a repeated first-use folder-trust
@@ -133,19 +134,22 @@ rules, and extra MCP servers. It does not copy or modify trust entries in the
 parent Codex configuration. The explicit command-line
 `danger-full-access`/`never` profile remains authoritative.
 
-The exact current directory is the project context and remains the native
-working directory for the Architect and every Codex/Claude task worker. It
-does not need to be a Git repository. The Architect can read and write project
-plans, `current_todo`, design notes, and discussion records, then binds each
+The exact current directory is the Architect's project context and does not
+need to be a Git repository. The Architect can read and write project plans,
+`current_todo`, design notes, and discussion records, then binds each
 authorized task to its actual source repository; that may be elsewhere or
-nested under the project. Architect, developer, and reviewer
+nested under the project. An App Server role thread uses that exact repository
+as its cwd; retained CLI workers keep the project cwd with a separate
+repository binding. Architect, Developer, and Reviewer
 model/effort/permission profiles are typed TOML settings in
 `$HCOM_DIR/config.toml` (normally `~/.hcom/config.toml`) and are frozen when
-the command starts. A reviewer's canonical project/source and Git state are
-read-only, while its private home, temporary directory, and generated language
-caches remain writable. See [the Architect user guide](docs/architect.md) for
-the complete schema, all four Codex/Claude role combinations, parent-terminal
-login inheritance, and path-preserving sandbox invariants.
+the command starts. In the App Server lane, the Reviewer has the same writable
+task envelope as the Developer so builds and tests work normally, but its
+verdict is accepted only if local pre/post branch, HEAD, tracked, index, and
+non-ignored-untracked Git evidence is exactly unchanged. Retained CLI
+reviewers keep their read-only source view. See
+[the Architect user guide](docs/architect.md) for the lane-specific schema,
+parent-terminal login inheritance, and path-preserving sandbox invariants.
 
 The Architect and every session task worker inherit the complete environment
 of the process that started `hcom arch`, captured once without a name

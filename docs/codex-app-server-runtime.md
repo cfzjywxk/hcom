@@ -56,7 +56,9 @@ profile, a bounded prompt, and either `DeveloperV1` or `ReviewerV1`. JSON-RPC
 IDs, Codex thread/turn IDs, process handles, stdio, notifications, and provider
 raw events remain private to the Codex implementation.
 
-The only P0 implementations are the seam and `FakeTaskWorkerRuntime`.
+P0 introduced only the seam and `FakeTaskWorkerRuntime`; the production
+Codex implementation and effect driver described below were added in later
+reviewed phases.
 
 ## Exact default profiles
 
@@ -146,3 +148,127 @@ transport I/O. The current matrix has explicit rows for all 91
 cover one/two task completion, different and shared repositories,
 request-changes/re-review, exact review exhaustion, safe completion recovery,
 identity/duplicate/race failures, and all closed plan/task bounds.
+
+## Production topology and effect driver
+
+The blank foreground Architect remains the existing interactive Codex CLI. It
+owns no background-worker stdio and receives only the private bounded
+session-control API. After exact plan binding and human execution authority,
+the in-process `AppServerSessionSupervisor` drives the pure core effects:
+
+```text
+typed control request
+  -> SupervisorCore::reduce(normalized event)
+  -> ordered SupervisorEffect list
+  -> AppServerSessionSupervisor local Git/process/environment action
+  -> normalized event back into SupervisorCore
+```
+
+The driver, not the model or provider, captures canonical repository identity,
+the attached branch, exact HEAD/ancestry, tracked and index diff hashes,
+non-ignored-untracked hash, clean state, and the bounded changed-path
+inventory. It double-captures repository observations and rejects unstable
+evidence. Repository locks are acquired while a plan is staged; a failed plan
+replacement leaves the previous plan and locks unchanged.
+
+After the approved task-start observation, the driver lazily creates one
+task-private process. The process opens one fresh native Developer thread and
+one fresh native Reviewer thread and permits exactly one in-flight turn.
+Correction, re-review, or the one Developer completion-recovery turn uses the
+same native thread for that role. A terminal task shuts down the process before
+the next task is observed or opened; cleanup failure prevents a false LGTM or
+review-exhausted transition and yields sanitized `needs_human`.
+
+An explicit cancel interrupts the active turn and closes the task process.
+Parent exit performs the same owned-process-group cleanup. App Server crash,
+EOF, timeout, protocol drift, identity mismatch, repository drift, invalid
+Reviewer outcome, or persistent Reviewer mutation fails closed. No daemon,
+Project Store, global App Server, restart, or cross-Architect-session recovery
+exists.
+
+## Task-private environment and Reviewer invariant
+
+The task process starts from the complete parent OS environment snapshot:
+unknown names, secret-shaped names, upper/lower-case proxy pairs, empty values,
+and non-UTF-8 names/values remain byte-exact. Only the documented
+task-private HOME, CODEX_HOME, HCOM_DIR, TMP, XDG/cache/runtime, Cargo/Rustup,
+and run/task identity entries are replaced. Environment values do not grant
+filesystem access by themselves.
+
+The outer bubblewrap namespace exposes the exact canonical task repository
+read-write plus pinned system/toolchain inputs and task-private state. It hides
+the host root, live hcom/Codex/Claude control surfaces, sibling session roots,
+and unrelated HOME state. Stdio is pipes, not a TTY; `/dev/tty` is unavailable.
+The private Codex config contains an empty `mcp_servers` table, inherits the
+materialized environment, and records only the exact repository as
+`trust_level = "untrusted"`.
+
+Developer and Reviewer deliberately receive the same writable namespace and
+exact runtime profile. This allows the Reviewer to build, test, and create
+ignored caches normally. The Reviewer role instructions prohibit persistent
+source, index, branch, or HEAD changes. Independently of that instruction, the
+Supervisor captures pre/post Git evidence and accepts a verdict only when
+repository identity, branch, HEAD, tracked diff, index diff,
+non-ignored-untracked state, and clean state are exactly equal. A Reviewer
+dirty file, stage, commit, branch change, or other residue ends the run at
+`needs_human`; ignored cache output is accepted.
+
+## Resource and semantic bounds
+
+Transport and semantic bounds remain separate:
+
+| Layer | Bound |
+|---|---:|
+| control request / response | 256 KiB each |
+| ordered tasks | 64 |
+| review rounds per task | 1–20 |
+| runtime prompt | 256 KiB |
+| role instructions / encoded outcome | 64 KiB each |
+| summary / question count / finding count | 8192 chars / 8 / 32 |
+| runtime/core diagnostic | 1024 bytes |
+| JSON-RPC line / turn protocol aggregate | 16 MiB / 64 MiB |
+| queued protocol events / bytes | 64 / 64 MiB |
+| outgoing JSON-RPC message | 1 MiB |
+| stderr tail / preflight output | 1 MiB / 2 MiB |
+| unknown notifications / client request IDs | 4096 / 256 |
+| native task turns | 64 |
+| native session/turn ID | 256 bytes |
+| repository changed paths / path bytes | 256 / 4096 |
+| auth source / redaction values | 1 MiB / 64 |
+
+Boundary tables exercise just below, exactly at, and just above closed limits.
+The decoder continuously drains stdout/stderr, caps queued events and bytes,
+and drops opted-out item payloads before they can accumulate. Diagnostics and
+status never contain raw provider events, command output, the private prompt,
+auth data, or secret-shaped environment values.
+
+## Checked test inventory
+
+The source-maintained inventory is deliberately split by layer:
+
+| Inventory | Count / checked regression |
+|---|---|
+| session states × event kinds | 7 × 13 = 91 rows in `every_session_state_by_event_kind_has_an_explicit_accept_or_reject_row` |
+| task states × lifecycle events | 8 × 7 = 56 rows in `every_task_state_by_relevant_lifecycle_event_has_an_explicit_matrix_row` |
+| task transition states/edges | all 8 states in `task_transition_inventory_covers_every_state_and_rejects_terminal_lifecycle` |
+| ordered effect variants | all 8 real production paths in `every_effect_kind_has_a_real_core_production_path` |
+| plan/task/text/path/version bounds | `plan_task_count_review_round_and_status_ordinal_bounds_are_exact`, `every_task_text_list_and_path_bound_has_below_equal_and_above_cases`, `session_and_plan_versions_hashes_and_overflow_fail_without_mutation` |
+| repository/outcome/diagnostic bounds | `repository_observation_bounds_ordering_and_plan_cleanliness_fail_closed`, `typed_outcome_cross_field_failures_are_rejected_without_consuming_the_turn`, `every_driver_failure_class_has_a_distinct_bounded_secret_free_terminal` |
+| races, at-most-once, invariants | `completion_identity_ordering_and_at_most_once_are_transactional`, `cancel_completion_and_parent_failure_races_have_one_deterministic_winner`, `invariant_audit_rejects_corrupted_operation_task_identity_and_terminal_state` |
+| RPC transport bounds/correlation | `exact_line_and_turn_protocol_bounds_are_closed`, `queue_outgoing_message_and_request_id_bounds_are_exact`, `unknown_notification_bound_is_exact_and_opted_out_events_do_not_consume_it`, `response_correlation_rejects_mismatch_duplicate_and_stale_ids` |
+| fake App Server lifecycle/protocol | `fresh_role_threads_same_thread_followup_and_exact_wire_fields`, `malformed_ids_eof_and_bound_violations_fail_closed_without_raw_output`, `every_server_request_class_and_unknown_request_terminate_the_runtime`, `interrupt_timeout_kills_the_entire_owned_process_group` |
+| production driver + disposable Git | `orchestrator::app_server::tests::*`, including multi-task, recovery, Reviewer mutation, locks, environment, auth bounds, cancel, cleanup, and drift |
+| real outer sandbox without model | `real_outer_sandbox_is_writable_for_both_roles_and_hides_unbound_host_state` |
+
+All fake-runtime and exact-binary contract tests are local and must not send a
+model turn or network request.
+
+## Human-only product acceptance
+
+Automated development/review ends at a source candidate. It does not run the
+real Fibonacci journey and does not authorize push or installation. After all
+phase and aggregate reviews are complete, a human may choose to start a new
+disposable terminal and follow the exact procedure in
+[architect.md](architect.md#human-only-fibonacci-acceptance). The target
+Architect must begin with an empty input buffer; only the human submits the
+first prompt.

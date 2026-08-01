@@ -3,9 +3,16 @@
 `hcom arch` starts one blank, foreground Codex or Claude architect. The
 Architect can maintain project plans and coordination records. After the human
 either directs the Architect to follow a named existing detailed plan or later
-approves a newly drafted plan, the same foreground parent starts one fresh no-TUI
-developer and reviewer per task. State exists only in memory and the whole run
-stops when the parent terminal exits.
+approves a newly drafted plan, the same foreground parent starts one fresh
+no-TUI Developer and Reviewer per task. State exists only in memory and the
+whole run stops when the parent terminal exits.
+
+`hcom arch codex` is the Codex App Server lane: every task owns one fresh,
+no-TTY Codex App Server 0.146 process with one fresh Developer thread and one
+fresh Reviewer thread. Same-task correction, re-review, or bounded completion
+recovery reuses the exact original role thread; a later task never reuses that
+process or either thread. `hcom arch claude` retains the existing CLI-worker
+lane.
 
 ## Start
 
@@ -18,9 +25,11 @@ hcom arch claude
 
 The exact current directory is the project directory. It must be an existing
 canonical directory, but it does not need to be a Git repository. The
-Architect and every native Codex/Claude task worker start in that same
-directory. hcom does not change it to `/hcom/workspace`, create a hidden
-project checkout, or require a repository argument.
+Architect starts there. A Codex App Server role thread starts at its task's
+exact canonical repository root; retained CLI workers keep the project cwd and
+receive an external repository binding when needed. hcom does not change paths
+to `/hcom/workspace`, create a hidden project checkout, or require a repository
+argument.
 
 The project documentation tells the Architect where its source repositories
 live. Every task in the proposed plan contains an absolute
@@ -68,16 +77,20 @@ Without profile configuration, the command selects these effective defaults:
 
 | Command | Architect | Developer | Reviewer |
 |---|---|---|---|
-| `hcom arch codex` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, approvals `never` | Codex `gpt-5.6-sol`, `xhigh` | Claude `opus`, `xhigh`, skip permissions |
+| `hcom arch codex` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, approvals `never` | Codex App Server `gpt-5.6-sol`, `xhigh`, `danger-full-access`, approvals `never` | Codex App Server `gpt-5.6-sol`, `xhigh`, `danger-full-access`, approvals `never` |
 | `hcom arch claude` | Claude `opus`, `xhigh`, skip permissions | Codex `gpt-5.6-sol`, `xhigh` | Claude `opus`, `xhigh`, skip permissions |
 
-The developer remains independently configurable and keeps its own built-in
-profile. When `[architect.reviewer]` is absent, the reviewer always uses
-Claude `opus` with `xhigh` effort and
-`dangerously_skip_permissions = true`. The selected Architect,
-`[architect.profile]`, and Architect command-line overrides do not change that
-implicit reviewer. Supplying an explicit `[architect.reviewer]` table replaces
-the built-in reviewer default.
+The two commands intentionally have different worker runtimes:
+
+- In `hcom arch codex`, both worker tables must use `adapter = "codex"`,
+  `sandbox = "danger-full-access"`, and `ask_for_approval = "never"`.
+  Model and reasoning effort remain independently configurable. Claude,
+  legacy-CLI, or weaker Codex worker profiles fail closed before the
+  Architect starts; there is no implicit Claude Reviewer or CLI fallback.
+- In `hcom arch claude`, the retained CLI-worker behavior remains available.
+  The Developer and Reviewer adapters are independently configurable as Codex
+  or Claude. With no explicit Reviewer table, that retained lane uses Claude
+  `opus`, `xhigh`, and `dangerously_skip_permissions = true`.
 
 The Codex Architect does not copy the parent `CODEX_HOME`: that would also
 import unrelated native configuration and control surfaces. Its private
@@ -101,8 +114,7 @@ run waiting for approval. The supervisor rechecks the exact version/hash and a
 required confirmation bit. This is model-relayed authorization, not
 independent OS-level proof of a human keystroke.
 
-For a Codex architect, this complete Codex-developer/Claude-reviewer example
-uses explicit profiles for all three roles:
+For a Codex Architect, a complete explicit App Server profile is:
 
 ```toml
 [architect.profile]
@@ -119,30 +131,28 @@ sandbox = "danger-full-access"
 ask_for_approval = "never"
 
 [architect.reviewer]
-adapter = "claude"
-model = "opus"
-effort = "xhigh"
-dangerously_skip_permissions = true
+adapter = "codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "xhigh"
+sandbox = "danger-full-access"
+ask_for_approval = "never"
 ```
 
-It covers the native options represented by:
+Both worker profiles map to typed `thread/start` and `turn/start` fields whose
+native semantics are equivalent to:
 
 ```bash
-hcom codex --tag dev1 -- \
+codex \
   --sandbox danger-full-access \
   --ask-for-approval never \
   --model gpt-5.6-sol \
   --config 'model_reasoning_effort="xhigh"'
-
-hcom claude --tag dev2 -- \
-  --dangerously-skip-permissions \
-  --effort xhigh \
-  --model opus
 ```
 
-Architect session workers are not retained interactive hcom agents, so
-`--tag dev1` and `--tag dev2` do not apply to this lane. Adapter, model,
-reasoning/effort, sandbox/approval, and Claude permission mode do apply.
+App Server task workers are not retained interactive hcom agents, so tags and
+interactive review commands do not apply to them. They receive no arbitrary
+argv, delegation capability, project-local config, plugin, hook, or MCP
+server.
 
 For a Claude architect, `[architect.profile]` has the Claude shape:
 
@@ -153,8 +163,8 @@ effort = "xhigh"
 dangerously_skip_permissions = true
 ```
 
-Developer and reviewer adapters are independent. For the reverse
-Claude-developer/Codex-reviewer combination:
+The retained Claude-Architect lane still supports independent worker adapters.
+For a Claude Developer and Codex Reviewer:
 
 ```toml
 [architect.developer]
@@ -171,33 +181,23 @@ sandbox = "danger-full-access"
 ask_for_approval = "never"
 ```
 
-To use Codex for both roles, use the Codex table shape for both
-`[architect.developer]` and `[architect.reviewer]`. To use Claude for both,
-use the Claude table shape for both. There is no developer/reviewer adapter
-pairing constraint.
-
-For example, a Codex reviewer table is:
-
-```toml
-[architect.reviewer]
-adapter = "codex"
-model = "gpt-5.6-sol"
-reasoning_effort = "max"
-sandbox = "danger-full-access"
-ask_for_approval = "never"
-```
-
 All fields in a profile table are required. Supported values are:
 
 - Codex `reasoning_effort`: `none`, `minimal`, `low`, `medium`, `high`,
   `xhigh`, or `max`.
 - Claude `effort`: `low`, `medium`, `high`, `xhigh`, or `max`.
 - Codex `sandbox`: `read-only`, `workspace-write`, or `danger-full-access`;
-  a Codex developer must use `workspace-write` or `danger-full-access` because
-  a successful developer turn must write and commit.
+  a retained CLI Developer must use `workspace-write` or
+  `danger-full-access`; both App Server roles require
+  `danger-full-access`.
 - Codex `ask_for_approval`: `untrusted`, `on-request`, or `never`.
 - Developer `adapter`: `claude` or `codex`.
 - Reviewer `adapter`: `claude` or `codex`.
+
+The last two adapter choices apply only to the retained Claude-Architect lane;
+the Codex App Server lane requires Codex for both roles. App Server workers
+also require `ask_for_approval = "never"` because they have no interactive
+approval channel.
 
 There is deliberately no arbitrary `args` field. This prevents a profile from
 adding a prompt, resume/fork target, alternate working directory, MCP server,
@@ -213,13 +213,14 @@ built-in defaults < config.toml < explicit hcom arch options
 
 The explicit options are `--model`, `--reasoning`, `--sandbox`, and
 `--approval` (`--ask-for-approval` is an alias) for Codex, and `--model` plus
-`--effort` for Claude. Developer and explicit reviewer profiles come from
-TOML.
+`--effort` for Claude. They change only the interactive Architect. Developer
+and Reviewer profiles come from TOML or their lane-specific defaults.
 
 Task workers have no TTY or interactive approval channel. A Codex worker
-approval policy other than `never`, or a Claude worker with
-`dangerously_skip_permissions = false`, can therefore stop at `needs_human`
-when the native CLI requires an approval; it never causes hcom to approve on
+in the App Server lane must use `never`, and that lane rejects any other
+policy before launch. In the retained CLI lane, a Codex policy other than
+`never` or a Claude worker with `dangerously_skip_permissions = false` can stop
+at `needs_human` when the native CLI requires approval; hcom never approves on
 the human's behalf.
 
 The parent reads and validates the file once before it starts the Architect.
@@ -228,10 +229,11 @@ configured developer/reviewer adapter and the profile hash are bound into the
 plan hash. Editing `config.toml` later cannot change a running session; start a
 new `hcom arch` invocation to pick up changes.
 
-Maintainers changing Codex arguments, isolated configuration, JSONL parsing,
-or size bounds must also follow the
-[Codex adapter maintenance contract](codex-adapter-contract.md), including its
-create/resume and developer/reviewer test matrix.
+Maintainers changing the retained Codex CLI arguments, isolated configuration,
+JSONL parsing, or size bounds must follow the
+[Codex CLI adapter maintenance contract](codex-adapter-contract.md). Changes
+to the App Server protocol, runtime profile mapping, or task lifecycle must
+follow the [Codex App Server runtime contract](codex-app-server-runtime.md).
 
 ## Login and environment inheritance
 
@@ -244,11 +246,14 @@ developer/reviewer profiles select:
 - Claude: `$CLAUDE_CONFIG_DIR/.credentials.json` when
   `CLAUDE_CONFIG_DIR` is set, otherwise `$HOME/.claude/.credentials.json`.
 
-The exact selected credential files are mounted read-only into fresh isolated
-native config directories for each worker. An all-Claude session does not
-require or inspect Codex credentials; an all-Codex session does not require or
-inspect Claude credentials. hcom does not copy credentials into its database
-or config, synthesize a login directory, or derive login from another window.
+The exact selected credential files are mounted read-only. In the App Server
+lane, one task-private `CODEX_HOME` and one read-only Codex auth overlay are
+shared by that task's two role threads. Retained CLI workers keep their fresh
+role-private native config directories. An all-Claude retained session does
+not require or inspect Codex credentials; an all-Codex session does not
+require or inspect Claude credentials. hcom does not copy credentials into its
+database or config, synthesize a login directory, or derive login from another
+window.
 
 The process that starts `hcom arch` also supplies one complete,
 session-frozen OS environment snapshot to the Architect and every developer
@@ -257,15 +262,20 @@ secret-shaped names, both cases of proxy variables, empty values, and
 non-UTF-8 names or values are retained exactly. hcom does not normalize proxy
 names or reconstruct values from another process.
 
-After copying that snapshot, hcom applies only these role-local replacements:
+After copying that snapshot, hcom applies only these runtime-local
+replacements:
 
 - the Architect gets a private `HCOM_DIR`, private selected native config,
   private temp/runtime paths, and Claude-private XDG/control flags when Claude
   is selected;
-- every worker gets its private HOME, selected native config, temp/runtime,
-  generated cache paths, pinned Cargo/Rustup roots, and exact
-  `HCOM_WORKER_ROLE`/`HCOM_RUN_ID`/`HCOM_TASK_ID`; Claude workers also get their
-  private XDG paths and fixed noninteractive control flags;
+- every App Server task process gets a task-private HOME, CODEX_HOME,
+  HCOM_DIR, temp/runtime/XDG/cache paths, pinned Cargo/Rustup roots, and exact
+  run/task identity; its OS role marker is `task-runtime`, while Developer and
+  Reviewer identity is carried by the closed thread/turn request;
+- every retained CLI worker gets its role-private HOME, selected native
+  config, temp/runtime/generated cache paths, pinned Cargo/Rustup roots, and
+  exact `HCOM_WORKER_ROLE`/`HCOM_RUN_ID`/`HCOM_TASK_ID`; Claude workers also
+  get private XDG paths and fixed noninteractive control flags;
 - ordinary hcom work terminals replace hcom-owned launch/identity variables
   and terminal-pane identity while directly inheriting every other parent OS
   entry.
@@ -290,10 +300,11 @@ unrelated non-UTF-8 names and values remain byte-exact.
 
 ## Fixed safety boundaries
 
-Profile configuration changes native CLI policy, not the outer containment:
+Profile configuration changes native policy, not the outer containment:
 
-- the exact invocation directory remains the native cwd for the Architect and
-  every task worker;
+- the exact invocation directory remains the Architect cwd; an App Server
+  role thread uses the exact task repository as its cwd, while retained CLI
+  workers keep the project cwd;
 - absolute host paths are preserved; no role sees a synthetic
   `/hcom/workspace`;
 - the interactive Architect keeps a whole-host read-write filesystem view so
@@ -307,15 +318,21 @@ Profile configuration changes native CLI policy, not the outer containment:
 - `HCOM_DIR` inside the Architect points to private per-run state, so invoking
   hcom there cannot message or wake retained interactive agents through the
   live v24 store;
-- the developer receives only its task repository read-write at that
+- an App Server task process receives only its task repository read-write at
   repository's real absolute path;
-- every reviewer sees the exact project and task repository HEAD read-only at
-  their real absolute paths; this source/Git restriction does not make the
-  whole reviewer environment read-only: its session-private home, temporary
-  directory, and generated language caches remain writable;
-- task-worker namespaces mount only the exact project/repository paths, pinned
-  system/toolchain inputs, and private per-role state; they do not mount the
-  host root or the user's unrelated HOME contents;
+- the App Server Reviewer deliberately has the same writable task repository,
+  HOME, temporary paths, toolchain, and shell/test ability as its Developer.
+  Its role contract forbids persistent source changes, and the Supervisor
+  accepts a verdict only if local pre/post repository identity, branch, HEAD,
+  tracked diff, index diff, and non-ignored-untracked evidence is exactly
+  unchanged;
+- retained CLI reviewers keep their existing read-only project/source/Git
+  view, with writable session-private home, temporary directory, and generated
+  language caches;
+- task-worker namespaces mount only the lane-required exact
+  project/repository paths, pinned system/toolchain inputs, and private
+  task/role state; they do not mount the host root or the user's unrelated HOME
+  contents;
 - no worker receives a TTY, hcom control socket, sibling session root, or host
   runtime contents; native credential/config directories remain read-only,
   while the complete parent environment may itself contain caller-provided
@@ -325,12 +342,14 @@ Profile configuration changes native CLI policy, not the outer containment:
   boundary;
 - Codex delegation, hooks, plugins, apps, and arbitrary MCP servers remain
   disabled for session workers;
-- when a task repository differs from the project directory, hcom declares it
-  to native Codex/Claude with `--add-dir`; Codex `workspace-write` therefore
-  applies to both the project workspace and the task repository, while the
-  outer mount still keeps the project read-only;
-- one task gets fresh developer/reviewer sessions, while request-changes
-  resumes only the exact sessions already bound to that task;
+- in the retained CLI lane, an external task repository is declared to native
+  Codex/Claude with `--add-dir` as needed. The App Server lane instead launches
+  the task process directly in the exact repository and binds only that
+  repository writable;
+- one App Server task gets one fresh process and two fresh role threads;
+  request-changes, re-review, and completion recovery resume only the exact
+  threads already bound to that task, and task terminal cleanup completes
+  before the next task process starts;
 - a developer completion that leaves an in-scope dirty worktree or an invalid
   result on otherwise safe repository state gets one automatic exact-session
   recovery turn before `needs_human`; recovery never uses a fresh fallback,
@@ -359,6 +378,67 @@ no configured repository-root allowlist. The exact binding display is
 therefore visibility and TOCTOU protection, not independent proof that the
 model selected the intended repository.
 
-Reviewer source/Git paths remain read-only regardless of the configured native
-permission mode. Developer write authority remains limited to the current task
-repository by the outer worker namespace.
+App Server Developer and Reviewer write authority remains limited to the
+current task repository by the outer worker namespace; Reviewer correctness is
+the post-turn Git invariant described above, not filesystem read-only.
+Retained CLI Reviewer source/Git paths remain read-only regardless of the
+configured native permission mode.
+
+## Terminal states and lifetime
+
+The foreground parent is the only lifecycle owner. It keeps the typed plan,
+task states, logical role-session bindings, review rounds, and runtime handles
+in memory. It starts no daemon or global service, writes no Project Store, and
+does not recover a run after the parent or terminal exits.
+
+An explicit cancel interrupts the active turn and closes the task runtime.
+Parent exit does the same. Runtime/protocol failure, repository drift,
+out-of-scope changes, a second invalid Developer completion, Reviewer
+mutation, or cleanup failure ends at a bounded `needs_human`/failure status;
+hcom never resets or repairs the real repository. An LGTM closes the current
+task runtime before the next task starts. If request changes reaches the
+task's configured maximum, the visible task state is `review_exhausted` and
+the ordered plan advances by policy.
+
+Neither task LGTM nor a completed session authorizes push, install, dependency
+installation, or modification of user hcom configuration. Those remain
+separate human actions.
+
+## Human-only Fibonacci acceptance
+
+The real App Server/model journey is deliberately outside automated
+development and review. After the source candidate has passed independent
+review, a human may choose to validate it in a newly created disposable
+terminal:
+
+```bash
+cd /home/ywxk/src/work/data/hcom-interactive/demo/fibonacci-background
+HCOM_DIR="$PWD/.hcom" hcom arch codex
+```
+
+The target Codex terminal must open with an empty input buffer. The human, not
+hcom or another agent, enters and submits:
+
+```text
+读取 TASKS.md，生成 exact 两任务技术方案并按照该方案执行。
+不要增加第三个任务；完成 dev/review loop 后在这个 session 向我汇报最终结果。
+```
+
+The Architect should display the exact two-task repositories, branch/base
+revisions, App Server profile, plan version, and plan hash; use the message's
+explicit execution authority; then let the task-local Developer/Reviewer
+loops advance. Task 2 must start from Task 1's terminal reviewed HEAD and use a
+fresh App Server process and fresh role threads.
+
+After both tasks finish, the human can run:
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 -m src.fib_cli 10
+```
+
+Acceptance requires all tests to pass, the CLI to print only `55`, the original
+branch and clean worktree/index to remain, one Developer commit per task,
+visible `lgtm` or `review_exhausted` outcomes, no Reviewer repository residue,
+all task processes exited, and the final report in the same foreground
+Architect session. This procedure does not authorize push or installation.

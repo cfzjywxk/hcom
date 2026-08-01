@@ -680,6 +680,77 @@ mod tests {
     }
 
     #[test]
+    fn queue_outgoing_message_and_request_id_bounds_are_exact() {
+        for (events, accepted) in [
+            (MAX_QUEUED_EVENTS - 1, true),
+            (MAX_QUEUED_EVENTS, true),
+            (MAX_QUEUED_EVENTS + 1, false),
+        ] {
+            let mut state = SharedState::new();
+            for _ in 0..events {
+                state.enqueue(RpcInbound::Eof, 0);
+            }
+            assert_eq!(state.fatal.is_none(), accepted);
+        }
+        for (bytes, accepted) in [
+            (MAX_QUEUED_PROTOCOL_BYTES - 1, true),
+            (MAX_QUEUED_PROTOCOL_BYTES, true),
+            (MAX_QUEUED_PROTOCOL_BYTES + 1, false),
+        ] {
+            let mut state = SharedState::new();
+            state.enqueue(RpcInbound::Eof, bytes);
+            assert_eq!(state.fatal.is_none(), accepted);
+        }
+
+        let empty = json!({"payload": ""});
+        let overhead = serde_json::to_vec(&empty).unwrap().len();
+        for (bytes, accepted) in [
+            (MAX_OUTGOING_RPC_BYTES - 1, true),
+            (MAX_OUTGOING_RPC_BYTES, false),
+            (MAX_OUTGOING_RPC_BYTES + 1, false),
+        ] {
+            let message = json!({"payload": "x".repeat(bytes - overhead)});
+            assert_eq!(serde_json::to_vec(&message).unwrap().len(), bytes);
+            let (writer, _written) = mpsc_writer();
+            let mut rpc = CodexRpc::new(
+                writer,
+                Cursor::new(Vec::<u8>::new()),
+                Cursor::new(Vec::new()),
+            );
+            assert_eq!(rpc.write_message(&message).is_ok(), accepted);
+        }
+
+        for (requests, accepted) in [
+            (MAX_CLIENT_REQUEST_IDS - 1, true),
+            (MAX_CLIENT_REQUEST_IDS, true),
+            (MAX_CLIENT_REQUEST_IDS + 1, false),
+        ] {
+            let (writer, _written) = mpsc_writer();
+            let mut rpc = CodexRpc::new(
+                writer,
+                Cursor::new(Vec::<u8>::new()),
+                Cursor::new(Vec::new()),
+            );
+            let mut result = Ok(());
+            for _ in 0..requests {
+                let id = match rpc.send_request("bounded/request", json!({})) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        result = Err(error);
+                        break;
+                    }
+                };
+                rpc.correlate(RpcInbound::Response {
+                    id,
+                    result: json!({}),
+                })
+                .unwrap();
+            }
+            assert_eq!(result.is_ok(), accepted);
+        }
+    }
+
+    #[test]
     fn unknown_notification_bound_is_exact_and_opted_out_events_do_not_consume_it() {
         for (notifications, accepted) in [
             (MAX_UNKNOWN_NOTIFICATIONS - 1, true),

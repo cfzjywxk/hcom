@@ -822,6 +822,11 @@ impl AppServerSessionSupervisor {
             return;
         };
         if active.task_ordinal != task_ordinal || active.logical_turn != logical_turn {
+            debug_assert_eq!(
+                (active.task_ordinal, active.logical_turn),
+                (task_ordinal, logical_turn),
+                "SupervisorCore emitted an interrupt for a different active App Server turn"
+            );
             self.active = Some(active);
             return;
         }
@@ -1349,7 +1354,16 @@ fn hash_bytes(bytes: &[u8]) -> String {
 }
 
 fn bounded_single_line(input: &str) -> String {
-    let mut output = input.replace(['\r', '\n'], " ");
+    let mut output: String = input
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
     if output.is_empty() {
         output.push_str("bounded driver failure");
     }
@@ -2012,6 +2026,45 @@ mod tests {
             fs::metadata(config_path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn driver_failure_details_remove_every_control_and_remain_utf8_bounded() {
+        assert_eq!(
+            bounded_single_line("prefix\tmiddle\nsuffix\r\u{0000}end"),
+            "prefix middle suffix  end"
+        );
+        let bounded = bounded_single_line(&format!("{}界", "x".repeat(1023)));
+        assert_eq!(bounded.len(), 1023);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert!(!bounded.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn auth_redaction_file_and_value_inventory_bounds_are_exact() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("auth.json");
+        for (bytes, accepted) in [
+            (MAX_AUTH_FILE_BYTES - 1, true),
+            (MAX_AUTH_FILE_BYTES, true),
+            (MAX_AUTH_FILE_BYTES + 1, false),
+        ] {
+            let encoded = format!("\"{}\"", "x".repeat(bytes - 2));
+            assert_eq!(encoded.len(), bytes);
+            fs::write(&path, encoded).unwrap();
+            assert_eq!(codex_auth_redaction_values(&path).is_ok(), accepted);
+        }
+        for (values, accepted) in [
+            (MAX_AUTH_REDACTION_VALUES - 1, true),
+            (MAX_AUTH_REDACTION_VALUES, true),
+            (MAX_AUTH_REDACTION_VALUES + 1, false),
+        ] {
+            let encoded: Vec<_> = (0..values)
+                .map(|index| format!("secret-{index:04}"))
+                .collect();
+            fs::write(&path, serde_json::to_vec(&encoded).unwrap()).unwrap();
+            assert_eq!(codex_auth_redaction_values(&path).is_ok(), accepted);
+        }
     }
 
     #[test]
