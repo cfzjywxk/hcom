@@ -2,7 +2,9 @@ use super::bridge::{
     BridgeActivation, BridgeConfiguration, activate_bridge, configure_bridge,
     relay_runtime_scope_hash, sha256_hex,
 };
-use super::profile::{LoadedInvocationProfiles, load_invocation_profiles};
+use super::profile::{
+    LoadedInvocationProfiles, load_codex_app_server_profiles, load_invocation_profiles,
+};
 use crate::control_api::ActionName;
 use crate::control_api::peer::{process_birth_identity, process_owns_foreground_tty};
 use crate::control_api::protocol::PROTOCOL_VERSION;
@@ -21,6 +23,7 @@ use crate::worker::profile::{
     validate_cli_help_contract,
 };
 use crate::worker::reviewer::{CLAUDE_REVIEWER_CLI_VERSION, CLAUDE_REVIEWER_EXECUTABLE};
+use crate::worker::runtime::CODEX_APP_SERVER_ADAPTER;
 use crate::worker::sandbox::{HostRootAccess, HostRootContract, HostRootMounts};
 use crate::worker::{ExecutableIdentity, ParentEnvironment};
 use anyhow::{Context, Result, bail};
@@ -84,14 +87,23 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
     )?;
     let architect_adapter = ArchitectAdapter::parse(&args.adapter)?;
     let mut loaded = match config_path {
+        Some(path) if architect_adapter == ArchitectAdapter::Codex => {
+            load_codex_app_server_profiles(path, architect_adapter)?
+        }
         Some(path) => load_invocation_profiles(path, architect_adapter)?,
         None => LoadedInvocationProfiles {
-            profiles: SessionInvocationProfiles::for_architect(architect_adapter),
+            profiles: if architect_adapter == ArchitectAdapter::Codex {
+                SessionInvocationProfiles::for_codex_app_server_lane(architect_adapter)?
+            } else {
+                SessionInvocationProfiles::for_architect(architect_adapter)
+            },
             config_path: PathBuf::from("<built-in defaults>"),
             loaded_from_file: false,
         },
     };
     apply_architect_cli_overrides(&args, &mut loaded.profiles)?;
+    let (developer_adapter, reviewer_adapter) =
+        worker_adapter_bindings(architect_adapter, &loaded.profiles);
     validate_foreground_terminal()?;
 
     let project_root = canonical_project_directory(&std::env::current_dir()?)?;
@@ -110,12 +122,21 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         native_environment.runtime_home.clone(),
         loaded.profiles.clone(),
     )?;
-    let supervisor_endpoint = SessionSupervisorEndpoint::bind(
-        control_paths.clone(),
-        run_id.clone(),
-        project_root.clone(),
-        runtime_sources,
-    )?;
+    let supervisor_endpoint = if architect_adapter == ArchitectAdapter::Codex {
+        SessionSupervisorEndpoint::bind_app_server(
+            control_paths.clone(),
+            run_id.clone(),
+            project_root.clone(),
+            runtime_sources,
+        )?
+    } else {
+        SessionSupervisorEndpoint::bind(
+            control_paths.clone(),
+            run_id.clone(),
+            project_root.clone(),
+            runtime_sources,
+        )?
+    };
     let startup = supervisor_endpoint.startup().clone();
     let supervisor_stop = Arc::new(AtomicBool::new(false));
     for signal in [
@@ -148,6 +169,12 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         )?;
         writeln!(stdout, "profile hash: {}", loaded.profiles.canonical_hash())?;
         write_profile_summary(&mut stdout, &loaded.profiles)?;
+        if architect_adapter == ArchitectAdapter::Codex {
+            writeln!(
+                stdout,
+                "worker runtime: codex-app-server-0.146.0 (one fresh process per task)"
+            )?;
+        }
         writeln!(
             stdout,
             "task repositories: discovered from project documentation and bound only after explicit execution authorization; each developer commits directly there"
@@ -259,8 +286,8 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         },
         relay_executable: tools.component.clone(),
         relay_runtime_scope_hash: relay_scope_hash.clone(),
-        developer_adapter: loaded.profiles.developer_adapter_name().into(),
-        reviewer_adapter: loaded.profiles.reviewer_adapter_name().into(),
+        developer_adapter: developer_adapter.into(),
+        reviewer_adapter: reviewer_adapter.into(),
     };
     if let Err(error) = configure_bridge(&mut bridge.bootstrap, configuration) {
         terminate_child(&mut bridge.child);
@@ -586,6 +613,20 @@ fn write_profile_summary(
         )?,
     }
     Ok(())
+}
+
+fn worker_adapter_bindings(
+    architect_adapter: ArchitectAdapter,
+    profiles: &SessionInvocationProfiles,
+) -> (&'static str, &'static str) {
+    if architect_adapter == ArchitectAdapter::Codex {
+        (CODEX_APP_SERVER_ADAPTER, CODEX_APP_SERVER_ADAPTER)
+    } else {
+        (
+            profiles.developer_adapter_name(),
+            profiles.reviewer_adapter_name(),
+        )
+    }
 }
 
 fn validate_foreground_terminal() -> Result<()> {
@@ -2511,6 +2552,27 @@ mod tests {
                 "summary={output}"
             );
         }
+    }
+
+    #[test]
+    fn production_worker_adapter_metadata_distinguishes_app_server_from_retained_cli() {
+        let app_server =
+            SessionInvocationProfiles::for_codex_app_server_lane(ArchitectAdapter::Codex).unwrap();
+        assert_eq!(
+            worker_adapter_bindings(ArchitectAdapter::Codex, &app_server),
+            (CODEX_APP_SERVER_ADAPTER, CODEX_APP_SERVER_ADAPTER)
+        );
+
+        let retained = SessionInvocationProfiles::for_architect(ArchitectAdapter::Claude);
+        assert_eq!(
+            worker_adapter_bindings(ArchitectAdapter::Claude, &retained),
+            (
+                retained.developer_adapter_name(),
+                retained.reviewer_adapter_name()
+            )
+        );
+        assert_ne!(retained.developer_adapter_name(), CODEX_APP_SERVER_ADAPTER);
+        assert_ne!(retained.reviewer_adapter_name(), CODEX_APP_SERVER_ADAPTER);
     }
 
     #[test]

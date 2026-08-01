@@ -32,10 +32,7 @@ pub(super) fn load_invocation_profiles(
     load_invocation_profiles_with_defaults(path, architect_adapter, false)
 }
 
-/// P0 contract resolver for the future Codex App Server production lane.
-/// Existing production dispatch continues to call [`load_invocation_profiles`]
-/// until the integration phase.
-#[allow(dead_code)]
+/// Resolver for the production Codex App Server task-runtime lane.
 pub(super) fn load_codex_app_server_profiles(
     path: &Path,
     architect_adapter: ArchitectAdapter,

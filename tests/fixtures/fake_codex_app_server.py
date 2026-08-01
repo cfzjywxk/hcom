@@ -197,6 +197,54 @@ def handle_turn(message):
     global turn_number
     params = message["params"]
     turn_number += 1
+    if SCENARIO == "sandbox_writable":
+        target = os.path.join(params["cwd"], "target")
+        os.makedirs(target, exist_ok=True)
+        with open(
+            os.path.join(target, "sandbox-turn-" + str(turn_number)),
+            "w",
+            encoding="ascii",
+        ) as output:
+            output.write("writable\n")
+        subprocess.run(
+            ["/usr/bin/git", "status", "--short"],
+            cwd=params["cwd"],
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={
+                "HOME": os.environ["HOME"],
+                "PATH": os.environ["PATH"],
+                "LC_ALL": "C",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+            },
+        )
+        protected = os.environ.get("HCOM_FAKE_PROTECTED_PATH")
+        if REPORT and protected:
+            controlling_tty = True
+            try:
+                descriptor = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+            except OSError:
+                controlling_tty = False
+            else:
+                os.close(descriptor)
+            with open(REPORT, "a", encoding="utf-8") as output:
+                output.write(
+                    json.dumps(
+                        {
+                            "method": "fixture/sandbox",
+                            "turn": turn_number,
+                            "protectedVisible": os.path.exists(protected),
+                            "stdioIsTty": any(os.isatty(fd) for fd in (0, 1, 2)),
+                            "controllingTty": controlling_tty,
+                        },
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+                output.flush()
     turn_id = "turn-1" if SCENARIO == "turn_duplicate_id" else "turn-" + str(turn_number)
     response = {
         "id": message["id"],

@@ -126,6 +126,7 @@ pub enum SupervisorEventKind {
     TurnStarted,
     TurnCompleted,
     TurnFailed,
+    DriverFailed,
     RepositoryObserved,
     Timeout,
     CancelRequested,
@@ -134,7 +135,7 @@ pub enum SupervisorEventKind {
 }
 
 impl SupervisorEventKind {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::PlanBound,
         Self::ExecutionAuthorized,
         Self::TaskRuntimeOpened,
@@ -142,6 +143,7 @@ impl SupervisorEventKind {
         Self::TurnStarted,
         Self::TurnCompleted,
         Self::TurnFailed,
+        Self::DriverFailed,
         Self::RepositoryObserved,
         Self::Timeout,
         Self::CancelRequested,
@@ -201,6 +203,11 @@ pub enum SupervisorEvent {
         completion_token: String,
         failure: SanitizedRuntimeFailure,
     },
+    DriverFailed {
+        expected_version: u64,
+        task_ordinal: usize,
+        failure: DriverFailure,
+    },
     RepositoryObserved {
         expected_version: u64,
         task_ordinal: usize,
@@ -235,6 +242,7 @@ impl SupervisorEvent {
             Self::TurnStarted { .. } => SupervisorEventKind::TurnStarted,
             Self::TurnCompleted { .. } => SupervisorEventKind::TurnCompleted,
             Self::TurnFailed { .. } => SupervisorEventKind::TurnFailed,
+            Self::DriverFailed { .. } => SupervisorEventKind::DriverFailed,
             Self::RepositoryObserved { .. } => SupervisorEventKind::RepositoryObserved,
             Self::Timeout { .. } => SupervisorEventKind::Timeout,
             Self::CancelRequested { .. } => SupervisorEventKind::CancelRequested,
@@ -266,6 +274,9 @@ impl SupervisorEvent {
             | Self::TurnFailed {
                 expected_version, ..
             }
+            | Self::DriverFailed {
+                expected_version, ..
+            }
             | Self::RepositoryObserved {
                 expected_version, ..
             }
@@ -279,6 +290,23 @@ impl SupervisorEvent {
             Self::StatusRequested => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DriverFailureClass {
+    Repository,
+    Runtime,
+    Environment,
+    Contract,
+    Cleanup,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DriverFailure {
+    pub class: DriverFailureClass,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -731,6 +759,11 @@ impl SupervisorCore {
                 &completion_token,
                 failure,
             ),
+            SupervisorEvent::DriverFailed {
+                task_ordinal,
+                failure,
+                ..
+            } => self.driver_failed(task_ordinal, failure),
             SupervisorEvent::RepositoryObserved {
                 task_ordinal,
                 checkpoint,
@@ -1134,6 +1167,32 @@ impl SupervisorCore {
             ),
         };
         self.terminalize_current(session_state, task_state, terminal_detail, Vec::new())
+    }
+
+    fn driver_failed(
+        &mut self,
+        task_ordinal: usize,
+        failure: DriverFailure,
+    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        self.require_running_task(task_ordinal)?;
+        validate_single_line(
+            "supervisor driver failure detail",
+            &failure.detail,
+            MAX_CORE_DIAGNOSTIC_BYTES,
+        )?;
+        let detail = match failure.class {
+            DriverFailureClass::Repository => "repository observation failed",
+            DriverFailureClass::Runtime => "task worker runtime operation failed",
+            DriverFailureClass::Environment => "task-private environment setup failed",
+            DriverFailureClass::Contract => "session runtime contract failed",
+            DriverFailureClass::Cleanup => "task worker runtime cleanup failed",
+        };
+        self.terminalize_current(
+            SessionState::NeedsHuman,
+            TaskState::NeedsHuman,
+            detail,
+            Vec::new(),
+        )
     }
 
     fn repository_observed(
@@ -2988,6 +3047,14 @@ mod tests {
                 completion_token: "active".into(),
                 failure: runtime_failure(RuntimeFailureClass::Process, false, "provider exited"),
             },
+            SupervisorEventKind::DriverFailed => SupervisorEvent::DriverFailed {
+                expected_version: core.version(),
+                task_ordinal: 0,
+                failure: DriverFailure {
+                    class: DriverFailureClass::Runtime,
+                    detail: "bounded driver failure".into(),
+                },
+            },
             SupervisorEventKind::RepositoryObserved => SupervisorEvent::RepositoryObserved {
                 expected_version: core.version(),
                 task_ordinal: 0,
@@ -3365,8 +3432,8 @@ mod tests {
         }
 
         assert_eq!(rows, 7 * SupervisorEventKind::ALL.len());
-        assert_eq!(accepted, 23);
-        assert_eq!(rejected, 61);
+        assert_eq!(accepted, 24);
+        assert_eq!(rejected, 67);
     }
 
     #[test]
@@ -4998,6 +5065,72 @@ mod tests {
             terminal_details.insert(expected.into());
         }
         assert_eq!(terminal_details.len(), 8);
+    }
+
+    #[test]
+    fn every_driver_failure_class_has_a_distinct_bounded_secret_free_terminal() {
+        for (class, expected) in [
+            (
+                DriverFailureClass::Repository,
+                "repository observation failed",
+            ),
+            (
+                DriverFailureClass::Runtime,
+                "task worker runtime operation failed",
+            ),
+            (
+                DriverFailureClass::Environment,
+                "task-private environment setup failed",
+            ),
+            (
+                DriverFailureClass::Contract,
+                "session runtime contract failed",
+            ),
+            (
+                DriverFailureClass::Cleanup,
+                "task worker runtime cleanup failed",
+            ),
+        ] {
+            let (mut core, _base) = authorized_core();
+            core.reduce(SupervisorEvent::DriverFailed {
+                expected_version: core.version(),
+                task_ordinal: 0,
+                failure: DriverFailure {
+                    class,
+                    detail: "RAW_SECRET_DRIVER_DETAIL".into(),
+                },
+            })
+            .unwrap();
+            let snapshot = core.snapshot();
+            assert_eq!(snapshot.state, SessionState::NeedsHuman);
+            assert_eq!(snapshot.tasks[0].state, TaskState::NeedsHuman);
+            assert_eq!(snapshot.terminal_detail.as_deref(), Some(expected));
+            assert!(
+                !serde_json::to_string(&snapshot)
+                    .unwrap()
+                    .contains("RAW_SECRET_DRIVER_DETAIL")
+            );
+        }
+
+        for length in [MAX_CORE_DIAGNOSTIC_BYTES, MAX_CORE_DIAGNOSTIC_BYTES + 1] {
+            let (mut core, _base) = authorized_core();
+            let before = core.clone();
+            let result = core.reduce(SupervisorEvent::DriverFailed {
+                expected_version: core.version(),
+                task_ordinal: 0,
+                failure: DriverFailure {
+                    class: DriverFailureClass::Runtime,
+                    detail: "x".repeat(length),
+                },
+            });
+            if length == MAX_CORE_DIAGNOSTIC_BYTES {
+                result.unwrap();
+                assert_eq!(core.session_state(), SessionState::NeedsHuman);
+            } else {
+                assert_eq!(result.unwrap_err().code, SupervisorErrorCode::InvalidEvent);
+                assert_eq!(core, before);
+            }
+        }
     }
 
     #[test]

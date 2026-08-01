@@ -1,0 +1,3242 @@
+//! Effect driver for the `hcom arch codex` Codex App Server task lane.
+//!
+//! The driver is the only owner of Git, filesystem, environment, and runtime
+//! I/O. Scheduling decisions remain in [`SupervisorCore`].
+
+use super::core::{
+    DriverFailure, DriverFailureClass, RepositoryObservation, SupervisorCore, SupervisorEffect,
+    SupervisorEvent, TaskRepositoryBinding,
+};
+use super::{
+    GitRunner, ManagedRepository, SessionRuntimeSources, SessionStartup, ensure_private_directory,
+    parse_nul_paths, path_value, prepare_auth_mount_target, sha256_hex,
+};
+use crate::control_api::{SessionState, SessionStatusSnapshot, TaskDraft, TaskState, WorkerRole};
+use crate::worker::codex_app_server::{
+    CodexAppServerPreflight, CodexAppServerRuntime, CodexAppServerSandboxConfig,
+};
+use crate::worker::environment::{
+    EnvironmentPolicy, ExecutionEnvironmentLease, MaterializedWorkerEnvironment,
+};
+use crate::worker::runtime::{
+    AppServerWorkerProfiles, CODEX_APP_SERVER_ADAPTER, OutcomeContract, RoleSessionSpec,
+    RuntimeContractIdentity, RuntimeError, RuntimeErrorCode, RuntimeFailureClass, RuntimeOutcome,
+    RuntimeProfile, RuntimeSessionKey, RuntimeTurnKey, RuntimeTurnPoll, RuntimeTurnPurpose,
+    RuntimeTurnSpec, SanitizedRuntimeFailure, TaskWorkerRuntime,
+};
+use anyhow::{Context, Result, anyhow, bail};
+use serde::Serialize;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tempfile::TempDir;
+use uuid::Uuid;
+
+const TURN_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+const MAX_AUTH_FILE_BYTES: usize = 1024 * 1024;
+const MAX_AUTH_REDACTION_VALUES: usize = 64;
+
+trait RuntimeFactory: Send {
+    fn contract(&self) -> RuntimeContractIdentity;
+
+    fn open(
+        &mut self,
+        request: RuntimeOpenRequest,
+    ) -> Result<Box<dyn TaskWorkerRuntime>, RuntimeError>;
+}
+
+struct ProductionRuntimeFactory {
+    preflight: Option<CodexAppServerPreflight>,
+}
+
+impl ProductionRuntimeFactory {
+    fn new() -> Self {
+        Self { preflight: None }
+    }
+}
+
+impl RuntimeFactory for ProductionRuntimeFactory {
+    fn contract(&self) -> RuntimeContractIdentity {
+        RuntimeContractIdentity::codex_app_server_0_146()
+    }
+
+    fn open(
+        &mut self,
+        request: RuntimeOpenRequest,
+    ) -> Result<Box<dyn TaskWorkerRuntime>, RuntimeError> {
+        if request.task_ordinal >= 64 {
+            return Err(RuntimeError::invalid_contract(
+                "task runtime ordinal exceeds the session bound",
+            ));
+        }
+        crate::worker::validation::validate_opaque_id("task runtime key", &request.task_key)
+            .map_err(|_| RuntimeError::invalid_contract("task runtime key was invalid"))?;
+        let preflight = match &self.preflight {
+            Some(preflight) => {
+                preflight.revalidate()?;
+                preflight.clone()
+            }
+            None => {
+                let preflight = CodexAppServerPreflight::verify_pinned()?;
+                self.preflight = Some(preflight.clone());
+                preflight
+            }
+        };
+        let runtime = CodexAppServerRuntime::launch_sandboxed(
+            preflight,
+            CodexAppServerSandboxConfig {
+                repository_root: request.repository_root,
+                isolated_home: request.paths.home,
+                codex_home: request.paths.codex_home,
+                temp_dir: request.paths.temp,
+                runtime_dir: request.paths.runtime,
+                artifact_dir: request.paths.artifacts,
+                hcom_dir: request.paths.hcom,
+                xdg_config_home: request.paths.xdg_config,
+                xdg_state_home: request.paths.xdg_state,
+                xdg_cache_home: request.paths.xdg_cache,
+                xdg_data_home: request.paths.xdg_data,
+                auth_source: request.auth_source,
+                cargo_bin_source: request.cargo_bin_source,
+                rustup_home_source: request.rustup_home_source,
+            },
+            request.environment,
+        )?;
+        Ok(Box::new(runtime))
+    }
+}
+
+struct RuntimeOpenRequest {
+    task_ordinal: usize,
+    task_key: String,
+    repository_root: PathBuf,
+    paths: TaskRuntimePaths,
+    auth_source: PathBuf,
+    cargo_bin_source: PathBuf,
+    rustup_home_source: PathBuf,
+    environment: Vec<(OsString, OsString)>,
+}
+
+struct RuntimeOpenFailure {
+    class: DriverFailureClass,
+    error: anyhow::Error,
+}
+
+impl RuntimeOpenFailure {
+    fn new(class: DriverFailureClass, error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            class,
+            error: error.into(),
+        }
+    }
+}
+
+struct TaskRuntimePaths {
+    home: PathBuf,
+    codex_home: PathBuf,
+    temp: PathBuf,
+    runtime: PathBuf,
+    artifacts: PathBuf,
+    hcom: PathBuf,
+    xdg_config: PathBuf,
+    xdg_state: PathBuf,
+    xdg_cache: PathBuf,
+    xdg_data: PathBuf,
+}
+
+impl TaskRuntimePaths {
+    fn create(
+        run_root: &Path,
+        task_ordinal: usize,
+        task_key: &str,
+        repository_root: &Path,
+    ) -> Result<(TempDir, Self)> {
+        let workers = run_root.join("app-server-workers");
+        ensure_private_directory(&workers)?;
+        let root = tempfile::Builder::new()
+            .prefix(&format!("task-{task_ordinal}-{task_key}."))
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(&workers)
+            .context("failed to create task-private App Server root")?;
+        let root_path = fs::canonicalize(root.path())?;
+        let home = root_path.join("home");
+        let paths = Self {
+            codex_home: home.join(".codex"),
+            temp: root_path.join("tmp"),
+            runtime: root_path.join("run"),
+            artifacts: root_path.join("artifacts"),
+            hcom: root_path.join("hcom"),
+            xdg_config: home.join(".config"),
+            xdg_state: home.join(".state"),
+            xdg_cache: home.join(".cache"),
+            xdg_data: home.join(".data"),
+            home,
+        };
+        for directory in [
+            &paths.home,
+            &paths.codex_home,
+            &paths.temp,
+            &paths.runtime,
+            &paths.artifacts,
+            &paths.hcom,
+            &paths.xdg_config,
+            &paths.xdg_state,
+            &paths.xdg_cache,
+            &paths.xdg_data,
+        ] {
+            fs::create_dir(directory).with_context(|| {
+                format!(
+                    "failed to create task-private App Server directory {}",
+                    directory.display()
+                )
+            })?;
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        }
+        prepare_auth_mount_target(&paths.codex_home.join("auth.json"))?;
+        write_private_codex_config(&paths.codex_home.join("config.toml"), repository_root)?;
+        Ok((root, paths))
+    }
+}
+
+struct OpenTaskRuntime {
+    task_ordinal: usize,
+    _root: TempDir,
+    environment: ExecutionEnvironmentLease,
+    runtime: Box<dyn TaskWorkerRuntime>,
+    sessions: BTreeMap<RuntimeSessionKey, LocalSession>,
+}
+
+#[derive(Clone, Copy)]
+struct LocalSession {
+    role: WorkerRole,
+    key: RuntimeSessionKey,
+}
+
+#[derive(Clone)]
+struct ActiveTurn {
+    task_ordinal: usize,
+    role: WorkerRole,
+    logical_session: RuntimeSessionKey,
+    logical_turn: RuntimeTurnKey,
+    local_turn: RuntimeTurnKey,
+    completion_token: String,
+    prompt: String,
+}
+
+pub(crate) struct AppServerSessionSupervisor {
+    startup: SessionStartup,
+    epoch: String,
+    core: SupervisorCore,
+    repositories: BTreeMap<PathBuf, ManagedRepository>,
+    lock_root: PathBuf,
+    run_root: PathBuf,
+    sources: SessionRuntimeSources,
+    profiles: AppServerWorkerProfiles,
+    developer_adapter: String,
+    reviewer_adapter: String,
+    factory: Box<dyn RuntimeFactory>,
+    task_runtime: Option<OpenTaskRuntime>,
+    active: Option<ActiveTurn>,
+    next_session: u64,
+    next_turn: u64,
+}
+
+impl AppServerSessionSupervisor {
+    pub(crate) fn open(
+        run_id: String,
+        project_root: PathBuf,
+        run_root: PathBuf,
+        lock_root: PathBuf,
+        sources: SessionRuntimeSources,
+    ) -> Result<Self> {
+        Self::open_with_factory(
+            run_id,
+            project_root,
+            run_root,
+            lock_root,
+            sources,
+            Box::new(ProductionRuntimeFactory::new()),
+        )
+    }
+
+    fn open_with_factory(
+        run_id: String,
+        project_root: PathBuf,
+        run_root: PathBuf,
+        lock_root: PathBuf,
+        sources: SessionRuntimeSources,
+        factory: Box<dyn RuntimeFactory>,
+    ) -> Result<Self> {
+        crate::worker::validation::validate_opaque_id("run id", &run_id)?;
+        let project_root = super::canonical_project_directory(&project_root)?;
+        let run_root = super::canonical_private_directory(&run_root, "session runtime root")?;
+        let lock_root = super::canonical_private_directory(&lock_root, "repository lock root")?;
+        let session_profiles = sources.profiles.clone().ok_or_else(|| {
+            anyhow!("Codex App Server production lane requires session-frozen profiles")
+        })?;
+        let profiles = AppServerWorkerProfiles::from_session_profiles(&session_profiles)
+            .map_err(|error| anyhow!(error.detail))?;
+        profiles.validate().map_err(|error| anyhow!(error.detail))?;
+        let contract = factory.contract();
+        contract.validate().map_err(|error| anyhow!(error.detail))?;
+        let profile_hash = sha256_hex(&serde_json::to_vec(&(
+            "hcom-codex-app-server-session-binding-v1",
+            session_profiles.canonical_hash(),
+            profiles.canonical_hash(),
+            contract.canonical_hash(),
+        ))?);
+        let startup = SessionStartup {
+            run_id: run_id.clone(),
+            project_root: project_root.clone(),
+        };
+        let core = SupervisorCore::new(run_id, project_root, profile_hash)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        Ok(Self {
+            startup,
+            epoch: format!("app-server-supervisor-{}", Uuid::new_v4()),
+            core,
+            repositories: BTreeMap::new(),
+            lock_root,
+            run_root,
+            sources,
+            profiles,
+            developer_adapter: CODEX_APP_SERVER_ADAPTER.into(),
+            reviewer_adapter: CODEX_APP_SERVER_ADAPTER.into(),
+            factory,
+            task_runtime: None,
+            active: None,
+            next_session: 1,
+            next_turn: 1,
+        })
+    }
+
+    pub(crate) fn startup(&self) -> &SessionStartup {
+        &self.startup
+    }
+
+    pub(crate) fn replace_plan(
+        &mut self,
+        expected_session_version: u64,
+        developer_adapter: &str,
+        reviewer_adapter: &str,
+        tasks: Vec<TaskDraft>,
+    ) -> Result<(u64, String)> {
+        if developer_adapter != self.developer_adapter || reviewer_adapter != self.reviewer_adapter
+        {
+            bail!("task plan adapters differ from the Codex App Server session binding");
+        }
+        if expected_session_version != self.core.version() {
+            bail!("session version is stale");
+        }
+        if !matches!(
+            self.core.session_state(),
+            SessionState::AwaitingPlan | SessionState::AwaitingApproval
+        ) {
+            bail!("task plan cannot change after this run starts");
+        }
+
+        let roots: BTreeSet<PathBuf> = tasks
+            .iter()
+            .map(|task| PathBuf::from(&task.repository_root))
+            .collect();
+        let mut staged = BTreeMap::new();
+        for root in &roots {
+            if self.repositories.contains_key(root) {
+                continue;
+            }
+            let repository = ManagedRepository::open(root, &self.lock_root)
+                .with_context(|| format!("failed to bind task repository {}", root.display()))?;
+            if repository.repository.root != *root {
+                bail!(
+                    "task repository_root must name the exact canonical Git top level: {}",
+                    root.display()
+                );
+            }
+            staged.insert(root.clone(), repository);
+        }
+        let bindings = plan_bindings(&tasks, &self.repositories, &staged)?;
+        let plan_version = self
+            .core
+            .plan_version()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("plan version overflow"))?;
+        let plan_hash = self
+            .core
+            .expected_plan_hash(plan_version, &tasks, &bindings);
+        let event = SupervisorEvent::PlanBound {
+            expected_version: expected_session_version,
+            plan_version,
+            plan_hash: plan_hash.clone(),
+            tasks,
+            repositories: bindings,
+        };
+        let effects = self
+            .core
+            .reduce(event)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let mut previous = std::mem::take(&mut self.repositories);
+        let mut repositories = BTreeMap::new();
+        for root in roots {
+            let repository = previous
+                .remove(&root)
+                .or_else(|| staged.remove(&root))
+                .ok_or_else(|| anyhow!("staged task repository disappeared"))?;
+            repositories.insert(root, repository);
+        }
+        self.repositories = repositories;
+        self.execute_effects(effects)?;
+        Ok((plan_version, plan_hash))
+    }
+
+    pub(crate) fn approve_and_start(
+        &mut self,
+        expected_session_version: u64,
+        plan_version: u64,
+        plan_hash: &str,
+        approval_confirmed: bool,
+    ) -> Result<()> {
+        if !approval_confirmed {
+            bail!("run start requires explicit human execution authorization");
+        }
+        let effects = self
+            .core
+            .reduce(SupervisorEvent::ExecutionAuthorized {
+                expected_version: expected_session_version,
+                plan_version: Some(plan_version),
+                plan_hash: Some(plan_hash.into()),
+            })
+            .map_err(|error| anyhow!(error.to_string()))?;
+        self.execute_effects(effects)
+    }
+
+    pub(crate) fn cancel(&mut self, expected_session_version: u64, reason: &str) -> Result<()> {
+        let effects = self
+            .core
+            .reduce(SupervisorEvent::CancelRequested {
+                expected_version: expected_session_version,
+                reason: reason.into(),
+            })
+            .map_err(|error| anyhow!(error.to_string()))?;
+        self.execute_effects(effects)
+    }
+
+    pub(crate) fn snapshot(&self) -> SessionStatusSnapshot {
+        self.core.snapshot()
+    }
+
+    pub(crate) fn poll_once(&mut self) -> Result<()> {
+        if self.core.session_state() != SessionState::Running || self.active.is_none() {
+            return Ok(());
+        }
+        let active = self
+            .active
+            .clone()
+            .ok_or_else(|| anyhow!("active App Server turn disappeared"))?;
+        let poll = {
+            let task_runtime = self.require_task_runtime_mut(active.task_ordinal)?;
+            task_runtime.runtime.poll_turn(active.local_turn)
+        };
+        let event = match poll {
+            Ok(RuntimeTurnPoll::Pending { .. }) => return Ok(()),
+            Ok(RuntimeTurnPoll::Completed { outcome, .. }) => {
+                if self.outcome_contains_sensitive_value(
+                    active.task_ordinal,
+                    &active.prompt,
+                    &outcome,
+                ) {
+                    SupervisorEvent::TurnFailed {
+                        expected_version: self.core.version(),
+                        task_ordinal: active.task_ordinal,
+                        role: active.role,
+                        session: active.logical_session,
+                        turn: active.logical_turn,
+                        completion_token: active.completion_token.clone(),
+                        failure: SanitizedRuntimeFailure::new(
+                            RuntimeFailureClass::Contract,
+                            "typed worker outcome contained protected session data",
+                            false,
+                        )
+                        .map_err(|error| anyhow!(error.detail))?,
+                    }
+                } else {
+                    SupervisorEvent::TurnCompleted {
+                        expected_version: self.core.version(),
+                        task_ordinal: active.task_ordinal,
+                        role: active.role,
+                        session: active.logical_session,
+                        turn: active.logical_turn,
+                        completion_token: active.completion_token.clone(),
+                        outcome,
+                    }
+                }
+            }
+            Ok(RuntimeTurnPoll::Failed { failure, .. }) => SupervisorEvent::TurnFailed {
+                expected_version: self.core.version(),
+                task_ordinal: active.task_ordinal,
+                role: active.role,
+                session: active.logical_session,
+                turn: active.logical_turn,
+                completion_token: active.completion_token.clone(),
+                failure,
+            },
+            Err(error) => SupervisorEvent::TurnFailed {
+                expected_version: self.core.version(),
+                task_ordinal: active.task_ordinal,
+                role: active.role,
+                session: active.logical_session,
+                turn: active.logical_turn,
+                completion_token: active.completion_token.clone(),
+                failure: runtime_error_failure(error)?,
+            },
+        };
+        self.active = None;
+        let effects = self
+            .core
+            .reduce(event)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        self.execute_effects(effects)
+    }
+
+    pub(crate) fn shutdown(&mut self) -> Result<()> {
+        if !self.core.session_state().is_terminal() {
+            let effects = self
+                .core
+                .reduce(SupervisorEvent::ParentStopping {
+                    expected_version: self.core.version(),
+                })
+                .map_err(|error| anyhow!(error.to_string()))?;
+            self.execute_effects(effects)?;
+        }
+        self.close_runtime_best_effort();
+        Ok(())
+    }
+
+    fn execute_effects(&mut self, initial: Vec<SupervisorEffect>) -> Result<()> {
+        let mut effects: VecDeque<_> = initial.into();
+        while let Some(effect) = effects.pop_front() {
+            let follow_up = match effect {
+                SupervisorEffect::PublishStatus | SupervisorEffect::FinishSession { .. } => {
+                    continue;
+                }
+                SupervisorEffect::ObserveRepository {
+                    task_ordinal,
+                    checkpoint,
+                } => {
+                    let observation = match self.observe_repository(task_ordinal) {
+                        Ok(observation) => observation,
+                        Err(error) => {
+                            return self.fail_driver_effect(
+                                task_ordinal,
+                                DriverFailureClass::Repository,
+                                error,
+                            );
+                        }
+                    };
+                    SupervisorEvent::RepositoryObserved {
+                        expected_version: self.core.version(),
+                        task_ordinal,
+                        checkpoint,
+                        observation,
+                    }
+                }
+                SupervisorEffect::OpenTaskRuntime { task_ordinal } => {
+                    if let Err(failure) = self.open_task_runtime(task_ordinal) {
+                        return self.fail_driver_effect(task_ordinal, failure.class, failure.error);
+                    }
+                    SupervisorEvent::TaskRuntimeOpened {
+                        expected_version: self.core.version(),
+                        task_ordinal,
+                    }
+                }
+                SupervisorEffect::OpenRoleSession { task_ordinal, role } => {
+                    let logical = match self.open_role_session(task_ordinal, role) {
+                        Ok(session) => session,
+                        Err(error) => {
+                            return self.fail_driver_effect(
+                                task_ordinal,
+                                DriverFailureClass::Runtime,
+                                error,
+                            );
+                        }
+                    };
+                    SupervisorEvent::RoleSessionOpened {
+                        expected_version: self.core.version(),
+                        task_ordinal,
+                        role,
+                        session: logical,
+                    }
+                }
+                SupervisorEffect::StartTurn {
+                    task_ordinal,
+                    role,
+                    purpose,
+                    session,
+                } => {
+                    let (logical_turn, completion_token) =
+                        match self.start_turn(task_ordinal, role, purpose, session) {
+                            Ok(started) => started,
+                            Err(error) => {
+                                return self.fail_driver_effect(
+                                    task_ordinal,
+                                    DriverFailureClass::Runtime,
+                                    error,
+                                );
+                            }
+                        };
+                    SupervisorEvent::TurnStarted {
+                        expected_version: self.core.version(),
+                        task_ordinal,
+                        role,
+                        purpose,
+                        session,
+                        turn: logical_turn,
+                        completion_token,
+                    }
+                }
+                SupervisorEffect::InterruptTurn {
+                    task_ordinal, turn, ..
+                } => {
+                    self.interrupt_turn(task_ordinal, turn);
+                    continue;
+                }
+                SupervisorEffect::CloseTaskRuntime { task_ordinal } => {
+                    self.close_task_runtime(task_ordinal)?;
+                    continue;
+                }
+            };
+            let mut next_core = self.core.clone();
+            let next = next_core
+                .reduce(follow_up)
+                .map_err(|error| anyhow!(error.to_string()))?;
+            if let Some(task_ordinal) = successful_task_close(&next_core, &next)
+                && let Err(error) = self.close_task_runtime(task_ordinal)
+            {
+                return self.fail_driver_effect(task_ordinal, DriverFailureClass::Cleanup, error);
+            }
+            self.core = next_core;
+            effects.extend(next);
+        }
+        Ok(())
+    }
+
+    fn fail_driver_effect(
+        &mut self,
+        task_ordinal: usize,
+        class: DriverFailureClass,
+        error: anyhow::Error,
+    ) -> Result<()> {
+        self.close_runtime_best_effort();
+        let detail = bounded_single_line(&error.to_string());
+        let effects = self
+            .core
+            .reduce(SupervisorEvent::DriverFailed {
+                expected_version: self.core.version(),
+                task_ordinal,
+                failure: DriverFailure { class, detail },
+            })
+            .map_err(|core_error| anyhow!(core_error.to_string()))?;
+        for effect in effects {
+            if let SupervisorEffect::CloseTaskRuntime { .. } = effect {
+                self.close_runtime_best_effort();
+            }
+        }
+        Err(error)
+    }
+
+    fn open_task_runtime(&mut self, task_ordinal: usize) -> Result<(), RuntimeOpenFailure> {
+        self.prepare_and_open_task_runtime(task_ordinal)
+    }
+
+    fn prepare_and_open_task_runtime(
+        &mut self,
+        task_ordinal: usize,
+    ) -> Result<(), RuntimeOpenFailure> {
+        if self.task_runtime.is_some() || self.active.is_some() {
+            return Err(RuntimeOpenFailure::new(
+                DriverFailureClass::Contract,
+                anyhow!("a task-local App Server runtime is already open"),
+            ));
+        }
+        let task = self.core.tasks().get(task_ordinal).ok_or_else(|| {
+            RuntimeOpenFailure::new(
+                DriverFailureClass::Contract,
+                anyhow!("App Server runtime task ordinal is out of range"),
+            )
+        })?;
+        let repository_root = PathBuf::from(&task.spec.repository_root);
+        let (root, paths) = TaskRuntimePaths::create(
+            &self.run_root,
+            task_ordinal,
+            &task.spec.task_key,
+            &repository_root,
+        )
+        .map_err(|error| RuntimeOpenFailure::new(DriverFailureClass::Environment, error))?;
+        let environment = self
+            .task_environment(&task.spec.task_key, &paths)
+            .map_err(|error| RuntimeOpenFailure::new(DriverFailureClass::Environment, error))?;
+        let materialized = environment
+            .materialize_task_runtime(&self.epoch, &self.startup.run_id, &task.spec.task_key)
+            .map_err(|error| RuntimeOpenFailure::new(DriverFailureClass::Environment, error))?;
+        let request = RuntimeOpenRequest {
+            task_ordinal,
+            task_key: task.spec.task_key.clone(),
+            repository_root,
+            paths: clone_runtime_paths(&paths),
+            auth_source: self.sources.codex_auth_source.clone().ok_or_else(|| {
+                RuntimeOpenFailure::new(
+                    DriverFailureClass::Environment,
+                    anyhow!("Codex auth source is unavailable"),
+                )
+            })?,
+            cargo_bin_source: self.sources.cargo_bin_source.clone(),
+            rustup_home_source: self.sources.rustup_home_source.clone(),
+            environment: materialized_environment(&materialized),
+        };
+        let runtime = self.factory.open(request).map_err(|error| {
+            RuntimeOpenFailure::new(DriverFailureClass::Runtime, anyhow!(error.detail))
+        })?;
+        if runtime.contract() != &self.factory.contract() {
+            return Err(RuntimeOpenFailure::new(
+                DriverFailureClass::Contract,
+                anyhow!("opened task runtime differs from the frozen runtime contract"),
+            ));
+        }
+        self.task_runtime = Some(OpenTaskRuntime {
+            task_ordinal,
+            _root: root,
+            environment,
+            runtime,
+            sessions: BTreeMap::new(),
+        });
+        Ok(())
+    }
+
+    fn open_role_session(
+        &mut self,
+        task_ordinal: usize,
+        role: WorkerRole,
+    ) -> Result<RuntimeSessionKey> {
+        let task = self
+            .core
+            .tasks()
+            .get(task_ordinal)
+            .ok_or_else(|| anyhow!("role session task ordinal is out of range"))?;
+        let task_key = task.spec.task_key.clone();
+        let repository_root = PathBuf::from(&task.spec.repository_root);
+        let profile = self.profile(role).clone();
+        let instructions = role_instructions(role).to_owned();
+        let local = self
+            .require_task_runtime_mut(task_ordinal)?
+            .runtime
+            .open_session(RoleSessionSpec {
+                role,
+                task_key,
+                cwd: repository_root,
+                profile,
+                developer_instructions: instructions,
+            })
+            .map_err(|error| anyhow!(error.detail))?;
+        let logical = self.allocate_session_key()?;
+        let runtime = self.require_task_runtime_mut(task_ordinal)?;
+        if runtime
+            .sessions
+            .insert(logical, LocalSession { role, key: local })
+            .is_some()
+        {
+            bail!("logical App Server role session key collided");
+        }
+        Ok(logical)
+    }
+
+    fn start_turn(
+        &mut self,
+        task_ordinal: usize,
+        role: WorkerRole,
+        purpose: RuntimeTurnPurpose,
+        logical_session: RuntimeSessionKey,
+    ) -> Result<(RuntimeTurnKey, String)> {
+        if self.active.is_some() {
+            bail!("a second App Server turn cannot start");
+        }
+        let task = self
+            .core
+            .tasks()
+            .get(task_ordinal)
+            .ok_or_else(|| anyhow!("turn task ordinal is out of range"))?;
+        let task_key = task.spec.task_key.clone();
+        let repository_root = PathBuf::from(&task.spec.repository_root);
+        let prompt = self.build_turn_prompt(task_ordinal, role, purpose)?;
+        let profile = self.profile(role).clone();
+        let local_session = self
+            .require_task_runtime_mut(task_ordinal)?
+            .sessions
+            .get(&logical_session)
+            .copied()
+            .ok_or_else(|| anyhow!("logical App Server role session is not bound"))?;
+        if local_session.role != role {
+            bail!("logical App Server session belongs to the wrong role");
+        }
+        let local_turn = self
+            .require_task_runtime_mut(task_ordinal)?
+            .runtime
+            .start_turn(
+                local_session.key,
+                RuntimeTurnSpec {
+                    role,
+                    task_key,
+                    purpose,
+                    cwd: repository_root,
+                    prompt: prompt.clone(),
+                    profile,
+                    outcome_contract: match role {
+                        WorkerRole::Developer => OutcomeContract::DeveloperV1,
+                        WorkerRole::Reviewer => OutcomeContract::ReviewerV1,
+                    },
+                    timeout: TURN_TIMEOUT,
+                },
+            )
+            .map_err(|error| anyhow!(error.detail))?;
+        let logical_turn = self.allocate_turn_key()?;
+        let completion_token = format!("app-server-turn-{}", Uuid::new_v4());
+        self.active = Some(ActiveTurn {
+            task_ordinal,
+            role,
+            logical_session,
+            logical_turn,
+            local_turn,
+            completion_token: completion_token.clone(),
+            prompt,
+        });
+        Ok((logical_turn, completion_token))
+    }
+
+    fn interrupt_turn(&mut self, task_ordinal: usize, logical_turn: RuntimeTurnKey) {
+        let Some(active) = self.active.take() else {
+            return;
+        };
+        if active.task_ordinal != task_ordinal || active.logical_turn != logical_turn {
+            self.active = Some(active);
+            return;
+        }
+        if let Some(runtime) = self.task_runtime.as_mut() {
+            let _ = runtime.runtime.cancel_turn(active.local_turn);
+        }
+    }
+
+    fn close_task_runtime(&mut self, task_ordinal: usize) -> Result<()> {
+        let Some(mut runtime) = self.task_runtime.take() else {
+            return Ok(());
+        };
+        if runtime.task_ordinal != task_ordinal {
+            self.task_runtime = Some(runtime);
+            bail!("close effect referenced the wrong task-local runtime");
+        }
+        self.active = None;
+        runtime
+            .runtime
+            .shutdown()
+            .map_err(|error| anyhow!(error.detail))
+    }
+
+    fn close_runtime_best_effort(&mut self) {
+        self.active = None;
+        if let Some(mut runtime) = self.task_runtime.take() {
+            let _ = runtime.runtime.shutdown();
+        }
+    }
+
+    fn observe_repository(&self, task_ordinal: usize) -> Result<RepositoryObservation> {
+        let task = self
+            .core
+            .tasks()
+            .get(task_ordinal)
+            .ok_or_else(|| anyhow!("repository observation task ordinal is out of range"))?;
+        let repository = self
+            .repositories
+            .get(Path::new(&task.spec.repository_root))
+            .ok_or_else(|| anyhow!("task repository binding disappeared"))?;
+        stable_repository_observation(repository, &task.expected_repository().head)
+    }
+
+    fn task_environment(
+        &self,
+        task_key: &str,
+        paths: &TaskRuntimePaths,
+    ) -> Result<ExecutionEnvironmentLease> {
+        let cargo_home = self
+            .sources
+            .cargo_bin_source
+            .parent()
+            .ok_or_else(|| anyhow!("Rust cargo-bin source has no parent"))?;
+        let mut override_names = vec![
+            "CARGO_HOME",
+            "CODEX_HOME",
+            "HCOM_DIR",
+            "HOME",
+            "PYTHONPYCACHEPREFIX",
+            "RUSTUP_HOME",
+            "TMPDIR",
+            "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_RUNTIME_DIR",
+            "XDG_STATE_HOME",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        override_names.sort();
+        let mut required_names = override_names.clone();
+        required_names.push("PATH".into());
+        required_names.sort();
+        let policy = EnvironmentPolicy::new(override_names, required_names)?;
+        let overrides = vec![
+            (
+                "CARGO_HOME".into(),
+                path_value("worker Cargo home", cargo_home)?,
+            ),
+            (
+                "CODEX_HOME".into(),
+                path_value("worker private CODEX_HOME", &paths.codex_home)?,
+            ),
+            (
+                "HCOM_DIR".into(),
+                path_value("worker private hcom directory", &paths.hcom)?,
+            ),
+            (
+                "HOME".into(),
+                path_value("worker private HOME", &paths.home)?,
+            ),
+            (
+                "PYTHONPYCACHEPREFIX".into(),
+                path_value(
+                    "worker Python bytecode cache",
+                    &paths.temp.join("python-pycache"),
+                )?,
+            ),
+            (
+                "RUSTUP_HOME".into(),
+                path_value("worker Rustup home", &self.sources.rustup_home_source)?,
+            ),
+            (
+                "TMPDIR".into(),
+                path_value("worker temporary directory", &paths.temp)?,
+            ),
+            (
+                "XDG_CACHE_HOME".into(),
+                path_value("worker XDG cache", &paths.xdg_cache)?,
+            ),
+            (
+                "XDG_CONFIG_HOME".into(),
+                path_value("worker XDG config", &paths.xdg_config)?,
+            ),
+            (
+                "XDG_DATA_HOME".into(),
+                path_value("worker XDG data", &paths.xdg_data)?,
+            ),
+            (
+                "XDG_RUNTIME_DIR".into(),
+                path_value("worker XDG runtime", &paths.runtime)?,
+            ),
+            (
+                "XDG_STATE_HOME".into(),
+                path_value("worker XDG state", &paths.xdg_state)?,
+            ),
+        ];
+        let lease = ExecutionEnvironmentLease::capture_complete(
+            format!("app-server-lease-{}", Uuid::new_v4()),
+            &self.epoch,
+            &policy,
+            &self.sources.parent_environment,
+            overrides,
+        )
+        .with_context(|| format!("failed to capture App Server environment for {task_key}"))?;
+        let auth_source = self
+            .sources
+            .codex_auth_source
+            .as_deref()
+            .ok_or_else(|| anyhow!("Codex auth source is unavailable"))?;
+        lease.with_secret_redaction_values(codex_auth_redaction_values(auth_source)?)
+    }
+
+    fn build_turn_prompt(
+        &self,
+        task_ordinal: usize,
+        role: WorkerRole,
+        purpose: RuntimeTurnPurpose,
+    ) -> Result<String> {
+        #[derive(Serialize)]
+        struct Prompt<'a> {
+            contract: &'static str,
+            role: &'static str,
+            purpose: RuntimeTurnPurpose,
+            task_ordinal: usize,
+            project_root: &'a Path,
+            task: &'a TaskDraft,
+            base_revision: Option<&'a str>,
+            head_revision: Option<&'a str>,
+            expected_repository: &'a RepositoryObservation,
+            developer_outcome: Option<&'a crate::worker::runtime::DeveloperOutcomeV1>,
+            reviewer_outcome: Option<&'a crate::worker::runtime::ReviewerOutcomeV1>,
+            recovery_checkpoint: Option<&'a RepositoryObservation>,
+        }
+        let task = self
+            .core
+            .tasks()
+            .get(task_ordinal)
+            .ok_or_else(|| anyhow!("turn prompt task ordinal is out of range"))?;
+        let prompt = Prompt {
+            contract: "hcom-app-server-turn-envelope-v1",
+            role: match role {
+                WorkerRole::Developer => "developer",
+                WorkerRole::Reviewer => "reviewer",
+            },
+            purpose,
+            task_ordinal,
+            project_root: &self.startup.project_root,
+            task: &task.spec,
+            base_revision: task.base_revision.as_deref(),
+            head_revision: task.head_revision.as_deref(),
+            expected_repository: task.expected_repository(),
+            developer_outcome: task.last_developer_outcome(),
+            reviewer_outcome: task.last_reviewer_outcome(),
+            recovery_checkpoint: task.recovery_checkpoint(),
+        };
+        let encoded = serde_json::to_string(&prompt)?;
+        if encoded.len() > crate::worker::runtime::MAX_RUNTIME_PROMPT_BYTES {
+            bail!("rendered task turn prompt exceeds its 256 KiB bound");
+        }
+        Ok(encoded)
+    }
+
+    fn outcome_contains_sensitive_value(
+        &self,
+        task_ordinal: usize,
+        prompt: &str,
+        outcome: &RuntimeOutcome,
+    ) -> bool {
+        let Some(runtime) = self
+            .task_runtime
+            .as_ref()
+            .filter(|runtime| runtime.task_ordinal == task_ordinal)
+        else {
+            return true;
+        };
+        let redactor = runtime.environment.redactor().with_value(prompt);
+        let value = match serde_json::to_value(outcome) {
+            Ok(value) => value,
+            Err(_) => return true,
+        };
+        json_contains_sensitive_value(&value, &redactor)
+    }
+
+    fn profile(&self, role: WorkerRole) -> &RuntimeProfile {
+        match role {
+            WorkerRole::Developer => &self.profiles.developer,
+            WorkerRole::Reviewer => &self.profiles.reviewer,
+        }
+    }
+
+    fn require_task_runtime_mut(&mut self, task_ordinal: usize) -> Result<&mut OpenTaskRuntime> {
+        let runtime = self
+            .task_runtime
+            .as_mut()
+            .ok_or_else(|| anyhow!("task-local App Server runtime is not open"))?;
+        if runtime.task_ordinal != task_ordinal {
+            bail!("task-local App Server runtime belongs to another task");
+        }
+        Ok(runtime)
+    }
+
+    fn allocate_session_key(&mut self) -> Result<RuntimeSessionKey> {
+        let counter = self.next_session;
+        self.next_session = self
+            .next_session
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("logical runtime session key overflow"))?;
+        RuntimeSessionKey::from_counter(counter).map_err(|error| anyhow!(error.detail))
+    }
+
+    fn allocate_turn_key(&mut self) -> Result<RuntimeTurnKey> {
+        let counter = self.next_turn;
+        self.next_turn = self
+            .next_turn
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("logical runtime turn key overflow"))?;
+        RuntimeTurnKey::from_counter(counter).map_err(|error| anyhow!(error.detail))
+    }
+}
+
+impl Drop for AppServerSessionSupervisor {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+fn successful_task_close(core: &SupervisorCore, effects: &[SupervisorEffect]) -> Option<usize> {
+    effects.iter().find_map(|effect| {
+        let SupervisorEffect::CloseTaskRuntime { task_ordinal } = effect else {
+            return None;
+        };
+        core.tasks()
+            .get(*task_ordinal)
+            .filter(|task| matches!(task.state, TaskState::Lgtm | TaskState::ReviewExhausted))
+            .map(|_| *task_ordinal)
+    })
+}
+
+fn plan_bindings(
+    tasks: &[TaskDraft],
+    retained: &BTreeMap<PathBuf, ManagedRepository>,
+    staged: &BTreeMap<PathBuf, ManagedRepository>,
+) -> Result<Vec<TaskRepositoryBinding>> {
+    tasks
+        .iter()
+        .map(|task| {
+            let repository = retained
+                .get(Path::new(&task.repository_root))
+                .or_else(|| staged.get(Path::new(&task.repository_root)))
+                .ok_or_else(|| anyhow!("task repository binding disappeared"))?;
+            let observation = stable_repository_observation(repository, &repository.current_head)?;
+            Ok(TaskRepositoryBinding {
+                task_key: task.task_key.clone(),
+                observation,
+            })
+        })
+        .collect()
+}
+
+fn stable_repository_observation(
+    repository: &ManagedRepository,
+    expected_head: &str,
+) -> Result<RepositoryObservation> {
+    let first = capture_repository_observation(repository, expected_head)?;
+    let second = capture_repository_observation(repository, expected_head)?;
+    if first != second {
+        bail!("repository changed while the Supervisor observed its Git state");
+    }
+    Ok(second)
+}
+
+fn capture_repository_observation(
+    managed: &ManagedRepository,
+    expected_head: &str,
+) -> Result<RepositoryObservation> {
+    crate::worker::validation::validate_git_oid("expected repository revision", expected_head)?;
+    let repository = &managed.repository;
+    repository.revalidate_identity()?;
+    repository.reject_indirections()?;
+    let runner = GitRunner {
+        git: &repository.git,
+        root: &repository.root,
+    };
+    let branch = repository.branch()?;
+    let head = repository.head()?;
+    let status = runner.success(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
+    let tracked = runner.success(&[
+        "diff",
+        "--binary",
+        "--no-ext-diff",
+        "--no-textconv",
+        "HEAD",
+        "--",
+    ])?;
+    let index = runner.success(&[
+        "diff",
+        "--cached",
+        "--binary",
+        "--no-ext-diff",
+        "--no-textconv",
+        "HEAD",
+        "--",
+    ])?;
+    let untracked = runner.success(&["ls-files", "--others", "--exclude-standard", "-z", "--"])?;
+    let ancestry = runner.run(&["merge-base", "--is-ancestor", expected_head, &head])?;
+    let head_descends_from_expected = match ancestry.status.code() {
+        Some(0) if ancestry.stderr.is_empty() => true,
+        Some(1) if ancestry.stderr.is_empty() => false,
+        _ => bail!("bounded Git ancestry evidence failed"),
+    };
+    let mut changed_paths = if head_descends_from_expected {
+        let range = format!("{expected_head}..{head}");
+        parse_nul_paths(&runner.success(&[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            &range,
+            "--",
+        ])?)?
+    } else {
+        Vec::new()
+    };
+    changed_paths.extend(parse_nul_paths(&runner.success(&[
+        "diff",
+        "--name-only",
+        "-z",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "HEAD",
+        "--",
+    ])?)?);
+    changed_paths.extend(parse_nul_paths(&untracked)?);
+    changed_paths.sort();
+    changed_paths.dedup();
+    if changed_paths.len() > 256 {
+        bail!("repository changed-path inventory exceeds 256 entries");
+    }
+    let identity_hash = sha256_hex(&serde_json::to_vec(&(
+        "hcom-app-server-repository-identity-v1",
+        &repository.root,
+        (
+            repository.root_identity.device,
+            repository.root_identity.inode,
+            repository.root_identity.uid,
+            repository.root_identity.mode,
+        ),
+        (
+            repository.git_dir.device,
+            repository.git_dir.inode,
+            repository.git_dir.uid,
+            repository.git_dir.mode,
+        ),
+        (
+            repository.common_dir.device,
+            repository.common_dir.inode,
+            repository.common_dir.uid,
+            repository.common_dir.mode,
+        ),
+        (
+            repository.object_dir.device,
+            repository.object_dir.inode,
+            repository.object_dir.uid,
+            repository.object_dir.mode,
+        ),
+        &repository.git,
+    ))?);
+    repository.revalidate_identity()?;
+    Ok(RepositoryObservation {
+        repository_root: path_value("task repository root", &repository.root)?,
+        identity_hash,
+        branch,
+        head,
+        tracked_diff_hash: hash_bytes(&tracked),
+        index_diff_hash: hash_bytes(&index),
+        untracked_status_hash: hash_bytes(&untracked),
+        clean: status.is_empty(),
+        changed_paths,
+        head_descends_from_expected,
+    })
+}
+
+fn runtime_error_failure(error: RuntimeError) -> Result<SanitizedRuntimeFailure> {
+    let class = match error.code {
+        RuntimeErrorCode::Internal => RuntimeFailureClass::Process,
+        RuntimeErrorCode::InvalidOutcome
+        | RuntimeErrorCode::InvalidContract
+        | RuntimeErrorCode::InvalidIdentity
+        | RuntimeErrorCode::InvalidProfile
+        | RuntimeErrorCode::InvalidTransition
+        | RuntimeErrorCode::Unsupported => RuntimeFailureClass::Contract,
+    };
+    SanitizedRuntimeFailure::new(class, bounded_single_line(&error.detail), false)
+        .map_err(|failure| anyhow!(failure.detail))
+}
+
+#[derive(Serialize)]
+struct TaskCodexConfig {
+    mcp_servers: BTreeMap<String, toml::Value>,
+    projects: BTreeMap<String, TaskCodexProject>,
+    shell_environment_policy: TaskShellEnvironmentPolicy,
+}
+
+#[derive(Serialize)]
+struct TaskCodexProject {
+    trust_level: &'static str,
+}
+
+#[derive(Serialize)]
+struct TaskShellEnvironmentPolicy {
+    inherit: &'static str,
+    ignore_default_excludes: bool,
+}
+
+fn write_private_codex_config(path: &Path, repository_root: &Path) -> Result<()> {
+    let repository_root = path_value("task repository root", repository_root)?;
+    let config = TaskCodexConfig {
+        mcp_servers: BTreeMap::new(),
+        projects: [(
+            repository_root,
+            TaskCodexProject {
+                trust_level: "untrusted",
+            },
+        )]
+        .into_iter()
+        .collect(),
+        shell_environment_policy: TaskShellEnvironmentPolicy {
+            inherit: "all",
+            ignore_default_excludes: true,
+        },
+    };
+    let contents = toml::to_string(&config)?.into_bytes();
+    if contents.len() > 16 * 1024 {
+        bail!("task-private Codex config exceeds its 16 KiB bound");
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    file.write_all(&contents)?;
+    file.flush()?;
+    Ok(())
+}
+
+fn clone_runtime_paths(paths: &TaskRuntimePaths) -> TaskRuntimePaths {
+    TaskRuntimePaths {
+        home: paths.home.clone(),
+        codex_home: paths.codex_home.clone(),
+        temp: paths.temp.clone(),
+        runtime: paths.runtime.clone(),
+        artifacts: paths.artifacts.clone(),
+        hcom: paths.hcom.clone(),
+        xdg_config: paths.xdg_config.clone(),
+        xdg_state: paths.xdg_state.clone(),
+        xdg_cache: paths.xdg_cache.clone(),
+        xdg_data: paths.xdg_data.clone(),
+    }
+}
+
+fn materialized_environment(
+    environment: &MaterializedWorkerEnvironment,
+) -> Vec<(OsString, OsString)> {
+    environment
+        .iter()
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect()
+}
+
+fn role_instructions(role: WorkerRole) -> &'static str {
+    match role {
+        WorkerRole::Developer => {
+            "You are the task Developer. Work directly in the exact repository and complete the bounded task. Change and commit only allowed paths, run the required checks, do not push/install or seek interactive input, and return only the required DeveloperV1 outcome."
+        }
+        WorkerRole::Reviewer => {
+            "You are the task Reviewer. Independently inspect the exact committed task range and run the checks needed for review. The sandbox is writable so tools and ignored caches work, but you must not edit reviewed source, stage, commit, change branch or HEAD, push, install, or repair findings. Return only the required ReviewerV1 outcome."
+        }
+    }
+}
+
+fn hash_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
+}
+
+fn bounded_single_line(input: &str) -> String {
+    let mut output = input.replace(['\r', '\n'], " ");
+    if output.is_empty() {
+        output.push_str("bounded driver failure");
+    }
+    if output.len() > 1024 {
+        let mut boundary = 1024;
+        while !output.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        output.truncate(boundary);
+    }
+    output
+}
+
+fn codex_auth_redaction_values(path: &Path) -> Result<Vec<String>> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take((MAX_AUTH_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_AUTH_FILE_BYTES {
+        bail!("Codex auth source exceeds its bounded size");
+    }
+    let value: Value = serde_json::from_slice(&bytes).context("Codex auth source is not JSON")?;
+    let mut values = BTreeSet::new();
+    collect_auth_strings(&value, &mut values)?;
+    Ok(values.into_iter().collect())
+}
+
+fn collect_auth_strings(value: &Value, values: &mut BTreeSet<String>) -> Result<()> {
+    match value {
+        Value::String(value)
+            if value.len() >= 8
+                && value.len() <= 16 * 1024
+                && !value.chars().any(char::is_control) =>
+        {
+            if values.len() >= MAX_AUTH_REDACTION_VALUES && !values.contains(value) {
+                bail!("Codex auth redaction inventory exceeds 64 values");
+            }
+            values.insert(value.clone());
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_auth_strings(item, values)?;
+            }
+        }
+        Value::Object(object) => {
+            for item in object.values() {
+                collect_auth_strings(item, values)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn json_contains_sensitive_value(
+    value: &Value,
+    redactor: &crate::worker::environment::SecretRedactor,
+) -> bool {
+    match value {
+        Value::String(value) => redactor.would_redact(value),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| json_contains_sensitive_value(value, redactor)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| json_contains_sensitive_value(value, redactor)),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::environment::ParentEnvironment;
+    use crate::worker::fake_runtime::{FakeTaskWorkerRuntime, FakeTurnScript};
+    use crate::worker::profile::{
+        ArchitectAdapter, DeveloperInvocationProfile, ReviewerInvocationProfile,
+        SessionInvocationProfiles,
+    };
+    use crate::worker::runtime::{
+        DeveloperOutcomeStatus, DeveloperOutcomeV1, ReviewFindingSeverity, ReviewFindingV1,
+        ReviewerOutcomeV1, ReviewerVerdict, RuntimeTelemetry,
+    };
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    enum Mutation {
+        None,
+        Commit {
+            path: &'static str,
+            contents: &'static str,
+        },
+        Dirty {
+            path: &'static str,
+            contents: &'static str,
+        },
+        Stage {
+            path: &'static str,
+            contents: &'static str,
+        },
+        Branch {
+            name: &'static str,
+        },
+        DeleteCommit {
+            path: &'static str,
+        },
+        RenameCommit {
+            from: &'static str,
+            to: &'static str,
+        },
+        ModeCommit {
+            path: &'static str,
+            mode: u32,
+        },
+        ReplaceGitDirectory,
+    }
+
+    struct TaskScript {
+        task_key: String,
+        turns: Vec<FakeTurnScript>,
+        mutations: VecDeque<Mutation>,
+        shutdown_failure: bool,
+    }
+
+    #[derive(Default)]
+    struct Audit {
+        opens: Vec<String>,
+        sessions: Vec<(String, WorkerRole, u64)>,
+        turns: Vec<(String, WorkerRole, RuntimeTurnPurpose, u64)>,
+        shutdowns: Vec<String>,
+        environments: Vec<Vec<(OsString, OsString)>>,
+        profiles: Vec<(String, WorkerRole, RuntimeProfile)>,
+    }
+
+    struct ScriptedFactory {
+        scripts: VecDeque<TaskScript>,
+        audit: Arc<Mutex<Audit>>,
+    }
+
+    impl RuntimeFactory for ScriptedFactory {
+        fn contract(&self) -> RuntimeContractIdentity {
+            RuntimeContractIdentity::codex_app_server_0_146()
+        }
+
+        fn open(
+            &mut self,
+            request: RuntimeOpenRequest,
+        ) -> Result<Box<dyn TaskWorkerRuntime>, RuntimeError> {
+            let script = self.scripts.pop_front().ok_or_else(|| {
+                RuntimeError::invalid_transition("scripted runtime factory is exhausted")
+            })?;
+            if script.task_key != request.task_key {
+                return Err(RuntimeError::invalid_identity(
+                    "scripted runtime task key mismatch",
+                ));
+            }
+            {
+                let mut audit = self.audit.lock().unwrap();
+                audit.opens.push(request.task_key.clone());
+                audit.environments.push(request.environment.clone());
+            }
+            Ok(Box::new(ScriptedRuntime {
+                task_key: request.task_key,
+                repository: request.repository_root,
+                inner: FakeTaskWorkerRuntime::new(script.turns),
+                mutations: script.mutations,
+                shutdown_failure: script.shutdown_failure,
+                audit: Arc::clone(&self.audit),
+            }))
+        }
+    }
+
+    struct ScriptedRuntime {
+        task_key: String,
+        repository: PathBuf,
+        inner: FakeTaskWorkerRuntime,
+        mutations: VecDeque<Mutation>,
+        shutdown_failure: bool,
+        audit: Arc<Mutex<Audit>>,
+    }
+
+    impl TaskWorkerRuntime for ScriptedRuntime {
+        fn contract(&self) -> &RuntimeContractIdentity {
+            self.inner.contract()
+        }
+
+        fn open_session(
+            &mut self,
+            spec: RoleSessionSpec,
+        ) -> Result<RuntimeSessionKey, RuntimeError> {
+            let role = spec.role;
+            let profile = spec.profile.clone();
+            let session = self.inner.open_session(spec)?;
+            let mut audit = self.audit.lock().unwrap();
+            audit
+                .sessions
+                .push((self.task_key.clone(), role, session.counter()));
+            audit.profiles.push((self.task_key.clone(), role, profile));
+            Ok(session)
+        }
+
+        fn start_turn(
+            &mut self,
+            session: RuntimeSessionKey,
+            spec: RuntimeTurnSpec,
+        ) -> Result<RuntimeTurnKey, RuntimeError> {
+            let role = spec.role;
+            let purpose = spec.purpose;
+            let turn = self.inner.start_turn(session, spec)?;
+            self.audit.lock().unwrap().turns.push((
+                self.task_key.clone(),
+                role,
+                purpose,
+                session.counter(),
+            ));
+            Ok(turn)
+        }
+
+        fn poll_turn(&mut self, turn: RuntimeTurnKey) -> Result<RuntimeTurnPoll, RuntimeError> {
+            let poll = self.inner.poll_turn(turn)?;
+            if poll.is_terminal() {
+                let mutation = self.mutations.pop_front().ok_or_else(|| {
+                    RuntimeError::internal("scripted runtime mutation inventory disappeared")
+                })?;
+                apply_mutation(&self.repository, mutation)
+                    .map_err(|_| RuntimeError::internal("scripted Git mutation failed"))?;
+            }
+            Ok(poll)
+        }
+
+        fn cancel_turn(&mut self, turn: RuntimeTurnKey) -> Result<(), RuntimeError> {
+            self.inner.cancel_turn(turn)
+        }
+
+        fn shutdown(&mut self) -> Result<(), RuntimeError> {
+            self.inner.shutdown()?;
+            self.audit
+                .lock()
+                .unwrap()
+                .shutdowns
+                .push(self.task_key.clone());
+            if self.shutdown_failure {
+                return Err(RuntimeError::internal(
+                    "scripted task-runtime cleanup failed",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    struct FailingFactory;
+
+    impl RuntimeFactory for FailingFactory {
+        fn contract(&self) -> RuntimeContractIdentity {
+            RuntimeContractIdentity::codex_app_server_0_146()
+        }
+
+        fn open(
+            &mut self,
+            _request: RuntimeOpenRequest,
+        ) -> Result<Box<dyn TaskWorkerRuntime>, RuntimeError> {
+            Err(RuntimeError::internal("runtime-factory-secret-sentinel"))
+        }
+    }
+
+    struct Fixture {
+        _temp: TempDir,
+        run_root: PathBuf,
+        lock_root: PathBuf,
+        project_root: PathBuf,
+        repository: PathBuf,
+        sources: SessionRuntimeSources,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(temp.path()).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            let run_root = root.join("run");
+            let lock_root = root.join("locks");
+            let project_root = root.join("project");
+            let repository = root.join("repository");
+            let toolchain = root.join("toolchain");
+            for directory in [
+                &run_root,
+                &lock_root,
+                &project_root,
+                &repository,
+                &toolchain,
+            ] {
+                fs::create_dir(directory).unwrap();
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            git(&repository, &["init", "-b", "master"]);
+            fs::create_dir(repository.join("src")).unwrap();
+            fs::write(repository.join("src/seed.txt"), "seed\n").unwrap();
+            fs::write(repository.join(".gitignore"), "target/\n").unwrap();
+            git(&repository, &["add", "--", "src/seed.txt", ".gitignore"]);
+            git_commit(&repository, "Initial fixture");
+            let repository = fs::canonicalize(repository).unwrap();
+
+            let auth = root.join("codex-auth.json");
+            fs::write(
+                &auth,
+                br#"{"OPENAI_API_KEY":"fixture-auth-secret-value","account_id":"fixture-account-value"}"#,
+            )
+            .unwrap();
+            fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
+            let auth = fs::canonicalize(auth).unwrap();
+
+            let mut sources = SessionRuntimeSources::fake(&toolchain);
+            sources.profiles = Some(
+                SessionInvocationProfiles::for_codex_app_server_lane(ArchitectAdapter::Codex)
+                    .unwrap(),
+            );
+            sources.codex_auth_source = Some(auth);
+            sources.parent_environment = ParentEnvironment::from_os(vec![
+                (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+                (
+                    OsString::from("UNKNOWN_PARENT_VALUE"),
+                    OsString::from("unknown-value"),
+                ),
+                (
+                    OsString::from("SERVICE_ACCESS_TOKEN"),
+                    OsString::from("environment-secret-sentinel"),
+                ),
+                (OsString::from("EMPTY_PARENT_VALUE"), OsString::new()),
+                (OsString::from("CASE_PAIR"), OsString::from("upper")),
+                (OsString::from("case_pair"), OsString::from("lower")),
+                (
+                    OsString::from("HTTP_PROXY"),
+                    OsString::from("http://proxy.example"),
+                ),
+                (
+                    OsString::from("https_proxy"),
+                    OsString::from("http://lower-proxy.example"),
+                ),
+                (
+                    OsString::from_vec(b"RAW_\xff_NAME".to_vec()),
+                    OsString::from_vec(b"value-\xfe".to_vec()),
+                ),
+                (
+                    OsString::from("HCOM_DIR"),
+                    OsString::from("/must/not/reach/task"),
+                ),
+            ]);
+            Self {
+                _temp: temp,
+                run_root,
+                lock_root,
+                project_root,
+                repository,
+                sources,
+            }
+        }
+
+        fn task(&self, key: &str, allowed_paths: &[&str], max_rounds: u8) -> TaskDraft {
+            TaskDraft {
+                task_key: key.into(),
+                title: format!("Task {key}"),
+                objective: format!("Implement {key}"),
+                repository_root: self.repository.to_string_lossy().into_owned(),
+                acceptance_criteria: vec![format!("{key} is complete")],
+                required_checks: vec!["cargo test --locked".into()],
+                allowed_paths: allowed_paths.iter().map(|path| (*path).into()).collect(),
+                forbidden_actions: vec!["do not push or install".into()],
+                max_review_rounds: max_rounds,
+            }
+        }
+
+        fn supervisor(
+            &self,
+            scripts: Vec<TaskScript>,
+            audit: Arc<Mutex<Audit>>,
+        ) -> AppServerSessionSupervisor {
+            AppServerSessionSupervisor::open_with_factory(
+                "run-driver-test".into(),
+                self.project_root.clone(),
+                self.run_root.clone(),
+                self.lock_root.clone(),
+                self.sources.clone(),
+                Box::new(ScriptedFactory {
+                    scripts: scripts.into(),
+                    audit,
+                }),
+            )
+            .unwrap()
+        }
+    }
+
+    fn task_script(
+        task_key: &str,
+        turns: Vec<FakeTurnScript>,
+        mutations: Vec<Mutation>,
+    ) -> TaskScript {
+        assert_eq!(turns.len(), mutations.len());
+        TaskScript {
+            task_key: task_key.into(),
+            turns,
+            mutations: mutations.into(),
+            shutdown_failure: false,
+        }
+    }
+
+    fn task_script_with_shutdown_failure(
+        task_key: &str,
+        turns: Vec<FakeTurnScript>,
+        mutations: Vec<Mutation>,
+    ) -> TaskScript {
+        let mut script = task_script(task_key, turns, mutations);
+        script.shutdown_failure = true;
+        script
+    }
+
+    fn completed(outcome: RuntimeOutcome) -> RuntimeTurnPoll {
+        RuntimeTurnPoll::Completed {
+            outcome,
+            telemetry: RuntimeTelemetry::default(),
+        }
+    }
+
+    fn ready(summary: &str) -> RuntimeTurnPoll {
+        completed(RuntimeOutcome::Developer(DeveloperOutcomeV1 {
+            status: DeveloperOutcomeStatus::Ready,
+            summary: summary.into(),
+            questions: Vec::new(),
+        }))
+    }
+
+    fn lgtm(summary: &str) -> RuntimeTurnPoll {
+        completed(RuntimeOutcome::Reviewer(ReviewerOutcomeV1 {
+            verdict: ReviewerVerdict::Lgtm,
+            summary: summary.into(),
+            findings: Vec::new(),
+        }))
+    }
+
+    fn request_changes(message: &str) -> RuntimeTurnPoll {
+        completed(RuntimeOutcome::Reviewer(ReviewerOutcomeV1 {
+            verdict: ReviewerVerdict::RequestChanges,
+            summary: "changes required".into(),
+            findings: vec![ReviewFindingV1 {
+                severity: ReviewFindingSeverity::Major,
+                path: Some("src/task.txt".into()),
+                line: Some(1),
+                message: message.into(),
+            }],
+        }))
+    }
+
+    fn failed_retryable() -> RuntimeTurnPoll {
+        RuntimeTurnPoll::Failed {
+            failure: SanitizedRuntimeFailure::new(
+                RuntimeFailureClass::Contract,
+                "developer outcome was missing",
+                true,
+            )
+            .unwrap(),
+            telemetry: RuntimeTelemetry::default(),
+        }
+    }
+
+    fn failed(class: RuntimeFailureClass, detail: &str) -> RuntimeTurnPoll {
+        RuntimeTurnPoll::Failed {
+            failure: SanitizedRuntimeFailure::new(class, detail, false).unwrap(),
+            telemetry: RuntimeTelemetry::default(),
+        }
+    }
+
+    fn start(supervisor: &mut AppServerSessionSupervisor, tasks: Vec<TaskDraft>) {
+        let (plan_version, plan_hash) = supervisor
+            .replace_plan(0, CODEX_APP_SERVER_ADAPTER, CODEX_APP_SERVER_ADAPTER, tasks)
+            .unwrap();
+        assert_eq!(supervisor.snapshot().state, SessionState::AwaitingApproval);
+        supervisor
+            .approve_and_start(1, plan_version, &plan_hash, true)
+            .unwrap();
+        assert_eq!(supervisor.snapshot().state, SessionState::Running);
+    }
+
+    fn drive_terminal(supervisor: &mut AppServerSessionSupervisor) -> SessionStatusSnapshot {
+        for _ in 0..64 {
+            supervisor.poll_once().unwrap();
+            let snapshot = supervisor.snapshot();
+            if snapshot.state.is_terminal() {
+                return snapshot;
+            }
+        }
+        panic!("scripted App Server supervisor did not become terminal");
+    }
+
+    fn apply_mutation(repository: &Path, mutation: Mutation) -> Result<()> {
+        match mutation {
+            Mutation::None => Ok(()),
+            Mutation::Commit { path, contents } => {
+                let target = repository.join(path);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&target, contents)?;
+                git(repository, &["add", "--", path]);
+                git_commit(repository, &format!("Implement {path}"));
+                Ok(())
+            }
+            Mutation::Dirty { path, contents } => {
+                let target = repository.join(path);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(target, contents)?;
+                Ok(())
+            }
+            Mutation::Stage { path, contents } => {
+                let target = repository.join(path);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(target, contents)?;
+                git(repository, &["add", "--", path]);
+                Ok(())
+            }
+            Mutation::Branch { name } => {
+                git(repository, &["checkout", "-b", name]);
+                Ok(())
+            }
+            Mutation::DeleteCommit { path } => {
+                fs::remove_file(repository.join(path))?;
+                git(repository, &["add", "-A", "--", path]);
+                git_commit(repository, &format!("Delete {path}"));
+                Ok(())
+            }
+            Mutation::RenameCommit { from, to } => {
+                if let Some(parent) = repository.join(to).parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                git(repository, &["mv", "--", from, to]);
+                git_commit(repository, &format!("Rename {from}"));
+                Ok(())
+            }
+            Mutation::ModeCommit { path, mode } => {
+                fs::set_permissions(repository.join(path), fs::Permissions::from_mode(mode))?;
+                git(repository, &["add", "--", path]);
+                git_commit(repository, &format!("Change mode for {path}"));
+                Ok(())
+            }
+            Mutation::ReplaceGitDirectory => {
+                let original = repository.join(".git");
+                let moved = repository.join(".git-replaced");
+                fs::rename(&original, &moved)?;
+                let output = Command::new("/bin/cp")
+                    .args(["-a", "--"])
+                    .arg(&moved)
+                    .arg(&original)
+                    .env_clear()
+                    .env("LC_ALL", "C")
+                    .output()?;
+                if !output.status.success() {
+                    bail!("failed to replace disposable Git directory");
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn git(repository: &Path, arguments: &[&str]) {
+        let output = Command::new("/usr/bin/git")
+            .args(arguments)
+            .current_dir(repository)
+            .env_clear()
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("HOME", "/nonexistent")
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            arguments,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_output(repository: &Path, arguments: &[&str]) -> String {
+        let output = Command::new("/usr/bin/git")
+            .args(arguments)
+            .current_dir(repository)
+            .env_clear()
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("HOME", "/nonexistent")
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            arguments,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn git_commit(repository: &Path, subject: &str) {
+        let output = Command::new("/usr/bin/git")
+            .args([
+                "-c",
+                "user.name=App Server Driver Fixture",
+                "-c",
+                "user.email=app-server-driver@example.invalid",
+                "commit",
+                "-m",
+                subject,
+            ])
+            .current_dir(repository)
+            .env_clear()
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("HOME", "/nonexistent")
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn task_private_codex_config_is_closed_and_marks_the_exact_repository_untrusted() {
+        let fixture = Fixture::new();
+        let (_root, paths) =
+            TaskRuntimePaths::create(&fixture.run_root, 0, "config", &fixture.repository).unwrap();
+        let config_path = paths.codex_home.join("config.toml");
+        let encoded = fs::read_to_string(&config_path).unwrap();
+        let config: toml::Table = toml::from_str(&encoded).unwrap();
+        let repository = fixture.repository.to_str().unwrap();
+        assert_eq!(
+            config["projects"][repository]["trust_level"].as_str(),
+            Some("untrusted")
+        );
+        assert_eq!(
+            config["shell_environment_policy"]["inherit"].as_str(),
+            Some("all")
+        );
+        assert_eq!(
+            config["shell_environment_policy"]["ignore_default_excludes"].as_bool(),
+            Some(true)
+        );
+        assert!(config["mcp_servers"].as_table().unwrap().is_empty());
+        assert_eq!(
+            fs::metadata(config_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn one_task_driver_commits_reviews_and_closes_one_task_runtime() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script(
+            "one",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("implemented")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [lgtm("sound")],
+                ),
+            ],
+            vec![
+                Mutation::Commit {
+                    path: "src/task.txt",
+                    contents: "done\n",
+                },
+                Mutation::None,
+            ],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
+        start(&mut supervisor, vec![fixture.task("one", &["src"], 3)]);
+        let snapshot = drive_terminal(&mut supervisor);
+        assert_eq!(snapshot.state, SessionState::Completed);
+        assert_eq!(snapshot.tasks[0].state, crate::control_api::TaskState::Lgtm);
+        assert_eq!(snapshot.tasks[0].review_round, 1);
+        assert!(snapshot.tasks[0].developer_session_bound);
+        assert!(snapshot.tasks[0].reviewer_session_bound);
+        let audit = audit.lock().unwrap();
+        assert_eq!(audit.opens, ["one"]);
+        assert_eq!(audit.shutdowns, ["one"]);
+        assert_eq!(
+            audit
+                .sessions
+                .iter()
+                .map(|(_, role, key)| (*role, *key))
+                .collect::<Vec<_>>(),
+            [(WorkerRole::Developer, 1), (WorkerRole::Reviewer, 2)]
+        );
+        assert!(
+            audit
+                .profiles
+                .iter()
+                .all(|(_, _, profile)| profile == &RuntimeProfile::codex_app_server_default())
+        );
+        assert!(
+            !fixture
+                .run_root
+                .join("app-server-workers")
+                .read_dir()
+                .unwrap()
+                .any(|entry| entry.is_ok())
+        );
+    }
+
+    #[test]
+    fn correction_and_rereview_reuse_each_exact_role_session() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script(
+            "correction",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("first")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [request_changes("correct it")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::DeveloperCorrection,
+                    [ready("corrected")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::ReviewerRereview,
+                    [lgtm("fixed")],
+                ),
+            ],
+            vec![
+                Mutation::Commit {
+                    path: "src/task.txt",
+                    contents: "first\n",
+                },
+                Mutation::None,
+                Mutation::Commit {
+                    path: "src/task.txt",
+                    contents: "corrected\n",
+                },
+                Mutation::None,
+            ],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
+        start(
+            &mut supervisor,
+            vec![fixture.task("correction", &["src"], 3)],
+        );
+        let snapshot = drive_terminal(&mut supervisor);
+        assert_eq!(snapshot.state, SessionState::Completed);
+        assert_eq!(snapshot.tasks[0].review_round, 2);
+        let audit = audit.lock().unwrap();
+        assert_eq!(audit.sessions.len(), 2);
+        assert_eq!(
+            audit
+                .turns
+                .iter()
+                .map(|(_, role, purpose, session)| (*role, *purpose, *session))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    1
+                ),
+                (WorkerRole::Reviewer, RuntimeTurnPurpose::InitialReview, 2),
+                (
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::DeveloperCorrection,
+                    1
+                ),
+                (
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::ReviewerRereview,
+                    2
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn dirty_and_invalid_completion_each_use_one_same_developer_session_recovery() {
+        for (name, first_poll, first_mutation) in [
+            (
+                "dirty-recovery",
+                ready("forgot commit"),
+                Mutation::Dirty {
+                    path: "src/task.txt",
+                    contents: "dirty\n",
+                },
+            ),
+            ("outcome-recovery", failed_retryable(), Mutation::None),
+        ] {
+            let fixture = Fixture::new();
+            let audit = Arc::new(Mutex::new(Audit::default()));
+            let script = task_script(
+                name,
+                vec![
+                    FakeTurnScript::new(
+                        WorkerRole::Developer,
+                        RuntimeTurnPurpose::InitialDevelopment,
+                        [first_poll],
+                    ),
+                    FakeTurnScript::new(
+                        WorkerRole::Developer,
+                        RuntimeTurnPurpose::DeveloperCompletionRecovery,
+                        [ready("recovered")],
+                    ),
+                    FakeTurnScript::new(
+                        WorkerRole::Reviewer,
+                        RuntimeTurnPurpose::InitialReview,
+                        [lgtm("sound")],
+                    ),
+                ],
+                vec![
+                    first_mutation,
+                    Mutation::Commit {
+                        path: "src/task.txt",
+                        contents: "recovered\n",
+                    },
+                    Mutation::None,
+                ],
+            );
+            let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
+            start(&mut supervisor, vec![fixture.task(name, &["src"], 3)]);
+            assert_eq!(
+                drive_terminal(&mut supervisor).state,
+                SessionState::Completed
+            );
+            let audit = audit.lock().unwrap();
+            let developer_turns: Vec<_> = audit
+                .turns
+                .iter()
+                .filter(|(_, role, _, _)| *role == WorkerRole::Developer)
+                .collect();
+            assert_eq!(developer_turns.len(), 2);
+            assert_eq!(developer_turns[0].3, developer_turns[1].3);
+            assert_eq!(
+                developer_turns[1].2,
+                RuntimeTurnPurpose::DeveloperCompletionRecovery
+            );
+        }
+    }
+
+    #[test]
+    fn second_invalid_developer_completion_stops_without_opening_a_reviewer_session() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script(
+            "recovery-exhausted",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [failed_retryable()],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::DeveloperCompletionRecovery,
+                    [failed_retryable()],
+                ),
+            ],
+            vec![Mutation::None, Mutation::None],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
+        start(
+            &mut supervisor,
+            vec![fixture.task("recovery-exhausted", &["src"], 3)],
+        );
+
+        let snapshot = drive_terminal(&mut supervisor);
+        assert_eq!(snapshot.state, SessionState::NeedsHuman);
+        assert_eq!(
+            snapshot.terminal_detail.as_deref(),
+            Some("developer completion result remained invalid after one recovery")
+        );
+        let audit = audit.lock().unwrap();
+        assert_eq!(
+            audit
+                .sessions
+                .iter()
+                .filter(|(_, role, _)| *role == WorkerRole::Developer)
+                .count(),
+            1
+        );
+        assert!(
+            audit
+                .sessions
+                .iter()
+                .all(|(_, role, _)| *role != WorkerRole::Reviewer)
+        );
+        let developer_turns: Vec<_> = audit
+            .turns
+            .iter()
+            .filter(|(_, role, _, _)| *role == WorkerRole::Developer)
+            .collect();
+        assert_eq!(developer_turns.len(), 2);
+        assert_eq!(developer_turns[0].3, developer_turns[1].3);
+        assert_eq!(audit.shutdowns, ["recovery-exhausted"]);
+    }
+
+    #[test]
+    fn normalized_runtime_process_protocol_and_timeout_failures_stop_the_driver() {
+        for (name, class, expected_detail) in [
+            (
+                "runtime-process",
+                RuntimeFailureClass::Process,
+                "worker runtime process failed",
+            ),
+            (
+                "runtime-protocol",
+                RuntimeFailureClass::Protocol,
+                "worker runtime protocol failed",
+            ),
+            (
+                "runtime-timeout",
+                RuntimeFailureClass::Timeout,
+                "worker runtime reported a timeout",
+            ),
+        ] {
+            let fixture = Fixture::new();
+            let audit = Arc::new(Mutex::new(Audit::default()));
+            let script = task_script(
+                name,
+                vec![FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [failed(class, "provider-private-detail")],
+                )],
+                vec![Mutation::None],
+            );
+            let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
+            start(&mut supervisor, vec![fixture.task(name, &["src"], 2)]);
+            let snapshot = drive_terminal(&mut supervisor);
+            assert_eq!(snapshot.state, SessionState::NeedsHuman);
+            assert_eq!(snapshot.terminal_detail.as_deref(), Some(expected_detail));
+            assert!(
+                !serde_json::to_string(&snapshot)
+                    .unwrap()
+                    .contains("provider-private-detail")
+            );
+            assert_eq!(audit.lock().unwrap().shutdowns, [name]);
+        }
+    }
+
+    #[test]
+    fn explicit_cancel_and_parent_stop_interrupt_and_close_the_active_runtime() {
+        for (name, parent_stop, expected_detail) in [
+            (
+                "explicit-cancel",
+                false,
+                "canceled by explicit Architect-session request",
+            ),
+            ("parent-stop", true, "foreground Architect parent stopped"),
+        ] {
+            let fixture = Fixture::new();
+            let audit = Arc::new(Mutex::new(Audit::default()));
+            let script = task_script(
+                name,
+                vec![FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [
+                        RuntimeTurnPoll::Pending {
+                            telemetry: RuntimeTelemetry::default(),
+                        },
+                        ready("must not be accepted"),
+                    ],
+                )],
+                vec![Mutation::None],
+            );
+            let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
+            start(&mut supervisor, vec![fixture.task(name, &["src"], 2)]);
+            if parent_stop {
+                supervisor.shutdown().unwrap();
+            } else {
+                supervisor
+                    .cancel(
+                        supervisor.snapshot().version,
+                        "human requested cancellation",
+                    )
+                    .unwrap();
+            }
+            let snapshot = supervisor.snapshot();
+            assert_eq!(snapshot.state, SessionState::Canceled);
+            assert_eq!(snapshot.terminal_detail.as_deref(), Some(expected_detail));
+            assert_eq!(audit.lock().unwrap().shutdowns, [name]);
+        }
+    }
+
+    #[test]
+    fn explicit_cancel_during_review_closes_the_same_task_runtime() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script(
+            "cancel-review",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("committed")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [RuntimeTurnPoll::Pending {
+                        telemetry: RuntimeTelemetry::default(),
+                    }],
+                ),
+            ],
+            vec![
+                Mutation::Commit {
+                    path: "src/task.txt",
+                    contents: "committed\n",
+                },
+                Mutation::None,
+            ],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
+        start(
+            &mut supervisor,
+            vec![fixture.task("cancel-review", &["src"], 2)],
+        );
+        supervisor.poll_once().unwrap();
+        let reviewing = supervisor.snapshot();
+        assert_eq!(reviewing.state, SessionState::Running);
+        assert_eq!(reviewing.tasks[0].state, TaskState::Reviewing);
+
+        supervisor
+            .cancel(reviewing.version, "human requested cancellation")
+            .unwrap();
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, SessionState::Canceled);
+        assert_eq!(
+            snapshot.terminal_detail.as_deref(),
+            Some("canceled by explicit Architect-session request")
+        );
+        let audit = audit.lock().unwrap();
+        assert_eq!(audit.opens, ["cancel-review"]);
+        assert_eq!(audit.shutdowns, ["cancel-review"]);
+    }
+
+    #[test]
+    fn reviewer_source_index_commit_and_branch_mutations_are_rejected_but_cache_is_allowed() {
+        for (name, reviewer_mutation, expected) in [
+            (
+                "reviewer-dirty",
+                Mutation::Dirty {
+                    path: "src/reviewer.txt",
+                    contents: "forbidden\n",
+                },
+                SessionState::NeedsHuman,
+            ),
+            (
+                "reviewer-stage",
+                Mutation::Stage {
+                    path: "src/reviewer.txt",
+                    contents: "forbidden\n",
+                },
+                SessionState::NeedsHuman,
+            ),
+            (
+                "reviewer-commit",
+                Mutation::Commit {
+                    path: "src/reviewer.txt",
+                    contents: "forbidden\n",
+                },
+                SessionState::NeedsHuman,
+            ),
+            (
+                "reviewer-branch",
+                Mutation::Branch {
+                    name: "reviewer-mutated-branch",
+                },
+                SessionState::NeedsHuman,
+            ),
+            (
+                "reviewer-cache",
+                Mutation::Dirty {
+                    path: "target/reviewer.cache",
+                    contents: "ignored\n",
+                },
+                SessionState::Completed,
+            ),
+        ] {
+            let fixture = Fixture::new();
+            let audit = Arc::new(Mutex::new(Audit::default()));
+            let script = task_script(
+                name,
+                vec![
+                    FakeTurnScript::new(
+                        WorkerRole::Developer,
+                        RuntimeTurnPurpose::InitialDevelopment,
+                        [ready("implemented")],
+                    ),
+                    FakeTurnScript::new(
+                        WorkerRole::Reviewer,
+                        RuntimeTurnPurpose::InitialReview,
+                        [lgtm("reviewed")],
+                    ),
+                ],
+                vec![
+                    Mutation::Commit {
+                        path: "src/task.txt",
+                        contents: "done\n",
+                    },
+                    reviewer_mutation,
+                ],
+            );
+            let mut supervisor = fixture.supervisor(vec![script], audit);
+            start(&mut supervisor, vec![fixture.task(name, &["src"], 3)]);
+            let snapshot = drive_terminal(&mut supervisor);
+            assert_eq!(snapshot.state, expected);
+            if expected == SessionState::NeedsHuman {
+                assert_eq!(
+                    snapshot.terminal_detail.as_deref(),
+                    Some("Reviewer changed repository state; verdict rejected")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_tasks_get_fresh_runtimes_and_nonreused_logical_sessions() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let scripts = ["one", "two"]
+            .into_iter()
+            .map(|key| {
+                task_script(
+                    key,
+                    vec![
+                        FakeTurnScript::new(
+                            WorkerRole::Developer,
+                            RuntimeTurnPurpose::InitialDevelopment,
+                            [ready("implemented")],
+                        ),
+                        FakeTurnScript::new(
+                            WorkerRole::Reviewer,
+                            RuntimeTurnPurpose::InitialReview,
+                            [lgtm("sound")],
+                        ),
+                    ],
+                    vec![
+                        Mutation::Commit {
+                            path: if key == "one" {
+                                "src/one.txt"
+                            } else {
+                                "src/two.txt"
+                            },
+                            contents: "done\n",
+                        },
+                        Mutation::None,
+                    ],
+                )
+            })
+            .collect();
+        let mut supervisor = fixture.supervisor(scripts, Arc::clone(&audit));
+        start(
+            &mut supervisor,
+            vec![
+                fixture.task("one", &["src"], 2),
+                fixture.task("two", &["src"], 2),
+            ],
+        );
+        let snapshot = drive_terminal(&mut supervisor);
+        assert_eq!(snapshot.state, SessionState::Completed);
+        assert_eq!(snapshot.tasks.len(), 2);
+        assert!(
+            snapshot
+                .tasks
+                .iter()
+                .all(|task| task.state == crate::control_api::TaskState::Lgtm)
+        );
+        let audit = audit.lock().unwrap();
+        assert_eq!(audit.opens, ["one", "two"]);
+        assert_eq!(audit.shutdowns, ["one", "two"]);
+        assert_eq!(
+            audit
+                .sessions
+                .iter()
+                .map(|(task, role, local)| (task.as_str(), *role, *local))
+                .collect::<Vec<_>>(),
+            [
+                ("one", WorkerRole::Developer, 1),
+                ("one", WorkerRole::Reviewer, 2),
+                ("two", WorkerRole::Developer, 1),
+                ("two", WorkerRole::Reviewer, 2),
+            ]
+        );
+        let first = supervisor.core.tasks()[0].developer_session.unwrap();
+        let second = supervisor.core.tasks()[1].developer_session.unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn ordered_tasks_can_bind_distinct_canonical_repositories() {
+        let fixture = Fixture::new();
+        let second = fixture
+            .project_root
+            .parent()
+            .unwrap()
+            .join("repository-two");
+        fs::create_dir(&second).unwrap();
+        fs::set_permissions(&second, fs::Permissions::from_mode(0o700)).unwrap();
+        git(&second, &["init", "-b", "master"]);
+        fs::create_dir(second.join("src")).unwrap();
+        fs::write(second.join("src/seed.txt"), "second seed\n").unwrap();
+        git(&second, &["add", "--", "src/seed.txt"]);
+        git_commit(&second, "Initial second fixture");
+        let second = fs::canonicalize(second).unwrap();
+        let second_base = git_output(&second, &["rev-parse", "HEAD"]);
+
+        let scripts = vec![
+            task_script(
+                "first-repository",
+                vec![
+                    FakeTurnScript::new(
+                        WorkerRole::Developer,
+                        RuntimeTurnPurpose::InitialDevelopment,
+                        [ready("implemented")],
+                    ),
+                    FakeTurnScript::new(
+                        WorkerRole::Reviewer,
+                        RuntimeTurnPurpose::InitialReview,
+                        [lgtm("sound")],
+                    ),
+                ],
+                vec![
+                    Mutation::Commit {
+                        path: "src/first.txt",
+                        contents: "first\n",
+                    },
+                    Mutation::None,
+                ],
+            ),
+            task_script(
+                "second-repository",
+                vec![
+                    FakeTurnScript::new(
+                        WorkerRole::Developer,
+                        RuntimeTurnPurpose::InitialDevelopment,
+                        [ready("implemented")],
+                    ),
+                    FakeTurnScript::new(
+                        WorkerRole::Reviewer,
+                        RuntimeTurnPurpose::InitialReview,
+                        [lgtm("sound")],
+                    ),
+                ],
+                vec![
+                    Mutation::Commit {
+                        path: "src/second.txt",
+                        contents: "second\n",
+                    },
+                    Mutation::None,
+                ],
+            ),
+        ];
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let mut supervisor = fixture.supervisor(scripts, Arc::clone(&audit));
+        let first_task = fixture.task("first-repository", &["src"], 2);
+        let mut second_task = fixture.task("second-repository", &["src"], 2);
+        second_task.repository_root = second.to_string_lossy().into_owned();
+        start(&mut supervisor, vec![first_task, second_task]);
+        let snapshot = drive_terminal(&mut supervisor);
+        assert_eq!(snapshot.state, SessionState::Completed);
+        assert_eq!(
+            snapshot.tasks[1].base_revision.as_deref(),
+            Some(second_base.as_str())
+        );
+        assert_eq!(
+            audit.lock().unwrap().opens,
+            ["first-repository", "second-repository"]
+        );
+    }
+
+    #[test]
+    fn review_exhausted_closes_the_first_runtime_and_advances_to_the_next_task() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let scripts = vec![
+            task_script(
+                "exhausted",
+                vec![
+                    FakeTurnScript::new(
+                        WorkerRole::Developer,
+                        RuntimeTurnPurpose::InitialDevelopment,
+                        [ready("implemented")],
+                    ),
+                    FakeTurnScript::new(
+                        WorkerRole::Reviewer,
+                        RuntimeTurnPurpose::InitialReview,
+                        [request_changes("bounded finding")],
+                    ),
+                ],
+                vec![
+                    Mutation::Commit {
+                        path: "src/exhausted.txt",
+                        contents: "first\n",
+                    },
+                    Mutation::None,
+                ],
+            ),
+            task_script(
+                "next",
+                vec![
+                    FakeTurnScript::new(
+                        WorkerRole::Developer,
+                        RuntimeTurnPurpose::InitialDevelopment,
+                        [ready("implemented")],
+                    ),
+                    FakeTurnScript::new(
+                        WorkerRole::Reviewer,
+                        RuntimeTurnPurpose::InitialReview,
+                        [lgtm("sound")],
+                    ),
+                ],
+                vec![
+                    Mutation::Commit {
+                        path: "src/next.txt",
+                        contents: "second\n",
+                    },
+                    Mutation::None,
+                ],
+            ),
+        ];
+        let mut supervisor = fixture.supervisor(scripts, Arc::clone(&audit));
+        start(
+            &mut supervisor,
+            vec![
+                fixture.task("exhausted", &["src"], 1),
+                fixture.task("next", &["src"], 2),
+            ],
+        );
+        let snapshot = drive_terminal(&mut supervisor);
+        assert_eq!(snapshot.state, SessionState::Completed);
+        assert_eq!(snapshot.tasks[0].state, TaskState::ReviewExhausted);
+        assert_eq!(snapshot.tasks[0].review_round, 1);
+        assert_eq!(snapshot.tasks[1].state, TaskState::Lgtm);
+        assert_eq!(audit.lock().unwrap().shutdowns, ["exhausted", "next"]);
+    }
+
+    #[test]
+    fn complete_parent_environment_is_materialized_with_task_private_overrides() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script(
+            "environment",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("implemented")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [lgtm("sound")],
+                ),
+            ],
+            vec![
+                Mutation::Commit {
+                    path: "src/task.txt",
+                    contents: "done\n",
+                },
+                Mutation::None,
+            ],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
+        start(
+            &mut supervisor,
+            vec![fixture.task("environment", &["src"], 2)],
+        );
+        assert_eq!(
+            drive_terminal(&mut supervisor).state,
+            SessionState::Completed
+        );
+        let audit = audit.lock().unwrap();
+        let environment = &audit.environments[0];
+        let get = |name: &[u8]| {
+            environment
+                .iter()
+                .find(|(candidate, _)| candidate.as_os_str().as_bytes() == name)
+                .map(|(_, value)| value.as_os_str().as_bytes())
+        };
+        assert_eq!(
+            get(b"UNKNOWN_PARENT_VALUE"),
+            Some(b"unknown-value".as_slice())
+        );
+        assert_eq!(
+            get(b"SERVICE_ACCESS_TOKEN"),
+            Some(b"environment-secret-sentinel".as_slice())
+        );
+        assert_eq!(get(b"EMPTY_PARENT_VALUE"), Some(b"".as_slice()));
+        assert_eq!(get(b"CASE_PAIR"), Some(b"upper".as_slice()));
+        assert_eq!(get(b"case_pair"), Some(b"lower".as_slice()));
+        assert_eq!(get(b"RAW_\xff_NAME"), Some(b"value-\xfe".as_slice()));
+        assert_eq!(get(b"HTTP_PROXY"), Some(b"http://proxy.example".as_slice()));
+        assert_eq!(
+            get(b"https_proxy"),
+            Some(b"http://lower-proxy.example".as_slice())
+        );
+        assert_ne!(get(b"HCOM_DIR"), Some(b"/must/not/reach/task".as_slice()));
+        assert_eq!(get(b"HCOM_WORKER_ROLE"), Some(b"task-runtime".as_slice()));
+        for name in [
+            b"HOME".as_slice(),
+            b"CODEX_HOME".as_slice(),
+            b"TMPDIR".as_slice(),
+            b"XDG_RUNTIME_DIR".as_slice(),
+            b"XDG_CACHE_HOME".as_slice(),
+        ] {
+            assert!(
+                get(name)
+                    .unwrap()
+                    .starts_with(fixture.run_root.as_os_str().as_bytes())
+            );
+        }
+    }
+
+    #[test]
+    fn independent_codex_role_overrides_are_frozen_into_runtime_turns() {
+        let mut fixture = Fixture::new();
+        let profiles = fixture.sources.profiles.as_mut().unwrap();
+        let DeveloperInvocationProfile::Codex { profile: developer } = &mut profiles.developer
+        else {
+            unreachable!()
+        };
+        developer.model = "developer-override".into();
+        developer.reasoning_effort = "high".into();
+        let ReviewerInvocationProfile::Codex { profile: reviewer } = &mut profiles.reviewer else {
+            unreachable!()
+        };
+        reviewer.model = "reviewer-override".into();
+        reviewer.reasoning_effort = "max".into();
+
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script(
+            "profile",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("implemented")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [lgtm("sound")],
+                ),
+            ],
+            vec![
+                Mutation::Commit {
+                    path: "src/task.txt",
+                    contents: "done\n",
+                },
+                Mutation::None,
+            ],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
+        start(&mut supervisor, vec![fixture.task("profile", &["src"], 2)]);
+        assert_eq!(
+            drive_terminal(&mut supervisor).state,
+            SessionState::Completed
+        );
+        let profiles = &audit.lock().unwrap().profiles;
+        assert_eq!(profiles[0].1, WorkerRole::Developer);
+        assert_eq!(profiles[0].2.model, "developer-override");
+        assert_eq!(profiles[0].2.reasoning_effort, "high");
+        assert_eq!(profiles[1].1, WorkerRole::Reviewer);
+        assert_eq!(profiles[1].2.model, "reviewer-override");
+        assert_eq!(profiles[1].2.reasoning_effort, "max");
+    }
+
+    #[test]
+    fn out_of_scope_commit_and_sensitive_outcome_fail_closed() {
+        for (name, developer_poll, path, expected_detail) in [
+            (
+                "outside",
+                ready("implemented"),
+                "outside.txt",
+                "developer changed paths outside the task allowlist",
+            ),
+            (
+                "secret",
+                ready("environment-secret-sentinel"),
+                "src/task.txt",
+                "worker runtime contract failed",
+            ),
+        ] {
+            let fixture = Fixture::new();
+            let audit = Arc::new(Mutex::new(Audit::default()));
+            let script = task_script(
+                name,
+                vec![FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [developer_poll],
+                )],
+                vec![Mutation::Commit {
+                    path,
+                    contents: "done\n",
+                }],
+            );
+            let mut supervisor = fixture.supervisor(vec![script], audit);
+            start(&mut supervisor, vec![fixture.task(name, &["src"], 2)]);
+            let snapshot = drive_terminal(&mut supervisor);
+            assert_eq!(snapshot.state, SessionState::NeedsHuman);
+            assert_eq!(
+                snapshot.terminal_detail.as_deref(),
+                Some(expected_detail),
+                "{name}"
+            );
+            let encoded = serde_json::to_string(&snapshot).unwrap();
+            assert!(!encoded.contains("environment-secret-sentinel"));
+        }
+    }
+
+    #[test]
+    fn allowed_delete_rename_and_mode_commits_reach_review() {
+        for (name, mutation) in [
+            (
+                "allowed-delete",
+                Mutation::DeleteCommit {
+                    path: "src/seed.txt",
+                },
+            ),
+            (
+                "allowed-rename",
+                Mutation::RenameCommit {
+                    from: "src/seed.txt",
+                    to: "src/renamed.txt",
+                },
+            ),
+            (
+                "allowed-mode",
+                Mutation::ModeCommit {
+                    path: "src/seed.txt",
+                    mode: 0o700,
+                },
+            ),
+        ] {
+            let fixture = Fixture::new();
+            let audit = Arc::new(Mutex::new(Audit::default()));
+            let script = task_script(
+                name,
+                vec![
+                    FakeTurnScript::new(
+                        WorkerRole::Developer,
+                        RuntimeTurnPurpose::InitialDevelopment,
+                        [ready("implemented")],
+                    ),
+                    FakeTurnScript::new(
+                        WorkerRole::Reviewer,
+                        RuntimeTurnPurpose::InitialReview,
+                        [lgtm("sound")],
+                    ),
+                ],
+                vec![mutation, Mutation::None],
+            );
+            let mut supervisor = fixture.supervisor(vec![script], audit);
+            start(&mut supervisor, vec![fixture.task(name, &["src"], 2)]);
+            assert_eq!(
+                drive_terminal(&mut supervisor).state,
+                SessionState::Completed
+            );
+        }
+    }
+
+    #[test]
+    fn repository_identity_replacement_is_a_driver_failure_not_a_worker_verdict() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script(
+            "identity-drift",
+            vec![FakeTurnScript::new(
+                WorkerRole::Developer,
+                RuntimeTurnPurpose::InitialDevelopment,
+                [ready("must not be accepted")],
+            )],
+            vec![Mutation::ReplaceGitDirectory],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
+        start(
+            &mut supervisor,
+            vec![fixture.task("identity-drift", &["src"], 2)],
+        );
+        assert!(supervisor.poll_once().is_err());
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, SessionState::NeedsHuman);
+        assert_eq!(
+            snapshot.terminal_detail.as_deref(),
+            Some("repository observation failed")
+        );
+        assert!(
+            audit
+                .lock()
+                .unwrap()
+                .sessions
+                .iter()
+                .all(|(_, role, _)| *role == WorkerRole::Developer)
+        );
+    }
+
+    #[test]
+    fn dirty_plan_never_opens_a_task_runtime() {
+        let fixture = Fixture::new();
+        fs::write(fixture.repository.join("src/dirty.txt"), "dirty\n").unwrap();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let mut supervisor = fixture.supervisor(Vec::new(), Arc::clone(&audit));
+        assert!(
+            supervisor
+                .replace_plan(
+                    0,
+                    CODEX_APP_SERVER_ADAPTER,
+                    CODEX_APP_SERVER_ADAPTER,
+                    vec![fixture.task("dirty", &["src"], 2)],
+                )
+                .is_err()
+        );
+        assert_eq!(supervisor.snapshot().state, SessionState::AwaitingPlan);
+        assert!(audit.lock().unwrap().sessions.is_empty());
+    }
+
+    #[test]
+    fn detached_head_and_non_top_level_repository_roots_fail_before_plan_binding() {
+        let detached = Fixture::new();
+        git(&detached.repository, &["checkout", "--detach"]);
+        let mut supervisor =
+            detached.supervisor(Vec::new(), Arc::new(Mutex::new(Audit::default())));
+        assert!(
+            supervisor
+                .replace_plan(
+                    0,
+                    CODEX_APP_SERVER_ADAPTER,
+                    CODEX_APP_SERVER_ADAPTER,
+                    vec![detached.task("detached", &["src"], 2)],
+                )
+                .is_err()
+        );
+        assert_eq!(supervisor.snapshot().state, SessionState::AwaitingPlan);
+
+        let nested = Fixture::new();
+        let mut task = nested.task("nested-root", &["src"], 2);
+        task.repository_root = nested.repository.join("src").to_string_lossy().into_owned();
+        let mut supervisor = nested.supervisor(Vec::new(), Arc::new(Mutex::new(Audit::default())));
+        assert!(
+            supervisor
+                .replace_plan(
+                    0,
+                    CODEX_APP_SERVER_ADAPTER,
+                    CODEX_APP_SERVER_ADAPTER,
+                    vec![task],
+                )
+                .is_err()
+        );
+        assert_eq!(supervisor.snapshot().state, SessionState::AwaitingPlan);
+    }
+
+    #[test]
+    fn failed_plan_replacement_preserves_the_previous_plan_and_repository_lock() {
+        let fixture = Fixture::new();
+        let second = fixture
+            .project_root
+            .parent()
+            .unwrap()
+            .join("replacement-locked-repository");
+        fs::create_dir(&second).unwrap();
+        fs::set_permissions(&second, fs::Permissions::from_mode(0o700)).unwrap();
+        git(&second, &["init", "-b", "master"]);
+        fs::create_dir(second.join("src")).unwrap();
+        fs::write(second.join("src/seed.txt"), "seed\n").unwrap();
+        git(&second, &["add", "--", "src/seed.txt"]);
+        git_commit(&second, "Initial replacement fixture");
+        let second = fs::canonicalize(second).unwrap();
+
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script(
+            "retained-plan",
+            vec![FakeTurnScript::new(
+                WorkerRole::Developer,
+                RuntimeTurnPurpose::InitialDevelopment,
+                [RuntimeTurnPoll::Pending {
+                    telemetry: RuntimeTelemetry::default(),
+                }],
+            )],
+            vec![Mutation::None],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], audit);
+        let retained_task = fixture.task("retained-plan", &["src"], 2);
+        let (plan_version, plan_hash) = supervisor
+            .replace_plan(
+                0,
+                CODEX_APP_SERVER_ADAPTER,
+                CODEX_APP_SERVER_ADAPTER,
+                vec![retained_task.clone()],
+            )
+            .unwrap();
+        let before = supervisor.snapshot();
+
+        let mut blocker = fixture.supervisor(Vec::new(), Arc::new(Mutex::new(Audit::default())));
+        let mut blocked_task = fixture.task("blocked-root", &["src"], 2);
+        blocked_task.repository_root = second.to_string_lossy().into_owned();
+        blocker
+            .replace_plan(
+                0,
+                CODEX_APP_SERVER_ADAPTER,
+                CODEX_APP_SERVER_ADAPTER,
+                vec![blocked_task.clone()],
+            )
+            .unwrap();
+
+        assert!(
+            supervisor
+                .replace_plan(
+                    before.version,
+                    CODEX_APP_SERVER_ADAPTER,
+                    CODEX_APP_SERVER_ADAPTER,
+                    vec![blocked_task],
+                )
+                .is_err()
+        );
+        assert_eq!(supervisor.snapshot(), before);
+
+        let mut probe = fixture.supervisor(Vec::new(), Arc::new(Mutex::new(Audit::default())));
+        assert!(
+            probe
+                .replace_plan(
+                    0,
+                    CODEX_APP_SERVER_ADAPTER,
+                    CODEX_APP_SERVER_ADAPTER,
+                    vec![retained_task],
+                )
+                .is_err()
+        );
+
+        supervisor
+            .approve_and_start(before.version, plan_version, &plan_hash, true)
+            .unwrap();
+        assert_eq!(supervisor.snapshot().state, SessionState::Running);
+    }
+
+    #[test]
+    fn runtime_factory_failure_is_distinct_from_environment_setup_and_is_sanitized() {
+        let fixture = Fixture::new();
+        let mut supervisor = AppServerSessionSupervisor::open_with_factory(
+            "run-factory-failure".into(),
+            fixture.project_root.clone(),
+            fixture.run_root.clone(),
+            fixture.lock_root.clone(),
+            fixture.sources.clone(),
+            Box::new(FailingFactory),
+        )
+        .unwrap();
+        let task = fixture.task("factory-failure", &["src"], 2);
+        let (plan_version, plan_hash) = supervisor
+            .replace_plan(
+                0,
+                CODEX_APP_SERVER_ADAPTER,
+                CODEX_APP_SERVER_ADAPTER,
+                vec![task],
+            )
+            .unwrap();
+        let error = supervisor
+            .approve_and_start(1, plan_version, &plan_hash, true)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("runtime-factory-secret-sentinel")
+        );
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, SessionState::NeedsHuman);
+        assert_eq!(
+            snapshot.terminal_detail.as_deref(),
+            Some("task worker runtime operation failed")
+        );
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(!encoded.contains("runtime-factory-secret-sentinel"));
+        assert!(
+            !fixture
+                .run_root
+                .join("app-server-workers")
+                .read_dir()
+                .unwrap()
+                .any(|entry| entry.is_ok())
+        );
+    }
+
+    #[test]
+    fn missing_runtime_source_is_classified_as_environment_setup_failure() {
+        let mut fixture = Fixture::new();
+        fixture.sources.codex_auth_source = None;
+        let mut supervisor = fixture.supervisor(Vec::new(), Arc::new(Mutex::new(Audit::default())));
+        let task = fixture.task("missing-auth", &["src"], 2);
+        let (plan_version, plan_hash) = supervisor
+            .replace_plan(
+                0,
+                CODEX_APP_SERVER_ADAPTER,
+                CODEX_APP_SERVER_ADAPTER,
+                vec![task],
+            )
+            .unwrap();
+        assert!(
+            supervisor
+                .approve_and_start(1, plan_version, &plan_hash, true)
+                .is_err()
+        );
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, SessionState::NeedsHuman);
+        assert_eq!(
+            snapshot.terminal_detail.as_deref(),
+            Some("task-private environment setup failed")
+        );
+    }
+
+    #[test]
+    fn successful_task_transition_is_not_committed_when_runtime_cleanup_fails() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script_with_shutdown_failure(
+            "cleanup-failure",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("implemented")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [lgtm("sound")],
+                ),
+            ],
+            vec![
+                Mutation::Commit {
+                    path: "src/task.txt",
+                    contents: "done\n",
+                },
+                Mutation::None,
+            ],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
+        start(
+            &mut supervisor,
+            vec![fixture.task("cleanup-failure", &["src"], 2)],
+        );
+        let mut saw_cleanup_error = false;
+        for _ in 0..8 {
+            if supervisor.poll_once().is_err() {
+                saw_cleanup_error = true;
+            }
+            if supervisor.snapshot().state.is_terminal() {
+                break;
+            }
+        }
+        assert!(saw_cleanup_error);
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, SessionState::NeedsHuman);
+        assert_eq!(snapshot.tasks[0].state, TaskState::NeedsHuman);
+        assert_eq!(
+            snapshot.terminal_detail.as_deref(),
+            Some("task worker runtime cleanup failed")
+        );
+        assert_eq!(audit.lock().unwrap().shutdowns, ["cleanup-failure"]);
+    }
+}

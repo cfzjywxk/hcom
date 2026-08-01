@@ -22,6 +22,7 @@ use crate::worker::profile::{
     CLAUDE_DEVELOPER_ADAPTER, CLAUDE_REVIEWER_ADAPTER, CODEX_DEVELOPER_ADAPTER,
     CODEX_REVIEWER_ADAPTER,
 };
+use crate::worker::runtime::CODEX_APP_SERVER_ADAPTER;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -263,20 +264,31 @@ fn validate_bridge_configuration(configuration: &BridgeConfiguration) -> Result<
         }
     }
     configuration.relay_executable.revalidate()?;
-    if !matches!(
-        configuration.developer_adapter.as_str(),
-        CODEX_DEVELOPER_ADAPTER | CLAUDE_DEVELOPER_ADAPTER
-    ) || !matches!(
-        configuration.reviewer_adapter.as_str(),
-        CODEX_REVIEWER_ADAPTER | CLAUDE_REVIEWER_ADAPTER
-    ) {
-        bail!("architect bridge received an unknown session-frozen worker adapter");
-    }
+    validate_worker_adapter_binding(
+        &configuration.developer_adapter,
+        &configuration.reviewer_adapter,
+    )?;
     let paths = ControlPaths::new(&configuration.run_root, &configuration.lock_root)?;
     if paths.socket_path() != configuration.control_socket_path
         || paths.registration_socket_path() != configuration.registration_socket_path
     {
         bail!("architect bridge session socket paths drifted");
+    }
+    Ok(())
+}
+
+fn validate_worker_adapter_binding(developer_adapter: &str, reviewer_adapter: &str) -> Result<()> {
+    let app_server_pair = developer_adapter == CODEX_APP_SERVER_ADAPTER
+        && reviewer_adapter == CODEX_APP_SERVER_ADAPTER;
+    let retained_cli_pair = matches!(
+        developer_adapter,
+        CODEX_DEVELOPER_ADAPTER | CLAUDE_DEVELOPER_ADAPTER
+    ) && matches!(
+        reviewer_adapter,
+        CODEX_REVIEWER_ADAPTER | CLAUDE_REVIEWER_ADAPTER
+    );
+    if !(app_server_pair || retained_cli_pair) {
+        bail!("architect bridge received an unknown session-frozen worker adapter");
     }
     Ok(())
 }
@@ -1021,6 +1033,21 @@ mod tests {
                 _session_path: session_path,
             }
         }
+    }
+
+    #[test]
+    fn bridge_accepts_exact_app_server_pair_without_mixing_runtime_families() {
+        validate_worker_adapter_binding(CODEX_APP_SERVER_ADAPTER, CODEX_APP_SERVER_ADAPTER)
+            .unwrap();
+        validate_worker_adapter_binding(CODEX_DEVELOPER_ADAPTER, CLAUDE_REVIEWER_ADAPTER).unwrap();
+        assert!(
+            validate_worker_adapter_binding(CODEX_APP_SERVER_ADAPTER, CODEX_REVIEWER_ADAPTER,)
+                .is_err()
+        );
+        assert!(
+            validate_worker_adapter_binding(CODEX_DEVELOPER_ADAPTER, CODEX_APP_SERVER_ADAPTER,)
+                .is_err()
+        );
     }
 
     fn codex_session_path(codex_home: &Path, id: &str) -> PathBuf {

@@ -1,8 +1,10 @@
 # Codex App Server task-runtime contract
 
-This document freezes the provider boundary introduced in development phase P0.
-Production dispatch remains on the released CLI adapters until the later
-integration phase.
+This document freezes the provider boundary introduced in development phase P0
+and its phase-P3 production integration. `hcom arch codex` uses this task-local
+runtime for background Developer and Reviewer turns. The retained CLI adapters
+remain available to the unchanged `hcom arch claude` lane and existing hcom
+products.
 
 ## Fixed identity
 
@@ -132,9 +134,13 @@ may request `DeveloperRecoveryPreflight`; identity, branch, ancestry and the
 changed-path allowlist must pass before the core schedules one
 `DeveloperCompletionRecovery` turn on the same logical session. A second such
 failure, every non-retryable failure and every Reviewer failure fails closed.
+`DriverFailed` separately normalizes repository, runtime-factory,
+task-environment, runtime-contract, and cleanup failures. A successful task
+transition is committed only after its task runtime shuts down successfully;
+cleanup failure leaves the session at a sanitized `needs_human` terminal.
 
 It does not own filesystem, Git, process, clock, network, terminal, or provider
-transport I/O. The P1 matrix has explicit rows for all 84
+transport I/O. The current matrix has explicit rows for all 91
 `SessionState × SupervisorEventKind` combinations and all 56
 `TaskState × relevant lifecycle event` combinations. Ordered pure journeys
 cover one/two task completion, different and shared repositories,

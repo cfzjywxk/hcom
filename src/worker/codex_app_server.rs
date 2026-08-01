@@ -4,7 +4,7 @@
 //! identities. The session supervisor sees only the provider-neutral runtime
 //! contract from `worker::runtime`.
 
-use super::codex::DISABLED_CODEX_FEATURES;
+use super::codex::{BWRAP_EXECUTABLE, BWRAP_VERSION, DISABLED_CODEX_FEATURES};
 use super::codex_rpc::{CodexRpc, OPT_OUT_NOTIFICATION_METHODS, RpcInbound};
 use super::contract::ExecutableIdentity;
 use super::process::{ProcessGroupBinding, configure_worker_child};
@@ -14,6 +14,7 @@ use super::runtime::{
     RuntimeContractIdentity, RuntimeError, RuntimeFailureClass, RuntimeOutcome, RuntimeSessionKey,
     RuntimeTurnKey, RuntimeTurnPoll, RuntimeTurnSpec, SanitizedRuntimeFailure, TaskWorkerRuntime,
 };
+use super::sandbox::{HostRootAccess, HostRootContract, HostRootMounts};
 use crate::control_api::WorkerRole;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -21,7 +22,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -202,6 +203,7 @@ struct CodexAppServerLaunch {
     arguments: Vec<OsString>,
     cwd: PathBuf,
     environment: Vec<(OsString, OsString)>,
+    sandbox: Option<Box<CodexAppServerSandbox>>,
     request_timeout: Duration,
     terminate_grace: Duration,
 }
@@ -226,6 +228,29 @@ impl CodexAppServerLaunch {
             arguments: native_app_server_arguments(),
             cwd,
             environment,
+            sandbox: None,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            terminate_grace: DEFAULT_TERMINATE_GRACE,
+        })
+    }
+
+    pub(crate) fn sandboxed(
+        preflight: CodexAppServerPreflight,
+        sandbox_config: CodexAppServerSandboxConfig,
+        environment: Vec<(OsString, OsString)>,
+    ) -> Result<Self, RuntimeError> {
+        preflight.revalidate()?;
+        let sandbox = CodexAppServerSandbox::capture(sandbox_config, preflight.executable())?;
+        let cwd = sandbox.repository.path.clone();
+        let program = sandbox.outer.canonical_path.clone();
+        let arguments = sandbox.launch_arguments()?;
+        Ok(Self {
+            authority: LaunchAuthority::Pinned(Box::new(preflight)),
+            program,
+            arguments,
+            cwd,
+            environment,
+            sandbox: Some(Box::new(sandbox)),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             terminate_grace: DEFAULT_TERMINATE_GRACE,
         })
@@ -244,9 +269,34 @@ impl CodexAppServerLaunch {
             arguments,
             cwd,
             environment,
+            sandbox: None,
             request_timeout: Duration::from_secs(3),
             terminate_grace: Duration::from_millis(250),
         }
+    }
+
+    #[cfg(test)]
+    fn sandboxed_fixture(
+        program: PathBuf,
+        sandbox_config: CodexAppServerSandboxConfig,
+        environment: Vec<(OsString, OsString)>,
+    ) -> Result<Self, RuntimeError> {
+        let native = ExecutableIdentity::capture(&program)
+            .map_err(|_| RuntimeError::invalid_identity("fixture executable was unsafe"))?;
+        let sandbox = CodexAppServerSandbox::capture(sandbox_config, &native)?;
+        let cwd = sandbox.repository.path.clone();
+        let outer_program = sandbox.outer.canonical_path.clone();
+        let arguments = sandbox.launch_arguments()?;
+        Ok(Self {
+            authority: LaunchAuthority::Fixture,
+            program: outer_program,
+            arguments,
+            cwd,
+            environment,
+            sandbox: Some(Box::new(sandbox)),
+            request_timeout: Duration::from_secs(3),
+            terminate_grace: Duration::from_millis(250),
+        })
     }
 
     fn contract(&self) -> RuntimeContractIdentity {
@@ -259,6 +309,9 @@ impl CodexAppServerLaunch {
 
     fn revalidate(&self) -> Result<(), RuntimeError> {
         validate_launch_cwd(&self.cwd)?;
+        if let Some(sandbox) = &self.sandbox {
+            sandbox.revalidate()?;
+        }
         let codex_home = required_environment_path(&self.environment, "CODEX_HOME")?;
         validate_private_runtime_directory(&codex_home, "Codex App Server CODEX_HOME")?;
         let temporary = required_environment_path(&self.environment, "TMPDIR")?;
@@ -278,6 +331,349 @@ impl CodexAppServerLaunch {
             LaunchAuthority::Fixture => Ok(()),
         }
     }
+}
+
+pub(crate) struct CodexAppServerSandboxConfig {
+    pub repository_root: PathBuf,
+    pub isolated_home: PathBuf,
+    pub codex_home: PathBuf,
+    pub temp_dir: PathBuf,
+    pub runtime_dir: PathBuf,
+    pub artifact_dir: PathBuf,
+    pub hcom_dir: PathBuf,
+    pub xdg_config_home: PathBuf,
+    pub xdg_state_home: PathBuf,
+    pub xdg_cache_home: PathBuf,
+    pub xdg_data_home: PathBuf,
+    pub auth_source: PathBuf,
+    pub cargo_bin_source: PathBuf,
+    pub rustup_home_source: PathBuf,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SandboxDirectoryIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    uid: u32,
+    mode: u32,
+    private: bool,
+}
+
+impl SandboxDirectoryIdentity {
+    fn capture(path: &Path, private: bool) -> Result<Self, RuntimeError> {
+        let link = fs::symlink_metadata(path).map_err(|_| {
+            RuntimeError::invalid_identity("Codex App Server sandbox directory was unavailable")
+        })?;
+        let canonical = fs::canonicalize(path).map_err(|_| {
+            RuntimeError::invalid_identity("Codex App Server sandbox directory was unavailable")
+        })?;
+        let metadata = fs::metadata(path).map_err(|_| {
+            RuntimeError::invalid_identity("Codex App Server sandbox directory was unavailable")
+        })?;
+        // SAFETY: geteuid has no preconditions.
+        let current_uid = unsafe { libc::geteuid() };
+        let mode = metadata.permissions().mode() & 0o777;
+        if canonical != path
+            || link.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != current_uid
+            || metadata.permissions().mode() & 0o002 != 0
+            || (private && mode != 0o700)
+        {
+            return Err(RuntimeError::invalid_identity(
+                "Codex App Server sandbox directory identity was unsafe",
+            ));
+        }
+        Ok(Self {
+            path: canonical,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+            mode,
+            private,
+        })
+    }
+
+    fn revalidate(&self) -> Result<(), RuntimeError> {
+        if Self::capture(&self.path, self.private)? != *self {
+            return Err(RuntimeError::invalid_identity(
+                "Codex App Server sandbox directory identity drifted",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SandboxFileIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    uid: u32,
+    mode: u32,
+    size: u64,
+    sha256: String,
+}
+
+impl SandboxFileIdentity {
+    fn capture(path: &Path) -> Result<Self, RuntimeError> {
+        let link = fs::symlink_metadata(path).map_err(|_| {
+            RuntimeError::invalid_identity("Codex App Server sandbox file was unavailable")
+        })?;
+        let canonical = fs::canonicalize(path).map_err(|_| {
+            RuntimeError::invalid_identity("Codex App Server sandbox file was unavailable")
+        })?;
+        let metadata = fs::metadata(path).map_err(|_| {
+            RuntimeError::invalid_identity("Codex App Server sandbox file was unavailable")
+        })?;
+        // SAFETY: geteuid has no preconditions.
+        let current_uid = unsafe { libc::geteuid() };
+        let mode = metadata.permissions().mode() & 0o777;
+        if canonical != path
+            || link.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.uid() != current_uid
+            || mode & 0o077 != 0
+            || metadata.len() > 16 * 1024 * 1024
+        {
+            return Err(RuntimeError::invalid_identity(
+                "Codex App Server sandbox file identity was unsafe",
+            ));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|_| {
+                RuntimeError::invalid_identity("Codex App Server sandbox file was unavailable")
+            })?;
+        let mut bytes = Vec::new();
+        file.take(16 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| RuntimeError::internal("failed to hash sandbox file identity"))?;
+        if bytes.len() as u64 != metadata.len() {
+            return Err(RuntimeError::invalid_identity(
+                "Codex App Server sandbox file changed while captured",
+            ));
+        }
+        Ok(Self {
+            path: canonical,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+            mode,
+            size: metadata.len(),
+            sha256: sha256_hex(&bytes),
+        })
+    }
+
+    fn revalidate(&self) -> Result<(), RuntimeError> {
+        if Self::capture(&self.path)? != *self {
+            return Err(RuntimeError::invalid_identity(
+                "Codex App Server sandbox file identity drifted",
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct CodexAppServerSandbox {
+    outer: ExecutableIdentity,
+    native: ExecutableIdentity,
+    repository: SandboxDirectoryIdentity,
+    isolated_home: SandboxDirectoryIdentity,
+    codex_home: SandboxDirectoryIdentity,
+    temp_dir: SandboxDirectoryIdentity,
+    runtime_dir: SandboxDirectoryIdentity,
+    artifact_dir: SandboxDirectoryIdentity,
+    hcom_dir: SandboxDirectoryIdentity,
+    xdg_config_home: SandboxDirectoryIdentity,
+    xdg_state_home: SandboxDirectoryIdentity,
+    xdg_cache_home: SandboxDirectoryIdentity,
+    xdg_data_home: SandboxDirectoryIdentity,
+    auth_source: SandboxFileIdentity,
+    auth_target: SandboxFileIdentity,
+    config_file: SandboxFileIdentity,
+    host_root: HostRootContract,
+}
+
+impl CodexAppServerSandbox {
+    fn capture(
+        config: CodexAppServerSandboxConfig,
+        native: &ExecutableIdentity,
+    ) -> Result<Self, RuntimeError> {
+        native
+            .revalidate()
+            .map_err(|_| RuntimeError::invalid_identity("pinned Codex executable drifted"))?;
+        let outer = capture_bwrap()?;
+        let repository = SandboxDirectoryIdentity::capture(&config.repository_root, false)?;
+        let isolated_home = SandboxDirectoryIdentity::capture(&config.isolated_home, true)?;
+        let codex_home = SandboxDirectoryIdentity::capture(&config.codex_home, true)?;
+        if !codex_home.path.starts_with(&isolated_home.path)
+            || codex_home.path == isolated_home.path
+        {
+            return Err(RuntimeError::invalid_contract(
+                "Codex App Server CODEX_HOME must be a strict child of isolated HOME",
+            ));
+        }
+        let temp_dir = SandboxDirectoryIdentity::capture(&config.temp_dir, true)?;
+        let runtime_dir = SandboxDirectoryIdentity::capture(&config.runtime_dir, true)?;
+        let artifact_dir = SandboxDirectoryIdentity::capture(&config.artifact_dir, true)?;
+        let hcom_dir = SandboxDirectoryIdentity::capture(&config.hcom_dir, true)?;
+        let xdg_config_home = SandboxDirectoryIdentity::capture(&config.xdg_config_home, true)?;
+        let xdg_state_home = SandboxDirectoryIdentity::capture(&config.xdg_state_home, true)?;
+        let xdg_cache_home = SandboxDirectoryIdentity::capture(&config.xdg_cache_home, true)?;
+        let xdg_data_home = SandboxDirectoryIdentity::capture(&config.xdg_data_home, true)?;
+        let auth_source = SandboxFileIdentity::capture(&config.auth_source)?;
+        let auth_target = SandboxFileIdentity::capture(&codex_home.path.join("auth.json"))?;
+        let config_file = SandboxFileIdentity::capture(&codex_home.path.join("config.toml"))?;
+        if auth_source.path == auth_target.path {
+            return Err(RuntimeError::invalid_contract(
+                "Codex App Server auth source must differ from its private mount target",
+            ));
+        }
+        let writable = [
+            &repository.path,
+            &isolated_home.path,
+            &temp_dir.path,
+            &runtime_dir.path,
+            &artifact_dir.path,
+            &hcom_dir.path,
+            &xdg_config_home.path,
+            &xdg_state_home.path,
+            &xdg_cache_home.path,
+            &xdg_data_home.path,
+        ];
+        for protected in [
+            native.canonical_path.as_path(),
+            outer.canonical_path.as_path(),
+            auth_source.path.as_path(),
+        ] {
+            if writable.iter().any(|root| protected.starts_with(root)) {
+                return Err(RuntimeError::invalid_contract(
+                    "Codex App Server writable roots contain a protected host file",
+                ));
+            }
+        }
+        let host_root =
+            HostRootContract::capture(&config.cargo_bin_source, &config.rustup_home_source)
+                .map_err(|_| {
+                    RuntimeError::invalid_identity("outer sandbox host roots were unsafe")
+                })?;
+        Ok(Self {
+            outer,
+            native: native.clone(),
+            repository,
+            isolated_home,
+            codex_home,
+            temp_dir,
+            runtime_dir,
+            artifact_dir,
+            hcom_dir,
+            xdg_config_home,
+            xdg_state_home,
+            xdg_cache_home,
+            xdg_data_home,
+            auth_source,
+            auth_target,
+            config_file,
+            host_root,
+        })
+    }
+
+    fn revalidate(&self) -> Result<(), RuntimeError> {
+        self.outer
+            .revalidate()
+            .and_then(|()| self.native.revalidate())
+            .map_err(|_| RuntimeError::invalid_identity("sandbox executable identity drifted"))?;
+        validate_bwrap_version(&self.outer)?;
+        for directory in [
+            &self.repository,
+            &self.isolated_home,
+            &self.codex_home,
+            &self.temp_dir,
+            &self.runtime_dir,
+            &self.artifact_dir,
+            &self.hcom_dir,
+            &self.xdg_config_home,
+            &self.xdg_state_home,
+            &self.xdg_cache_home,
+            &self.xdg_data_home,
+        ] {
+            directory.revalidate()?;
+        }
+        self.auth_source.revalidate()?;
+        self.auth_target.revalidate()?;
+        self.config_file.revalidate()?;
+        self.host_root
+            .revalidate()
+            .map_err(|_| RuntimeError::invalid_identity("outer sandbox host roots drifted"))
+    }
+
+    fn launch_arguments(&self) -> Result<Vec<OsString>, RuntimeError> {
+        self.revalidate()?;
+        let extra_writable_dirs = [
+            self.temp_dir.path.as_path(),
+            self.runtime_dir.path.as_path(),
+            self.hcom_dir.path.as_path(),
+            self.xdg_config_home.path.as_path(),
+            self.xdg_state_home.path.as_path(),
+            self.xdg_cache_home.path.as_path(),
+            self.xdg_data_home.path.as_path(),
+        ];
+        let argv = self
+            .host_root
+            .host_root_argv(HostRootMounts {
+                isolated_home: &self.isolated_home.path,
+                native_config: &self.codex_home.path,
+                launch_cwd: &self.repository.path,
+                artifact_dir: &self.artifact_dir.path,
+                auth_source: &self.auth_source.path,
+                auth_target: &self.auth_target.path,
+                readable_roots: &[&self.repository.path],
+                writable_roots: &[&self.repository.path],
+                read_only_files: &[&self.native.canonical_path],
+                extra_writable_dirs: &extra_writable_dirs,
+                host_root_access: HostRootAccess::Hidden,
+                masked_dirs: &[],
+            })
+            .map_err(|_| RuntimeError::invalid_contract("outer sandbox manifest was invalid"))?;
+        let mut arguments: Vec<OsString> = argv.into_iter().map(OsString::from).collect();
+        arguments.push("--".into());
+        arguments.push(self.native.canonical_path.as_os_str().to_owned());
+        arguments.extend(native_app_server_arguments());
+        Ok(arguments)
+    }
+}
+
+fn capture_bwrap() -> Result<ExecutableIdentity, RuntimeError> {
+    let executable = ExecutableIdentity::capture(Path::new(BWRAP_EXECUTABLE))
+        .map_err(|_| RuntimeError::invalid_identity("bubblewrap executable was unavailable"))?;
+    validate_bwrap_version(&executable)?;
+    Ok(executable)
+}
+
+fn validate_bwrap_version(executable: &ExecutableIdentity) -> Result<(), RuntimeError> {
+    executable
+        .revalidate()
+        .map_err(|_| RuntimeError::invalid_identity("bubblewrap executable drifted"))?;
+    let output = Command::new(&executable.canonical_path)
+        .arg("--version")
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|_| RuntimeError::internal("failed to run bubblewrap version probe"))?;
+    if !output.status.success()
+        || output.stdout.len() > 4096
+        || output.stderr.len() > 4096
+        || trim_single_line(&output.stdout) != Some(BWRAP_VERSION)
+    {
+        return Err(RuntimeError::invalid_contract(
+            "bubblewrap version contract mismatch",
+        ));
+    }
+    Ok(())
 }
 
 struct NativeSession {
@@ -383,6 +779,31 @@ impl CodexAppServerRuntime {
         environment: Vec<(OsString, OsString)>,
     ) -> Result<Self, RuntimeError> {
         Self::launch(CodexAppServerLaunch::direct(preflight, cwd, environment)?)
+    }
+
+    pub(crate) fn launch_sandboxed(
+        preflight: CodexAppServerPreflight,
+        sandbox: CodexAppServerSandboxConfig,
+        environment: Vec<(OsString, OsString)>,
+    ) -> Result<Self, RuntimeError> {
+        Self::launch(CodexAppServerLaunch::sandboxed(
+            preflight,
+            sandbox,
+            environment,
+        )?)
+    }
+
+    #[cfg(test)]
+    fn launch_sandboxed_fixture(
+        program: PathBuf,
+        sandbox: CodexAppServerSandboxConfig,
+        environment: Vec<(OsString, OsString)>,
+    ) -> Result<Self, RuntimeError> {
+        Self::launch(CodexAppServerLaunch::sandboxed_fixture(
+            program,
+            sandbox,
+            environment,
+        )?)
     }
 
     fn initialize(&mut self) -> Result<(), RuntimeError> {
@@ -1466,6 +1887,7 @@ mod tests {
         RuntimeTurnPurpose,
     };
     use std::os::unix::ffi::OsStringExt;
+    use std::process::Command;
     use std::thread;
 
     struct FixtureRuntime {
@@ -1773,6 +2195,268 @@ mod tests {
         assert!(!report.contains("environment-secret-sentinel"));
         assert!(!report.contains("proxy.example"));
         fixture.runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn real_outer_sandbox_is_writable_for_both_roles_and_hides_unbound_host_state() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = fs::canonicalize(root.path()).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let repository = root_path.join("repository");
+        let home = root_path.join("private-home");
+        let codex_home = home.join(".codex");
+        let temp = root_path.join("private-tmp");
+        let runtime_dir = root_path.join("private-run");
+        let artifacts = root_path.join("artifacts");
+        let hcom_dir = root_path.join("private-hcom");
+        let xdg_config = home.join(".config");
+        let xdg_state = home.join(".state");
+        let xdg_cache = home.join(".cache");
+        let xdg_data = home.join(".data");
+        let cargo_bin = root_path.join("cargo-bin");
+        let rustup_home = root_path.join("rustup-home");
+        let protected = root_path.join("unbound-protected");
+        for directory in [
+            &repository,
+            &home,
+            &codex_home,
+            &temp,
+            &runtime_dir,
+            &artifacts,
+            &hcom_dir,
+            &xdg_config,
+            &xdg_state,
+            &xdg_cache,
+            &xdg_data,
+            &cargo_bin,
+            &rustup_home,
+            &protected,
+        ] {
+            fs::create_dir(directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let git = |arguments: &[&str]| {
+            let output = Command::new("/usr/bin/git")
+                .args(arguments)
+                .current_dir(&repository)
+                .env_clear()
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("HOME", "/nonexistent")
+                .env("LC_ALL", "C")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                arguments,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-b", "master"]);
+        fs::write(repository.join(".gitignore"), "target/\n").unwrap();
+        fs::write(repository.join("seed.txt"), "seed\n").unwrap();
+        git(&["add", "--", ".gitignore", "seed.txt"]);
+        let commit = Command::new("/usr/bin/git")
+            .args([
+                "-c",
+                "user.name=Sandbox Fixture",
+                "-c",
+                "user.email=sandbox@example.invalid",
+                "commit",
+                "-m",
+                "Initial fixture",
+            ])
+            .current_dir(&repository)
+            .env_clear()
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("HOME", "/nonexistent")
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        assert!(commit.status.success());
+
+        let auth_source = root_path.join("native-auth.json");
+        let auth_target = codex_home.join("auth.json");
+        let config = codex_home.join("config.toml");
+        let protected_file = protected.join("live-control-secret");
+        for (path, contents) in [
+            (&auth_source, b"{\"token\":\"fixture-secret\"}".as_slice()),
+            (&auth_target, b"placeholder".as_slice()),
+            (
+                &config,
+                b"mcp_servers = {}\n[shell_environment_policy]\ninherit = \"all\"\nignore_default_excludes = true\n"
+                    .as_slice(),
+            ),
+            (&protected_file, b"must remain hidden".as_slice()),
+        ] {
+            fs::write(path, contents).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let fixture_program = root_path.join("fake-app-server.py");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_codex_app_server.py"),
+            &fixture_program,
+        )
+        .unwrap();
+        fs::set_permissions(&fixture_program, fs::Permissions::from_mode(0o700)).unwrap();
+        let report = artifacts.join("sandbox-report.jsonl");
+        let environment = vec![
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (OsString::from("HOME"), home.as_os_str().to_owned()),
+            (
+                OsString::from("CODEX_HOME"),
+                codex_home.as_os_str().to_owned(),
+            ),
+            (OsString::from("TMPDIR"), temp.as_os_str().to_owned()),
+            (
+                OsString::from("XDG_RUNTIME_DIR"),
+                runtime_dir.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("XDG_CONFIG_HOME"),
+                xdg_config.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("XDG_STATE_HOME"),
+                xdg_state.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("XDG_CACHE_HOME"),
+                xdg_cache.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("XDG_DATA_HOME"),
+                xdg_data.as_os_str().to_owned(),
+            ),
+            (OsString::from("HCOM_DIR"), hcom_dir.as_os_str().to_owned()),
+            (
+                OsString::from("HCOM_FAKE_CODEX_SCENARIO"),
+                OsString::from("sandbox_writable"),
+            ),
+            (
+                OsString::from("HCOM_FAKE_CODEX_REPORT"),
+                report.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("HCOM_FAKE_PROTECTED_PATH"),
+                protected_file.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("PYTHONDONTWRITEBYTECODE"),
+                OsString::from("1"),
+            ),
+        ];
+        let mut runtime = CodexAppServerRuntime::launch_sandboxed_fixture(
+            fs::canonicalize(&fixture_program).unwrap(),
+            CodexAppServerSandboxConfig {
+                repository_root: fs::canonicalize(&repository).unwrap(),
+                isolated_home: fs::canonicalize(&home).unwrap(),
+                codex_home: fs::canonicalize(&codex_home).unwrap(),
+                temp_dir: fs::canonicalize(&temp).unwrap(),
+                runtime_dir: fs::canonicalize(&runtime_dir).unwrap(),
+                artifact_dir: fs::canonicalize(&artifacts).unwrap(),
+                hcom_dir: fs::canonicalize(&hcom_dir).unwrap(),
+                xdg_config_home: fs::canonicalize(&xdg_config).unwrap(),
+                xdg_state_home: fs::canonicalize(&xdg_state).unwrap(),
+                xdg_cache_home: fs::canonicalize(&xdg_cache).unwrap(),
+                xdg_data_home: fs::canonicalize(&xdg_data).unwrap(),
+                auth_source: fs::canonicalize(&auth_source).unwrap(),
+                cargo_bin_source: fs::canonicalize(&cargo_bin).unwrap(),
+                rustup_home_source: fs::canonicalize(&rustup_home).unwrap(),
+            },
+            environment,
+        )
+        .unwrap();
+        let session_spec = |role| RoleSessionSpec {
+            role,
+            task_key: "sandbox-task".into(),
+            cwd: fs::canonicalize(&repository).unwrap(),
+            profile: RuntimeProfile::codex_app_server_default(),
+            developer_instructions: "closed role contract".into(),
+        };
+        let developer = runtime
+            .open_session(session_spec(WorkerRole::Developer))
+            .unwrap();
+        let reviewer = runtime
+            .open_session(session_spec(WorkerRole::Reviewer))
+            .unwrap();
+        for (session, role, purpose) in [
+            (
+                developer,
+                WorkerRole::Developer,
+                RuntimeTurnPurpose::InitialDevelopment,
+            ),
+            (
+                reviewer,
+                WorkerRole::Reviewer,
+                RuntimeTurnPurpose::InitialReview,
+            ),
+        ] {
+            let turn = runtime
+                .start_turn(
+                    session,
+                    RuntimeTurnSpec {
+                        role,
+                        task_key: "sandbox-task".into(),
+                        purpose,
+                        cwd: fs::canonicalize(&repository).unwrap(),
+                        prompt: "bounded sandbox probe".into(),
+                        profile: RuntimeProfile::codex_app_server_default(),
+                        outcome_contract: match role {
+                            WorkerRole::Developer => OutcomeContract::DeveloperV1,
+                            WorkerRole::Reviewer => OutcomeContract::ReviewerV1,
+                        },
+                        timeout: Duration::from_secs(5),
+                    },
+                )
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                match runtime.poll_turn(turn).unwrap() {
+                    RuntimeTurnPoll::Pending { .. } if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    RuntimeTurnPoll::Pending { .. } => panic!("sandboxed fixture turn timed out"),
+                    RuntimeTurnPoll::Completed { .. } => break,
+                    RuntimeTurnPoll::Failed { failure, .. } => {
+                        panic!("sandboxed fixture turn failed: {}", failure.detail)
+                    }
+                }
+            }
+        }
+        runtime.shutdown().unwrap();
+        assert_eq!(
+            fs::read_to_string(repository.join("target/sandbox-turn-1")).unwrap(),
+            "writable\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repository.join("target/sandbox-turn-2")).unwrap(),
+            "writable\n"
+        );
+        let report = fs::read_to_string(report).unwrap();
+        let sandbox_records: Vec<Value> = report
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .filter(|record: &Value| record["method"] == "fixture/sandbox")
+            .collect();
+        assert_eq!(sandbox_records.len(), 2);
+        assert!(
+            sandbox_records
+                .iter()
+                .all(|record| record["protectedVisible"] == false)
+        );
+        assert!(
+            sandbox_records
+                .iter()
+                .all(|record| record["stdioIsTty"] == false)
+        );
+        assert!(
+            sandbox_records
+                .iter()
+                .all(|record| record["controllingTty"] == false)
+        );
     }
 
     #[test]

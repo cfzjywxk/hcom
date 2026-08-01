@@ -229,28 +229,44 @@ impl ExecutionEnvironmentLease {
         supervisor_epoch: &str,
         identity: &WorkerEnvironmentIdentity,
     ) -> Result<MaterializedWorkerEnvironment> {
-        self.descriptor.require_supervisor_epoch(supervisor_epoch)?;
         identity.validate()?;
+        self.materialize_with_identity(
+            supervisor_epoch,
+            match identity.role {
+                WorkerRole::Developer => "developer",
+                WorkerRole::Reviewer => "reviewer",
+            },
+            &identity.run_id,
+            &identity.task_id,
+        )
+    }
+
+    pub(crate) fn materialize_task_runtime(
+        &self,
+        supervisor_epoch: &str,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<MaterializedWorkerEnvironment> {
+        validate_opaque_id("worker run id", run_id)?;
+        validate_opaque_id("worker task id", task_id)?;
+        self.materialize_with_identity(supervisor_epoch, "task-runtime", run_id, task_id)
+    }
+
+    fn materialize_with_identity(
+        &self,
+        supervisor_epoch: &str,
+        role: &str,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<MaterializedWorkerEnvironment> {
+        self.descriptor.require_supervisor_epoch(supervisor_epoch)?;
         if environment_hash(&self.values) != self.descriptor.environment_hash {
             bail!("in-memory environment lease no longer matches its descriptor");
         }
         let mut values = self.values.clone();
-        values.insert(
-            OsString::from("HCOM_WORKER_ROLE"),
-            match identity.role {
-                WorkerRole::Developer => "developer",
-                WorkerRole::Reviewer => "reviewer",
-            }
-            .into(),
-        );
-        values.insert(
-            OsString::from("HCOM_RUN_ID"),
-            identity.run_id.clone().into(),
-        );
-        values.insert(
-            OsString::from("HCOM_TASK_ID"),
-            identity.task_id.clone().into(),
-        );
+        values.insert(OsString::from("HCOM_WORKER_ROLE"), role.into());
+        values.insert(OsString::from("HCOM_RUN_ID"), run_id.into());
+        values.insert(OsString::from("HCOM_TASK_ID"), task_id.into());
         Ok(MaterializedWorkerEnvironment { values })
     }
 

@@ -1,5 +1,7 @@
 //! Foreground, in-memory task supervisor for one `hcom arch` invocation.
 
+#[cfg(target_os = "linux")]
+pub(crate) mod app_server;
 pub mod core;
 
 use crate::artifact::{
@@ -174,6 +176,11 @@ impl SessionRuntimeSources {
             host_runtime_dir: path.to_owned(),
             profiles: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_profiles_for_test(&mut self, profiles: SessionInvocationProfiles) {
+        self.profiles = Some(profiles);
     }
 
     fn environment_for(

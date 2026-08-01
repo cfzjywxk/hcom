@@ -16,6 +16,7 @@ use super::registration::{
     NATIVE_SESSION_REFUSAL_VERSION, REGISTRATION_REFUSAL_GENERIC, RegistrationAction,
     RegistrationCaller, RegistrationRequest, RegistrationResponse, validate_request_envelope,
 };
+use crate::orchestrator::app_server::AppServerSessionSupervisor;
 use crate::orchestrator::{SessionRuntimeSources, SessionStartup, SessionSupervisor};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -100,6 +101,27 @@ impl SessionSupervisorEndpoint {
         })
     }
 
+    pub(crate) fn bind_app_server(
+        paths: ControlPaths,
+        run_id: String,
+        project_root: PathBuf,
+        sources: SessionRuntimeSources,
+    ) -> Result<Self> {
+        let control =
+            SessionSupervisorControl::open_app_server(&paths, run_id, project_root, sources)?;
+        let socket_guard = SocketGuard::bind(&paths.socket_path())?;
+        let listener = socket_guard.listener.try_clone()?;
+        let registration_socket_guard = SocketGuard::bind(&paths.registration_socket_path())?;
+        let registration_listener = registration_socket_guard.listener.try_clone()?;
+        Ok(Self {
+            control,
+            listener,
+            _socket_guard: socket_guard,
+            registration_listener,
+            _registration_socket_guard: registration_socket_guard,
+        })
+    }
+
     pub(crate) fn startup(&self) -> &SessionStartup {
         self.control.supervisor.startup()
     }
@@ -164,12 +186,144 @@ impl SessionSupervisorEndpoint {
 }
 
 struct SessionSupervisorControl {
-    supervisor: SessionSupervisor,
+    supervisor: Box<dyn SupervisorBackend>,
     expected_uid: u32,
     parent_pid: u32,
     parent_birth: String,
     bindings: BTreeMap<String, ArchitectBinding>,
     requests: BTreeMap<(String, String), RequestRecord>,
+}
+
+trait SupervisorBackend: Send {
+    fn startup(&self) -> &SessionStartup;
+
+    fn replace_plan(
+        &mut self,
+        expected_session_version: u64,
+        developer_adapter: &str,
+        reviewer_adapter: &str,
+        tasks: Vec<crate::control_api::TaskDraft>,
+    ) -> Result<(u64, String)>;
+
+    fn approve_and_start(
+        &mut self,
+        expected_session_version: u64,
+        plan_version: u64,
+        plan_hash: &str,
+        approval_confirmed: bool,
+    ) -> Result<()>;
+
+    fn cancel(&mut self, expected_session_version: u64, reason: &str) -> Result<()>;
+
+    fn snapshot(&self) -> crate::control_api::SessionStatusSnapshot;
+
+    fn poll_once(&mut self) -> Result<()>;
+
+    fn shutdown(&mut self) -> Result<()>;
+}
+
+impl SupervisorBackend for SessionSupervisor {
+    fn startup(&self) -> &SessionStartup {
+        self.startup()
+    }
+
+    fn replace_plan(
+        &mut self,
+        expected_session_version: u64,
+        developer_adapter: &str,
+        reviewer_adapter: &str,
+        tasks: Vec<crate::control_api::TaskDraft>,
+    ) -> Result<(u64, String)> {
+        self.replace_plan(
+            expected_session_version,
+            developer_adapter,
+            reviewer_adapter,
+            tasks,
+        )
+    }
+
+    fn approve_and_start(
+        &mut self,
+        expected_session_version: u64,
+        plan_version: u64,
+        plan_hash: &str,
+        approval_confirmed: bool,
+    ) -> Result<()> {
+        self.approve_and_start(
+            expected_session_version,
+            plan_version,
+            plan_hash,
+            approval_confirmed,
+        )
+    }
+
+    fn cancel(&mut self, expected_session_version: u64, reason: &str) -> Result<()> {
+        self.cancel(expected_session_version, reason)
+    }
+
+    fn snapshot(&self) -> crate::control_api::SessionStatusSnapshot {
+        self.snapshot()
+    }
+
+    fn poll_once(&mut self) -> Result<()> {
+        self.poll_once()
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        self.shutdown()
+    }
+}
+
+impl SupervisorBackend for AppServerSessionSupervisor {
+    fn startup(&self) -> &SessionStartup {
+        self.startup()
+    }
+
+    fn replace_plan(
+        &mut self,
+        expected_session_version: u64,
+        developer_adapter: &str,
+        reviewer_adapter: &str,
+        tasks: Vec<crate::control_api::TaskDraft>,
+    ) -> Result<(u64, String)> {
+        self.replace_plan(
+            expected_session_version,
+            developer_adapter,
+            reviewer_adapter,
+            tasks,
+        )
+    }
+
+    fn approve_and_start(
+        &mut self,
+        expected_session_version: u64,
+        plan_version: u64,
+        plan_hash: &str,
+        approval_confirmed: bool,
+    ) -> Result<()> {
+        self.approve_and_start(
+            expected_session_version,
+            plan_version,
+            plan_hash,
+            approval_confirmed,
+        )
+    }
+
+    fn cancel(&mut self, expected_session_version: u64, reason: &str) -> Result<()> {
+        self.cancel(expected_session_version, reason)
+    }
+
+    fn snapshot(&self) -> crate::control_api::SessionStatusSnapshot {
+        self.snapshot()
+    }
+
+    fn poll_once(&mut self) -> Result<()> {
+        self.poll_once()
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        self.shutdown()
+    }
 }
 
 struct RequestRecord {
@@ -222,7 +376,34 @@ impl SessionSupervisorControl {
             sources,
         )?;
         Ok(Self {
-            supervisor,
+            supervisor: Box::new(supervisor),
+            expected_uid,
+            parent_pid,
+            parent_birth,
+            bindings: BTreeMap::new(),
+            requests: BTreeMap::new(),
+        })
+    }
+
+    fn open_app_server(
+        paths: &ControlPaths,
+        run_id: String,
+        project_root: PathBuf,
+        sources: SessionRuntimeSources,
+    ) -> Result<Self> {
+        // SAFETY: geteuid has no preconditions.
+        let expected_uid = unsafe { libc::geteuid() };
+        let parent_pid = std::process::id();
+        let parent_birth = process_birth_identity(parent_pid)?;
+        let supervisor = AppServerSessionSupervisor::open(
+            run_id,
+            project_root,
+            paths.run_root().to_owned(),
+            paths.lock_root().to_owned(),
+            sources,
+        )?;
+        Ok(Self {
+            supervisor: Box::new(supervisor),
             expected_uid,
             parent_pid,
             parent_birth,
@@ -886,6 +1067,7 @@ fn constant_time_equal(left: &str, right: &str) -> bool {
 mod tests {
     use super::*;
     use crate::control_api::protocol::PROTOCOL_VERSION;
+    use crate::worker::profile::{ArchitectAdapter, SessionInvocationProfiles};
     use std::collections::BTreeSet;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
@@ -982,6 +1164,31 @@ mod tests {
                     || name.contains("project")
                     || name.contains("recovery")
             }));
+        }
+        assert!(!control_socket.exists());
+        assert!(!registration_socket.exists());
+    }
+
+    #[test]
+    fn app_server_backend_uses_the_same_private_control_endpoint_contract() {
+        let mut fixture = Fixture::new();
+        fixture.sources.set_profiles_for_test(
+            SessionInvocationProfiles::for_codex_app_server_lane(ArchitectAdapter::Codex).unwrap(),
+        );
+        let control_socket = fixture.paths.socket_path();
+        let registration_socket = fixture.paths.registration_socket_path();
+        {
+            let endpoint = SessionSupervisorEndpoint::bind_app_server(
+                fixture.paths.clone(),
+                "run-app-server-endpoint".into(),
+                fixture.repository.clone(),
+                fixture.sources.clone(),
+            )
+            .unwrap();
+            assert_eq!(endpoint.startup().run_id, "run-app-server-endpoint");
+            assert_eq!(endpoint.startup().project_root, fixture.repository);
+            assert!(control_socket.exists());
+            assert!(registration_socket.exists());
         }
         assert!(!control_socket.exists());
         assert!(!registration_socket.exists());
