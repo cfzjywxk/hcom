@@ -1826,14 +1826,6 @@ impl FileIdentity {
     }
 }
 
-pub(crate) fn claude_auth_redaction_values(path: &Path) -> Result<Vec<String>> {
-    let bytes = read_private_json_file(path, "Claude auth source")?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
-    let mut values = BTreeMap::<String, ()>::new();
-    collect_secret_values(&value, false, &mut values)?;
-    Ok(values.into_keys().collect())
-}
-
 pub(crate) fn validate_claude_auth_readiness(path: &Path, now: SystemTime) -> Result<()> {
     let bytes = read_private_json_file(path, "Claude auth source")?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)?;
@@ -1870,47 +1862,6 @@ pub(crate) fn validate_claude_auth_readiness(path: &Path, now: SystemTime) -> Re
     }
     if refresh_expires_at <= expires_at {
         bail!("Claude refresh token does not outlive the access token");
-    }
-    Ok(())
-}
-
-fn collect_secret_values(
-    value: &serde_json::Value,
-    secret_context: bool,
-    values: &mut BTreeMap<String, ()>,
-) -> Result<()> {
-    match value {
-        serde_json::Value::Object(object) => {
-            for (key, value) in object {
-                let normalized: String = key
-                    .chars()
-                    .filter(char::is_ascii_alphanumeric)
-                    .flat_map(char::to_lowercase)
-                    .collect();
-                let secret = secret_context
-                    || normalized.contains("token")
-                    || normalized.contains("secret")
-                    || normalized.contains("apikey")
-                    || normalized.contains("credential")
-                    || normalized.contains("authorization");
-                collect_secret_values(value, secret, values)?;
-            }
-        }
-        serde_json::Value::Array(array) => {
-            for value in array {
-                collect_secret_values(value, secret_context, values)?;
-            }
-        }
-        serde_json::Value::String(value) if secret_context && value.len() >= 8 => {
-            if value.len() > 16 * 1024 || value.chars().any(char::is_control) {
-                bail!("Claude auth secret has an unsafe bounded shape");
-            }
-            values.insert(value.clone(), ());
-            if values.len() > 64 {
-                bail!("Claude auth secret inventory exceeds its bound");
-            }
-        }
-        _ => {}
     }
     Ok(())
 }
@@ -3988,62 +3939,6 @@ mod tests {
         assert!(validate_claude_auth_readiness(&auth, now).is_err());
         fs::set_permissions(&auth, fs::Permissions::from_mode(0o640)).unwrap();
         assert!(validate_claude_auth_readiness(&auth, now).is_err());
-    }
-
-    #[test]
-    fn claude_auth_stays_a_read_only_overlay_and_joins_artifact_redaction() {
-        let fixture = Fixture::new();
-        let adapter = fixture.claude_adapter();
-        let control = fixture.control(
-            "task-auth-overlay",
-            "logical-auth-overlay",
-            Some(CLAUDE_SESSION),
-            1,
-            1,
-            &fixture.first_head,
-        );
-        let prepared = prepare_create_turn(
-            &adapter,
-            &adapter.profile(),
-            &control,
-            b"verify read-only auth overlay".to_vec(),
-        )
-        .unwrap();
-        let argv = prepared
-            .command()
-            .outer_launch
-            .as_ref()
-            .unwrap()
-            .fixed_argv
-            .as_slice();
-        let auth_target = fixture.claude_config_dir.join(CLAUDE_AUTH_FILE);
-        assert!(argv.windows(3).any(|part| {
-            part == [
-                "--ro-bind",
-                fixture.claude_auth_source.to_str().unwrap(),
-                auth_target.to_str().unwrap(),
-            ]
-        }));
-        assert!(!argv.windows(3).any(|part| {
-            part[0] == "--bind" && part[1] == fixture.claude_auth_source.to_str().unwrap()
-        }));
-
-        let values = claude_auth_redaction_values(&fixture.claude_auth_source).unwrap();
-        assert_eq!(
-            values,
-            vec![
-                "fixture-access-v1".to_owned(),
-                "fixture-refresh-v1".to_owned()
-            ]
-        );
-        let redactor = fixture
-            .claude_lease("lease-auth-redaction")
-            .with_secret_redaction_values(values)
-            .unwrap()
-            .redactor();
-        let sanitized = redactor.redact("fixture-access-v1 fixture-refresh-v1");
-        assert!(!sanitized.contains("fixture-access-v1"));
-        assert!(!sanitized.contains("fixture-refresh-v1"));
     }
 
     fn assert_closed_codex_argv(argv: &[String], fixture: &Fixture, prompt: &[u8]) {

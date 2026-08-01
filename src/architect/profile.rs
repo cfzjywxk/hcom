@@ -25,13 +25,6 @@ struct ArchitectToml {
     reviewer: Option<ReviewerInvocationProfile>,
 }
 
-pub(super) fn load_invocation_profiles(
-    path: &Path,
-    architect_adapter: ArchitectAdapter,
-) -> Result<LoadedInvocationProfiles> {
-    load_invocation_profiles_with_defaults(path, architect_adapter, false)
-}
-
 /// Resolver for the production Codex App Server task-runtime lane.
 pub(super) fn load_codex_app_server_profiles(
     path: &Path,
@@ -160,10 +153,7 @@ fn load_invocation_profiles_with_defaults(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::profile::{
-        CLAUDE_DEVELOPER_ADAPTER, CLAUDE_REVIEWER_ADAPTER, CODEX_DEVELOPER_ADAPTER,
-        CODEX_REVIEWER_ADAPTER, CodexSandbox,
-    };
+    use crate::worker::profile::{CODEX_DEVELOPER_ADAPTER, CODEX_REVIEWER_ADAPTER, CodexSandbox};
     use std::os::unix::fs::PermissionsExt;
 
     fn write_config(contents: &str) -> (tempfile::TempDir, PathBuf) {
@@ -177,80 +167,46 @@ mod tests {
     #[test]
     fn missing_file_uses_reviewed_defaults() {
         let temp = tempfile::tempdir().unwrap();
-        let loaded =
-            load_invocation_profiles(&temp.path().join("missing.toml"), ArchitectAdapter::Codex)
-                .unwrap();
+        let loaded = load_codex_app_server_profiles(
+            &temp.path().join("missing.toml"),
+            ArchitectAdapter::Codex,
+        )
+        .unwrap();
         assert!(!loaded.loaded_from_file);
         assert_eq!(
             loaded.profiles.architect.codex().unwrap().sandbox,
             CodexSandbox::DangerFullAccess
         );
+        // Workers are Codex-only in this lane, for both roles.
+        assert_eq!(
+            loaded.profiles.developer_adapter_name(),
+            CODEX_DEVELOPER_ADAPTER
+        );
         assert_eq!(
             loaded.profiles.reviewer_adapter_name(),
-            CLAUDE_REVIEWER_ADAPTER
+            CODEX_REVIEWER_ADAPTER
         );
-        let reviewer = loaded.profiles.reviewer.claude().unwrap();
-        assert_eq!(reviewer.model, "opus");
-        assert_eq!(reviewer.effort, "xhigh");
-        assert!(reviewer.dangerously_skip_permissions);
     }
 
     #[test]
-    fn missing_file_uses_claude_opus_xhigh_for_architect_and_reviewer() {
+    fn claude_architect_keeps_its_adapter_but_gets_codex_workers() {
         let temp = tempfile::tempdir().unwrap();
-        let loaded =
-            load_invocation_profiles(&temp.path().join("missing.toml"), ArchitectAdapter::Claude)
-                .unwrap();
+        let loaded = load_codex_app_server_profiles(
+            &temp.path().join("missing.toml"),
+            ArchitectAdapter::Claude,
+        )
+        .unwrap();
         let architect = loaded.profiles.architect.claude().unwrap();
-        let reviewer = loaded.profiles.reviewer.claude().unwrap();
         assert_eq!(architect.model, "opus");
         assert_eq!(architect.effort, "xhigh");
         assert_eq!(
+            loaded.profiles.developer_adapter_name(),
+            CODEX_DEVELOPER_ADAPTER
+        );
+        assert_eq!(
             loaded.profiles.reviewer_adapter_name(),
-            CLAUDE_REVIEWER_ADAPTER
+            CODEX_REVIEWER_ADAPTER
         );
-        assert_eq!(reviewer.model, "opus");
-        assert_eq!(reviewer.effort, "xhigh");
-        assert!(reviewer.dangerously_skip_permissions);
-    }
-
-    #[test]
-    fn existing_config_without_reviewer_uses_claude_opus_xhigh_for_both_architects() {
-        let (_temp, path) = write_config(
-            r#"
-[terminal]
-active = "default"
-"#,
-        );
-        for adapter in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
-            let loaded = load_invocation_profiles(&path, adapter).unwrap();
-            assert!(loaded.loaded_from_file);
-            let reviewer = loaded.profiles.reviewer.claude().unwrap();
-            assert_eq!(reviewer.model, "opus");
-            assert_eq!(reviewer.effort, "xhigh");
-            assert!(reviewer.dangerously_skip_permissions);
-        }
-    }
-
-    #[test]
-    fn codex_architect_toml_override_does_not_change_the_implicit_reviewer() {
-        let (_temp, path) = write_config(
-            r#"
-[architect.profile]
-model = "gpt-5.6-sol-configured"
-reasoning_effort = "max"
-sandbox = "danger-full-access"
-ask_for_approval = "never"
-"#,
-        );
-        let loaded = load_invocation_profiles(&path, ArchitectAdapter::Codex).unwrap();
-        let architect = loaded.profiles.architect.codex().unwrap();
-        let reviewer = loaded.profiles.reviewer.claude().unwrap();
-        assert_eq!(architect.model, "gpt-5.6-sol-configured");
-        assert_eq!(architect.reasoning_effort, "max");
-        assert_eq!(reviewer.model, "opus");
-        assert_eq!(reviewer.effort, "xhigh");
-        assert!(reviewer.dangerously_skip_permissions);
     }
 
     #[test]
@@ -362,82 +318,6 @@ model = "partial"
             "invalid [architect] profile configuration"
         );
     }
-
-    #[test]
-    fn existing_hcom_toml_can_select_all_three_typed_profiles() {
-        let (_temp, path) = write_config(
-            r#"
-[terminal]
-active = "default"
-
-[architect.profile]
-model = "gpt-5.6-sol"
-reasoning_effort = "max"
-sandbox = "danger-full-access"
-ask_for_approval = "never"
-
-[architect.developer]
-adapter = "codex"
-model = "gpt-5.6-sol"
-reasoning_effort = "max"
-sandbox = "danger-full-access"
-ask_for_approval = "never"
-
-[architect.reviewer]
-adapter = "claude"
-model = "opus"
-effort = "xhigh"
-dangerously_skip_permissions = true
-"#,
-        );
-        let loaded = load_invocation_profiles(&path, ArchitectAdapter::Codex).unwrap();
-        assert!(loaded.loaded_from_file);
-        assert_eq!(
-            loaded.profiles.architect.codex().unwrap().reasoning_effort,
-            "max"
-        );
-        assert_eq!(
-            loaded.profiles.developer.codex().unwrap().reasoning_effort,
-            "max"
-        );
-        let reviewer = loaded.profiles.reviewer.claude().unwrap();
-        assert_eq!(reviewer.model, "opus");
-        assert_eq!(reviewer.effort, "xhigh");
-        assert!(reviewer.dangerously_skip_permissions);
-    }
-
-    #[test]
-    fn config_can_select_claude_developer_independently_of_reviewer() {
-        let (_temp, path) = write_config(
-            r#"
-[architect.developer]
-adapter = "claude"
-model = "opus"
-effort = "xhigh"
-dangerously_skip_permissions = true
-
-[architect.reviewer]
-adapter = "codex"
-model = "gpt-5.6-sol"
-reasoning_effort = "xhigh"
-sandbox = "danger-full-access"
-ask_for_approval = "never"
-"#,
-        );
-        let loaded = load_invocation_profiles(&path, ArchitectAdapter::Codex).unwrap();
-        assert_eq!(
-            loaded.profiles.developer_adapter_name(),
-            CLAUDE_DEVELOPER_ADAPTER
-        );
-        assert_eq!(
-            loaded.profiles.reviewer_adapter_name(),
-            CODEX_REVIEWER_ADAPTER
-        );
-        let developer = loaded.profiles.developer.claude().unwrap();
-        assert_eq!(developer.model, "opus");
-        assert_eq!(developer.effort, "xhigh");
-    }
-
     #[test]
     fn config_can_select_codex_for_both_roles() {
         let (_temp, path) = write_config(
@@ -458,7 +338,7 @@ ask_for_approval = "never"
 "#,
         );
         for architect_adapter in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
-            let loaded = load_invocation_profiles(&path, architect_adapter).unwrap();
+            let loaded = load_codex_app_server_profiles(&path, architect_adapter).unwrap();
             assert_eq!(
                 loaded.profiles.developer_adapter_name(),
                 CODEX_DEVELOPER_ADAPTER
@@ -469,37 +349,6 @@ ask_for_approval = "never"
             );
         }
     }
-
-    #[test]
-    fn config_can_select_claude_for_both_roles() {
-        let (_temp, path) = write_config(
-            r#"
-[architect.developer]
-adapter = "claude"
-model = "opus"
-effort = "xhigh"
-dangerously_skip_permissions = true
-
-[architect.reviewer]
-adapter = "claude"
-model = "opus"
-effort = "xhigh"
-dangerously_skip_permissions = true
-"#,
-        );
-        for architect_adapter in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
-            let loaded = load_invocation_profiles(&path, architect_adapter).unwrap();
-            assert_eq!(
-                loaded.profiles.developer_adapter_name(),
-                CLAUDE_DEVELOPER_ADAPTER
-            );
-            assert_eq!(
-                loaded.profiles.reviewer_adapter_name(),
-                CLAUDE_REVIEWER_ADAPTER
-            );
-        }
-    }
-
     #[test]
     fn config_can_select_the_closed_codex_reviewer_profile() {
         let (_temp, path) = write_config(
@@ -513,7 +362,7 @@ ask_for_approval = "never"
 "#,
         );
         for architect_adapter in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
-            let loaded = load_invocation_profiles(&path, architect_adapter).unwrap();
+            let loaded = load_codex_app_server_profiles(&path, architect_adapter).unwrap();
             assert_eq!(
                 loaded.profiles.reviewer_adapter_name(),
                 CODEX_REVIEWER_ADAPTER
@@ -537,7 +386,7 @@ ask_for_approval = "never"
 args = ["--resume", "foreign-session"]
 "#,
         );
-        assert!(load_invocation_profiles(&path, ArchitectAdapter::Codex).is_err());
+        assert!(load_codex_app_server_profiles(&path, ArchitectAdapter::Codex).is_err());
 
         fs::write(
             &path,
@@ -547,7 +396,7 @@ unknown = true
 "#,
         )
         .unwrap();
-        assert!(load_invocation_profiles(&path, ArchitectAdapter::Codex).is_err());
+        assert!(load_codex_app_server_profiles(&path, ArchitectAdapter::Codex).is_err());
 
         fs::write(
             &path,
@@ -561,30 +410,9 @@ args = ["--resume", "foreign-session"]
 "#,
         )
         .unwrap();
-        assert!(load_invocation_profiles(&path, ArchitectAdapter::Codex).is_err());
+        assert!(load_codex_app_server_profiles(&path, ArchitectAdapter::Codex).is_err());
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o622)).unwrap();
-        assert!(load_invocation_profiles(&path, ArchitectAdapter::Codex).is_err());
-    }
-
-    #[test]
-    fn claude_profile_is_typed_by_the_selected_architect_adapter() {
-        let (_temp, path) = write_config(
-            r#"
-[architect.profile]
-model = "sonnet"
-effort = "max"
-dangerously_skip_permissions = false
-"#,
-        );
-        let loaded = load_invocation_profiles(&path, ArchitectAdapter::Claude).unwrap();
-        let architect = loaded.profiles.architect.claude().unwrap();
-        let reviewer = loaded.profiles.reviewer.claude().unwrap();
-        assert_eq!(architect.model, "sonnet");
-        assert_eq!(architect.effort, "max");
-        assert!(!architect.dangerously_skip_permissions);
-        assert_eq!(reviewer.model, "opus");
-        assert_eq!(reviewer.effort, "xhigh");
-        assert!(reviewer.dangerously_skip_permissions);
+        assert!(load_codex_app_server_profiles(&path, ArchitectAdapter::Codex).is_err());
     }
 }

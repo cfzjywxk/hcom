@@ -4,10 +4,6 @@ pub(crate) mod validation;
 
 #[cfg(target_os = "linux")]
 pub mod codex;
-#[cfg(target_os = "linux")]
-pub mod codex_app_server;
-#[cfg(target_os = "linux")]
-pub(crate) mod codex_rpc;
 pub mod contract;
 pub mod environment;
 #[cfg(target_os = "linux")]

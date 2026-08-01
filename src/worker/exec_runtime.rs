@@ -10,7 +10,6 @@
 //! redacted evidence artifacts without interpretation.
 
 use super::codex::{BWRAP_EXECUTABLE, DISABLED_CODEX_FEATURES};
-use super::codex_app_server::CODEX_APP_SERVER_EXECUTABLE;
 use super::environment::{ExecutionEnvironmentLease, SecretRedactor};
 use super::process::{ProcessGroupBinding, configure_worker_child};
 use super::profile::validate_cli_help_contract;
@@ -38,6 +37,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::JoinHandle;
 use std::time::Instant;
+
+/// Pinned Codex 0.146 standalone build: the only executable this lane runs.
+pub const CODEX_EXECUTABLE: &str =
+    "/home/ywxk/.codex/packages/standalone/releases/0.146.0-x86_64-unknown-linux-musl/bin/codex";
 
 pub const CODEX_EXEC_ADAPTER: &str = "codex-exec-0.146.0";
 pub const CODEX_EXEC_VERSION: &str = "0.146.0";
@@ -116,7 +119,7 @@ pub struct ExecPreflight {
 
 impl ExecPreflight {
     pub fn verify_pinned() -> Result<Self, RuntimeError> {
-        let codex = PathBuf::from(CODEX_APP_SERVER_EXECUTABLE);
+        let codex = PathBuf::from(CODEX_EXECUTABLE);
         let digest = sha256_file(&codex)
             .map_err(|error| RuntimeError::invalid_contract(single_line(&error.to_string())))?;
         if digest != CODEX_APP_SERVER_EXECUTABLE_SHA256 {
