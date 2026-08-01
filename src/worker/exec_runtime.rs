@@ -179,7 +179,11 @@ pub fn codex_exec_contract_identity() -> RuntimeContractIdentity {
 
 struct ExecSession {
     role: WorkerRole,
+    /// Native working root: the Architect's project directory.
     cwd: PathBuf,
+    /// The task's repository. Equal to `cwd` when the project itself is the
+    /// repository; otherwise an extra scope the worker must still reach.
+    task_repository: PathBuf,
     instructions: String,
     label: String,
     thread_id: Option<String>,
@@ -196,9 +200,15 @@ struct ExecTurn {
     state: TurnState,
 }
 
+/// Bytes seen, the tail kept for diagnostics, and any evidence I/O failure.
+type StderrDrained = (u64, Vec<u8>, Option<String>);
+
 struct StdoutDrained {
     thread_id: Option<String>,
     bytes: u64,
+    /// Set when the pipe read or the artifact write failed. Losing evidence
+    /// must stop the run instead of silently routing an incomplete record.
+    io_error: Option<String>,
 }
 
 struct RunningTurn {
@@ -212,7 +222,7 @@ struct RunningTurn {
     redactor: SecretRedactor,
     expected_thread: Option<String>,
     stdout_thread: Option<JoinHandle<StdoutDrained>>,
-    stderr_thread: Option<JoinHandle<(u64, Vec<u8>)>>,
+    stderr_thread: Option<JoinHandle<StderrDrained>>,
     stdin_thread: Option<JoinHandle<()>>,
     clarification_used: bool,
     /// The pre-clarification final message, carried forward so the relayed
@@ -276,6 +286,12 @@ impl ExecTaskWorkerRuntime {
             profile.sandbox.as_str().into(),
             "--skip-git-repo-check".into(),
         ];
+        // The developer writes in the task repository; when that is not the
+        // project directory it needs an explicit extra writable scope.
+        if session.role == WorkerRole::Developer && session.task_repository != session.cwd {
+            argv.push("--add-dir".into());
+            argv.push(session.task_repository.as_os_str().to_owned());
+        }
         if let Some(thread) = resume_thread {
             argv.push("resume".into());
             argv.push(thread.into());
@@ -331,17 +347,28 @@ impl ExecTaskWorkerRuntime {
             .ok_or_else(|| anyhow!("bwrap configured without a host root contract"))?;
         contract.revalidate()?;
         let auth_target = self.config.paths.codex_home.join("auth.json");
-        let repo: &Path = &self.config.repository_root;
-        let writable_roots: Vec<&Path> = if session.role == WorkerRole::Developer {
-            vec![repo]
-        } else {
-            Vec::new()
-        };
-        let readable_roots: Vec<&Path> = if session.role == WorkerRole::Developer {
-            Vec::new()
-        } else {
-            vec![repo]
-        };
+        let repo: &Path = &session.task_repository;
+        let project: &Path = &session.cwd;
+        let repo_is_project = repo == project;
+        let (writable_roots, readable_roots): (Vec<&Path>, Vec<&Path>) =
+            if session.role == WorkerRole::Developer {
+                // Developer writes the repository; the project is readable so
+                // task notes and plans stay reachable.
+                let readable = if repo_is_project {
+                    Vec::new()
+                } else {
+                    vec![project]
+                };
+                (vec![repo], readable)
+            } else {
+                // Reviewer reads both and writes neither.
+                let readable = if repo_is_project {
+                    vec![repo]
+                } else {
+                    vec![repo, project]
+                };
+                (Vec::new(), readable)
+            };
         let extra: Vec<&Path> = vec![&self.config.paths.temp, &self.config.paths.runtime];
         let outer_argv = contract.host_root_argv(HostRootMounts {
             isolated_home: &self.config.paths.home,
@@ -404,8 +431,12 @@ impl ExecTaskWorkerRuntime {
             redaction_seed.as_bytes(),
         )
         .map_err(|error| RuntimeError::internal(single_line(&error.to_string())))?;
-        attempt
-            .write_control_file("prompt.md", full_prompt.as_bytes())
+        let mut prompt_writer = attempt
+            .start_native_stream(ArtifactKind::NativePrompt, NATIVE_STREAM_CAP)
+            .map_err(|error| RuntimeError::internal(single_line(&error.to_string())))?;
+        prompt_writer
+            .write_chunk(full_prompt.as_bytes())
+            .and_then(|_| prompt_writer.finish())
             .map_err(|error| RuntimeError::internal(single_line(&error.to_string())))?;
         let redactor = self.config.lease.redactor().with_value(redaction_seed);
 
@@ -502,6 +533,9 @@ impl ExecTaskWorkerRuntime {
         status: ExitStatus,
         mut running: Box<RunningTurn>,
     ) -> Result<RuntimeTurnPoll, RuntimeError> {
+        // The leader exited; any descendant still holding the pipes must go
+        // first, or the drain joins below never return.
+        let settled = running.group.settle_after_exit(CANCEL_GRACE);
         if let Some(handle) = running.stdin_thread.take() {
             let _ = handle.join();
         }
@@ -512,17 +546,19 @@ impl ExecTaskWorkerRuntime {
                 handle.join().unwrap_or(StdoutDrained {
                     thread_id: None,
                     bytes: 0,
+                    io_error: Some("stdout drain thread panicked".into()),
                 })
             })
             .unwrap_or(StdoutDrained {
                 thread_id: None,
                 bytes: 0,
+                io_error: None,
             });
-        let (stderr_bytes, stderr_tail) = running
+        let (stderr_bytes, stderr_tail, stderr_io_error) = running
             .stderr_thread
             .take()
-            .map(|handle| handle.join().unwrap_or((0, Vec::new())))
-            .unwrap_or((0, Vec::new()));
+            .map(|handle| handle.join().unwrap_or((0, Vec::new(), None)))
+            .unwrap_or((0, Vec::new(), None));
         let telemetry = RuntimeTelemetry {
             protocol_bytes: stdout.bytes,
             stderr_bytes,
@@ -531,7 +567,11 @@ impl ExecTaskWorkerRuntime {
 
         // Ingest the raw final message: pin identity, bound the read, seal a
         // redacted copy into the durable artifacts, and remove the raw file.
-        let raw = ingest_raw_final(&running.raw_final, running.raw_final_identity);
+        let raw = ingest_raw_final(
+            &running.raw_final,
+            running.raw_final_identity,
+            running.redactor.trailing_guard_bytes(),
+        );
         let sealed = match &raw {
             Ok(Some(bytes)) => {
                 let mut writer = running
@@ -558,10 +598,30 @@ impl ExecTaskWorkerRuntime {
         // Routing preconditions: exit 0 AND session proof AND non-empty final
         // message. Anything else is a process-level failure; artifacts stay as
         // evidence but never route.
+        if let Some(error) = stdout.io_error.clone().or(stderr_io_error) {
+            return fail(RuntimeFailureClass::Process, single_line(&error), telemetry);
+        }
         if !status.success() {
             let detail = exit_failure_detail(status, &stderr_tail, &running.redactor);
             let class = RuntimeFailureClass::Process;
             return fail(class, detail, telemetry);
+        }
+        match settled {
+            Ok(false) => {}
+            Ok(true) => {
+                return fail(
+                    RuntimeFailureClass::Process,
+                    "codex exec left background descendants that had to be killed".into(),
+                    telemetry,
+                );
+            }
+            Err(error) => {
+                return fail(
+                    RuntimeFailureClass::Process,
+                    single_line(&format!("worker descendants could not be settled: {error}")),
+                    telemetry,
+                );
+            }
         }
         let Some(thread_id) = stdout.thread_id else {
             return fail(
@@ -692,6 +752,25 @@ fn fail(
     })
 }
 
+impl Drop for RunningTurn {
+    /// Backstop for every path that drops a live turn without finalizing it
+    /// (an error return, a panic, or a supervisor teardown): the process group
+    /// dies with the run rather than becoming an orphan.
+    fn drop(&mut self) {
+        let _ = self.group.terminate_and_reap(&mut self.child, CANCEL_GRACE);
+        if let Some(handle) = self.stdin_thread.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.stdout_thread.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.stderr_thread.take() {
+            let _ = handle.join();
+        }
+        let _ = fs::remove_file(&self.raw_final);
+    }
+}
+
 impl TaskWorkerRuntime for ExecTaskWorkerRuntime {
     fn contract(&self) -> &RuntimeContractIdentity {
         &self.contract
@@ -709,6 +788,7 @@ impl TaskWorkerRuntime for ExecTaskWorkerRuntime {
             ExecSession {
                 role: spec.role,
                 cwd: spec.cwd,
+                task_repository: spec.task_repository,
                 instructions: spec.developer_instructions,
                 label: format!("session-{}", self.next_session),
                 thread_id: None,
@@ -907,16 +987,23 @@ fn drain_stdout(
     let mut thread_id: Option<String> = None;
     let mut saw_newline = false;
     let mut total: u64 = 0;
+    let mut io_error: Option<String> = None;
     let mut buffer = vec![0_u8; PIPE_CHUNK];
     loop {
         let read = match pipe.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => read,
-            Err(_) => break,
+            Err(error) => {
+                io_error = Some(format!("stdout read failed: {error}"));
+                break;
+            }
         };
         let chunk = &buffer[..read];
         total += read as u64;
-        let _ = writer.write_chunk(chunk);
+        if let Err(error) = writer.write_chunk(chunk) {
+            io_error = Some(format!("stdout evidence write failed: {error}"));
+            break;
+        }
         if !saw_newline {
             for (index, byte) in chunk.iter().enumerate() {
                 if *byte == b'\n' {
@@ -934,37 +1021,49 @@ fn drain_stdout(
     if !saw_newline && thread_id.is_none() {
         thread_id = parse_thread_started(&first_line);
     }
-    let _ = writer.finish();
+    if let Err(error) = writer.finish() {
+        io_error.get_or_insert(format!("stdout evidence seal failed: {error}"));
+    }
     StdoutDrained {
         thread_id,
         bytes: total,
+        io_error,
     }
 }
 
 fn drain_stderr(
     mut pipe: impl Read,
     mut writer: crate::artifact::BoundedArtifactWriter,
-) -> (u64, Vec<u8>) {
+) -> StderrDrained {
     let mut total: u64 = 0;
     let mut tail: Vec<u8> = Vec::new();
+    let mut io_error: Option<String> = None;
     let mut buffer = vec![0_u8; PIPE_CHUNK];
     loop {
         let read = match pipe.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => read,
-            Err(_) => break,
+            Err(error) => {
+                io_error = Some(format!("stderr read failed: {error}"));
+                break;
+            }
         };
         let chunk = &buffer[..read];
         total += read as u64;
-        let _ = writer.write_chunk(chunk);
+        if let Err(error) = writer.write_chunk(chunk) {
+            io_error = Some(format!("stderr evidence write failed: {error}"));
+            break;
+        }
         tail.extend_from_slice(chunk);
         if tail.len() > STDERR_TAIL_BYTES {
             let cut = tail.len() - STDERR_TAIL_BYTES;
             tail.drain(..cut);
         }
     }
-    let _ = writer.finish();
-    (total, tail)
+    if let Err(error) = writer.finish() {
+        io_error.get_or_insert(format!("stderr evidence seal failed: {error}"));
+    }
+    (total, tail, io_error)
 }
 
 /// Parse exactly one documented event: `{"type":"thread.started","thread_id":...}`.
@@ -982,7 +1081,12 @@ fn parse_thread_started(line: &[u8]) -> Option<String> {
 
 /// Bounded raw-final ingestion with identity pinning: the pre-created target
 /// must still be the same inode and a regular file.
-fn ingest_raw_final(path: &Path, expected: (u64, u64)) -> Result<Option<Vec<u8>>> {
+/// Read the CLI's final-message file, then delete it.
+///
+/// A truncated read must drop `guard` trailing bytes: a credential straddling
+/// the cut would otherwise survive as a plaintext prefix that the redactor can
+/// no longer recognize.
+fn ingest_raw_final(path: &Path, expected: (u64, u64), guard: usize) -> Result<Option<Vec<u8>>> {
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -1003,7 +1107,8 @@ fn ingest_raw_final(path: &Path, expected: (u64, u64)) -> Result<Option<Vec<u8>>
     let mut bounded = file.take(RAW_FINAL_READ_CAP as u64 + 1);
     bounded.read_to_end(&mut bytes)?;
     if bytes.len() > RAW_FINAL_READ_CAP {
-        bytes.truncate(RAW_FINAL_READ_CAP);
+        bytes.truncate(RAW_FINAL_READ_CAP.saturating_sub(guard));
+        bytes.extend_from_slice(b"\n[hcom: truncated at the ingestion bound]\n");
     }
     let _ = fs::remove_file(path);
     if bytes.is_empty() {
@@ -1172,6 +1277,7 @@ for a in "$@"; do
   prev="$a"
 done
 { echo ===INVOCATION===; printf '%s\n' "$@"; } >> "$CAPTURE/args.log"
+pwd >> "$CAPTURE/cwd.log"
 cat >> "$CAPTURE/stdin.log"
 echo ===STDIN-END=== >> "$CAPTURE/stdin.log"
 "#;
@@ -1236,12 +1342,22 @@ echo ===STDIN-END=== >> "$CAPTURE/stdin.log"
     }
 
     fn session(fixture: &mut Fixture, role: WorkerRole) -> RuntimeSessionKey {
+        let project = fixture.repo.clone();
+        session_with_repository(fixture, role, project)
+    }
+
+    fn session_with_repository(
+        fixture: &mut Fixture,
+        role: WorkerRole,
+        task_repository: PathBuf,
+    ) -> RuntimeSessionKey {
         fixture
             .runtime
             .open_session(RoleSessionSpec {
                 role,
                 task_key: "task-1".into(),
                 cwd: fixture.repo.clone(),
+                task_repository,
                 profile: RuntimeProfile::codex_exec_default(),
                 developer_instructions: "You are the worker.".into(),
             })
@@ -1259,6 +1375,7 @@ echo ===STDIN-END=== >> "$CAPTURE/stdin.log"
             task_key: "task-1".into(),
             purpose,
             cwd: repo.to_path_buf(),
+            task_repository: repo.to_path_buf(),
             prompt: "do the task".into(),
             profile: RuntimeProfile::codex_exec_default(),
             outcome_contract: match role {
@@ -1471,6 +1588,17 @@ printf 'turn done' > "$OUT"
         // Second turn skips the instructions preamble.
         let stdin = fs::read_to_string(fixture.capture.join("stdin.log")).unwrap();
         assert_eq!(stdin.matches("You are the worker.").count(), 1);
+        // A resume carries no --cd, so Codex takes the *process* working
+        // directory. Both invocations must therefore be launched from the
+        // project directory, or the resumed turn would silently work
+        // somewhere else.
+        let cwds = fs::read_to_string(fixture.capture.join("cwd.log")).unwrap();
+        let observed: Vec<&str> = cwds.lines().collect();
+        assert_eq!(observed.len(), 2);
+        assert!(
+            observed.iter().all(|cwd| *cwd == repo.to_str().unwrap()),
+            "every invocation must run from the project directory: {observed:?}"
+        );
     }
 
     #[test]
@@ -1737,6 +1865,170 @@ printf 'work done; leaked value: %s' "$FAKE_SECRET_TOKEN" > "$OUT"
             !sealed.contains(SECRET_VALUE),
             "sealed artifact leaked the secret"
         );
+    }
+
+    #[test]
+    fn external_task_repository_is_exposed_with_add_dir_for_the_developer() {
+        let mut fixture = fixture(HAPPY_DEVELOPER);
+        let external = fixture.repo.parent().unwrap().join("external-repo");
+        fs::create_dir_all(&external).unwrap();
+        let external = fs::canonicalize(&external).unwrap();
+
+        let key = session_with_repository(&mut fixture, WorkerRole::Developer, external.clone());
+        let repo = fixture.repo.clone();
+        let turn = fixture
+            .runtime
+            .start_turn(
+                key,
+                spec(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    Duration::from_secs(30),
+                    &repo,
+                ),
+            )
+            .unwrap();
+        assert!(matches!(
+            poll_terminal(&mut fixture, turn),
+            RuntimeTurnPoll::Completed { .. }
+        ));
+
+        let args = fs::read_to_string(fixture.capture.join("args.log")).unwrap();
+        // --add-dir belongs to the exec parent, ahead of --json, and the
+        // native working root stays the project directory.
+        let add_dir = args
+            .find("--add-dir")
+            .expect("developer must receive the external repository scope");
+        assert!(add_dir < args.find("--json").unwrap());
+        assert!(args.contains(external.to_str().unwrap()));
+        assert!(args.contains(&format!(
+            "--cd
+{}",
+            repo.display()
+        )));
+    }
+
+    #[test]
+    fn reviewer_never_receives_a_writable_repository_scope() {
+        let mut fixture = fixture(
+            r#"
+printf '{"type":"thread.started","thread_id":"thread-fake-1"}\n'
+printf 'VERDICT: LGTM\nfine' > "$OUT"
+"#,
+        );
+        let external = fixture.repo.parent().unwrap().join("reviewer-external");
+        fs::create_dir_all(&external).unwrap();
+        let external = fs::canonicalize(&external).unwrap();
+        let key = session_with_repository(&mut fixture, WorkerRole::Reviewer, external);
+        let repo = fixture.repo.clone();
+        let turn = fixture
+            .runtime
+            .start_turn(
+                key,
+                spec(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    Duration::from_secs(30),
+                    &repo,
+                ),
+            )
+            .unwrap();
+        assert!(matches!(
+            poll_terminal(&mut fixture, turn),
+            RuntimeTurnPoll::Completed { .. }
+        ));
+        let args = fs::read_to_string(fixture.capture.join("args.log")).unwrap();
+        assert!(
+            !args.contains("--add-dir"),
+            "reviewer must not get a writable scope: {args}"
+        );
+    }
+
+    #[test]
+    fn background_descendant_holding_pipes_does_not_hang_or_orphan() {
+        // The leader exits immediately but leaves a child holding stdout for
+        // 30s. Without settling descendants the drain join would block for
+        // the full sleep; the turn must instead finish promptly and report it.
+        let mut fixture = fixture(
+            r#"
+printf '{"type":"thread.started","thread_id":"thread-fake-1"}
+'
+printf 'leader done' > "$OUT"
+sleep 30 &
+echo "$!" > "$CAPTURE/descendant.pid"
+"#,
+        );
+        let (_key, turn) = start(
+            &mut fixture,
+            WorkerRole::Developer,
+            RuntimeTurnPurpose::InitialDevelopment,
+        );
+        let started = Instant::now();
+        let poll = poll_terminal(&mut fixture, turn);
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "settling descendants must not wait for the background sleep"
+        );
+        let RuntimeTurnPoll::Failed { failure, .. } = poll else {
+            panic!("a leftover descendant must be reported, got {poll:?}");
+        };
+        assert!(
+            failure.detail.contains("background descendants"),
+            "{}",
+            failure.detail
+        );
+        let pid: i32 = fs::read_to_string(fixture.capture.join("descendant.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 only probes for existence.
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "the descendant outlived the turn"
+        );
+    }
+
+    #[test]
+    fn a_secret_straddling_the_ingestion_bound_is_not_leaked() {
+        // The final message is padded so the synthetic secret lands exactly on
+        // the truncation boundary; the guard must drop the surviving prefix.
+        let mut fixture = fixture(&format!(
+            r#"
+printf '{{"type":"thread.started","thread_id":"thread-fake-1"}}\n'
+head -c {pad} /dev/zero | tr '\0' 'a' > "$OUT"
+printf '%s' "$FAKE_SECRET_TOKEN" >> "$OUT"
+head -c 4096 /dev/zero | tr '\0' 'b' >> "$OUT"
+"#,
+            pad = RAW_FINAL_READ_CAP - 8
+        ));
+        let (_key, turn) = start(
+            &mut fixture,
+            WorkerRole::Developer,
+            RuntimeTurnPurpose::InitialDevelopment,
+        );
+        let poll = poll_terminal(&mut fixture, turn);
+        let RuntimeTurnPoll::Completed { outcome, .. } = poll else {
+            panic!("expected completion, got {poll:?}");
+        };
+        let RuntimeOutcome::Developer(outcome) = outcome else {
+            panic!("expected developer outcome");
+        };
+        for fragment_len in [SECRET_VALUE.len(), SECRET_VALUE.len() / 2] {
+            let fragment = &SECRET_VALUE[..fragment_len];
+            assert!(
+                !outcome.summary.contains(fragment),
+                "summary leaked {fragment:?}"
+            );
+        }
+        let sealed = fs::read_to_string(
+            fixture
+                .artifacts
+                .join("run-1/task-1/developer/session-1/turn-1/attempt-1/native-final.partial"),
+        )
+        .unwrap();
+        assert!(!sealed.contains(&SECRET_VALUE[..SECRET_VALUE.len() / 2]));
     }
 
     #[test]

@@ -87,17 +87,6 @@ impl RepositoryObservation {
         }
         Ok(())
     }
-
-    fn same_git_state(&self, other: &Self) -> bool {
-        self.repository_root == other.repository_root
-            && self.identity_hash == other.identity_hash
-            && self.branch == other.branch
-            && self.head == other.head
-            && self.tracked_diff_hash == other.tracked_diff_hash
-            && self.index_diff_hash == other.index_diff_hash
-            && self.untracked_status_hash == other.untracked_status_hash
-            && self.clean == other.clean
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -878,15 +867,10 @@ impl SupervisorCore {
                 ));
             }
             binding.observation.validate()?;
-            if let Some(previous) = roots.insert(
+            roots.insert(
                 binding.observation.repository_root.as_str(),
                 &binding.observation,
-            ) && !previous.same_git_state(&binding.observation)
-            {
-                return Err(SupervisorError::invalid_plan(
-                    "same-repository task bindings must describe one exact Git state",
-                ));
-            }
+            );
         }
 
         let expected_hash = self.expected_plan_hash(plan_version, &tasks, &repositories);
@@ -4970,7 +4954,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_repository_binding_order_and_same_root_identity_are_exact() {
+    fn plan_repository_binding_order_is_exact_but_snapshots_may_differ() {
         let tasks = vec![task("one", "/repo", 1), task("two", "/repo", 1)];
         let mut mismatched_order = bindings_for(&tasks);
         mismatched_order.swap(0, 1);
@@ -4981,14 +4965,14 @@ mod tests {
             SupervisorErrorCode::InvalidPlan
         );
 
-        let mut inconsistent = bindings_for(&tasks);
-        inconsistent[1].observation.head = revision('2');
+        // Two tasks may name one repository whose routing snapshots were taken
+        // at different moments; that is data, not a contract violation.
+        let mut differing = bindings_for(&tasks);
+        differing[1].observation.head = revision('2');
         let mut core = new_core();
-        let event = plan_event_for(&core, tasks.clone(), inconsistent);
-        assert_eq!(
-            core.reduce(event).unwrap_err().code,
-            SupervisorErrorCode::InvalidPlan
-        );
+        let event = plan_event_for(&core, tasks.clone(), differing);
+        core.reduce(event).unwrap();
+        assert_eq!(core.session_state(), SessionState::AwaitingApproval);
 
         assert!(plan_result(tasks).is_ok());
     }

@@ -261,6 +261,7 @@ mod tests {
             role,
             task_key: "task-1".into(),
             cwd: PathBuf::from("/repo"),
+            task_repository: PathBuf::from("/repo"),
             profile: RuntimeProfile::codex_exec_default(),
             developer_instructions: "closed role instructions".into(),
         }
@@ -272,6 +273,7 @@ mod tests {
             task_key: "task-1".into(),
             purpose,
             cwd: PathBuf::from("/repo"),
+            task_repository: PathBuf::from("/repo"),
             prompt: "bounded turn prompt".into(),
             profile: RuntimeProfile::codex_exec_default(),
             outcome_contract: match role {

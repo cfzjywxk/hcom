@@ -19,6 +19,7 @@ WORK=$(mktemp -d -t hcom-exec-smokes.XXXXXX)
 trap 'rm -rf -- "$WORK"' EXIT
 pass=0
 fail=0
+block=0
 
 report() { # name, ok(0/1), detail
   if [ "$2" -eq 0 ]; then
@@ -30,7 +31,20 @@ report() { # name, ok(0/1), detail
   fi
 }
 
-# Create turns carry --cd; resume turns must not (0.146 rejects it there).
+# A known upstream defect this lane cannot work around. Never reported as
+# PASS: silently green would claim a guarantee the runtime does not have.
+report_block() { # name, ok(0/1), detail
+  if [ "$2" -eq 0 ]; then
+    printf 'PASS  %-46s %s\n' "$1" "${3:-}"
+    pass=$((pass + 1))
+  else
+    printf 'BLOCK %-46s %s\n' "$1" "${3:-}"
+    block=$((block + 1))
+  fi
+}
+
+# Create turns carry --cd; resume turns must not (0.146 rejects it there) and
+# instead inherit the *process* working directory, so run from `cwd` either way.
 closed_shape() { # cwd, out_file, extra args...
   local cwd="$1" out="$2"
   shift 2
@@ -38,6 +52,7 @@ closed_shape() { # cwd, out_file, extra args...
   for argument in "$@"; do
     [ "$argument" = "resume" ] && cd_args=()
   done
+  cd "$cwd" || return 1
   local disable=(apps auth_elicitation browser_use browser_use_external
     browser_use_full_cdp_access code_mode_host collaboration_modes computer_use
     enable_fanout goals guardian_approval hooks image_generation in_app_browser
@@ -136,7 +151,7 @@ export smoke_case=lower-value SMOKE_CASE=UPPER-VALUE SMOKE_EMPTY=
 export smoke_proxy=http://proxy.invalid:8080
 printf 'Use your shell tool to run: sh probe.sh
 Then reply with a final message of exactly: SMOKE-C4' \
-  | closed_shape "$WORK/c4/project" "$WORK/c4/last.md" >/dev/null 2>&1
+  | closed_shape "$WORK/c4/project" "$WORK/c4/last.md" >"$WORK/c4/events.jsonl" 2>/dev/null
 probe=$(cat "$WORK/c4/project/probe.txt" 2>/dev/null)
 ok=0
 grep -q "SECRETSHAPED=synthtok-smoke-abcdef" <<<"$probe" || ok=1
@@ -146,10 +161,44 @@ grep -q "EMPTY=\[\]" <<<"$probe" || ok=1
 grep -q "PROXY=http://proxy.invalid:8080" <<<"$probe" || ok=1
 report "C4 complete env reaches tool commands" $ok
 
+# --- C4b: the same environment survives a resume ----------------------------
+tid4=$(head -1 "$WORK/c4/events.jsonl" 2>/dev/null | grep -oE '"thread_id":"[^"]+"' | cut -d'"' -f4)
+if [ -n "$tid4" ]; then
+  rm -f "$WORK/c4/project/probe.txt"
+  printf 'Use your shell tool to run: sh probe.sh
+Then reply with a final message of exactly: SMOKE-C4B' \
+    | closed_shape "$WORK/c4/project" "$WORK/c4/resume.md" resume "$tid4" >/dev/null 2>&1
+  probe=$(cat "$WORK/c4/project/probe.txt" 2>/dev/null)
+  grep -q "SECRETSHAPED=synthtok-smoke-abcdef" <<<"$probe"
+  report "C4b env survives exec resume" $?
+else
+  report "C4b env survives exec resume" 1 "no thread id from C4"
+fi
+
+# --- C4c: non-UTF-8 environment (known upstream block) ----------------------
+# hcom inherits the parent environment byte-for-byte. Codex 0.146 panics in its
+# tool executor on a non-UTF-8 value and still exits 0, so tool calls silently
+# do nothing. Probe it explicitly instead of pretending the layer is clean.
+mkdir -p "$WORK/c4c/project" "$WORK/c4c/home"
+export CODEX_HOME="$WORK/c4c/home"
+cp ~/.codex/auth.json "$CODEX_HOME/auth.json" 2>/dev/null
+cp "$WORK/c4/project/probe.sh" "$WORK/c4c/project/probe.sh"
+export SMOKE_NON_UTF8=$'\xff\xfe-nonutf8'
+printf 'Use your shell tool to run: sh probe.sh
+Then reply with a final message of exactly: SMOKE-C4C' \
+  | closed_shape "$WORK/c4c/project" "$WORK/c4c/last.md" >/dev/null 2>&1
+unset SMOKE_NON_UTF8
+[ -f "$WORK/c4c/project/probe.txt" ]
+report_block "C4c non-UTF-8 env keeps tools working" $? \
+  "upstream codex panics on non-UTF-8 env values"
+
 # --- C5: private CODEX_HOME keeps exactly one session -----------------------
 sessions=$(find "$WORK/c1/home" -name 'state_*.sqlite' | wc -l)
 [ "$sessions" -ge 1 ]
 report "C5 private CODEX_HOME session store" $? "state files: $sessions"
 
-printf '\n%d passed, %d failed\n' "$pass" "$fail"
+printf '\n%d passed, %d failed, %d known-blocked\n' "$pass" "$fail" "$block"
+if [ "$block" -ne 0 ]; then
+  printf 'known upstream blocks are recorded above and are not treated as passes\n'
+fi
 [ "$fail" -eq 0 ]

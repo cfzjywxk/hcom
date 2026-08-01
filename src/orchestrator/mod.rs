@@ -136,9 +136,7 @@ impl ManagedRepository {
     fn open(root: &Path, lock_root: &Path) -> Result<Self> {
         let repository = CanonicalRepository::open(root)?;
         let lock = RepositoryLock::acquire(&repository, lock_root)?;
-        let branch = repository.branch()?;
         let start_head = repository.head()?;
-        repository.require_exact(&branch, &start_head)?;
         Ok(Self {
             repository,
             _lock: lock,
@@ -233,37 +231,14 @@ impl CanonicalRepository {
         Ok(head)
     }
 
-    fn require_clean(&self) -> Result<()> {
-        let runner = GitRunner {
-            git: &self.git,
-            root: &self.root,
-        };
-        if !runner
-            .success(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?
-            .is_empty()
-        {
-            bail!("canonical checkout must be completely clean");
-        }
-        if !runner
-            .success(&["for-each-ref", "--format=%(refname)", "refs/replace/"])?
-            .is_empty()
-        {
-            bail!("canonical checkout contains replacement refs");
-        }
-        Ok(())
-    }
-
+    /// Only refuses states that would make the *reviewer's* diff range
+    /// meaningless. A dirty tree is not one of them: it is the reviewer's and
+    /// the human's judgment, so the run proceeds and lets them see it.
     fn require_clean_start(&self) -> Result<()> {
         let runner = GitRunner {
             git: &self.git,
             root: &self.root,
         };
-        if !runner
-            .success(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?
-            .is_empty()
-        {
-            bail!("task repository is dirty before plan start");
-        }
         if !runner
             .success(&["for-each-ref", "--format=%(refname)", "refs/replace/"])?
             .is_empty()
@@ -271,16 +246,6 @@ impl CanonicalRepository {
             bail!("task repository contains replacement refs before plan start");
         }
         Ok(())
-    }
-
-    fn require_exact(&self, branch: &str, head: &str) -> Result<()> {
-        self.revalidate_identity()?;
-        self.require_clean()?;
-        if self.branch()? != branch || self.head()? != head {
-            bail!("canonical checkout branch or HEAD drifted");
-        }
-        self.revalidate_identity()?;
-        self.require_clean()
     }
 
     fn reject_indirections(&self) -> Result<()> {
@@ -526,22 +491,6 @@ fn terminate_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn parse_nul_paths(bytes: &[u8]) -> Result<Vec<String>> {
-    let mut paths = Vec::new();
-    for component in bytes.split(|byte| *byte == 0) {
-        if component.is_empty() {
-            continue;
-        }
-        let path = std::str::from_utf8(component)?;
-        crate::worker::validation::validate_relative_path("Git changed path", path)?;
-        paths.push(path.to_owned());
-        if paths.len() > 256 {
-            bail!("Git changed paths exceed their bound");
-        }
-    }
-    Ok(paths)
-}
-
 fn canonical_git_path(value: &str) -> Result<PathBuf> {
     if value.len() > 4096 {
         bail!("Git path exceeds its bound");
@@ -745,15 +694,5 @@ mod tests {
             error.to_string().contains("canonical Git top level"),
             "{error}"
         );
-    }
-
-    #[test]
-    fn parse_nul_paths_splits_and_rejects_traversal() {
-        assert_eq!(
-            parse_nul_paths(b"a.txt\0dir/b.txt\0").unwrap(),
-            vec!["a.txt".to_string(), "dir/b.txt".to_string()]
-        );
-        assert!(parse_nul_paths(b"../escape\0").is_err());
-        assert!(parse_nul_paths(b"/absolute\0").is_err());
     }
 }

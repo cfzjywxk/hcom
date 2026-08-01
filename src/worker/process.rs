@@ -56,6 +56,16 @@ impl ProcessGroupBinding {
         Ok(Self { pidfd, identity })
     }
 
+    /// Settle the group after the leader has already exited on its own: any
+    /// surviving descendant is signalled and reaped. Without this a background
+    /// child keeps the leader's pipes open (blocking the drain threads) or
+    /// simply outlives the run as an orphan.
+    ///
+    /// Returns true when descendants had to be killed.
+    pub(crate) fn settle_after_exit(&self, grace: Duration) -> Result<bool> {
+        settle_reaped_group(self.identity.process_group, grace)
+    }
+
     pub(crate) fn terminate_and_reap(&self, child: &mut Child, grace: Duration) -> Result<()> {
         if !pidfd_is_ready(&self.pidfd)? && process_identity_is_live(&self.identity)? {
             signal_owned_group(&self.identity, libc::SIGTERM)?;
@@ -766,6 +776,77 @@ fn process_identity_is_live(identity: &ProcessIdentity) -> Result<bool> {
     Ok(birth == identity.process_birth
         && process_group_id(identity.pid)? == identity.process_group
         && identity.process_group == identity.pid)
+}
+
+/// Descendants of an already-reaped leader, matched by the group id the
+/// leader owned. The leader itself is gone, so its identity cannot be
+/// re-verified; the group id is still exact because `configure_worker_child`
+/// made the leader its own session and group leader, and only its children
+/// can carry that id.
+fn reaped_group_has_live_descendants(process_group: u32) -> Result<bool> {
+    // SAFETY: geteuid has no preconditions.
+    let expected_uid = unsafe { libc::geteuid() };
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if proc_entry_vanished(&error) => continue,
+            Err(error) => return Err(error).context("failed to inspect /proc process owner"),
+        };
+        if metadata.uid() != expected_uid {
+            continue;
+        }
+        let stat = match fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if proc_entry_vanished(&error) => continue,
+            Err(error) => return Err(error).context("failed to inspect owned /proc process"),
+        };
+        let Some((_, fields)) = stat.rsplit_once(") ") else {
+            continue;
+        };
+        let mut fields = fields.split_ascii_whitespace();
+        let Some(state) = fields.next() else { continue };
+        let _parent = fields.next();
+        let Some(group) = fields.next().and_then(|v| v.parse::<u32>().ok()) else {
+            continue;
+        };
+        // Zombies hold no resources and are reaped by init.
+        if group == process_group && pid != process_group && state != "Z" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Kill and reap descendants left behind by a leader that already exited.
+/// Returns true when anything had to be killed.
+pub(crate) fn settle_reaped_group(process_group: u32, grace: Duration) -> Result<bool> {
+    if !reaped_group_has_live_descendants(process_group)? {
+        return Ok(false);
+    }
+    let group = i32::try_from(process_group).context("worker process group exceeds pid_t")?;
+    for signal in [libc::SIGTERM, libc::SIGKILL] {
+        // SAFETY: the negative PID targets the exact worker process group.
+        unsafe { libc::kill(-group, signal) };
+        let deadline = Instant::now() + grace;
+        loop {
+            if !reaped_group_has_live_descendants(process_group)? {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    bail!("worker descendants survived SIGKILL")
 }
 
 fn signal_owned_group(identity: &ProcessIdentity, signal: i32) -> Result<()> {

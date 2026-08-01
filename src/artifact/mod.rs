@@ -28,6 +28,9 @@ pub const MAX_MANIFEST_ARTIFACT_BYTES: u64 = 256 * 1024;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
+    /// The exact prompt handed to the worker. Streamed rather than written as
+    /// a control file so a legal full-size prompt cannot fail the turn.
+    NativePrompt,
     NativeStdout,
     NativeStderr,
     NativeFinal,
@@ -38,6 +41,7 @@ pub enum ArtifactKind {
 impl ArtifactKind {
     pub fn file_name(self) -> &'static str {
         match self {
+            Self::NativePrompt => "prompt.md",
             Self::NativeStdout => "native.stdout.partial",
             Self::NativeStderr => "native.stderr.partial",
             Self::NativeFinal => "native-final.partial",
@@ -48,7 +52,7 @@ impl ArtifactKind {
 
     fn hard_cap(self) -> u64 {
         match self {
-            Self::NativeStdout | Self::NativeStderr | Self::NativeFinal => {
+            Self::NativePrompt | Self::NativeStdout | Self::NativeStderr | Self::NativeFinal => {
                 MAX_NATIVE_ARTIFACT_BYTES
             }
             Self::Activity => MAX_ACTIVITY_ARTIFACT_BYTES,
@@ -323,7 +327,10 @@ impl ArtifactAttempt {
     ) -> Result<BoundedArtifactWriter> {
         if !matches!(
             kind,
-            ArtifactKind::NativeStdout | ArtifactKind::NativeStderr | ArtifactKind::NativeFinal
+            ArtifactKind::NativePrompt
+                | ArtifactKind::NativeStdout
+                | ArtifactKind::NativeStderr
+                | ArtifactKind::NativeFinal
         ) {
             bail!("only native output kinds use a bounded stream writer");
         }

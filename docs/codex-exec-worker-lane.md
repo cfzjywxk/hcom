@@ -45,6 +45,13 @@ codex exec
   -                                         # bounded stdin prompt, then EOF
 ```
 
+`--cd` applies to create turns only. A **resume takes no `--cd` and inherits
+the process working directory**, so every invocation is launched from the
+project directory (bwrap `--chdir`, or `Command::current_dir` when unsandboxed)
+— otherwise a resumed turn would silently work somewhere else. `--add-dir`
+belongs to the exec parent, ahead of `resume`, and is passed only for a
+developer whose task repository is not the project directory itself.
+
 `--ignore-user-config` makes argv the single source of configuration truth
 (Codex writes its own `config.toml` into the private `CODEX_HOME`). That is why
 the two `shell_environment_policy` entries must travel as `--config`: without
@@ -73,6 +80,12 @@ A turn routes onward only when all three hold:
 - the process exited 0;
 - a `thread.started` proof was captured;
 - the native final-message file is non-empty.
+
+Plus two integrity conditions: the drain threads must report no read/write/seal
+error (losing evidence stops the run rather than routing an incomplete record),
+and the process group must have no surviving descendants. A background child of
+the worker would otherwise hold the pipes open — blocking the drain joins — or
+outlive the run as an orphan that keeps burning tokens.
 
 Otherwise it is a process-level stop for a human, and the artifacts stay as
 evidence without routing. A run that exits non-zero but leaves a plausible
@@ -110,6 +123,12 @@ CLI writing it and hcom ingesting it, no unredacted bytes ever land in the
 project directory. Ingestion reads the file bounded, redacts it, writes the
 sealed copy atomically, and deletes the raw one.
 
+Truncation is guarded: when a final message exceeds the ingestion bound the cut
+drops `max-secret-length` extra bytes, because a credential straddling the
+boundary would otherwise survive as a plaintext prefix the redactor can no
+longer recognize. Prompts are streamed as bounded artifacts rather than written
+as adapter control files, so a legal full-size prompt cannot fail the turn.
+
 The workspace is handoff material, not a recovery store. A restarted hcom never
 reads it to resume; a human reads `latest/`, then authorizes a new run.
 
@@ -136,10 +155,18 @@ turn fails as a timeout.
   every release and after every pin bump. The environment probe reads only
   allowlisted synthetic variables; dumping the real environment would ship live
   credentials into the model context and to the provider.
-- **Real acceptance** (`cargo test --lib real_exec -- --ignored`) — a single
-  task and a two-task run against the real binary on a disposable project.
+- **Real acceptance** (`cargo test --lib real_exec -- --ignored`) — four runs
+  against the real binary on disposable projects: a single task, a Rust
+  hello-world, a two-task run (both tasks must reach LGTM; exhaustion is not
+  success), and the full review loop — REQUEST_CHANGES, an exact developer
+  resume, an exact reviewer re-review, then LGTM. The loop test reads the
+  native thread ids back out of the sealed stdout evidence to prove each role
+  resumed its own session and that tasks never share one. Every run also
+  asserts it left no stray worker processes behind.
 
 Known upstream limitation: Codex 0.146's tool executor panics when the
 inherited environment contains a non-UTF-8 value (`std::env::vars()` unwrap),
 which fails every tool call while the turn still exits 0. hcom inherits the
-parent environment byte-for-byte and does not work around this.
+parent environment byte-for-byte and does not work around it. The smoke script
+probes this explicitly and reports it as `BLOCK`, never as a pass: a silently
+green run would claim a guarantee the lane does not have.

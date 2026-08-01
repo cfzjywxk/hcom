@@ -444,7 +444,12 @@ impl RuntimeTurnPurpose {
 pub struct RoleSessionSpec {
     pub role: WorkerRole,
     pub task_key: String,
+    /// The Architect's project directory: the worker's native working root.
+    /// It need not be a Git repository.
     pub cwd: PathBuf,
+    /// The task's repository, exposed as an extra writable scope when it is
+    /// not the project directory itself.
+    pub task_repository: PathBuf,
     pub profile: RuntimeProfile,
     pub developer_instructions: String,
 }
@@ -453,6 +458,7 @@ impl RoleSessionSpec {
     pub fn validate(&self) -> Result<(), RuntimeError> {
         validate_task_key(&self.task_key)?;
         validate_absolute_path("role session cwd", &self.cwd)?;
+        validate_absolute_path("role session task repository", &self.task_repository)?;
         self.profile.validate("role runtime profile")?;
         validate_single_line_or_multiline(
             "role developer instructions",
@@ -591,6 +597,7 @@ pub struct RuntimeTurnSpec {
     pub task_key: String,
     pub purpose: RuntimeTurnPurpose,
     pub cwd: PathBuf,
+    pub task_repository: PathBuf,
     pub prompt: String,
     pub profile: RuntimeProfile,
     pub outcome_contract: OutcomeContract,

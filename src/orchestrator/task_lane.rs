@@ -10,7 +10,7 @@ use super::core::{
 use super::workspace::TasksWorkspace;
 use super::{
     GitRunner, ManagedRepository, SessionRuntimeSources, SessionStartup, ensure_private_directory,
-    parse_nul_paths, path_value, prepare_auth_mount_target, sha256_hex,
+    path_value, prepare_auth_mount_target, sha256_hex,
 };
 use crate::control_api::{SessionState, SessionStatusSnapshot, TaskDraft, TaskState, WorkerRole};
 use crate::worker::environment::{
@@ -29,7 +29,6 @@ use crate::worker::runtime::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -41,6 +40,11 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 const TURN_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+/// The supervisor no longer hashes working-tree state, so the observation's
+/// content-digest fields carry a fixed placeholder. They remain in the type
+/// because the reducer's identity plumbing is shared.
+const EMPTY_OBSERVATION_HASH: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 const MAX_AUTH_FILE_BYTES: usize = 1024 * 1024;
 const MAX_AUTH_REDACTION_VALUES: usize = 64;
 
@@ -790,6 +794,7 @@ impl TaskLaneSupervisor {
             .ok_or_else(|| anyhow!("role session task ordinal is out of range"))?;
         let task_key = task.spec.task_key.clone();
         let repository_root = PathBuf::from(&task.spec.repository_root);
+        let project_root = self.startup.project_root.clone();
         let profile = self.profile(role).clone();
         let instructions = role_instructions(role).to_owned();
         let local = self
@@ -798,7 +803,8 @@ impl TaskLaneSupervisor {
             .open_session(RoleSessionSpec {
                 role,
                 task_key,
-                cwd: repository_root,
+                cwd: project_root,
+                task_repository: repository_root,
                 profile,
                 developer_instructions: instructions,
             })
@@ -843,6 +849,7 @@ impl TaskLaneSupervisor {
         if local_session.role != role {
             bail!("logical exec worker session belongs to the wrong role");
         }
+        let project_root = self.startup.project_root.clone();
         let local_turn = self
             .require_task_runtime_mut(task_ordinal)?
             .runtime
@@ -852,7 +859,8 @@ impl TaskLaneSupervisor {
                     role,
                     task_key,
                     purpose,
-                    cwd: repository_root,
+                    cwd: project_root,
+                    task_repository: repository_root,
                     prompt: prompt.clone(),
                     profile,
                     outcome_contract: match role {
@@ -1217,14 +1225,17 @@ fn stable_repository_observation(
     repository: &ManagedRepository,
     expected_head: &str,
 ) -> Result<RepositoryObservation> {
-    let first = capture_repository_observation(repository, expected_head)?;
-    let second = capture_repository_observation(repository, expected_head)?;
-    if first != second {
-        bail!("repository changed while the Supervisor observed its Git state");
-    }
-    Ok(second)
+    capture_repository_observation(repository, expected_head)
 }
 
+/// Routing data, not a verdict.
+///
+/// The task-agnostic supervisor needs one thing from Git: the revision to hand
+/// the reviewer as the base of its diff. It deliberately does NOT collect
+/// status, diffs, or changed-path sets — a dirty tree, an out-of-scope commit,
+/// a detached HEAD, or a rewritten history are all things the reviewer and the
+/// human judge, and collecting them here would make an unstable working tree
+/// fail the run instead of reaching review.
 fn capture_repository_observation(
     managed: &ManagedRepository,
     expected_head: &str,
@@ -1232,109 +1243,44 @@ fn capture_repository_observation(
     crate::worker::validation::validate_git_oid("expected repository revision", expected_head)?;
     let repository = &managed.repository;
     repository.revalidate_identity()?;
-    repository.reject_indirections()?;
     let runner = GitRunner {
         git: &repository.git,
         root: &repository.root,
     };
-    let branch = repository.branch()?;
     let head = repository.head()?;
-    let status = runner.success(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
-    let tracked = runner.success(&[
-        "diff",
-        "--binary",
-        "--no-ext-diff",
-        "--no-textconv",
-        "HEAD",
-        "--",
-    ])?;
-    let index = runner.success(&[
-        "diff",
-        "--cached",
-        "--binary",
-        "--no-ext-diff",
-        "--no-textconv",
-        "HEAD",
-        "--",
-    ])?;
-    let untracked = runner.success(&["ls-files", "--others", "--exclude-standard", "-z", "--"])?;
+    // A detached HEAD is legitimate; report it as such instead of failing.
+    let branch = repository.branch().unwrap_or_else(|_| "HEAD".to_string());
     let ancestry = runner.run(&["merge-base", "--is-ancestor", expected_head, &head])?;
-    let head_descends_from_expected = match ancestry.status.code() {
-        Some(0) if ancestry.stderr.is_empty() => true,
-        Some(1) if ancestry.stderr.is_empty() => false,
-        _ => bail!("bounded Git ancestry evidence failed"),
-    };
-    let mut changed_paths = if head_descends_from_expected {
-        let range = format!("{expected_head}..{head}");
-        parse_nul_paths(&runner.success(&[
-            "diff",
-            "--name-only",
-            "-z",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-renames",
-            &range,
-            "--",
-        ])?)?
-    } else {
-        Vec::new()
-    };
-    changed_paths.extend(parse_nul_paths(&runner.success(&[
-        "diff",
-        "--name-only",
-        "-z",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-renames",
-        "HEAD",
-        "--",
-    ])?)?);
-    changed_paths.extend(parse_nul_paths(&untracked)?);
-    changed_paths.sort();
-    changed_paths.dedup();
-    if changed_paths.len() > 256 {
-        bail!("repository changed-path inventory exceeds 256 entries");
+    if !ancestry.stderr.is_empty() || !matches!(ancestry.status.code(), Some(0) | Some(1)) {
+        bail!("failed to compare the task revision with HEAD");
     }
-    let identity_hash = sha256_hex(&serde_json::to_vec(&(
-        "hcom-exec-repository-identity-v1",
-        &repository.root,
-        (
-            repository.root_identity.device,
-            repository.root_identity.inode,
-            repository.root_identity.uid,
-            repository.root_identity.mode,
-        ),
-        (
-            repository.git_dir.device,
-            repository.git_dir.inode,
-            repository.git_dir.uid,
-            repository.git_dir.mode,
-        ),
-        (
-            repository.common_dir.device,
-            repository.common_dir.inode,
-            repository.common_dir.uid,
-            repository.common_dir.mode,
-        ),
-        (
-            repository.object_dir.device,
-            repository.object_dir.inode,
-            repository.object_dir.uid,
-            repository.object_dir.mode,
-        ),
-        &repository.git,
-    ))?);
-    repository.revalidate_identity()?;
+    let head_descends_from_expected = ancestry.status.success();
     Ok(RepositoryObservation {
         repository_root: path_value("task repository root", &repository.root)?,
-        identity_hash,
+        identity_hash: sha256_hex(&serde_json::to_vec(&(
+            "hcom-exec-repository-identity-v1",
+            &repository.root,
+            (
+                repository.root_identity.device,
+                repository.root_identity.inode,
+                repository.root_identity.uid,
+                repository.root_identity.mode,
+            ),
+            (
+                repository.git_dir.device,
+                repository.git_dir.inode,
+                repository.git_dir.uid,
+                repository.git_dir.mode,
+            ),
+            &repository.git,
+        ))?),
         branch,
         head,
-        tracked_diff_hash: hash_bytes(&tracked),
-        index_diff_hash: hash_bytes(&index),
-        untracked_status_hash: hash_bytes(&untracked),
-        clean: status.is_empty(),
-        changed_paths,
+        tracked_diff_hash: EMPTY_OBSERVATION_HASH.into(),
+        index_diff_hash: EMPTY_OBSERVATION_HASH.into(),
+        untracked_status_hash: EMPTY_OBSERVATION_HASH.into(),
+        clean: true,
+        changed_paths: Vec::new(),
         head_descends_from_expected,
     })
 }
@@ -1470,16 +1416,6 @@ fn bounded_relay(text: &str) -> String {
         "{}\n\n[hcom: truncated at {end} bytes; the full message is on disk in this run's artifacts]",
         &text[..end]
     )
-}
-
-fn hash_bytes(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    output
 }
 
 fn bounded_single_line(input: &str) -> String {
@@ -2043,6 +1979,38 @@ mod tests {
                     );
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
+            }
+
+            /// The native thread ids this run recorded, per role, in turn
+            /// order — read back out of the sealed stdout evidence, so the
+            /// assertion sees what Codex actually did rather than what the
+            /// runtime believes.
+            pub(crate) fn thread_ids(&self, task_key: &str, role: &str) -> Vec<String> {
+                let role_dir = self
+                    .project_root
+                    .join("hcom-tasks/run-real-exec")
+                    .join(task_key)
+                    .join(role);
+                let mut found: Vec<(PathBuf, String)> = Vec::new();
+                for path in walk_files(&role_dir) {
+                    if path.file_name().and_then(|n| n.to_str()) != Some("native.stdout.partial") {
+                        continue;
+                    }
+                    let Ok(text) = fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    let Some(first) = text.lines().next() else {
+                        continue;
+                    };
+                    let Some(rest) = first.split("\"thread_id\":\"").nth(1) else {
+                        continue;
+                    };
+                    if let Some(id) = rest.split('"').next() {
+                        found.push((path, id.to_string()));
+                    }
+                }
+                found.sort_by(|a, b| a.0.cmp(&b.0));
+                found.into_iter().map(|(_, id)| id).collect()
             }
 
             /// Every role of a task left durable evidence in `hcom-tasks/`.
@@ -3580,43 +3548,77 @@ mod tests {
     }
 
     #[test]
-    fn dirty_plan_never_opens_a_task_runtime() {
+    fn a_dirty_plan_still_runs_and_reaches_review() {
+        // The supervisor does not police the working tree: a task that starts
+        // from a dirty checkout runs, and the reviewer sees the result.
         let fixture = Fixture::new();
         fs::write(fixture.repository.join("src/dirty.txt"), "dirty\n").unwrap();
         let audit = Arc::new(Mutex::new(Audit::default()));
-        let mut supervisor = fixture.supervisor(Vec::new(), Arc::clone(&audit));
-        assert!(
-            supervisor
-                .replace_plan(
-                    0,
-                    CODEX_TASK_WORKER_ADAPTER,
-                    CODEX_TASK_WORKER_ADAPTER,
-                    vec![fixture.task("dirty", &["src"], 2)],
-                )
-                .is_err()
+        let script = task_script(
+            "dirty",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("worked from an untidy tree")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [lgtm("acceptable")],
+                ),
+            ],
+            vec![
+                Mutation::Commit {
+                    path: "src/task.txt",
+                    contents: "done\n",
+                },
+                Mutation::None,
+            ],
         );
-        assert_eq!(supervisor.snapshot().state, SessionState::AwaitingPlan);
-        assert!(audit.lock().unwrap().sessions.is_empty());
+        let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
+        start(&mut supervisor, vec![fixture.task("dirty", &["src"], 2)]);
+        assert_eq!(
+            drive_terminal(&mut supervisor).state,
+            SessionState::Completed
+        );
+        assert_eq!(
+            audit
+                .lock()
+                .unwrap()
+                .sessions
+                .iter()
+                .filter(|(_, role, _)| *role == WorkerRole::Reviewer)
+                .count(),
+            1
+        );
     }
 
     #[test]
-    fn detached_head_and_non_top_level_repository_roots_fail_before_plan_binding() {
-        let detached = Fixture::new();
-        git(&detached.repository, &["checkout", "--detach"]);
-        let mut supervisor =
-            detached.supervisor(Vec::new(), Arc::new(Mutex::new(Audit::default())));
-        assert!(
+    fn a_detached_or_dirty_checkout_still_binds_but_a_non_top_level_root_does_not() {
+        // Working-tree condition is the reviewer's and the human's business.
+        for prepare in [
+            |repository: &Path| git(repository, &["checkout", "--detach"]),
+            |repository: &Path| {
+                fs::write(repository.join("src/dirty.txt"), "uncommitted\n").unwrap()
+            },
+        ] {
+            let fixture = Fixture::new();
+            prepare(&fixture.repository);
+            let mut supervisor =
+                fixture.supervisor(Vec::new(), Arc::new(Mutex::new(Audit::default())));
             supervisor
                 .replace_plan(
                     0,
                     CODEX_TASK_WORKER_ADAPTER,
                     CODEX_TASK_WORKER_ADAPTER,
-                    vec![detached.task("detached", &["src"], 2)],
+                    vec![fixture.task("binds", &["src"], 2)],
                 )
-                .is_err()
-        );
-        assert_eq!(supervisor.snapshot().state, SessionState::AwaitingPlan);
+                .expect("an untidy checkout must still bind");
+            assert_eq!(supervisor.snapshot().state, SessionState::AwaitingApproval);
+        }
 
+        // Repository identity is still exact: a subdirectory is not a root.
         let nested = Fixture::new();
         let mut task = nested.task("nested-root", &["src"], 2);
         task.repository_root = nested.repository.join("src").to_string_lossy().into_owned();
@@ -3891,6 +3893,84 @@ mod real_exec_tests {
         );
     }
 
+    /// Gate 1: the full review loop against the real binary — an initial
+    /// REQUEST_CHANGES, an exact developer resume, an exact reviewer
+    /// re-review, then LGTM. The brief tells the developer to land the work in
+    /// two steps so the first round has something concrete to reject.
+    #[test]
+    #[ignore = "requires the pinned real codex binary, auth, and network"]
+    fn real_request_changes_round_resumes_both_roles_and_then_reaches_lgtm() {
+        let fixture = RealFixture::new("loop");
+        let mut supervisor = fixture.supervisor();
+        let task = TaskDraft {
+            task_key: "loop".into(),
+            title: "Add add() with its test".into(),
+            objective: "Create calc.py in the repository root containing a function \
+                        add(a, b) that returns a + b, and commit it. On this first \
+                        turn create ONLY calc.py — do not write any test file yet; \
+                        a later turn covers the tests."
+                .into(),
+            repository_root: fixture.repository.to_string_lossy().into_owned(),
+            acceptance_criteria: vec![
+                "calc.py defines add(a, b) returning a + b".into(),
+                "test_calc.py exists and asserts add(2, 3) == 5; the task is \
+                 incomplete without it and must be rejected"
+                    .into(),
+            ],
+            required_checks: vec!["python3 test_calc.py".into()],
+            allowed_paths: vec!["calc.py".into(), "test_calc.py".into()],
+            forbidden_actions: vec!["do not push".into()],
+            max_review_rounds: 3,
+        };
+        let snapshot = fixture.run(&mut supervisor, vec![task]);
+        assert_eq!(
+            snapshot.state,
+            SessionState::Completed,
+            "terminal detail: {:?}",
+            snapshot.terminal_detail
+        );
+        assert_eq!(
+            snapshot.tasks[0].state,
+            TaskState::Lgtm,
+            "the loop must end in LGTM, not exhaustion"
+        );
+        assert!(
+            snapshot.tasks[0].review_round >= 2,
+            "expected a rejected round before approval, got {}",
+            snapshot.tasks[0].review_round
+        );
+
+        // Both roles resumed their own exact native session across rounds.
+        let developer = fixture.thread_ids("loop", "developer");
+        let reviewer = fixture.thread_ids("loop", "reviewer");
+        assert!(developer.len() >= 2, "developer did not run twice");
+        assert!(reviewer.len() >= 2, "reviewer did not run twice");
+        assert!(
+            developer.windows(2).all(|w| w[0] == w[1]),
+            "developer changed native session: {developer:?}"
+        );
+        assert!(
+            reviewer.windows(2).all(|w| w[0] == w[1]),
+            "reviewer changed native session: {reviewer:?}"
+        );
+        assert_ne!(
+            developer[0], reviewer[0],
+            "developer and reviewer must not share a native session"
+        );
+
+        let calc = std::fs::read_to_string(fixture.repository.join("calc.py")).unwrap();
+        assert!(calc.contains("def add"), "{calc}");
+        assert!(
+            fixture.repository.join("test_calc.py").is_file(),
+            "the correction round must have added the missing test"
+        );
+        assert!(
+            fixture.stray_worker_pids().is_empty(),
+            "workers outlived the run: {:?}",
+            fixture.stray_worker_pids()
+        );
+    }
+
     /// End-to-end acceptance on a real Rust project: the developer writes and
     /// commits a hello-world crate, the reviewer independently judges it, and
     /// the run reaches LGTM with durable evidence on disk.
@@ -3979,13 +4059,19 @@ mod real_exec_tests {
         );
         assert_eq!(snapshot.tasks.len(), 2);
         for task in &snapshot.tasks {
-            assert!(
-                matches!(task.state, TaskState::Lgtm | TaskState::ReviewExhausted),
-                "task {} ended as {:?}",
+            assert_eq!(
+                task.state,
+                TaskState::Lgtm,
+                "task {} ended as {:?}; exhaustion is not success",
                 task.task_key,
                 task.state
             );
         }
+        // Each task ran in its own fresh native sessions.
+        let first = fixture.thread_ids("greet", "developer");
+        let second = fixture.thread_ids("square", "developer");
+        assert!(!first.is_empty() && !second.is_empty());
+        assert_ne!(first[0], second[0], "tasks shared a developer session");
         assert!(fixture.repository.join("greet.py").is_file());
         assert!(fixture.repository.join("square.py").is_file());
         fixture.assert_artifacts("greet", &["developer", "reviewer"]);
