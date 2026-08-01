@@ -3846,6 +3846,47 @@ mod real_exec_tests {
         fixture.assert_artifacts("fib", &["developer", "reviewer"]);
     }
 
+    /// End-to-end acceptance on a real Rust project: the developer writes and
+    /// commits a hello-world crate, the reviewer independently judges it, and
+    /// the run reaches LGTM with durable evidence on disk.
+    #[test]
+    #[ignore = "requires the pinned real codex binary, auth, and network"]
+    fn real_rust_hello_world_task_reaches_lgtm_with_evidence() {
+        let fixture = RealFixture::new("hello");
+        let mut supervisor = fixture.supervisor();
+        let task = TaskDraft {
+            task_key: "hello".into(),
+            title: "Create a hello world Rust binary".into(),
+            objective: "In the repository root create a Cargo binary crate: \
+                        Cargo.toml naming the package `hello` with edition 2021, and \
+                        src/main.rs whose main function prints exactly `Hello, world!`. \
+                        Verify it with `cargo run`, then commit both files with git."
+                .into(),
+            repository_root: fixture.repository.to_string_lossy().into_owned(),
+            acceptance_criteria: vec![
+                "cargo run prints Hello, world!".into(),
+                "Cargo.toml and src/main.rs are committed".into(),
+            ],
+            required_checks: vec!["cargo run".into()],
+            allowed_paths: vec!["Cargo.toml".into(), "src".into()],
+            forbidden_actions: vec!["do not push".into()],
+            max_review_rounds: 2,
+        };
+        let snapshot = fixture.run(&mut supervisor, vec![task]);
+        assert_eq!(
+            snapshot.state,
+            SessionState::Completed,
+            "terminal detail: {:?}",
+            snapshot.terminal_detail
+        );
+        assert_eq!(snapshot.tasks[0].state, TaskState::Lgtm);
+        assert!(fixture.repository.join("Cargo.toml").is_file());
+        assert!(fixture.repository.join("src/main.rs").is_file());
+        let main = std::fs::read_to_string(fixture.repository.join("src/main.rs")).unwrap();
+        assert!(main.contains("Hello, world!"), "{main}");
+        fixture.assert_artifacts("hello", &["developer", "reviewer"]);
+    }
+
     #[test]
     #[ignore = "requires the pinned real codex binary, auth, and network"]
     fn real_two_task_run_advances_automatically() {

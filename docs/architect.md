@@ -229,11 +229,12 @@ configured developer/reviewer adapter and the profile hash are bound into the
 plan hash. Editing `config.toml` later cannot change a running session; start a
 new `hcom arch` invocation to pick up changes.
 
-Maintainers changing the retained Codex CLI arguments, isolated configuration,
-JSONL parsing, or size bounds must follow the
-[Codex CLI adapter maintenance contract](codex-adapter-contract.md). Changes
-to the App Server protocol, runtime profile mapping, or task lifecycle must
-follow the [Codex App Server runtime contract](codex-app-server-runtime.md).
+Maintainers changing the retained interactive Codex CLI arguments or isolated
+configuration must follow the
+[Codex CLI adapter maintenance contract](codex-adapter-contract.md). Changes to
+the background worker invocation, session identity, verdict grammar, or task
+lifecycle must follow the
+[Codex exec worker lane contract](codex-exec-worker-lane.md).
 
 ## Login and environment inheritance
 

@@ -1,0 +1,155 @@
+#!/bin/bash
+# Contract smokes for the Codex exec worker seam.
+#
+# These probe the *external* assumptions the lane depends on, against the real
+# pinned binary. Unit tests cannot cover them: a fake CLI would just reproduce
+# whatever hcom already believes. Run before every release, and again after any
+# change to the pinned Codex version.
+#
+#   scripts/codex-exec-contract-smokes
+#
+# Requires: the pinned codex build, a working auth.json, and network access.
+set -uo pipefail
+
+CODEX=/home/ywxk/.codex/packages/standalone/releases/0.146.0-x86_64-unknown-linux-musl/bin/codex
+MODEL=${SMOKE_MODEL:-gpt-5.3-codex-spark}
+EFFORT=${SMOKE_EFFORT:-medium}
+
+WORK=$(mktemp -d -t hcom-exec-smokes.XXXXXX)
+trap 'rm -rf -- "$WORK"' EXIT
+pass=0
+fail=0
+
+report() { # name, ok(0/1), detail
+  if [ "$2" -eq 0 ]; then
+    printf 'PASS  %-46s %s\n' "$1" "${3:-}"
+    pass=$((pass + 1))
+  else
+    printf 'FAIL  %-46s %s\n' "$1" "${3:-}"
+    fail=$((fail + 1))
+  fi
+}
+
+# Create turns carry --cd; resume turns must not (0.146 rejects it there).
+closed_shape() { # cwd, out_file, extra args...
+  local cwd="$1" out="$2"
+  shift 2
+  local cd_args=(--cd "$cwd")
+  for argument in "$@"; do
+    [ "$argument" = "resume" ] && cd_args=()
+  done
+  local disable=(apps auth_elicitation browser_use browser_use_external
+    browser_use_full_cdp_access code_mode_host collaboration_modes computer_use
+    enable_fanout goals guardian_approval hooks image_generation in_app_browser
+    memories multi_agent multi_agent_v2 plugins plugin_sharing remote_plugin
+    shell_snapshot skill_mcp_dependency_install skill_search
+    tool_call_mcp_elicitation workspace_dependencies)
+  local dis=()
+  for feature in "${disable[@]}"; do dis+=(--disable "$feature"); done
+  timeout "${SMOKE_TIMEOUT:-280}" "$CODEX" exec \
+    --sandbox danger-full-access \
+    --skip-git-repo-check \
+    "$@" \
+    --json \
+    --strict-config \
+    --model "$MODEL" \
+    --config "model_reasoning_effort=\"$EFFORT\"" \
+    --config 'approval_policy="never"' \
+    --config 'mcp_servers={}' \
+    --config 'shell_environment_policy.inherit="all"' \
+    --config 'shell_environment_policy.ignore_default_excludes=true' \
+    --ignore-user-config \
+    --ignore-rules \
+    "${dis[@]}" \
+    "${cd_args[@]}" \
+    --output-last-message "$out" \
+    -
+}
+
+# --- C0: pinned binary and help contract ------------------------------------
+if [ -x "$CODEX" ]; then report "C0 pinned binary present" 0; else
+  report "C0 pinned binary present" 1 "$CODEX"; exit 1
+fi
+help=$("$CODEX" exec --help 2>&1)
+missing=""
+for flag in resume --sandbox --skip-git-repo-check --json --strict-config \
+            --model --config --ignore-user-config --ignore-rules --disable \
+            --cd --output-last-message --add-dir; do
+  grep -q -- "$flag" <<<"$help" || missing="$missing $flag"
+done
+[ -z "$missing" ]
+report "C0 exec help contract" $? "$missing"
+
+# --- C1: create turn writes the final message -------------------------------
+mkdir -p "$WORK/c1/project" "$WORK/c1/home"
+export CODEX_HOME="$WORK/c1/home"
+cp ~/.codex/auth.json "$CODEX_HOME/auth.json" 2>/dev/null
+printf 'Reply with a final message of exactly: SMOKE-C1' \
+  | closed_shape "$WORK/c1/project" "$WORK/c1/last.md" \
+  > "$WORK/c1/events.jsonl" 2>"$WORK/c1/stderr.log"
+c1_exit=$?
+grep -q "SMOKE-C1" "$WORK/c1/last.md" 2>/dev/null
+report "C1 exec create + --output-last-message" $((c1_exit || $?))
+
+# --- C2: thread.started proof and resume identity ---------------------------
+tid=$(head -1 "$WORK/c1/events.jsonl" 2>/dev/null | grep -oE '"thread_id":"[^"]+"' | cut -d'"' -f4)
+[ -n "$tid" ]
+report "C2a first stdout line is thread.started" $? "$tid"
+if [ -n "$tid" ]; then
+  printf 'Reply with a final message of exactly: SMOKE-C2' \
+    | closed_shape "$WORK/c1/project" "$WORK/c1/resume.md" resume "$tid" \
+    > "$WORK/c1/resume-events.jsonl" 2>/dev/null
+  rid=$(head -1 "$WORK/c1/resume-events.jsonl" | grep -oE '"thread_id":"[^"]+"' | cut -d'"' -f4)
+  [ "$rid" = "$tid" ]
+  report "C2b resume re-emits the same thread id" $?
+fi
+
+# --- C3: non-Git project directory + --add-dir ------------------------------
+mkdir -p "$WORK/c3/project" "$WORK/c3/extra" "$WORK/c3/home"
+export CODEX_HOME="$WORK/c3/home"
+cp ~/.codex/auth.json "$CODEX_HOME/auth.json" 2>/dev/null
+printf 'Use your shell tool to run: touch ../extra/wrote.txt
+Then reply with a final message of exactly: SMOKE-C3' \
+  | closed_shape "$WORK/c3/project" "$WORK/c3/last.md" --add-dir "$WORK/c3/extra" \
+  > /dev/null 2>&1
+[ -f "$WORK/c3/extra/wrote.txt" ]
+report "C3 non-Git cwd + --add-dir write scope" $?
+
+# --- C4: environment inheritance at the tool-command layer ------------------
+# Allowlisted synthetic variables only: a full env dump would ship real
+# credentials into the model context and the provider.
+mkdir -p "$WORK/c4/project" "$WORK/c4/home"
+export CODEX_HOME="$WORK/c4/home"
+cp ~/.codex/auth.json "$CODEX_HOME/auth.json" 2>/dev/null
+cat > "$WORK/c4/project/probe.sh" <<'PROBE'
+#!/bin/sh
+{
+  printf 'SECRETSHAPED=%s\n' "$SMOKE_SYNTH_TOKEN_VALUE"
+  printf 'CASE_low=%s\n' "$smoke_case"
+  printf 'CASE_UP=%s\n' "$SMOKE_CASE"
+  printf 'EMPTY=[%s]\n' "$SMOKE_EMPTY"
+  printf 'PROXY=%s\n' "$smoke_proxy"
+} > probe.txt
+PROBE
+export SMOKE_SYNTH_TOKEN_VALUE=synthtok-smoke-abcdef
+export smoke_case=lower-value SMOKE_CASE=UPPER-VALUE SMOKE_EMPTY=
+export smoke_proxy=http://proxy.invalid:8080
+printf 'Use your shell tool to run: sh probe.sh
+Then reply with a final message of exactly: SMOKE-C4' \
+  | closed_shape "$WORK/c4/project" "$WORK/c4/last.md" >/dev/null 2>&1
+probe=$(cat "$WORK/c4/project/probe.txt" 2>/dev/null)
+ok=0
+grep -q "SECRETSHAPED=synthtok-smoke-abcdef" <<<"$probe" || ok=1
+grep -q "CASE_low=lower-value" <<<"$probe" || ok=1
+grep -q "CASE_UP=UPPER-VALUE" <<<"$probe" || ok=1
+grep -q "EMPTY=\[\]" <<<"$probe" || ok=1
+grep -q "PROXY=http://proxy.invalid:8080" <<<"$probe" || ok=1
+report "C4 complete env reaches tool commands" $ok
+
+# --- C5: private CODEX_HOME keeps exactly one session -----------------------
+sessions=$(find "$WORK/c1/home" -name 'state_*.sqlite' | wc -l)
+[ "$sessions" -ge 1 ]
+report "C5 private CODEX_HOME session store" $? "state files: $sessions"
+
+printf '\n%d passed, %d failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

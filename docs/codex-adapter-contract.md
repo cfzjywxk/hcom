@@ -6,11 +6,11 @@ CLI task workers behind `hcom arch claude`. It records which native arguments
 and configuration hcom owns, where size bounds are enforced, and which tests
 must change with the contract.
 
-`hcom arch codex` does not use this CLI `exec`/JSONL/final-file adapter for its
-background Developer or Reviewer. Those roles use one task-local Codex App
-Server 0.146 process and are governed by
-[codex-app-server-runtime.md](codex-app-server-runtime.md). The two contracts
-coexist; changing or removing one must not silently alter the other.
+`hcom arch` does not use this adapter for its background Developer or Reviewer.
+Those roles run the exec worker lane described in
+[codex-exec-worker-lane.md](codex-exec-worker-lane.md). This document now covers
+only the retained interactive Codex integration; the two contracts are
+independent, and changing one must not silently alter the other.
 
 The user-facing profile syntax remains in [architect.md](architect.md). This
 document is normative for implementation changes: do not infer compatibility
