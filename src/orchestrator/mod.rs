@@ -3,6 +3,8 @@
 #[cfg(target_os = "linux")]
 pub(crate) mod app_server;
 pub mod core;
+#[cfg(target_os = "linux")]
+pub mod workspace;
 
 use crate::artifact::{
     ArtifactAttempt, ArtifactRoot, ArtifactScope, ManifestMetadata, TurnManifest,

@@ -21,6 +21,7 @@ pub mod reviewer;
 pub mod runtime;
 #[cfg(target_os = "linux")]
 pub(crate) mod sandbox;
+pub mod verdict;
 
 pub use contract::{
     AdapterCapabilities, AdapterDescriptor, CommandSpec, ExecutableIdentity, NativeArtifacts,

@@ -878,11 +878,6 @@ impl SupervisorCore {
                 ));
             }
             binding.observation.validate()?;
-            if !binding.observation.clean || !binding.observation.changed_paths.is_empty() {
-                return Err(SupervisorError::invalid_plan(
-                    "task repository must be clean when the plan is bound",
-                ));
-            }
             if let Some(previous) = roots.insert(
                 binding.observation.repository_root.as_str(),
                 &binding.observation,
@@ -1163,25 +1158,6 @@ impl SupervisorCore {
         self.accepted_completion_tokens
             .insert(active.completion_token);
 
-        if role == WorkerRole::Developer
-            && failure.class == RuntimeFailureClass::Contract
-            && failure.retryable
-        {
-            if self.tasks[task_ordinal].recovery_used {
-                return self.terminalize_current(
-                    SessionState::NeedsHuman,
-                    TaskState::NeedsHuman,
-                    &failure.detail,
-                    Vec::new(),
-                );
-            }
-            return self.schedule_repository(
-                task_ordinal,
-                RepositoryCheckpoint::DeveloperRecoveryPreflight,
-                None,
-            );
-        }
-
         let (session_state, task_state, terminal_detail) = match failure.class {
             RuntimeFailureClass::Canceled => (
                 SessionState::Failed,
@@ -1270,14 +1246,9 @@ impl SupervisorCore {
                 };
                 self.handle_developer_repository(task_ordinal, observation, outcome)
             }
-            RepositoryCheckpoint::DeveloperRecoveryPreflight => {
-                if pending.outcome.is_some() {
-                    return Err(SupervisorError::invariant(
-                        "developer recovery preflight unexpectedly carried an outcome",
-                    ));
-                }
-                self.handle_developer_recovery_preflight(task_ordinal, observation)
-            }
+            RepositoryCheckpoint::DeveloperRecoveryPreflight => Err(SupervisorError::invariant(
+                "developer completion recovery is retired in the task-agnostic lane",
+            )),
             RepositoryCheckpoint::ReviewerPreflight => {
                 if pending.outcome.is_some() {
                     return Err(SupervisorError::invariant(
@@ -1357,17 +1328,8 @@ impl SupervisorCore {
                 "task-start observation requires a pending task",
             ));
         }
-        if !observation.clean
-            || !observation.head_descends_from_expected
-            || !observation.same_git_state(&task.expected_repository)
-        {
-            return self.terminalize_current(
-                SessionState::NeedsHuman,
-                TaskState::NeedsHuman,
-                "task repository drifted before task start",
-                Vec::new(),
-            );
-        }
+        // Task-agnostic supervisor: the observation is routing data (base for
+        // the review diff), never a quality gate.
         task.branch = Some(observation.branch.clone());
         task.base_revision = Some(observation.head.clone());
         task.expected_repository = observation;
@@ -1386,119 +1348,17 @@ impl SupervisorCore {
                 "developer completion checkpoint requires a developing task",
             ));
         }
-        let expected = self.tasks[task_ordinal].expected_repository.clone();
-        if observation.repository_root != expected.repository_root
-            || observation.identity_hash != expected.identity_hash
-            || observation.branch != expected.branch
-            || !observation.head_descends_from_expected
-        {
-            return self.terminalize_current(
-                SessionState::NeedsHuman,
-                TaskState::NeedsHuman,
-                "developer repository identity, branch, or history drifted",
-                Vec::new(),
-            );
-        }
-        if !self.changed_paths_allowed(task_ordinal, &observation.changed_paths) {
-            return self.terminalize_current(
-                SessionState::NeedsHuman,
-                TaskState::NeedsHuman,
-                "developer changed paths outside the task allowlist",
-                Vec::new(),
-            );
-        }
-
-        let valid_completion = observation.clean
-            && observation.head != expected.head
-            && !observation.changed_paths.is_empty();
-        if valid_completion {
-            let task = &mut self.tasks[task_ordinal];
-            task.head_revision = Some(observation.head.clone());
-            task.expected_repository = observation;
-            task.last_developer_outcome = Some(outcome);
-            task.recovery_checkpoint = None;
-            task.state = TaskState::Reviewing;
-            task.outcome_detail = Some("developer produced a clean committed revision".into());
-            return self.schedule_repository(
-                task_ordinal,
-                RepositoryCheckpoint::ReviewerPreflight,
-                None,
-            );
-        }
-
-        if self.tasks[task_ordinal].recovery_used {
-            return self.terminalize_current(
-                SessionState::NeedsHuman,
-                TaskState::NeedsHuman,
-                "developer completion remained invalid after one recovery",
-                Vec::new(),
-            );
-        }
-        let session = self.tasks[task_ordinal]
-            .developer_session
-            .ok_or_else(|| SupervisorError::invariant("developer session disappeared"))?;
+        // Task-agnostic supervisor: the developer's exit routes to review
+        // unconditionally. The observation is captured as routing data (head
+        // for the review diff range and status snapshots); repository quality,
+        // scope, and cleanliness are the reviewer's and the human's judgment.
         let task = &mut self.tasks[task_ordinal];
-        task.recovery_used = true;
-        task.recovery_checkpoint = Some(observation);
+        task.head_revision = Some(observation.head.clone());
+        task.expected_repository = observation;
         task.last_developer_outcome = Some(outcome);
-        task.outcome_detail = Some("developer completion recovery in progress".into());
-        self.schedule_turn(
-            task_ordinal,
-            WorkerRole::Developer,
-            RuntimeTurnPurpose::DeveloperCompletionRecovery,
-            session,
-        )
-    }
-
-    fn handle_developer_recovery_preflight(
-        &mut self,
-        task_ordinal: usize,
-        observation: RepositoryObservation,
-    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
-        if self.tasks[task_ordinal].state != TaskState::Developing {
-            return Err(SupervisorError::invalid_transition(
-                "developer recovery checkpoint requires a developing task",
-            ));
-        }
-        let expected = self.tasks[task_ordinal].expected_repository.clone();
-        if observation.repository_root != expected.repository_root
-            || observation.identity_hash != expected.identity_hash
-            || observation.branch != expected.branch
-            || !observation.head_descends_from_expected
-        {
-            return self.terminalize_current(
-                SessionState::NeedsHuman,
-                TaskState::NeedsHuman,
-                "developer repository identity, branch, or history drifted",
-                Vec::new(),
-            );
-        }
-        if !self.changed_paths_allowed(task_ordinal, &observation.changed_paths) {
-            return self.terminalize_current(
-                SessionState::NeedsHuman,
-                TaskState::NeedsHuman,
-                "developer changed paths outside the task allowlist",
-                Vec::new(),
-            );
-        }
-        if self.tasks[task_ordinal].recovery_used {
-            return Err(SupervisorError::invariant(
-                "developer recovery preflight arrived after the recovery budget was consumed",
-            ));
-        }
-        let session = self.tasks[task_ordinal]
-            .developer_session
-            .ok_or_else(|| SupervisorError::invariant("developer session disappeared"))?;
-        let task = &mut self.tasks[task_ordinal];
-        task.recovery_used = true;
-        task.recovery_checkpoint = Some(observation);
-        task.outcome_detail = Some("developer completion recovery in progress".into());
-        self.schedule_turn(
-            task_ordinal,
-            WorkerRole::Developer,
-            RuntimeTurnPurpose::DeveloperCompletionRecovery,
-            session,
-        )
+        task.state = TaskState::Reviewing;
+        task.outcome_detail = Some("developer turn completed; routing to review".into());
+        self.schedule_repository(task_ordinal, RepositoryCheckpoint::ReviewerPreflight, None)
     }
 
     fn handle_reviewer_preflight(
@@ -1512,17 +1372,7 @@ impl SupervisorCore {
                 "reviewer preflight requires a reviewing task",
             ));
         }
-        if !observation.clean
-            || !observation.head_descends_from_expected
-            || !observation.same_git_state(&task.expected_repository)
-        {
-            return self.terminalize_current(
-                SessionState::NeedsHuman,
-                TaskState::NeedsHuman,
-                "repository drifted before Reviewer started",
-                Vec::new(),
-            );
-        }
+        // Routing data only; drift is the reviewer's to notice, not a gate.
         task.reviewer_pre_repository = Some(observation);
         if let Some(session) = task.reviewer_session {
             let purpose = if task.review_round == 0 {
@@ -1547,18 +1397,12 @@ impl SupervisorCore {
                 "reviewer postflight requires a reviewing task",
             ));
         }
-        let before = self.tasks[task_ordinal]
-            .reviewer_pre_repository
-            .clone()
-            .ok_or_else(|| SupervisorError::invariant("reviewer preflight state disappeared"))?;
-        if !observation.clean || !observation.same_git_state(&before) {
-            return self.terminalize_current(
-                SessionState::NeedsHuman,
-                TaskState::NeedsHuman,
-                "Reviewer changed repository state; verdict rejected",
-                Vec::new(),
-            );
+        if self.tasks[task_ordinal].reviewer_pre_repository.is_none() {
+            return Err(SupervisorError::invariant(
+                "reviewer preflight state disappeared",
+            ));
         }
+        let _ = observation; // routing/diagnostic data only, never a gate
         let next_round = self.tasks[task_ordinal]
             .review_round
             .checked_add(1)
@@ -1780,21 +1624,6 @@ impl SupervisorCore {
             .active_turn
             .take()
             .expect("active turn was just validated"))
-    }
-
-    fn changed_paths_allowed(&self, task_ordinal: usize, changed_paths: &[String]) -> bool {
-        changed_paths.iter().all(|changed| {
-            self.tasks[task_ordinal]
-                .spec
-                .allowed_paths
-                .iter()
-                .any(|allowed| {
-                    changed == allowed
-                        || changed
-                            .strip_prefix(allowed)
-                            .is_some_and(|suffix| suffix.starts_with('/'))
-                })
-        })
     }
 
     fn interrupt_active_effect(&mut self) -> Vec<SupervisorEffect> {
@@ -2033,12 +1862,11 @@ impl SupervisorCore {
             }
             if task.state == TaskState::Reviewing
                 && (task.head_revision.is_none()
-                    || !task.expected_repository.clean
                     || task.developer_session.is_none()
                     || task.review_round >= u32::from(task.spec.max_review_rounds))
             {
                 return Err(SupervisorError::invariant(
-                    "reviewing task lacks a clean committed Developer handoff",
+                    "reviewing task lacks a Developer handoff",
                 ));
             }
             if task.reviewer_session.is_some() && task.developer_session.is_none() {
@@ -3564,7 +3392,7 @@ mod tests {
         );
         edges.insert((
             name(before),
-            "safe_completion_recovery",
+            "dirty_completion",
             name(developing.tasks[0].state),
         ));
 
@@ -3659,7 +3487,7 @@ mod tests {
         );
         edges.insert((
             name(before),
-            "reviewer_mutation",
+            "reviewer_mutation_ignored",
             name(mutation.tasks[0].state),
         ));
 
@@ -3685,13 +3513,17 @@ mod tests {
             edges,
             BTreeSet::from([
                 ("pending", "runtime_opened", "developing"),
-                ("developing", "safe_completion_recovery", "developing"),
+                // Task-agnostic lane: a dirty developer completion routes to
+                // review like any other exit; quality is the reviewer's call.
+                ("developing", "dirty_completion", "reviewing"),
                 ("developing", "clean_commit", "reviewing"),
                 ("developing", "developer_blocked", "needs_human"),
                 ("reviewing", "request_changes", "developing"),
                 ("reviewing", "lgtm", "lgtm"),
                 ("reviewing", "max_round_request_changes", "review_exhausted",),
-                ("reviewing", "reviewer_mutation", "needs_human"),
+                // Reviewer-side repository mutation is diagnostic data, not a
+                // verdict gate.
+                ("reviewing", "reviewer_mutation_ignored", "lgtm"),
             ])
         );
 
@@ -4059,19 +3891,21 @@ mod tests {
     }
 
     #[test]
-    fn one_safe_developer_completion_recovery_succeeds_and_second_failure_stops() {
+    fn dirty_or_unchanged_developer_completion_routes_to_review() {
+        // Task-agnostic lane: no completion quality gate and no recovery
+        // machinery — any developer completion observation routes to review,
+        // and the checkpoint only records routing data.
         let base = observation("/repo", '1');
-
-        let mut success = new_core();
+        let mut core = new_core();
         bind(
-            &mut success,
-            vec![task("success", "/repo", 2)],
+            &mut core,
+            vec![task("routes", "/repo", 2)],
             vec![base.clone()],
         );
-        authorize(&mut success);
-        let developer = start_first_developer(&mut success, 0, base.clone(), 1, 1, "d1");
+        authorize(&mut core);
+        let developer = start_first_developer(&mut core, 0, base.clone(), 1, 1, "d1");
         complete_turn(
-            &mut success,
+            &mut core,
             0,
             WorkerRole::Developer,
             developer.session,
@@ -4082,110 +3916,22 @@ mod tests {
         let dirty = developer_observation(&base, '1', false, &["src/lib.rs"]);
         assert_eq!(
             observe(
-                &mut success,
+                &mut core,
                 0,
                 RepositoryCheckpoint::DeveloperCompletion,
                 dirty
             ),
             vec![
-                SupervisorEffect::StartTurn {
+                SupervisorEffect::ObserveRepository {
                     task_ordinal: 0,
-                    role: WorkerRole::Developer,
-                    purpose: RuntimeTurnPurpose::DeveloperCompletionRecovery,
-                    session: developer.session,
+                    checkpoint: RepositoryCheckpoint::ReviewerPreflight,
                 },
                 SupervisorEffect::PublishStatus,
             ]
         );
-        let recovery_turn = RuntimeTurnKey::from_counter(2).unwrap();
-        start_turn(
-            &mut success,
-            0,
-            WorkerRole::Developer,
-            RuntimeTurnPurpose::DeveloperCompletionRecovery,
-            developer.session,
-            recovery_turn,
-            "d-recovery",
-        );
-        complete_turn(
-            &mut success,
-            0,
-            WorkerRole::Developer,
-            developer.session,
-            recovery_turn,
-            "d-recovery",
-            ready(),
-        );
-        let committed = developer_observation(&base, '2', true, &["src/lib.rs"]);
-        observe(
-            &mut success,
-            0,
-            RepositoryCheckpoint::DeveloperCompletion,
-            committed,
-        );
-        assert_eq!(success.tasks[0].state, TaskState::Reviewing);
-        assert!(success.tasks[0].recovery_used);
-
-        let mut failure = new_core();
-        bind(
-            &mut failure,
-            vec![task("failure", "/repo", 2)],
-            vec![base.clone()],
-        );
-        authorize(&mut failure);
-        let developer = start_first_developer(&mut failure, 0, base.clone(), 1, 1, "d1");
-        complete_turn(
-            &mut failure,
-            0,
-            WorkerRole::Developer,
-            developer.session,
-            developer.turn,
-            developer.token,
-            ready(),
-        );
-        observe(
-            &mut failure,
-            0,
-            RepositoryCheckpoint::DeveloperCompletion,
-            developer_observation(&base, '1', false, &["src/lib.rs"]),
-        );
-        let recovery_turn = RuntimeTurnKey::from_counter(2).unwrap();
-        start_turn(
-            &mut failure,
-            0,
-            WorkerRole::Developer,
-            RuntimeTurnPurpose::DeveloperCompletionRecovery,
-            developer.session,
-            recovery_turn,
-            "d-recovery",
-        );
-        complete_turn(
-            &mut failure,
-            0,
-            WorkerRole::Developer,
-            developer.session,
-            recovery_turn,
-            "d-recovery",
-            ready(),
-        );
-        let effects = observe(
-            &mut failure,
-            0,
-            RepositoryCheckpoint::DeveloperCompletion,
-            developer_observation(&base, '1', false, &["src/lib.rs"]),
-        );
-        assert_eq!(
-            effects,
-            vec![
-                SupervisorEffect::CloseTaskRuntime { task_ordinal: 0 },
-                SupervisorEffect::FinishSession {
-                    state: SessionState::NeedsHuman,
-                    detail: "developer completion remained invalid after one recovery".into(),
-                },
-                SupervisorEffect::PublishStatus,
-            ]
-        );
-        assert_eq!(failure.session_state(), SessionState::NeedsHuman);
+        assert_eq!(core.tasks[0].state, TaskState::Reviewing);
+        assert!(!core.tasks[0].recovery_used);
+        assert_eq!(core.tasks[0].head_revision, Some(revision('1')));
     }
 
     #[test]
@@ -4231,179 +3977,31 @@ mod tests {
                     "typed final outcome was missing or invalid",
                 ))
                 .unwrap();
-            if role == WorkerRole::Developer && retryable {
-                assert_eq!(
-                    effects,
-                    vec![
-                        SupervisorEffect::ObserveRepository {
-                            task_ordinal: 0,
-                            checkpoint: RepositoryCheckpoint::DeveloperRecoveryPreflight,
-                        },
-                        SupervisorEffect::PublishStatus,
-                    ]
-                );
-                assert_eq!(core.session_state(), SessionState::Running);
-                assert!(!core.tasks[0].recovery_used);
-
-                let safe_dirty = developer_observation(&repository, '1', false, &["src/lib.rs"]);
-                assert_eq!(
-                    observe(
-                        &mut core,
-                        0,
-                        RepositoryCheckpoint::DeveloperRecoveryPreflight,
-                        safe_dirty,
-                    ),
-                    vec![
-                        SupervisorEffect::StartTurn {
-                            task_ordinal: 0,
-                            role: WorkerRole::Developer,
-                            purpose: RuntimeTurnPurpose::DeveloperCompletionRecovery,
-                            session: active.session,
-                        },
-                        SupervisorEffect::PublishStatus,
-                    ]
-                );
-                let snapshot = core.snapshot();
-                assert_eq!(snapshot.state, SessionState::Running);
-                assert_eq!(snapshot.current_task_ordinal, Some(0));
-                assert_eq!(
-                    snapshot.tasks[0].outcome_detail.as_deref(),
-                    Some("developer completion recovery in progress")
-                );
-                assert!(core.tasks[0].recovery_used);
-                assert_eq!(core.tasks[0].developer_session, Some(active.session));
-
-                let recovery_turn = RuntimeTurnKey::from_counter(20).unwrap();
-                start_turn(
-                    &mut core,
-                    0,
-                    WorkerRole::Developer,
-                    RuntimeTurnPurpose::DeveloperCompletionRecovery,
-                    active.session,
-                    recovery_turn,
-                    "retryable-recovery",
-                );
-                let recovery = ActiveIdentity {
-                    task: 0,
-                    role: WorkerRole::Developer,
-                    session: active.session,
-                    turn: recovery_turn,
-                    token: "retryable-recovery",
-                };
-                assert_eq!(
-                    core.reduce(fail_turn_event(
-                        &core,
-                        recovery,
-                        RuntimeFailureClass::Contract,
-                        true,
-                        "typed final outcome was invalid again",
-                    ))
-                    .unwrap(),
-                    vec![
-                        SupervisorEffect::CloseTaskRuntime { task_ordinal: 0 },
-                        SupervisorEffect::FinishSession {
-                            state: SessionState::NeedsHuman,
-                            detail: "typed final outcome was invalid again".into(),
-                        },
-                        SupervisorEffect::PublishStatus,
-                    ]
-                );
-                assert_eq!(
-                    core.snapshot().terminal_detail.as_deref(),
-                    Some("typed final outcome was invalid again")
-                );
-            } else {
-                assert_eq!(
-                    effects,
-                    vec![
-                        SupervisorEffect::CloseTaskRuntime { task_ordinal: 0 },
-                        SupervisorEffect::FinishSession {
-                            state: SessionState::NeedsHuman,
-                            detail: "worker runtime contract failed".into(),
-                        },
-                        SupervisorEffect::PublishStatus,
-                    ]
-                );
-                let snapshot = core.snapshot();
-                assert_eq!(snapshot.state, SessionState::NeedsHuman);
-                assert_eq!(
-                    snapshot.terminal_detail.as_deref(),
-                    Some("worker runtime contract failed")
-                );
-                assert_eq!(
-                    snapshot.tasks[0].outcome_detail.as_deref(),
-                    Some("worker runtime contract failed")
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn retryable_developer_failure_requires_safe_repository_evidence() {
-        let base = observation("/repo", '1');
-        let mut identity_drift = developer_observation(&base, '1', false, &["src/lib.rs"]);
-        identity_drift.identity_hash = "2".repeat(64);
-        let mut branch_drift = developer_observation(&base, '1', false, &["src/lib.rs"]);
-        branch_drift.branch = "other".into();
-        let mut history_drift = developer_observation(&base, '2', true, &["src/lib.rs"]);
-        history_drift.head_descends_from_expected = false;
-        let outside_allowlist = developer_observation(&base, '1', false, &["outside/secret.txt"]);
-
-        for (repository, expected) in [
-            (
-                identity_drift,
-                "developer repository identity, branch, or history drifted",
-            ),
-            (
-                branch_drift,
-                "developer repository identity, branch, or history drifted",
-            ),
-            (
-                history_drift,
-                "developer repository identity, branch, or history drifted",
-            ),
-            (
-                outside_allowlist,
-                "developer changed paths outside the task allowlist",
-            ),
-        ] {
-            let (mut core, _base, active) = active_core();
+            // Task-agnostic lane: the retryable flag no longer triggers any
+            // recovery path — every contract failure is terminal for every
+            // role, and `repository` stays unused routing context.
+            let _ = repository;
             assert_eq!(
-                core.reduce(fail_turn_event(
-                    &core,
-                    active,
-                    RuntimeFailureClass::Contract,
-                    true,
-                    "typed final outcome was missing",
-                ))
-                .unwrap(),
-                vec![
-                    SupervisorEffect::ObserveRepository {
-                        task_ordinal: 0,
-                        checkpoint: RepositoryCheckpoint::DeveloperRecoveryPreflight,
-                    },
-                    SupervisorEffect::PublishStatus,
-                ]
-            );
-            assert_eq!(
-                observe(
-                    &mut core,
-                    0,
-                    RepositoryCheckpoint::DeveloperRecoveryPreflight,
-                    repository,
-                ),
+                effects,
                 vec![
                     SupervisorEffect::CloseTaskRuntime { task_ordinal: 0 },
                     SupervisorEffect::FinishSession {
                         state: SessionState::NeedsHuman,
-                        detail: expected.into(),
+                        detail: "worker runtime contract failed".into(),
                     },
                     SupervisorEffect::PublishStatus,
                 ]
             );
-            assert_eq!(core.session_state(), SessionState::NeedsHuman);
-            assert!(!core.tasks[0].recovery_used);
-            assert_eq!(core.snapshot().terminal_detail.as_deref(), Some(expected));
+            let snapshot = core.snapshot();
+            assert_eq!(snapshot.state, SessionState::NeedsHuman);
+            assert_eq!(
+                snapshot.terminal_detail.as_deref(),
+                Some("worker runtime contract failed")
+            );
+            assert_eq!(
+                snapshot.tasks[0].outcome_detail.as_deref(),
+                Some("worker runtime contract failed")
+            );
         }
     }
 
@@ -4901,7 +4499,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_observation_bounds_ordering_and_plan_cleanliness_fail_closed() {
+    fn repository_observation_bounds_ordering_fail_closed_and_dirty_binding_accepted() {
         let base_task = task("one", "/repo", 1);
         let invalid_observations = {
             let mut values = Vec::new();
@@ -4940,6 +4538,8 @@ mod tests {
             assert_eq!(core, before);
         }
 
+        // Task-agnostic lane: a dirty repository binding is routing data, not
+        // a plan gate — binding succeeds and awaits approval.
         let mut dirty = observation("/repo", '1');
         dirty.clean = false;
         dirty.changed_paths = vec!["src/lib.rs".into()];
@@ -4952,10 +4552,8 @@ mod tests {
                 observation: dirty,
             }],
         );
-        assert_eq!(
-            core.reduce(event).unwrap_err().code,
-            SupervisorErrorCode::InvalidPlan
-        );
+        core.reduce(event).unwrap();
+        assert_eq!(core.session_state(), SessionState::AwaitingApproval);
     }
 
     #[test]
@@ -5224,6 +4822,8 @@ mod tests {
     fn git_failure_diagnostics_are_distinct_and_snapshots_exclude_raw_outcomes() {
         let base = observation("/repo", '1');
 
+        // Task-agnostic lane: a dirty task-start observation proceeds to the
+        // runtime open instead of terminalizing.
         let mut dirty_start = new_core();
         bind(
             &mut dirty_start,
@@ -5235,44 +4835,42 @@ mod tests {
         dirty.clean = false;
         dirty.changed_paths = vec!["src/lib.rs".into()];
         dirty.index_diff_hash = "c".repeat(64);
-        observe(&mut dirty_start, 0, RepositoryCheckpoint::TaskStart, dirty);
+        assert_eq!(
+            observe(&mut dirty_start, 0, RepositoryCheckpoint::TaskStart, dirty),
+            vec![
+                SupervisorEffect::OpenTaskRuntime { task_ordinal: 0 },
+                SupervisorEffect::PublishStatus,
+            ]
+        );
+        assert_eq!(dirty_start.session_state(), SessionState::Running);
 
-        let (mut out_of_scope, _base, active) = active_core();
-        complete_turn(
-            &mut out_of_scope,
-            0,
-            WorkerRole::Developer,
-            active.session,
-            active.turn,
-            active.token,
-            ready(),
-        );
-        observe(
-            &mut out_of_scope,
-            0,
-            RepositoryCheckpoint::DeveloperCompletion,
-            developer_observation(&base, '2', true, &["Cargo.toml"]),
-        );
+        // Out-of-scope and non-fast-forward completions route to review; the
+        // reviewer and the human judge scope and history, not the supervisor.
+        for case in [developer_observation(&base, '2', true, &["Cargo.toml"]), {
+            let mut non_ff = developer_observation(&base, '2', true, &["src/lib.rs"]);
+            non_ff.head_descends_from_expected = false;
+            non_ff
+        }] {
+            let (mut core, _base, active) = active_core();
+            complete_turn(
+                &mut core,
+                0,
+                WorkerRole::Developer,
+                active.session,
+                active.turn,
+                active.token,
+                ready(),
+            );
+            observe(
+                &mut core,
+                0,
+                RepositoryCheckpoint::DeveloperCompletion,
+                case,
+            );
+            assert_eq!(core.tasks[0].state, TaskState::Reviewing);
+        }
 
-        let (mut history_drift, _base, active) = active_core();
-        complete_turn(
-            &mut history_drift,
-            0,
-            WorkerRole::Developer,
-            active.session,
-            active.turn,
-            active.token,
-            ready(),
-        );
-        let mut non_ff = developer_observation(&base, '2', true, &["src/lib.rs"]);
-        non_ff.head_descends_from_expected = false;
-        observe(
-            &mut history_drift,
-            0,
-            RepositoryCheckpoint::DeveloperCompletion,
-            non_ff,
-        );
-
+        // Reviewer-side repository mutation no longer rejects the verdict.
         let (mut reviewer_mutation, committed, reviewer) = active_reviewer_core(1);
         complete_turn(
             &mut reviewer_mutation,
@@ -5293,23 +4891,7 @@ mod tests {
             RepositoryCheckpoint::ReviewerPostflight,
             changed,
         );
-
-        let details = [
-            dirty_start.snapshot().terminal_detail.unwrap(),
-            out_of_scope.snapshot().terminal_detail.unwrap(),
-            history_drift.snapshot().terminal_detail.unwrap(),
-            reviewer_mutation.snapshot().terminal_detail.unwrap(),
-        ];
-        assert_eq!(details.iter().collect::<BTreeSet<_>>().len(), details.len());
-        assert_eq!(
-            details,
-            [
-                "task repository drifted before task start",
-                "developer changed paths outside the task allowlist",
-                "developer repository identity, branch, or history drifted",
-                "Reviewer changed repository state; verdict rejected",
-            ]
-        );
+        assert_eq!(reviewer_mutation.tasks[0].state, TaskState::Lgtm);
 
         let (mut raw_outcome, _base, active) = active_core();
         complete_turn(
@@ -5402,7 +4984,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_checkpoint_external_drift_and_future_task_events_stop_or_reject() {
+    fn future_task_events_are_rejected_before_their_turn() {
         let base = observation("/repo", '1');
         let mut core = new_core();
         bind(
@@ -5423,54 +5005,20 @@ mod tests {
         assert_eq!(error.code, SupervisorErrorCode::InvalidIdentity);
         assert_eq!(core, before);
 
+        // The retired recovery checkpoint is rejected outright.
         let developer = start_first_developer(&mut core, 0, base.clone(), 1, 1, "developer");
-        complete_turn(
-            &mut core,
-            0,
-            WorkerRole::Developer,
-            developer.session,
-            developer.turn,
-            developer.token,
-            ready(),
-        );
-        observe(
-            &mut core,
-            0,
-            RepositoryCheckpoint::DeveloperCompletion,
-            developer_observation(&base, '1', false, &["src/lib.rs"]),
-        );
-        let recovery_turn = RuntimeTurnKey::from_counter(2).unwrap();
-        start_turn(
-            &mut core,
-            0,
-            WorkerRole::Developer,
-            RuntimeTurnPurpose::DeveloperCompletionRecovery,
-            developer.session,
-            recovery_turn,
-            "recovery",
-        );
-        complete_turn(
-            &mut core,
-            0,
-            WorkerRole::Developer,
-            developer.session,
-            recovery_turn,
-            "recovery",
-            ready(),
-        );
-        let mut drift = developer_observation(&base, '2', true, &["src/lib.rs"]);
-        drift.branch = "other".into();
-        observe(
-            &mut core,
-            0,
-            RepositoryCheckpoint::DeveloperCompletion,
-            drift,
-        );
-        assert_eq!(core.session_state(), SessionState::NeedsHuman);
-        assert_eq!(
-            core.snapshot().terminal_detail.as_deref(),
-            Some("developer repository identity, branch, or history drifted")
-        );
+        let _ = developer;
+        let error = core
+            .reduce(SupervisorEvent::RepositoryObserved {
+                expected_version: core.version(),
+                task_ordinal: 0,
+                checkpoint: RepositoryCheckpoint::DeveloperRecoveryPreflight,
+                observation: base,
+            })
+            .unwrap_err();
+        // Nothing schedules the retired checkpoint, so the event can never
+        // match a pending observation slot.
+        assert_eq!(error.code, SupervisorErrorCode::InvalidTransition);
     }
 
     #[test]

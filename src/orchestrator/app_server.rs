@@ -2207,100 +2207,87 @@ mod tests {
     }
 
     #[test]
-    fn dirty_and_invalid_completion_each_use_one_same_developer_session_recovery() {
-        for (name, first_poll, first_mutation) in [
-            (
-                "dirty-recovery",
-                ready("forgot commit"),
-                Mutation::Dirty {
-                    path: "src/task.txt",
-                    contents: "dirty\n",
-                },
-            ),
-            ("outcome-recovery", failed_retryable(), Mutation::None),
-        ] {
-            let fixture = Fixture::new();
-            let audit = Arc::new(Mutex::new(Audit::default()));
-            let script = task_script(
-                name,
-                vec![
-                    FakeTurnScript::new(
-                        WorkerRole::Developer,
-                        RuntimeTurnPurpose::InitialDevelopment,
-                        [first_poll],
-                    ),
-                    FakeTurnScript::new(
-                        WorkerRole::Developer,
-                        RuntimeTurnPurpose::DeveloperCompletionRecovery,
-                        [ready("recovered")],
-                    ),
-                    FakeTurnScript::new(
-                        WorkerRole::Reviewer,
-                        RuntimeTurnPurpose::InitialReview,
-                        [lgtm("sound")],
-                    ),
-                ],
-                vec![
-                    first_mutation,
-                    Mutation::Commit {
-                        path: "src/task.txt",
-                        contents: "recovered\n",
-                    },
-                    Mutation::None,
-                ],
-            );
-            let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
-            start(&mut supervisor, vec![fixture.task(name, &["src"], 3)]);
-            assert_eq!(
-                drive_terminal(&mut supervisor).state,
-                SessionState::Completed
-            );
-            let audit = audit.lock().unwrap();
-            let developer_turns: Vec<_> = audit
-                .turns
-                .iter()
-                .filter(|(_, role, _, _)| *role == WorkerRole::Developer)
-                .collect();
-            assert_eq!(developer_turns.len(), 2);
-            assert_eq!(developer_turns[0].3, developer_turns[1].3);
-            assert_eq!(
-                developer_turns[1].2,
-                RuntimeTurnPurpose::DeveloperCompletionRecovery
-            );
-        }
-    }
-
-    #[test]
-    fn second_invalid_developer_completion_stops_without_opening_a_reviewer_session() {
+    fn dirty_completion_routes_to_review_without_recovery() {
+        // Task-agnostic lane: an uncommitted developer completion is not a
+        // supervisor concern — the task routes straight to review with a
+        // single developer turn and no recovery machinery.
         let fixture = Fixture::new();
         let audit = Arc::new(Mutex::new(Audit::default()));
         let script = task_script(
-            "recovery-exhausted",
+            "dirty-routes",
             vec![
                 FakeTurnScript::new(
                     WorkerRole::Developer,
                     RuntimeTurnPurpose::InitialDevelopment,
-                    [failed_retryable()],
+                    [ready("forgot commit")],
                 ),
                 FakeTurnScript::new(
-                    WorkerRole::Developer,
-                    RuntimeTurnPurpose::DeveloperCompletionRecovery,
-                    [failed_retryable()],
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [lgtm("reviewer judged the dirty tree acceptable")],
                 ),
             ],
-            vec![Mutation::None, Mutation::None],
+            vec![
+                Mutation::Dirty {
+                    path: "src/task.txt",
+                    contents: "dirty\n",
+                },
+                Mutation::None,
+            ],
         );
         let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
         start(
             &mut supervisor,
-            vec![fixture.task("recovery-exhausted", &["src"], 3)],
+            vec![fixture.task("dirty-routes", &["src"], 3)],
+        );
+        assert_eq!(
+            drive_terminal(&mut supervisor).state,
+            SessionState::Completed
+        );
+        let audit = audit.lock().unwrap();
+        let developer_turns: Vec<_> = audit
+            .turns
+            .iter()
+            .filter(|(_, role, _, _)| *role == WorkerRole::Developer)
+            .collect();
+        assert_eq!(developer_turns.len(), 1);
+        assert_eq!(
+            audit
+                .sessions
+                .iter()
+                .filter(|(_, role, _)| *role == WorkerRole::Reviewer)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn retryable_contract_failure_is_terminal_without_recovery() {
+        // The retryable flag no longer buys a recovery turn: any contract
+        // failure stops for the human with exactly one developer turn and no
+        // reviewer session.
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script(
+            "contract-terminal",
+            vec![FakeTurnScript::new(
+                WorkerRole::Developer,
+                RuntimeTurnPurpose::InitialDevelopment,
+                [failed_retryable()],
+            )],
+            vec![Mutation::None],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
+        start(
+            &mut supervisor,
+            vec![fixture.task("contract-terminal", &["src"], 3)],
         );
 
         let snapshot = drive_terminal(&mut supervisor);
         assert_eq!(snapshot.state, SessionState::NeedsHuman);
         assert_eq!(
             snapshot.terminal_detail.as_deref(),
-            Some("developer outcome was missing")
+            Some("worker runtime contract failed")
         );
         let audit = audit.lock().unwrap();
         assert_eq!(
@@ -2322,9 +2309,8 @@ mod tests {
             .iter()
             .filter(|(_, role, _, _)| *role == WorkerRole::Developer)
             .collect();
-        assert_eq!(developer_turns.len(), 2);
-        assert_eq!(developer_turns[0].3, developer_turns[1].3);
-        assert_eq!(audit.shutdowns, ["recovery-exhausted"]);
+        assert_eq!(developer_turns.len(), 1);
+        assert_eq!(audit.shutdowns, ["contract-terminal"]);
     }
 
     #[test]
@@ -2469,7 +2455,11 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_source_index_commit_and_branch_mutations_are_rejected_but_cache_is_allowed() {
+    fn reviewer_side_mutations_never_gate_the_verdict() {
+        // Task-agnostic lane: reviewer-side repository observations are
+        // diagnostic only. The reviewer's inability to mutate canonical
+        // source is enforced by its read-only sandbox mounts, not by a
+        // supervisor verdict gate.
         for (name, reviewer_mutation, expected) in [
             (
                 "reviewer-dirty",
@@ -2477,7 +2467,7 @@ mod tests {
                     path: "src/reviewer.txt",
                     contents: "forbidden\n",
                 },
-                SessionState::NeedsHuman,
+                SessionState::Completed,
             ),
             (
                 "reviewer-stage",
@@ -2485,7 +2475,7 @@ mod tests {
                     path: "src/reviewer.txt",
                     contents: "forbidden\n",
                 },
-                SessionState::NeedsHuman,
+                SessionState::Completed,
             ),
             (
                 "reviewer-commit",
@@ -2493,14 +2483,14 @@ mod tests {
                     path: "src/reviewer.txt",
                     contents: "forbidden\n",
                 },
-                SessionState::NeedsHuman,
+                SessionState::Completed,
             ),
             (
                 "reviewer-branch",
                 Mutation::Branch {
                     name: "reviewer-mutated-branch",
                 },
-                SessionState::NeedsHuman,
+                SessionState::Completed,
             ),
             (
                 "reviewer-cache",
@@ -2538,13 +2528,7 @@ mod tests {
             let mut supervisor = fixture.supervisor(vec![script], audit);
             start(&mut supervisor, vec![fixture.task(name, &["src"], 3)]);
             let snapshot = drive_terminal(&mut supervisor);
-            assert_eq!(snapshot.state, expected);
-            if expected == SessionState::NeedsHuman {
-                assert_eq!(
-                    snapshot.terminal_detail.as_deref(),
-                    Some("Reviewer changed repository state; verdict rejected")
-                );
-            }
+            assert_eq!(snapshot.state, expected, "{name}");
         }
     }
 
@@ -2901,47 +2885,65 @@ mod tests {
     }
 
     #[test]
-    fn out_of_scope_commit_and_sensitive_outcome_fail_closed() {
-        for (name, developer_poll, path, expected_detail) in [
-            (
-                "outside",
-                ready("implemented"),
-                "outside.txt",
-                "developer changed paths outside the task allowlist",
-            ),
-            (
-                "secret",
-                ready("environment-secret-sentinel"),
-                "src/task.txt",
-                "worker runtime contract failed",
-            ),
-        ] {
-            let fixture = Fixture::new();
-            let audit = Arc::new(Mutex::new(Audit::default()));
-            let script = task_script(
-                name,
-                vec![FakeTurnScript::new(
+    fn out_of_scope_commit_routes_to_review_and_sensitive_outcome_fails_closed() {
+        // Task-agnostic lane: an out-of-allowlist commit is the reviewer's
+        // and the human's call, not a supervisor gate.
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script(
+            "outside",
+            vec![
+                FakeTurnScript::new(
                     WorkerRole::Developer,
                     RuntimeTurnPurpose::InitialDevelopment,
-                    [developer_poll],
-                )],
-                vec![Mutation::Commit {
-                    path,
+                    [ready("implemented")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [lgtm("scope judged acceptable")],
+                ),
+            ],
+            vec![
+                Mutation::Commit {
+                    path: "outside.txt",
                     contents: "done\n",
-                }],
-            );
-            let mut supervisor = fixture.supervisor(vec![script], audit);
-            start(&mut supervisor, vec![fixture.task(name, &["src"], 2)]);
-            let snapshot = drive_terminal(&mut supervisor);
-            assert_eq!(snapshot.state, SessionState::NeedsHuman);
-            assert_eq!(
-                snapshot.terminal_detail.as_deref(),
-                Some(expected_detail),
-                "{name}"
-            );
-            let encoded = serde_json::to_string(&snapshot).unwrap();
-            assert!(!encoded.contains("environment-secret-sentinel"));
-        }
+                },
+                Mutation::None,
+            ],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], audit);
+        start(&mut supervisor, vec![fixture.task("outside", &["src"], 2)]);
+        assert_eq!(
+            drive_terminal(&mut supervisor).state,
+            SessionState::Completed
+        );
+
+        // The secret-leak screen on outcomes remains a hard stop.
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script(
+            "secret",
+            vec![FakeTurnScript::new(
+                WorkerRole::Developer,
+                RuntimeTurnPurpose::InitialDevelopment,
+                [ready("environment-secret-sentinel")],
+            )],
+            vec![Mutation::Commit {
+                path: "src/task.txt",
+                contents: "done\n",
+            }],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], audit);
+        start(&mut supervisor, vec![fixture.task("secret", &["src"], 2)]);
+        let snapshot = drive_terminal(&mut supervisor);
+        assert_eq!(snapshot.state, SessionState::NeedsHuman);
+        assert_eq!(
+            snapshot.terminal_detail.as_deref(),
+            Some("worker runtime contract failed")
+        );
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(!encoded.contains("environment-secret-sentinel"));
     }
 
     #[test]
