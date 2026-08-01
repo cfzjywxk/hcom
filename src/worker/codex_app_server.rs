@@ -10,9 +10,10 @@ use super::contract::ExecutableIdentity;
 use super::process::{ProcessGroupBinding, configure_worker_child};
 use super::runtime::{
     CODEX_APP_SERVER_EXECUTABLE_SHA256, CODEX_APP_SERVER_SCHEMA_CANONICAL_SHA256,
-    CODEX_APP_SERVER_SCHEMA_EXEMPLAR_SHA256, OutcomeContract, RoleSessionSpec,
-    RuntimeContractIdentity, RuntimeError, RuntimeFailureClass, RuntimeOutcome, RuntimeSessionKey,
-    RuntimeTurnKey, RuntimeTurnPoll, RuntimeTurnSpec, SanitizedRuntimeFailure, TaskWorkerRuntime,
+    CODEX_APP_SERVER_SCHEMA_EXEMPLAR_SHA256, MAX_RUNTIME_OUTCOME_BYTES, OutcomeContract,
+    RoleSessionSpec, RuntimeContractIdentity, RuntimeError, RuntimeFailureClass, RuntimeOutcome,
+    RuntimeSessionKey, RuntimeTurnKey, RuntimeTurnPoll, RuntimeTurnSpec, SanitizedRuntimeFailure,
+    TaskWorkerRuntime,
 };
 use super::sandbox::{HostRootAccess, HostRootContract, HostRootMounts};
 use crate::control_api::WorkerRole;
@@ -687,6 +688,15 @@ struct ActiveTurn {
     turn_id: String,
     spec: RuntimeTurnSpec,
     started: Instant,
+    completed_agent_message_ids: BTreeSet<String>,
+    terminal_messages: Vec<TerminalAgentMessage>,
+    item_failure: Option<SanitizedRuntimeFailure>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TerminalAgentMessage {
+    id: String,
+    text: String,
 }
 
 pub struct CodexAppServerRuntime {
@@ -703,6 +713,8 @@ pub struct CodexAppServerRuntime {
     terminate_grace: Duration,
     expected_codex_home: PathBuf,
     shutdown: bool,
+    #[cfg(test)]
+    last_completed_agent_message_count: usize,
 }
 
 impl CodexAppServerRuntime {
@@ -765,6 +777,8 @@ impl CodexAppServerRuntime {
             terminate_grace: launch.terminate_grace,
             expected_codex_home,
             shutdown: false,
+            #[cfg(test)]
+            last_completed_agent_message_count: 0,
         };
         if let Err(error) = runtime.initialize() {
             let _ = runtime.shutdown();
@@ -844,6 +858,9 @@ impl CodexAppServerRuntime {
             )),
             Ok(Some(RpcInbound::ServerRequest { method })) => Err(RuntimeError::invalid_contract(
                 format!("Codex App Server issued forbidden server request {method}"),
+            )),
+            Ok(Some(RpcInbound::ItemCompleted { .. })) => Err(RuntimeError::invalid_contract(
+                "Codex App Server completed an item before its turn start response",
             )),
             Ok(Some(RpcInbound::TurnCompleted { .. })) => Err(RuntimeError::invalid_contract(
                 "Codex App Server completed a turn before its start response",
@@ -1078,6 +1095,9 @@ impl TaskWorkerRuntime for CodexAppServerRuntime {
             turn_id,
             spec,
             started: Instant::now(),
+            completed_agent_message_ids: BTreeSet::new(),
+            terminal_messages: Vec::new(),
+            item_failure: None,
         });
         Ok(key)
     }
@@ -1113,22 +1133,51 @@ impl TaskWorkerRuntime for CodexAppServerRuntime {
             Err(failure) => return Ok(self.fail_transport(failure)),
         };
         match event {
+            RpcInbound::ItemCompleted { params } => {
+                let active = self.active.as_mut().expect("active turn was checked");
+                match capture_completed_item(&params, active) {
+                    Ok(()) => Ok(RuntimeTurnPoll::Pending {
+                        telemetry: self.rpc.telemetry(),
+                    }),
+                    Err(failure) if failure.class == RuntimeFailureClass::Protocol => {
+                        Ok(self.fail_transport(failure))
+                    }
+                    Err(failure) => {
+                        if active.item_failure.is_none() {
+                            active.item_failure = Some(failure);
+                        }
+                        Ok(RuntimeTurnPoll::Pending {
+                            telemetry: self.rpc.telemetry(),
+                        })
+                    }
+                }
+            }
             RpcInbound::TurnCompleted { params } => {
                 let active = self.active.take().expect("active turn was checked");
                 let telemetry = self.rpc.telemetry();
                 self.rpc.end_turn_window();
-                match extract_terminal_outcome(
+                #[cfg(test)]
+                {
+                    self.last_completed_agent_message_count = active.terminal_messages.len();
+                }
+                let terminal = extract_terminal_outcome(
                     &params,
                     &active.thread_id,
                     &active.turn_id,
                     active.spec.role,
                     active.spec.outcome_contract,
-                ) {
-                    Ok(outcome) => Ok(RuntimeTurnPoll::Completed { outcome, telemetry }),
-                    Err(failure) if failure.class == RuntimeFailureClass::Protocol => {
+                    &active.terminal_messages,
+                );
+                match (active.item_failure, terminal) {
+                    (_, Err(failure)) if failure.class == RuntimeFailureClass::Protocol => {
                         Ok(self.fail_transport(failure))
                     }
-                    Err(failure) => Ok(RuntimeTurnPoll::Failed { failure, telemetry }),
+                    (_, Err(failure)) if failure.class != RuntimeFailureClass::Contract => {
+                        Ok(RuntimeTurnPoll::Failed { failure, telemetry })
+                    }
+                    (Some(failure), _) => Ok(RuntimeTurnPoll::Failed { failure, telemetry }),
+                    (None, Ok(outcome)) => Ok(RuntimeTurnPoll::Completed { outcome, telemetry }),
+                    (None, Err(failure)) => Ok(RuntimeTurnPoll::Failed { failure, telemetry }),
                 }
             }
             RpcInbound::ServerRequest { method } => {
@@ -1287,12 +1336,160 @@ fn validate_turn_start_response(value: &Value) -> Result<String, RuntimeError> {
     Ok(id.to_owned())
 }
 
+fn capture_completed_item(
+    params: &Value,
+    active: &mut ActiveTurn,
+) -> Result<(), SanitizedRuntimeFailure> {
+    let object = params.as_object().ok_or_else(|| {
+        sanitized_failure(
+            RuntimeFailureClass::Protocol,
+            "Codex item/completed params were not an object",
+            false,
+        )
+    })?;
+    if object.get("threadId").and_then(Value::as_str) != Some(active.thread_id.as_str()) {
+        return Err(sanitized_failure(
+            RuntimeFailureClass::Protocol,
+            "Codex item/completed thread id mismatched the active turn",
+            false,
+        ));
+    }
+    if object.get("turnId").and_then(Value::as_str) != Some(active.turn_id.as_str()) {
+        return Err(sanitized_failure(
+            RuntimeFailureClass::Protocol,
+            "Codex item/completed turn id mismatched the active turn",
+            false,
+        ));
+    }
+    let item = object
+        .get("item")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            sanitized_failure(
+                RuntimeFailureClass::Protocol,
+                "Codex item/completed omitted its item object",
+                false,
+            )
+        })?;
+    let id = item.get("id").and_then(Value::as_str).ok_or_else(|| {
+        sanitized_failure(
+            RuntimeFailureClass::Protocol,
+            "Codex completed item omitted its id",
+            false,
+        )
+    })?;
+    if validate_native_id(id).is_err() {
+        return Err(sanitized_failure(
+            RuntimeFailureClass::Protocol,
+            "Codex completed item id violated its bound",
+            false,
+        ));
+    }
+    if active.completed_agent_message_ids.contains(id) {
+        return Err(sanitized_failure(
+            RuntimeFailureClass::Protocol,
+            "Codex App Server repeated a completed item id",
+            false,
+        ));
+    }
+    active.completed_agent_message_ids.insert(id.to_owned());
+
+    let item_type = item.get("type").and_then(Value::as_str).ok_or_else(|| {
+        sanitized_failure(
+            RuntimeFailureClass::Protocol,
+            "Codex completed item omitted its type",
+            false,
+        )
+    })?;
+    if item_type != "agentMessage" {
+        return Ok(());
+    }
+    if let Some(message) = terminal_agent_message(item, active.spec.role)? {
+        if active.terminal_messages.len() >= 2 {
+            return Err(sanitized_failure(
+                RuntimeFailureClass::Contract,
+                "Codex turn emitted more than two terminal agent-message candidates",
+                active.spec.role == WorkerRole::Developer,
+            ));
+        }
+        active.terminal_messages.push(message);
+    }
+    Ok(())
+}
+
+fn terminal_agent_message(
+    item: &serde_json::Map<String, Value>,
+    role: WorkerRole,
+) -> Result<Option<TerminalAgentMessage>, SanitizedRuntimeFailure> {
+    let id = item.get("id").and_then(Value::as_str).ok_or_else(|| {
+        sanitized_failure(
+            RuntimeFailureClass::Contract,
+            "Codex terminal agent message omitted its id",
+            role == WorkerRole::Developer,
+        )
+    })?;
+    if validate_native_id(id).is_err() {
+        return Err(sanitized_failure(
+            RuntimeFailureClass::Contract,
+            "Codex terminal agent message id violated its bound",
+            role == WorkerRole::Developer,
+        ));
+    }
+    let text = item.get("text").and_then(Value::as_str).ok_or_else(|| {
+        sanitized_failure(
+            RuntimeFailureClass::Contract,
+            "Codex terminal agent message omitted its text",
+            role == WorkerRole::Developer,
+        )
+    })?;
+    match item.get("phase") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(phase)) if phase == "final_answer" => {}
+        Some(Value::String(phase)) if phase == "commentary" => return Ok(None),
+        _ => {
+            return Err(sanitized_failure(
+                RuntimeFailureClass::Contract,
+                "Codex terminal agent message had an invalid phase",
+                role == WorkerRole::Developer,
+            ));
+        }
+    };
+    if text.len() > MAX_RUNTIME_OUTCOME_BYTES {
+        return Err(sanitized_failure(
+            RuntimeFailureClass::Contract,
+            "Codex terminal agent message exceeded the outcome bound",
+            role == WorkerRole::Developer,
+        ));
+    }
+    Ok(Some(TerminalAgentMessage {
+        id: id.to_owned(),
+        text: text.to_owned(),
+    }))
+}
+
+fn select_terminal_message<'a>(
+    messages: &'a [TerminalAgentMessage],
+    role: WorkerRole,
+    source: &'static str,
+) -> Result<Option<&'a TerminalAgentMessage>, SanitizedRuntimeFailure> {
+    match messages {
+        [] => Ok(None),
+        [message] => Ok(Some(message)),
+        _ => Err(sanitized_failure(
+            RuntimeFailureClass::Contract,
+            format!("Codex {source} had ambiguous final agent messages"),
+            role == WorkerRole::Developer,
+        )),
+    }
+}
+
 fn extract_terminal_outcome(
     params: &Value,
     expected_thread: &str,
     expected_turn: &str,
     role: WorkerRole,
     contract: OutcomeContract,
+    completed_messages: &[TerminalAgentMessage],
 ) -> Result<RuntimeOutcome, SanitizedRuntimeFailure> {
     let object = params.as_object().ok_or_else(|| {
         sanitized_failure(
@@ -1349,13 +1546,22 @@ fn extract_terminal_outcome(
             ));
         }
     }
-    if let Some(items_view) = turn.get("itemsView")
-        && items_view.as_str() != Some("full")
-    {
+    let items_view = match turn.get("itemsView") {
+        None => "full",
+        Some(Value::String(items_view)) => items_view.as_str(),
+        Some(_) => {
+            return Err(sanitized_failure(
+                RuntimeFailureClass::Protocol,
+                "Codex terminal turn carried a non-string items view",
+                false,
+            ));
+        }
+    };
+    if !matches!(items_view, "notLoaded" | "summary" | "full") {
         return Err(sanitized_failure(
-            RuntimeFailureClass::Contract,
-            "Codex terminal turn items were not a full view",
-            role == WorkerRole::Developer,
+            RuntimeFailureClass::Protocol,
+            "Codex terminal turn carried an invalid items view",
+            false,
         ));
     }
     let items = turn.get("items").and_then(Value::as_array).ok_or_else(|| {
@@ -1365,7 +1571,14 @@ fn extract_terminal_outcome(
             false,
         )
     })?;
-    let mut terminal_text = None;
+    if items_view == "notLoaded" && !items.is_empty() {
+        return Err(sanitized_failure(
+            RuntimeFailureClass::Protocol,
+            "Codex not-loaded terminal turn unexpectedly carried items",
+            false,
+        ));
+    }
+    let mut fallback_messages = Vec::new();
     for item in items {
         let Some(item) = item.as_object() else {
             continue;
@@ -1373,47 +1586,42 @@ fn extract_terminal_outcome(
         if item.get("type").and_then(Value::as_str) != Some("agentMessage") {
             continue;
         }
-        if item.get("id").and_then(Value::as_str).is_none()
-            || item.get("text").and_then(Value::as_str).is_none()
-        {
-            return Err(sanitized_failure(
-                RuntimeFailureClass::Contract,
-                "Codex terminal agent message omitted a required field",
-                role == WorkerRole::Developer,
-            ));
-        }
-        match item.get("phase") {
-            None | Some(Value::Null) => {}
-            Some(Value::String(phase)) if phase == "final_answer" => {}
-            Some(Value::String(phase)) if phase == "commentary" => continue,
-            _ => {
+        if let Some(message) = terminal_agent_message(item, role)? {
+            if fallback_messages.len() >= 2 {
                 return Err(sanitized_failure(
                     RuntimeFailureClass::Contract,
-                    "Codex terminal agent message had an invalid phase",
+                    "Codex terminal summary had more than two final agent-message candidates",
                     role == WorkerRole::Developer,
                 ));
             }
+            fallback_messages.push(message);
         }
-        if terminal_text
-            .replace(item.get("text").and_then(Value::as_str).unwrap())
-            .is_some()
-        {
+    }
+    let completed = select_terminal_message(completed_messages, role, "completed-item stream")?;
+    let fallback = select_terminal_message(&fallback_messages, role, "terminal summary")?;
+    let terminal = match (completed, fallback) {
+        (Some(completed), Some(fallback)) => {
+            if completed.id != fallback.id || completed.text != fallback.text {
+                return Err(sanitized_failure(
+                    RuntimeFailureClass::Contract,
+                    "Codex terminal summary mismatched the canonical completed item",
+                    role == WorkerRole::Developer,
+                ));
+            }
+            completed
+        }
+        (Some(completed), None) => completed,
+        (None, Some(fallback)) => fallback,
+        (None, None) => {
             return Err(sanitized_failure(
                 RuntimeFailureClass::Contract,
-                "Codex terminal turn had ambiguous final agent messages",
+                "Codex turn omitted a canonical or fallback final agent message",
                 role == WorkerRole::Developer,
             ));
         }
-    }
-    let terminal_text = terminal_text.ok_or_else(|| {
-        sanitized_failure(
-            RuntimeFailureClass::Contract,
-            "Codex terminal turn omitted a final agent message",
-            role == WorkerRole::Developer,
-        )
-    })?;
+    };
     contract
-        .parse(terminal_text.as_bytes())
+        .parse(terminal.text.as_bytes())
         .map_err(|_| {
             sanitized_failure(
                 RuntimeFailureClass::Contract,
@@ -2096,6 +2304,194 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "token-consuming: requires HCOM_RUN_REAL_CODEX_APP_SERVER=1, current Codex auth, and network access"]
+    fn real_codex_app_server_spark_low_returns_typed_outcome() {
+        const REAL_TEST_MODEL: &str = "gpt-5.3-codex-spark";
+        const REAL_TEST_EFFORT: &str = "low";
+
+        assert_eq!(
+            std::env::var("HCOM_RUN_REAL_CODEX_APP_SERVER").as_deref(),
+            Ok("1"),
+            "real App Server test requires an explicit token-spend opt-in"
+        );
+        let production_profile = RuntimeProfile::codex_app_server_default();
+        assert_ne!(REAL_TEST_MODEL, production_profile.model);
+        assert_ne!(REAL_TEST_EFFORT, production_profile.reasoning_effort);
+        let test_profile = RuntimeProfile {
+            model: REAL_TEST_MODEL.into(),
+            reasoning_effort: REAL_TEST_EFFORT.into(),
+            ..production_profile
+        };
+        test_profile.validate("real Codex test profile").unwrap();
+
+        let root = tempfile::Builder::new()
+            .prefix("hcom-real-codex-app-server.")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")
+            .unwrap();
+        let cwd = fs::canonicalize(root.path()).unwrap();
+        let home = cwd.join("home");
+        let codex_home = home.join(".codex");
+        let private_tmp = cwd.join("tmp");
+        let runtime_dir = cwd.join("run");
+        let xdg_config = home.join(".config");
+        let xdg_state = home.join(".state");
+        let xdg_cache = home.join(".cache");
+        let xdg_data = home.join(".data");
+        for directory in [
+            &home,
+            &codex_home,
+            &private_tmp,
+            &runtime_dir,
+            &xdg_config,
+            &xdg_state,
+            &xdg_cache,
+            &xdg_data,
+        ] {
+            fs::create_dir(directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let parent_codex_home = std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+            .expect("real App Server test requires CODEX_HOME or HOME");
+        fs::copy(
+            parent_codex_home.join("auth.json"),
+            codex_home.join("auth.json"),
+        )
+        .expect("real App Server test requires current Codex auth");
+        fs::set_permissions(
+            codex_home.join("auth.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let project_key = toml::Value::String(cwd.to_string_lossy().into_owned()).to_string();
+        fs::write(
+            codex_home.join("config.toml"),
+            format!(
+                concat!(
+                    "mcp_servers = {{}}\n",
+                    "[shell_environment_policy]\n",
+                    "inherit = \"all\"\n",
+                    "ignore_default_excludes = true\n",
+                    "[projects.{project_key}]\n",
+                    "trust_level = \"untrusted\"\n",
+                ),
+                project_key = project_key,
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(
+            codex_home.join("config.toml"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        let git = Command::new("/usr/bin/git")
+            .args(["init", "-q", "-b", "master"])
+            .current_dir(&cwd)
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(
+            git.status.success(),
+            "failed to initialize real App Server test repository: {}",
+            String::from_utf8_lossy(&git.stderr)
+        );
+
+        let mut environment: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+        for (name, value) in [
+            ("HOME", home.as_os_str()),
+            ("CODEX_HOME", codex_home.as_os_str()),
+            ("TMPDIR", private_tmp.as_os_str()),
+            ("XDG_RUNTIME_DIR", runtime_dir.as_os_str()),
+            ("XDG_CONFIG_HOME", xdg_config.as_os_str()),
+            ("XDG_STATE_HOME", xdg_state.as_os_str()),
+            ("XDG_CACHE_HOME", xdg_cache.as_os_str()),
+            ("XDG_DATA_HOME", xdg_data.as_os_str()),
+        ] {
+            environment.insert(name.into(), value.to_owned());
+        }
+        let preflight = CodexAppServerPreflight::verify_pinned().unwrap();
+        let mut runtime = CodexAppServerRuntime::launch_direct(
+            preflight,
+            cwd.clone(),
+            environment.into_iter().collect(),
+        )
+        .unwrap();
+        let session = runtime
+            .open_session(RoleSessionSpec {
+                role: WorkerRole::Developer,
+                task_key: "real-transport".into(),
+                cwd: cwd.clone(),
+                profile: test_profile.clone(),
+                developer_instructions: concat!(
+                    "This is a transport integration check. Do not use tools, inspect files, ",
+                    "or modify anything. Your final response must satisfy the supplied JSON ",
+                    "schema with status ready, a concise summary, and no questions."
+                )
+                .into(),
+            })
+            .unwrap();
+        let turn = runtime
+            .start_turn(
+                session,
+                RuntimeTurnSpec {
+                    role: WorkerRole::Developer,
+                    task_key: "real-transport".into(),
+                    purpose: RuntimeTurnPurpose::InitialDevelopment,
+                    cwd: cwd.clone(),
+                    prompt: concat!(
+                        "Without using tools, complete this transport check. Return status ready, ",
+                        "summary \"real Codex App Server transport passed\", and an empty questions ",
+                        "array through the required output contract."
+                    )
+                    .into(),
+                    profile: test_profile,
+                    outcome_contract: OutcomeContract::DeveloperV1,
+                    timeout: Duration::from_secs(10 * 60),
+                },
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10 * 60);
+        let terminal = loop {
+            let poll = runtime.poll_turn(turn).unwrap();
+            if poll.is_terminal() {
+                break poll;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "real Codex App Server test timed out"
+            );
+            thread::sleep(Duration::from_millis(100));
+        };
+        assert!(
+            runtime.last_completed_agent_message_count >= 1,
+            "real Codex turn did not exercise canonical item/completed result delivery"
+        );
+        runtime.shutdown().unwrap();
+        drop(runtime);
+
+        match terminal {
+            RuntimeTurnPoll::Completed {
+                outcome: RuntimeOutcome::Developer(outcome),
+                ..
+            } if outcome.status == DeveloperOutcomeStatus::Ready
+                && outcome.questions.is_empty() => {}
+            other => {
+                let preserved = root.keep();
+                panic!(
+                    "real Codex App Server test failed; preserved private evidence at {}: {other:?}",
+                    preserved.display()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn native_id_turn_inventory_and_preflight_output_bounds_are_exact() {
         for (bytes, accepted) in [
             (MAX_NATIVE_ID_BYTES - 1, true),
@@ -2587,7 +2983,7 @@ mod tests {
                         assert!(telemetry.stderr_bytes > MAX_STDERR_TAIL_BYTES as u64);
                     }
                     if scenario == "unknown_notifications_exact" {
-                        assert_eq!(telemetry.notification_count, MAX_UNKNOWN_NOTIFICATIONS + 1);
+                        assert_eq!(telemetry.notification_count, MAX_UNKNOWN_NOTIFICATIONS + 3);
                     }
                     if matches!(scenario, "line_below" | "line_exact") {
                         assert!(telemetry.protocol_bytes > MAX_RPC_LINE_BYTES as u64);
@@ -2864,6 +3260,48 @@ mod tests {
         match fixture.poll_terminal(turn) {
             RuntimeTurnPoll::Failed { failure, .. } => assert!(!failure.retryable),
             _ => panic!("missing reviewer result did not fail"),
+        }
+    }
+
+    #[test]
+    fn canonical_completed_item_and_terminal_summary_fallback_are_both_supported() {
+        for scenario in ["happy", "canonical_only", "summary_only"] {
+            let mut fixture = FixtureRuntime::launch(scenario, None);
+            let developer = fixture.open(WorkerRole::Developer);
+            let turn = fixture.start(
+                developer,
+                WorkerRole::Developer,
+                RuntimeTurnPurpose::InitialDevelopment,
+            );
+            match fixture.poll_terminal(turn) {
+                RuntimeTurnPoll::Completed {
+                    outcome: RuntimeOutcome::Developer(outcome),
+                    ..
+                } => assert_eq!(outcome.status, DeveloperOutcomeStatus::Ready),
+                _ => panic!("terminal result scenario {scenario} did not complete"),
+            }
+            fixture.runtime.shutdown().unwrap();
+        }
+
+        for (scenario, expected_class) in [
+            ("summary_mismatch", RuntimeFailureClass::Contract),
+            ("invalid_items_view", RuntimeFailureClass::Protocol),
+            ("non_string_items_view", RuntimeFailureClass::Protocol),
+            ("invalid_outcome_wrong_turn", RuntimeFailureClass::Protocol),
+        ] {
+            let mut fixture = FixtureRuntime::launch(scenario, None);
+            let developer = fixture.open(WorkerRole::Developer);
+            let turn = fixture.start(
+                developer,
+                WorkerRole::Developer,
+                RuntimeTurnPurpose::InitialDevelopment,
+            );
+            match fixture.poll_terminal(turn) {
+                RuntimeTurnPoll::Failed { failure, .. } => {
+                    assert_eq!(failure.class, expected_class, "scenario {scenario}");
+                }
+                _ => panic!("terminal result scenario {scenario} did not fail closed"),
+            }
         }
     }
 

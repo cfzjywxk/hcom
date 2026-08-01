@@ -1171,7 +1171,7 @@ impl SupervisorCore {
                 return self.terminalize_current(
                     SessionState::NeedsHuman,
                     TaskState::NeedsHuman,
-                    "developer completion result remained invalid after one recovery",
+                    &failure.detail,
                     Vec::new(),
                 );
             }
@@ -4303,16 +4303,14 @@ mod tests {
                         SupervisorEffect::CloseTaskRuntime { task_ordinal: 0 },
                         SupervisorEffect::FinishSession {
                             state: SessionState::NeedsHuman,
-                            detail:
-                                "developer completion result remained invalid after one recovery"
-                                    .into(),
+                            detail: "typed final outcome was invalid again".into(),
                         },
                         SupervisorEffect::PublishStatus,
                     ]
                 );
                 assert_eq!(
                     core.snapshot().terminal_detail.as_deref(),
-                    Some("developer completion result remained invalid after one recovery")
+                    Some("typed final outcome was invalid again")
                 );
             } else {
                 assert_eq!(

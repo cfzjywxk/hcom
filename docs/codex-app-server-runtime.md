@@ -38,8 +38,9 @@ The corresponding field inventory is frozen in
 `RuntimeContractIdentity::codex_app_server_0_146`. It covers only client
 identity/notification opt-out, role-thread cwd/profile/instructions/ephemeral
 state, turn thread/input/cwd/profile/output schema, returned native IDs,
-terminal status/items, and interrupt identity. Adding another field requires
-an explicit contract revision and schema rebaseline.
+canonical completed-agent-message identity/text/phase, terminal
+status/items-view/summary items, and interrupt identity. Adding another field
+requires an explicit contract revision and schema rebaseline.
 
 ## Provider-neutral seam
 
@@ -111,6 +112,15 @@ Both outcomes have a 64 KiB encoded bound plus field/count bounds enforced in
 Rust after deny-unknown deserialization. Provider output cannot supply Git
 authority; the Supervisor observes repository state separately.
 
+Codex 0.146 delivers the canonical final agent message through
+`item/completed`. `turn/completed` is the terminal barrier and may report
+`itemsView` as `notLoaded`, `summary`, or `full`; its agent-message items are a
+compatibility fallback, not the sole result transport. When both sources are
+present, hcom requires their native ID and text to agree. Commentary and
+non-agent completed items are discarded before the runtime queue, while
+duplicate or mismatched canonical identities and ambiguous/malformed results
+fail closed.
+
 ## Pure SupervisorCore
 
 `SupervisorCore::reduce(event)` is a transactional deterministic reducer. Every
@@ -136,6 +146,9 @@ may request `DeveloperRecoveryPreflight`; identity, branch, ancestry and the
 changed-path allowlist must pass before the core schedules one
 `DeveloperCompletionRecovery` turn on the same logical session. A second such
 failure, every non-retryable failure and every Reviewer failure fails closed.
+If the recovery result is invalid too, the terminal snapshot retains the
+second bounded sanitized provider detail instead of replacing it with a
+generic recovery-exhausted message.
 `DriverFailed` separately normalizes repository, runtime-factory,
 task-environment, runtime-contract, and cleanup failures. A successful task
 transition is committed only after its task runtime shuts down successfully;
@@ -238,9 +251,9 @@ Transport and semantic bounds remain separate:
 
 Boundary tables exercise just below, exactly at, and just above closed limits.
 The decoder continuously drains stdout/stderr, caps queued events and bytes,
-and drops opted-out item payloads before they can accumulate. Diagnostics and
-status never contain raw provider events, command output, the private prompt,
-auth data, or secret-shaped environment values.
+and drops opted-out or non-agent completed-item payloads before they can
+accumulate. Diagnostics and status never contain raw provider events, command
+output, the private prompt, auth data, or secret-shaped environment values.
 
 ## Checked test inventory
 
@@ -256,19 +269,31 @@ The source-maintained inventory is deliberately split by layer:
 | repository/outcome/diagnostic bounds | `repository_observation_bounds_ordering_and_plan_cleanliness_fail_closed`, `typed_outcome_cross_field_failures_are_rejected_without_consuming_the_turn`, `every_driver_failure_class_has_a_distinct_bounded_secret_free_terminal` |
 | races, at-most-once, invariants | `completion_identity_ordering_and_at_most_once_are_transactional`, `cancel_completion_and_parent_failure_races_have_one_deterministic_winner`, `invariant_audit_rejects_corrupted_operation_task_identity_and_terminal_state` |
 | RPC transport bounds/correlation | `exact_line_and_turn_protocol_bounds_are_closed`, `queue_outgoing_message_and_request_id_bounds_are_exact`, `unknown_notification_bound_is_exact_and_opted_out_events_do_not_consume_it`, `response_correlation_rejects_mismatch_duplicate_and_stale_ids` |
-| fake App Server lifecycle/protocol | `fresh_role_threads_same_thread_followup_and_exact_wire_fields`, `malformed_ids_eof_and_bound_violations_fail_closed_without_raw_output`, `every_server_request_class_and_unknown_request_terminate_the_runtime`, `interrupt_timeout_kills_the_entire_owned_process_group` |
+| fake App Server lifecycle/protocol | `fresh_role_threads_same_thread_followup_and_exact_wire_fields`, `canonical_completed_item_and_terminal_summary_fallback_are_both_supported`, `malformed_ids_eof_and_bound_violations_fail_closed_without_raw_output`, `every_server_request_class_and_unknown_request_terminate_the_runtime`, `interrupt_timeout_kills_the_entire_owned_process_group` |
 | production driver + disposable Git | `orchestrator::app_server::tests::*`, including multi-task, recovery, Reviewer mutation, locks, environment, auth bounds, cancel, cleanup, and drift |
 | real outer sandbox without model | `real_outer_sandbox_is_writable_for_both_roles_and_hides_unbound_host_state` |
+| opt-in real Codex transport | ignored `real_codex_app_server_spark_low_returns_typed_outcome`, pinned to Codex 0.146 with `gpt-5.3-codex-spark` / `low` |
 
 All fake-runtime and exact-binary contract tests are local and must not send a
-model turn or network request.
+model turn or network request. The ignored real transport test is the sole
+exception. It requires current auth, network access, and the explicit
+token-spend opt-in below; its fixed profile is deliberately different from the
+production `gpt-5.6-sol` / `xhigh` defaults:
+
+```bash
+HCOM_RUN_REAL_CODEX_APP_SERVER=1 \
+  cargo test --all-features \
+  worker::codex_app_server::tests::real_codex_app_server_spark_low_returns_typed_outcome \
+  -- --ignored --exact
+```
 
 ## Human-only product acceptance
 
-Automated development/review ends at a source candidate. It does not run the
-real Fibonacci journey and does not authorize push or installation. After all
-phase and aggregate reviews are complete, a human may choose to start a new
-disposable terminal and follow the exact procedure in
+Automated development/review ends at a source candidate. The opt-in transport
+test above is one bounded no-TTY model turn; it does not run the real
+multi-task Fibonacci journey and does not authorize push or installation.
+After all phase and aggregate reviews are complete, a human may choose to
+start a new disposable terminal and follow the exact procedure in
 [architect.md](architect.md#human-only-fibonacci-acceptance). The target
 Architect must begin with an empty input buffer; only the human submits the
 first prompt.

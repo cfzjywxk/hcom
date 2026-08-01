@@ -2300,7 +2300,7 @@ mod tests {
         assert_eq!(snapshot.state, SessionState::NeedsHuman);
         assert_eq!(
             snapshot.terminal_detail.as_deref(),
-            Some("developer completion result remained invalid after one recovery")
+            Some("developer outcome was missing")
         );
         let audit = audit.lock().unwrap();
         assert_eq!(

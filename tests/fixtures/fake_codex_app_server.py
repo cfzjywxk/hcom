@@ -166,10 +166,38 @@ def completed(thread_id, turn_id, schema, status="completed"):
                 "text": text,
             }
         )
-    elif SCENARIO == "invalid_outcome":
+    elif SCENARIO in ("invalid_outcome", "invalid_outcome_wrong_turn"):
         items[-1]["text"] = '{"status":"ready","summary":"bad","questions":["why"]}'
     event_thread = "wrong-thread" if SCENARIO == "wrong_thread" else thread_id
-    event_turn = "wrong-turn" if SCENARIO == "wrong_turn" else turn_id
+    event_turn = (
+        "wrong-turn"
+        if SCENARIO in ("wrong_turn", "invalid_outcome_wrong_turn")
+        else turn_id
+    )
+    if SCENARIO != "summary_only":
+        for item in items:
+            emit(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": event_thread,
+                        "turnId": event_turn,
+                        "item": item,
+                    },
+                }
+            )
+    if SCENARIO == "canonical_only":
+        items_view = "notLoaded"
+        summary_items = []
+    else:
+        items_view = "summary"
+        summary_items = [dict(item) for item in items]
+    if SCENARIO == "summary_mismatch":
+        summary_items[-1]["text"] = '{"status":"ready","summary":"mismatch","questions":[]}'
+    if SCENARIO == "invalid_items_view":
+        items_view = "future"
+    elif SCENARIO == "non_string_items_view":
+        items_view = 7
     emit(
         {
             "method": "turn/completed",
@@ -178,8 +206,8 @@ def completed(thread_id, turn_id, schema, status="completed"):
                 "turn": {
                     "id": event_turn,
                     "status": status,
-                    "itemsView": "full",
-                    "items": items,
+                    "itemsView": items_view,
+                    "items": summary_items,
                 },
             },
         }
@@ -299,25 +327,19 @@ def handle_turn(message):
     elif SCENARIO == "stdout_backpressure":
         raw = "RAW_COMMAND_OUTPUT_SECRET_SENTINEL" + "x" * (64 * 1024)
         for index in range(128):
-            item = {"id": str(index), "rawOutput": raw}
-            if index == 0:
-                item.update(
-                    {
-                        "type": "agentMessage",
-                        "text": json.dumps(
-                            {
-                                "status": "needs_human",
-                                "summary": "must be ignored",
-                                "questions": ["wrong transport"],
-                            },
-                            separators=(",", ":"),
-                        ),
-                    }
-                )
+            item = {
+                "id": str(index),
+                "type": "commandExecution",
+                "rawOutput": raw,
+            }
             emit(
                 {
                     "method": "item/completed",
-                    "params": {"item": item},
+                    "params": {
+                        "threadId": params["threadId"],
+                        "turnId": turn_id,
+                        "item": item,
+                    },
                 }
             )
     elif SCENARIO == "stderr_saturation":

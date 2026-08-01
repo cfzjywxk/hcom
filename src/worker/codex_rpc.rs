@@ -1,9 +1,9 @@
 //! Bounded JSONL transport for the pinned Codex App Server protocol.
 //!
 //! The reader threads continuously drain both child pipes. Only correlated
-//! responses, terminal turn notifications, and sanitized server-request
-//! methods cross into the runtime. Raw command output and protocol transcripts
-//! are never retained as artifacts or diagnostics.
+//! responses, canonical completed items, terminal turn notifications, and
+//! sanitized server-request methods cross into the runtime. Raw command output
+//! and protocol transcripts are never retained as artifacts or diagnostics.
 
 use super::runtime::{
     MAX_RUNTIME_DIAGNOSTIC_BYTES, RuntimeError, RuntimeFailureClass, RuntimeTelemetry,
@@ -29,7 +29,6 @@ const READ_CHUNK_BYTES: usize = 32 * 1024;
 
 pub(crate) const OPT_OUT_NOTIFICATION_METHODS: &[&str] = &[
     "item/started",
-    "item/completed",
     "item/agentMessage/delta",
     "item/reasoning/summaryTextDelta",
     "item/reasoning/summaryPartAdded",
@@ -43,6 +42,7 @@ pub(crate) const OPT_OUT_NOTIFICATION_METHODS: &[&str] = &[
 pub(crate) enum RpcInbound {
     Response { id: u64, result: Value },
     ResponseError { id: u64 },
+    ItemCompleted { params: Value },
     TurnCompleted { params: Value },
     ServerRequest { method: String },
     Eof,
@@ -51,6 +51,7 @@ pub(crate) enum RpcInbound {
 enum ParsedInbound {
     Response { id: u64, result: Value },
     ResponseError { id: u64 },
+    ItemCompleted { params: Value },
     TurnCompleted { params: Value },
     ServerRequest { method: String },
     IgnoredNotification,
@@ -553,6 +554,10 @@ fn process_line(line: &[u8], wire_bytes: usize, shared: &Shared) {
         ParsedInbound::ResponseError { id } => {
             state.enqueue(RpcInbound::ResponseError { id }, wire_bytes);
         }
+        ParsedInbound::ItemCompleted { params } => {
+            state.account_notification(false);
+            state.enqueue(RpcInbound::ItemCompleted { params }, wire_bytes);
+        }
         ParsedInbound::TurnCompleted { params } => {
             state.account_notification(false);
             state.enqueue(RpcInbound::TurnCompleted { params }, wire_bytes);
@@ -578,12 +583,16 @@ fn classify_message(value: Value) -> Result<ParsedInbound, &'static str> {
         }),
         (Some(Value::String(method)), None) => {
             let params = object.remove("params").unwrap_or(Value::Null);
-            if method == "turn/completed" {
-                Ok(ParsedInbound::TurnCompleted { params })
-            } else if OPT_OUT_NOTIFICATION_METHODS.contains(&method.as_str()) {
-                Ok(ParsedInbound::IgnoredNotification)
-            } else {
-                Ok(ParsedInbound::UnknownNotification)
+            match method.as_str() {
+                "item/completed" if is_terminal_agent_message(&params) => {
+                    Ok(ParsedInbound::ItemCompleted { params })
+                }
+                "item/completed" => Ok(ParsedInbound::IgnoredNotification),
+                "turn/completed" => Ok(ParsedInbound::TurnCompleted { params }),
+                method if OPT_OUT_NOTIFICATION_METHODS.contains(&method) => {
+                    Ok(ParsedInbound::IgnoredNotification)
+                }
+                _ => Ok(ParsedInbound::UnknownNotification),
             }
         }
         (Some(_), _) => Err("Codex App Server JSON-RPC method was not a string"),
@@ -599,6 +608,17 @@ fn classify_message(value: Value) -> Result<ParsedInbound, &'static str> {
         }
         (None, None) => Err("Codex App Server JSON-RPC envelope omitted method and id"),
     }
+}
+
+fn is_terminal_agent_message(params: &Value) -> bool {
+    let item = params.get("item");
+    item.and_then(|item| item.get("type"))
+        .and_then(Value::as_str)
+        == Some("agentMessage")
+        && item
+            .and_then(|item| item.get("phase"))
+            .and_then(Value::as_str)
+            != Some("commentary")
 }
 
 fn parse_response_id(value: Value) -> Result<u64, &'static str> {
@@ -839,6 +859,38 @@ mod tests {
             classify_message(json!({
                 "method": "item/completed",
                 "params": {"raw": "secret-command-output"}
+            }))
+            .unwrap(),
+            ParsedInbound::IgnoredNotification
+        ));
+        assert!(matches!(
+            classify_message(json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "final-1",
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "{}"
+                    }
+                }
+            }))
+            .unwrap(),
+            ParsedInbound::ItemCompleted { .. }
+        ));
+        assert!(matches!(
+            classify_message(json!({
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "id": "commentary-1",
+                        "type": "agentMessage",
+                        "phase": "commentary",
+                        "text": "ignored"
+                    }
+                }
             }))
             .unwrap(),
             ParsedInbound::IgnoredNotification
