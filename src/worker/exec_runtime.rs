@@ -71,7 +71,7 @@ const RESUME_HELP_REQUIREMENTS: &[&str] = &[
 
 const THREAD_STARTED_LINE_CAP: usize = 8 * 1024;
 const PIPE_CHUNK: usize = 32 * 1024;
-const NATIVE_STREAM_CAP: u64 = 1024 * 1024;
+const NATIVE_STREAM_CAP: u64 = 1024 * 1024 * 1024;
 const RAW_FINAL_CHUNK: usize = 64 * 1024;
 /// How much of a final message the supervisor may quote onward. The full text
 /// is always sealed into the artifacts regardless of this bound.
@@ -79,6 +79,8 @@ const RELAY_WINDOW_BYTES: usize = 256 * 1024;
 const MAX_HELP_OUTPUT: usize = 128 * 1024;
 const STDERR_TAIL_BYTES: usize = 320;
 const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+const REAPER_ATTEMPTS: usize = 30;
+const REAPER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 const CLARIFICATION_PROMPT: &str = "Your previous final message did not contain a usable \
 verdict. Reply once more: the FIRST line of your final message must be exactly \
@@ -784,6 +786,27 @@ fn fail(
     })
 }
 
+/// Keep trying to kill a process group that survived the inline attempt.
+///
+/// The supervisor must neither block on it nor forget it: an abandoned worker
+/// keeps running and burning tokens.
+fn spawn_detached_reaper(running: Box<RunningTurn>) {
+    std::thread::spawn(move || {
+        let mut running = running;
+        for _ in 0..REAPER_ATTEMPTS {
+            std::thread::sleep(REAPER_INTERVAL);
+            if running
+                .group
+                .terminate_and_reap(&mut running.child, CANCEL_GRACE)
+                .is_ok()
+            {
+                return;
+            }
+        }
+        // Give up only after a bounded series of attempts; Drop runs last.
+    });
+}
+
 impl Drop for RunningTurn {
     /// Backstop for every path that drops a live turn without finalizing it
     /// (an error return, a panic, or a supervisor teardown): the process group
@@ -965,9 +988,11 @@ impl TaskWorkerRuntime for ExecTaskWorkerRuntime {
                 };
                 let _ = fs::remove_file(&running.raw_final);
                 if kill_error.is_some() {
-                    // Skip Drop's terminate/join: it would block on the same
-                    // unkillable group.
-                    std::mem::forget(running);
+                    // The group survived SIGKILL. Hand the still-owned handle
+                    // to a detached reaper that keeps retrying instead of
+                    // abandoning the process (mem::forget) or blocking the
+                    // supervisor on an unbounded join.
+                    spawn_detached_reaper(running);
                 }
                 RuntimeTurnPoll::Failed {
                     failure: SanitizedRuntimeFailure::new(
@@ -1015,10 +1040,16 @@ impl TaskWorkerRuntime for ExecTaskWorkerRuntime {
                 }
             }
             let _ = fs::remove_file(&running.raw_final);
+            let detail = match &killed {
+                Ok(_) => "exec turn canceled by the supervisor".to_string(),
+                Err(error) => single_line(&format!(
+                    "exec turn canceled but its process group could not be terminated: {error}"
+                )),
+            };
             entry.state = TurnState::Done(RuntimeTurnPoll::Failed {
                 failure: SanitizedRuntimeFailure::new(
                     RuntimeFailureClass::Canceled,
-                    "exec turn canceled by the supervisor",
+                    detail,
                     false,
                 )?,
                 telemetry: RuntimeTelemetry::default(),
@@ -1249,11 +1280,17 @@ fn exit_failure_detail(
     }
 }
 
+/// Cut a relayed message to `limit` characters, always leaving a visible
+/// marker: the next role must be able to tell that it is reading a prefix.
 fn truncate_chars(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
         return text.to_string();
     }
-    text.chars().take(limit).collect()
+    const MARKER: &str = "\n\n[hcom: message truncated for relay; the full text is in this run's artifacts]";
+    let keep = limit.saturating_sub(MARKER.chars().count());
+    let mut out: String = text.chars().take(keep).collect();
+    out.push_str(MARKER);
+    out
 }
 
 fn utf8_prefix(text: &str, max_bytes: usize) -> &str {
@@ -2167,6 +2204,44 @@ head -c 4096 /dev/zero | tr '\0' 'b' >> "$OUT"
         assert!(prompt.contains("You are the worker."), "{prompt}");
         assert!(prompt.contains("do the task"), "{prompt}");
         assert!(!prompt.contains("[REDACTED"), "{prompt}");
+    }
+
+    #[test]
+    fn a_final_message_larger_than_the_old_cap_is_persisted_whole() {
+        // 3 MiB: comfortably past the previous 1 MiB durable cap, and past
+        // the relay window, so both behaviours are exercised at once.
+        let mut fixture = fixture(
+            r#"
+printf '{"type":"thread.started","thread_id":"thread-fake-1"}
+'
+yes zzzzzzzzzzzzzzzz | head -c 3145728 > "$OUT"
+printf 'TAILMARK' >> "$OUT"
+"#,
+        );
+        let (_key, turn) = start(
+            &mut fixture,
+            WorkerRole::Developer,
+            RuntimeTurnPurpose::InitialDevelopment,
+        );
+        let poll = poll_terminal(&mut fixture, turn);
+        let RuntimeTurnPoll::Completed { outcome, .. } = poll else {
+            panic!("expected completion, got {poll:?}");
+        };
+        let RuntimeOutcome::Developer(outcome) = outcome else {
+            panic!("expected developer outcome");
+        };
+        // Relayed onward: bounded, and the cut is explicitly marked.
+        assert!(outcome.summary.len() <= 300 * 1024, "{}", outcome.summary.len());
+        assert!(outcome.summary.contains("[hcom: message truncated for relay"));
+        // Persisted: the whole message, tail included.
+        let sealed = fs::read_to_string(
+            fixture
+                .artifacts
+                .join("run-1/task-1/developer/session-1/turn-1/attempt-1/native-final.partial"),
+        )
+        .unwrap();
+        assert!(sealed.len() > 3 * 1024 * 1024, "sealed {} bytes", sealed.len());
+        assert!(sealed.ends_with("TAILMARK"), "the tail was dropped");
     }
 
     #[test]

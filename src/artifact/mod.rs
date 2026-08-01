@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-pub const MAX_NATIVE_ARTIFACT_BYTES: u64 = 1024 * 1024;
+pub const MAX_NATIVE_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MAX_ACTIVITY_ARTIFACT_BYTES: u64 = 512 * 1024;
 pub const MAX_RESULT_ARTIFACT_BYTES: u64 = 256 * 1024;
 pub const MAX_MANIFEST_ARTIFACT_BYTES: u64 = 256 * 1024;
@@ -374,7 +374,9 @@ impl ArtifactAttempt {
             kind,
             file,
             hard_cap,
-            raw_buffer: Vec::new(),
+            carry: Vec::new(),
+            written: 0,
+            hasher: Sha256::new(),
             truncated: false,
             redactor: self.redactor.clone(),
             registry: self.registry.clone(),
@@ -480,7 +482,13 @@ pub struct BoundedArtifactWriter {
     kind: ArtifactKind,
     file: File,
     hard_cap: u64,
-    raw_buffer: Vec<u8>,
+    /// Only the tail that may still be part of a secret spanning two chunks,
+    /// plus any partial UTF-8 sequence. Everything before it is already
+    /// sanitized and on disk, so memory stays bounded no matter how large the
+    /// artifact grows.
+    carry: Vec<u8>,
+    written: u64,
+    hasher: Sha256,
     truncated: bool,
     redactor: Arc<SecretRedactor>,
     registry: Arc<Mutex<ReceiptRegistry>>,
@@ -488,13 +496,49 @@ pub struct BoundedArtifactWriter {
 
 impl BoundedArtifactWriter {
     pub fn write_chunk(&mut self, bytes: &[u8]) -> Result<ArtifactWriteStatus> {
-        let raw_remaining =
-            usize::try_from(self.hard_cap.saturating_sub(self.raw_buffer.len() as u64))
-                .context("artifact raw capacity does not fit usize")?;
-        let accepted = bytes.len().min(raw_remaining);
-        self.raw_buffer.extend_from_slice(&bytes[..accepted]);
-        if accepted < bytes.len() {
+        if self.truncated {
+            return Ok(ArtifactWriteStatus::Truncated);
+        }
+        self.carry.extend_from_slice(bytes);
+        // Hold back the guard window: it may be the head of a secret whose
+        // tail arrives in the next chunk.
+        let guard = self.redactor.trailing_guard_bytes();
+        if self.carry.len() <= guard {
+            return Ok(ArtifactWriteStatus::Accepted);
+        }
+        let mut split = self.carry.len() - guard;
+        while split > 0 && !is_utf8_start(self.carry[split]) {
+            split -= 1;
+        }
+        if split == 0 {
+            return Ok(ArtifactWriteStatus::Accepted);
+        }
+        let piece: Vec<u8> = self.carry.drain(..split).collect();
+        self.emit(&piece)
+    }
+
+    /// Sanitize and append one already-safe-to-cut piece, honouring the cap.
+    fn emit(&mut self, piece: &[u8]) -> Result<ArtifactWriteStatus> {
+        let sanitized = sanitize_untrusted(piece, &self.redactor);
+        let mut bytes = sanitized.as_bytes();
+        let remaining = self.hard_cap.saturating_sub(self.written);
+        if (bytes.len() as u64) > remaining {
+            // Reserve room for the marker, and drop a guard window so the cut
+            // cannot leave the head of a secret whose tail is discarded.
+            let guard = self.redactor.trailing_guard_bytes() as u64;
+            let reserve = guard + TRUNCATION_MARKER.len() as u64;
+            let keep = usize::try_from(remaining.saturating_sub(reserve))
+                .context("artifact cap does not fit usize")?;
+            bytes = utf8_prefix(bytes, keep);
             self.truncated = true;
+        }
+        self.file.write_all(bytes)?;
+        self.hasher.update(bytes);
+        self.written += bytes.len() as u64;
+        if self.truncated {
+            self.file.write_all(TRUNCATION_MARKER)?;
+            self.hasher.update(TRUNCATION_MARKER);
+            self.written += TRUNCATION_MARKER.len() as u64;
         }
         Ok(if self.truncated {
             ArtifactWriteStatus::Truncated
@@ -504,36 +548,32 @@ impl BoundedArtifactWriter {
     }
 
     pub fn finish(mut self) -> Result<ArtifactReceipt> {
-        if self.truncated {
-            let guard = self
-                .redactor
-                .trailing_guard_bytes()
-                .min(self.raw_buffer.len());
-            self.raw_buffer.truncate(self.raw_buffer.len() - guard);
+        if !self.truncated && !self.carry.is_empty() {
+            let tail = std::mem::take(&mut self.carry);
+            self.emit(&tail)?;
         }
-        let sanitized = sanitize_untrusted(&self.raw_buffer, &self.redactor);
-        let accepted = utf8_prefix(
-            sanitized.as_bytes(),
-            usize::try_from(self.hard_cap).context("artifact cap does not fit usize")?,
-        );
-        if accepted.len() < sanitized.len() {
-            self.truncated = true;
-        }
-        self.file.write_all(accepted)?;
         self.file.flush()?;
         self.file.sync_all()?;
         verify_private_regular_file(&self.file, self.kind.file_name())?;
         let receipt = ArtifactReceipt {
             kind: self.kind,
             file_name: self.kind.file_name().into(),
-            bytes: accepted.len() as u64,
-            sha256: hex_bytes(&Sha256::digest(accepted)),
+            bytes: self.written,
+            sha256: hex_bytes(&self.hasher.clone().finalize()),
             truncated: self.truncated,
         };
         receipt.validate()?;
         complete_receipt(&self.registry, receipt.clone())?;
         Ok(receipt)
     }
+}
+
+/// Appended whenever a stream hits its cap, so a reader can always tell a
+/// complete artifact from a prefix.
+const TRUNCATION_MARKER: &[u8] = b"\n[hcom: truncated at the artifact cap]\n";
+
+fn is_utf8_start(byte: u8) -> bool {
+    (byte & 0xC0) != 0x80
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1496,7 +1536,7 @@ mod tests {
     }
 
     #[test]
-    fn activity_is_incremental_while_native_streams_remain_unsealed() {
+    fn native_streams_are_incremental_and_sealed_only_on_finish() {
         let (_temp, root) = fixture_root();
         let attempt = create_attempt(&root, scope());
         let mut native = attempt
@@ -1509,13 +1549,18 @@ mod tests {
         activity
             .record("progress", b"safe incremental event")
             .unwrap();
-        let native_on_disk = fs::read(attempt.artifact_path(ArtifactKind::NativeStdout)).unwrap();
+        // Native output streams to disk as it arrives — memory must not grow
+        // with the artifact — while the receipt is produced only by finish().
         let activity_on_disk =
             fs::read_to_string(attempt.artifact_path(ArtifactKind::Activity)).unwrap();
-        assert!(native_on_disk.is_empty());
         assert!(activity_on_disk.contains("safe incremental event"));
-        native.finish().unwrap();
+        let receipt = native.finish().unwrap();
         activity.finish().unwrap();
+        let native_on_disk = fs::read(attempt.artifact_path(ArtifactKind::NativeStdout)).unwrap();
+        assert_eq!(receipt.bytes, native_on_disk.len() as u64);
+        assert!(
+            String::from_utf8_lossy(&native_on_disk).contains("native partial must not be followed")
+        );
     }
 
     #[test]

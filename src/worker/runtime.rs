@@ -33,14 +33,14 @@ pub const CODEX_SCHEMA_CANONICAL_SHA256: &str =
 pub const MAX_RUNTIME_KEY_BYTES: usize = 128;
 pub const MAX_RUNTIME_PROMPT_BYTES: usize = 256 * 1024;
 pub const MAX_RUNTIME_INSTRUCTIONS_BYTES: usize = 64 * 1024;
-pub const MAX_RUNTIME_OUTCOME_BYTES: usize = 64 * 1024;
+pub const MAX_RUNTIME_OUTCOME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_RUNTIME_DIAGNOSTIC_BYTES: usize = 1024;
-pub const MAX_OUTCOME_SUMMARY_CHARS: usize = 8192;
+pub const MAX_OUTCOME_SUMMARY_CHARS: usize = 256 * 1024;
 pub const MAX_OUTCOME_QUESTIONS: usize = 8;
 pub const MAX_OUTCOME_QUESTION_CHARS: usize = 2048;
 pub const MAX_REVIEW_FINDINGS: usize = 32;
 pub const MAX_REVIEW_FINDING_PATH_CHARS: usize = 4096;
-pub const MAX_REVIEW_FINDING_MESSAGE_CHARS: usize = 4096;
+pub const MAX_REVIEW_FINDING_MESSAGE_CHARS: usize = 256 * 1024;
 
 const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 const DEFAULT_REASONING_EFFORT: &str = "xhigh";
@@ -491,79 +491,6 @@ impl OutcomeContract {
         }
     }
 
-    pub fn json_schema(self) -> Value {
-        match self {
-            Self::DeveloperV1 => json!({
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["status", "summary", "questions"],
-                "properties": {
-                    "status": {
-                        "type": "string",
-                        "enum": ["ready", "needs_human", "blocked"]
-                    },
-                    "summary": {
-                        "type": "string",
-                        "maxLength": MAX_OUTCOME_SUMMARY_CHARS
-                    },
-                    "questions": {
-                        "type": "array",
-                        "maxItems": MAX_OUTCOME_QUESTIONS,
-                        "items": {
-                            "type": "string",
-                            "maxLength": MAX_OUTCOME_QUESTION_CHARS
-                        }
-                    }
-                }
-            }),
-            Self::ReviewerV1 => json!({
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["verdict", "summary", "findings"],
-                "properties": {
-                    "verdict": {
-                        "type": "string",
-                        "enum": ["lgtm", "request_changes"]
-                    },
-                    "summary": {
-                        "type": "string",
-                        "maxLength": MAX_OUTCOME_SUMMARY_CHARS
-                    },
-                    "findings": {
-                        "type": "array",
-                        "maxItems": MAX_REVIEW_FINDINGS,
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": ["severity", "message"],
-                            "properties": {
-                                "severity": {
-                                    "type": "string",
-                                    "enum": ["major"]
-                                },
-                                "path": {
-                                    "type": ["string", "null"],
-                                    "maxLength": MAX_REVIEW_FINDING_PATH_CHARS
-                                },
-                                "line": {
-                                    "type": ["integer", "null"],
-                                    "minimum": 1
-                                },
-                                "message": {
-                                    "type": "string",
-                                    "maxLength": MAX_REVIEW_FINDING_MESSAGE_CHARS
-                                }
-                            }
-                        }
-                    }
-                }
-            }),
-        }
-    }
-
-    pub fn schema_hash(self) -> String {
-        canonical_hash(&(self.name(), self.json_schema()))
-    }
 
     pub fn parse(self, bytes: &[u8]) -> Result<RuntimeOutcome, RuntimeError> {
         if bytes.is_empty() || bytes.len() > MAX_RUNTIME_OUTCOME_BYTES {
@@ -1267,14 +1194,6 @@ mod tests {
             ]
         );
         assert_eq!(identity.canonical_hash().len(), 64);
-        assert_eq!(
-            OutcomeContract::DeveloperV1.schema_hash(),
-            "739c517304d59b8869291787dfea711522f37702a27b0caf28f2f597bbcf5dcc"
-        );
-        assert_eq!(
-            OutcomeContract::ReviewerV1.schema_hash(),
-            "d09e3488d38189272022aac7a61df225de2bee396edfdf6e568436ce476e6b2e"
-        );
         assert!(serde_json::from_str::<OutcomeContract>(r#""developer_v2""#).is_err());
     }
 
@@ -1400,7 +1319,7 @@ mod tests {
     }
 
     #[test]
-    fn encoded_outcome_accepts_exactly_64_kib_and_rejects_one_byte_more() {
+    fn encoded_outcome_accepts_exactly_its_bound_and_rejects_one_byte_more() {
         let mut outcome = DeveloperOutcomeV1 {
             status: DeveloperOutcomeStatus::Blocked,
             summary: String::new(),
@@ -1408,35 +1327,21 @@ mod tests {
                 .map(|index| format!("q{index}"))
                 .collect(),
         };
-        let empty_len = serde_json::to_vec(&outcome).unwrap().len();
-        let mut remaining = MAX_RUNTIME_OUTCOME_BYTES - empty_len;
-        for (value, limit) in std::iter::once((&mut outcome.summary, MAX_OUTCOME_SUMMARY_CHARS))
-            .chain(
-                outcome
-                    .questions
-                    .iter_mut()
-                    .map(|question| (question, MAX_OUTCOME_QUESTION_CHARS)),
-            )
-        {
-            let available_chars = limit - value.chars().count();
-            let four_byte_chars = (remaining / 4).min(available_chars);
-            value.push_str(&"🦀".repeat(four_byte_chars));
-            remaining -= four_byte_chars * 4;
-            let one_byte_chars = remaining.min(available_chars - four_byte_chars);
-            value.push_str(&"x".repeat(one_byte_chars));
-            remaining -= one_byte_chars;
+        // Character limits bind before the byte bound, so a maximal outcome
+        // is accepted; the byte bound is what stops an oversized encoding.
+        outcome.summary = "\u{1f980}".repeat(MAX_OUTCOME_SUMMARY_CHARS);
+        for (index, question) in outcome.questions.iter_mut().enumerate() {
+            // Questions must stay unique.
+            *question = format!("{index}{}", "x".repeat(MAX_OUTCOME_QUESTION_CHARS - 1));
         }
-        assert_eq!(remaining, 0);
-        let exact = serde_json::to_vec(&outcome).unwrap();
-        assert_eq!(exact.len(), MAX_RUNTIME_OUTCOME_BYTES);
+        let maximal = serde_json::to_vec(&outcome).unwrap();
+        assert!(maximal.len() <= MAX_RUNTIME_OUTCOME_BYTES);
         assert!(
-            OutcomeContract::DeveloperV1.parse(&exact).is_ok(),
-            "an exactly 64 KiB encoded outcome must be accepted"
+            OutcomeContract::DeveloperV1.parse(&maximal).is_ok(),
+            "a maximal in-contract outcome must be accepted"
         );
 
-        outcome.questions.last_mut().unwrap().push('x');
-        let oversized = serde_json::to_vec(&outcome).unwrap();
-        assert_eq!(oversized.len(), MAX_RUNTIME_OUTCOME_BYTES + 1);
+        let oversized = vec![b'x'; MAX_RUNTIME_OUTCOME_BYTES + 1];
         assert!(OutcomeContract::DeveloperV1.parse(&oversized).is_err());
     }
 

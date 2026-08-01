@@ -908,8 +908,16 @@ impl TaskLaneSupervisor {
             self.active = Some(active);
             return;
         }
-        if let Some(runtime) = self.task_runtime.as_mut() {
-            let _ = runtime.runtime.cancel_turn(active.local_turn);
+        if let Some(runtime) = self.task_runtime.as_mut()
+            && let Err(error) = runtime.runtime.cancel_turn(active.local_turn)
+        {
+            // Cancellation that could not confirm the worker died is evidence,
+            // not something to swallow: the run is ending either way, so
+            // record it where a human will see it.
+            self.note(&format!(
+                "task {task_ordinal}: cancel could not confirm worker termination: {}",
+                bounded_single_line(&error.detail)
+            ));
         }
     }
 

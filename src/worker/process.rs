@@ -783,10 +783,6 @@ fn process_identity_is_live(identity: &ProcessIdentity) -> Result<bool> {
 /// re-verified; the group id is still exact because `configure_worker_child`
 /// made the leader its own session and group leader, and only its children
 /// can carry that id.
-fn reaped_group_has_live_descendants(process_group: u32) -> Result<bool> {
-    Ok(!owned_descendants(process_group)?.is_empty())
-}
-
 /// Live, non-zombie processes of this user whose session *and* process group
 /// are both the worker's. `configure_worker_child` made the leader a session
 /// leader, so both ids match only for processes it started.
@@ -842,25 +838,35 @@ fn owned_descendants(process_group: u32) -> Result<Vec<u32>> {
 /// Kill and reap descendants left behind by a leader that already exited.
 /// Returns true when anything had to be killed.
 pub(crate) fn settle_reaped_group(process_group: u32, grace: Duration) -> Result<bool> {
-    if !reaped_group_has_live_descendants(process_group)? {
+    if owned_descendants(process_group)?.is_empty() {
         return Ok(false);
     }
     for signal in [libc::SIGTERM, libc::SIGKILL] {
-        // Signal each verified descendant individually. A group-wide
-        // `kill(-pgid)` would race with pid reuse: between the scan and the
-        // signal the id can be recycled by an unrelated group of the same
-        // user.
+        // Take a pidfd *first*, then re-verify the process still belongs to
+        // this worker's session and group, then signal through the pidfd. The
+        // descriptor pins the exact process, so a pid recycled between the
+        // scan and the signal can never be hit.
         for pid in owned_descendants(process_group)? {
-            let Ok(target) = i32::try_from(pid) else {
-                continue;
+            let Ok(pidfd) = open_pidfd(pid) else {
+                continue; // already gone
             };
-            // SAFETY: `owned_descendants` verified this pid is a live process
-            // of this user in the worker's own session and group.
-            unsafe { libc::kill(target, signal) };
+            if !process_is_owned_descendant(pid, process_group)? {
+                continue; // vanished and the id was reused; leave it alone
+            }
+            // SAFETY: the pidfd refers to exactly the verified process.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
         }
         let deadline = Instant::now() + grace;
         loop {
-            if !reaped_group_has_live_descendants(process_group)? {
+            if owned_descendants(process_group)?.is_empty() {
                 return Ok(true);
             }
             if Instant::now() >= deadline {
@@ -870,6 +876,11 @@ pub(crate) fn settle_reaped_group(process_group: u32, grace: Duration) -> Result
         }
     }
     bail!("worker descendants survived SIGKILL")
+}
+
+/// Re-check one pid's ownership after its pidfd was taken.
+fn process_is_owned_descendant(pid: u32, process_group: u32) -> Result<bool> {
+    Ok(owned_descendants(process_group)?.contains(&pid))
 }
 
 fn signal_owned_group(identity: &ProcessIdentity, signal: i32) -> Result<()> {
