@@ -10,6 +10,8 @@ pub mod codex_app_server;
 pub(crate) mod codex_rpc;
 pub mod contract;
 pub mod environment;
+#[cfg(target_os = "linux")]
+pub mod exec_runtime;
 pub mod fake;
 pub mod fake_runtime;
 #[cfg(target_os = "linux")]

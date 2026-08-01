@@ -7,16 +7,18 @@ use super::core::{
     DriverFailure, DriverFailureClass, RepositoryObservation, SupervisorCore, SupervisorEffect,
     SupervisorEvent, TaskRepositoryBinding,
 };
+use super::workspace::TasksWorkspace;
 use super::{
     GitRunner, ManagedRepository, SessionRuntimeSources, SessionStartup, ensure_private_directory,
     parse_nul_paths, path_value, prepare_auth_mount_target, sha256_hex,
 };
 use crate::control_api::{SessionState, SessionStatusSnapshot, TaskDraft, TaskState, WorkerRole};
-use crate::worker::codex_app_server::{
-    CodexAppServerPreflight, CodexAppServerRuntime, CodexAppServerSandboxConfig,
-};
 use crate::worker::environment::{
     EnvironmentPolicy, ExecutionEnvironmentLease, MaterializedWorkerEnvironment,
+};
+use crate::worker::exec_runtime::{
+    ExecPreflight, ExecRuntimeConfig, ExecTaskPaths, ExecTaskWorkerRuntime,
+    codex_exec_contract_identity,
 };
 use crate::worker::runtime::{
     AppServerWorkerProfiles, CODEX_APP_SERVER_ADAPTER, OutcomeContract, RoleSessionSpec,
@@ -52,7 +54,7 @@ trait RuntimeFactory: Send {
 }
 
 struct ProductionRuntimeFactory {
-    preflight: Option<CodexAppServerPreflight>,
+    preflight: Option<ExecPreflight>,
 }
 
 impl ProductionRuntimeFactory {
@@ -63,7 +65,7 @@ impl ProductionRuntimeFactory {
 
 impl RuntimeFactory for ProductionRuntimeFactory {
     fn contract(&self) -> RuntimeContractIdentity {
-        RuntimeContractIdentity::codex_app_server_0_146()
+        codex_exec_contract_identity()
     }
 
     fn open(
@@ -78,36 +80,32 @@ impl RuntimeFactory for ProductionRuntimeFactory {
         crate::worker::validation::validate_opaque_id("task runtime key", &request.task_key)
             .map_err(|_| RuntimeError::invalid_contract("task runtime key was invalid"))?;
         let preflight = match &self.preflight {
-            Some(preflight) => {
-                preflight.revalidate()?;
-                preflight.clone()
-            }
+            Some(preflight) => preflight.clone(),
             None => {
-                let preflight = CodexAppServerPreflight::verify_pinned()?;
+                let preflight = ExecPreflight::verify_pinned()?;
                 self.preflight = Some(preflight.clone());
                 preflight
             }
         };
-        let runtime = CodexAppServerRuntime::launch_sandboxed(
-            preflight,
-            CodexAppServerSandboxConfig {
-                repository_root: request.repository_root,
-                isolated_home: request.paths.home,
+        let runtime = ExecTaskWorkerRuntime::open(ExecRuntimeConfig {
+            codex: preflight.codex().to_path_buf(),
+            bwrap: Some(preflight.bwrap().to_path_buf()),
+            repository_root: request.repository_root,
+            paths: ExecTaskPaths {
+                home: request.paths.home,
                 codex_home: request.paths.codex_home,
-                temp_dir: request.paths.temp,
-                runtime_dir: request.paths.runtime,
-                artifact_dir: request.paths.artifacts,
-                hcom_dir: request.paths.hcom,
-                xdg_config_home: request.paths.xdg_config,
-                xdg_state_home: request.paths.xdg_state,
-                xdg_cache_home: request.paths.xdg_cache,
-                xdg_data_home: request.paths.xdg_data,
-                auth_source: request.auth_source,
-                cargo_bin_source: request.cargo_bin_source,
-                rustup_home_source: request.rustup_home_source,
+                temp: request.paths.temp,
+                runtime: request.paths.runtime,
             },
-            request.environment,
-        )?;
+            auth_source: request.auth_source,
+            cargo_bin_source: request.cargo_bin_source,
+            rustup_home_source: request.rustup_home_source,
+            environment: request.environment,
+            lease: request.lease,
+            artifact_root_path: request.artifact_root,
+            run_id: request.run_id,
+            task_id: request.task_key,
+        })?;
         Ok(Box::new(runtime))
     }
 }
@@ -121,6 +119,9 @@ struct RuntimeOpenRequest {
     cargo_bin_source: PathBuf,
     rustup_home_source: PathBuf,
     environment: Vec<(OsString, OsString)>,
+    lease: ExecutionEnvironmentLease,
+    artifact_root: PathBuf,
+    run_id: String,
 }
 
 struct RuntimeOpenFailure {
@@ -245,6 +246,7 @@ pub(crate) struct AppServerSessionSupervisor {
     active: Option<ActiveTurn>,
     next_session: u64,
     next_turn: u64,
+    tasks_workspace: Option<TasksWorkspace>,
 }
 
 impl AppServerSessionSupervisor {
@@ -313,6 +315,7 @@ impl AppServerSessionSupervisor {
             active: None,
             next_session: 1,
             next_turn: 1,
+            tasks_workspace: None,
         })
     }
 
@@ -413,7 +416,41 @@ impl AppServerSessionSupervisor {
                 plan_hash: Some(plan_hash.into()),
             })
             .map_err(|error| anyhow!(error.to_string()))?;
+        if self.tasks_workspace.is_none() {
+            let workspace = TasksWorkspace::open(&self.startup.project_root, &self.startup.run_id)
+                .context("failed to open the hcom-tasks workspace")?;
+            workspace.write_run_file(
+                "plan.md",
+                self.render_plan(plan_version, plan_hash).as_bytes(),
+            )?;
+            let _ = workspace.append_decision(&format!(
+                "execution authorized: plan version {plan_version} hash {plan_hash}"
+            ));
+            self.tasks_workspace = Some(workspace);
+        }
         self.execute_effects(effects)
+    }
+
+    fn render_plan(&self, plan_version: u64, plan_hash: &str) -> String {
+        let mut plan = format!(
+            "# hcom arch run {}\n\nplan version: {plan_version}\nplan hash: {plan_hash}\n\n",
+            self.startup.run_id
+        );
+        for (ordinal, task) in self.core.tasks().iter().enumerate() {
+            let spec = &task.spec;
+            plan.push_str(&format!(
+                "## task {ordinal}: {}\n\n- title: {}\n- repository: {}\n- max review rounds: {}\n\n{}\n\n",
+                spec.task_key, spec.title, spec.repository_root, spec.max_review_rounds, spec.objective
+            ));
+        }
+        plan
+    }
+
+    /// Best-effort mechanical narration; the decision log never gates a run.
+    fn note(&self, line: &str) {
+        if let Some(workspace) = &self.tasks_workspace {
+            let _ = workspace.append_decision(line);
+        }
     }
 
     pub(crate) fn cancel(&mut self, expected_session_version: u64, reason: &str) -> Result<()> {
@@ -590,6 +627,9 @@ impl AppServerSessionSupervisor {
                                 );
                             }
                         };
+                    self.note(&format!(
+                        "task {task_ordinal}: started {role:?} turn ({purpose:?})"
+                    ));
                     SupervisorEvent::TurnStarted {
                         expected_version: self.core.version(),
                         task_ordinal,
@@ -620,6 +660,11 @@ impl AppServerSessionSupervisor {
             {
                 return self.fail_driver_effect(task_ordinal, DriverFailureClass::Cleanup, error);
             }
+            for effect in &next {
+                if let SupervisorEffect::FinishSession { state, detail } = effect {
+                    self.note(&format!("session finished: {state:?}: {detail}"));
+                }
+            }
             self.core = next_core;
             effects.extend(next);
         }
@@ -634,6 +679,9 @@ impl AppServerSessionSupervisor {
     ) -> Result<()> {
         self.close_runtime_best_effort();
         let detail = bounded_single_line(&error.to_string());
+        self.note(&format!(
+            "task {task_ordinal}: driver failure ({class:?}): {detail}"
+        ));
         let effects = self
             .core
             .reduce(SupervisorEvent::DriverFailed {
@@ -698,6 +746,18 @@ impl AppServerSessionSupervisor {
             cargo_bin_source: self.sources.cargo_bin_source.clone(),
             rustup_home_source: self.sources.rustup_home_source.clone(),
             environment: materialized_environment(&materialized),
+            lease: environment.clone(),
+            artifact_root: self
+                .tasks_workspace
+                .as_ref()
+                .map(|workspace| workspace.root().to_path_buf())
+                .ok_or_else(|| {
+                    RuntimeOpenFailure::new(
+                        DriverFailureClass::Environment,
+                        anyhow!("hcom-tasks workspace is not open"),
+                    )
+                })?,
+            run_id: self.startup.run_id.clone(),
         };
         let runtime = self.factory.open(request).map_err(|error| {
             RuntimeOpenFailure::new(DriverFailureClass::Runtime, anyhow!(error.detail))

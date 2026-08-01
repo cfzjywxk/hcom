@@ -378,13 +378,18 @@ impl SessionInvocationProfiles {
     /// released CLI worker path is retained. Production selects this resolver
     /// only when the App Server integration phase is enabled.
     pub fn for_codex_app_server_lane(adapter: ArchitectAdapter) -> Result<Self> {
-        if adapter != ArchitectAdapter::Codex {
-            bail!("the Codex App Server task-runtime lane requires a Codex architect");
-        }
-        Ok(Self {
-            architect: ArchitectInvocationProfile::Codex {
+        // Both `hcom arch codex` and `hcom arch claude` keep their own
+        // foreground Architect adapter but share one Codex-only worker lane.
+        let architect = match adapter {
+            ArchitectAdapter::Codex => ArchitectInvocationProfile::Codex {
                 profile: CodexInvocationProfile::architect_default(),
             },
+            ArchitectAdapter::Claude => ArchitectInvocationProfile::Claude {
+                profile: ClaudeInvocationProfile::architect_default(),
+            },
+        };
+        Ok(Self {
+            architect,
             developer: DeveloperInvocationProfile::Codex {
                 profile: CodexInvocationProfile::developer_default(),
             },
@@ -528,8 +533,20 @@ mod tests {
                 approval_policy: CodexApprovalPolicy::Never,
             }
         );
-        assert!(
-            SessionInvocationProfiles::for_codex_app_server_lane(ArchitectAdapter::Claude).is_err()
+        // A Claude Architect keeps its own foreground adapter but binds the
+        // same Codex-only worker lane.
+        let claude =
+            SessionInvocationProfiles::for_codex_app_server_lane(ArchitectAdapter::Claude).unwrap();
+        claude.validate().unwrap();
+        assert!(matches!(
+            claude.architect,
+            ArchitectInvocationProfile::Claude { .. }
+        ));
+        assert_eq!(claude.developer_adapter_name(), CODEX_DEVELOPER_ADAPTER);
+        assert_eq!(claude.reviewer_adapter_name(), CODEX_REVIEWER_ADAPTER);
+        assert_eq!(
+            claude.developer.codex().unwrap(),
+            profiles.developer.codex().unwrap()
         );
     }
 

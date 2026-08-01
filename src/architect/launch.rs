@@ -2,9 +2,7 @@ use super::bridge::{
     BridgeActivation, BridgeConfiguration, activate_bridge, configure_bridge,
     relay_runtime_scope_hash, sha256_hex,
 };
-use super::profile::{
-    LoadedInvocationProfiles, load_codex_app_server_profiles, load_invocation_profiles,
-};
+use super::profile::{LoadedInvocationProfiles, load_codex_app_server_profiles};
 use crate::control_api::ActionName;
 use crate::control_api::peer::{process_birth_identity, process_owns_foreground_tty};
 use crate::control_api::protocol::PROTOCOL_VERSION;
@@ -87,17 +85,12 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         std::iter::once("hcom arch".to_owned()).chain(argv.iter().skip(1).cloned()),
     )?;
     let architect_adapter = ArchitectAdapter::parse(&args.adapter)?;
+    // Both public entrypoints bind the same Codex-only task worker lane; a
+    // configured Claude developer or reviewer fails closed inside the loader.
     let mut loaded = match config_path {
-        Some(path) if architect_adapter == ArchitectAdapter::Codex => {
-            load_codex_app_server_profiles(path, architect_adapter)?
-        }
-        Some(path) => load_invocation_profiles(path, architect_adapter)?,
+        Some(path) => load_codex_app_server_profiles(path, architect_adapter)?,
         None => LoadedInvocationProfiles {
-            profiles: if architect_adapter == ArchitectAdapter::Codex {
-                SessionInvocationProfiles::for_codex_app_server_lane(architect_adapter)?
-            } else {
-                SessionInvocationProfiles::for_architect(architect_adapter)
-            },
+            profiles: SessionInvocationProfiles::for_codex_app_server_lane(architect_adapter)?,
             config_path: PathBuf::from("<built-in defaults>"),
             loaded_from_file: false,
         },
@@ -123,21 +116,12 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         native_environment.runtime_home.clone(),
         loaded.profiles.clone(),
     )?;
-    let supervisor_endpoint = if architect_adapter == ArchitectAdapter::Codex {
-        SessionSupervisorEndpoint::bind_app_server(
-            control_paths.clone(),
-            run_id.clone(),
-            project_root.clone(),
-            runtime_sources,
-        )?
-    } else {
-        SessionSupervisorEndpoint::bind(
-            control_paths.clone(),
-            run_id.clone(),
-            project_root.clone(),
-            runtime_sources,
-        )?
-    };
+    let supervisor_endpoint = SessionSupervisorEndpoint::bind_app_server(
+        control_paths.clone(),
+        run_id.clone(),
+        project_root.clone(),
+        runtime_sources,
+    )?;
     let startup = supervisor_endpoint.startup().clone();
     let supervisor_stop = Arc::new(AtomicBool::new(false));
     for signal in [
@@ -621,14 +605,9 @@ fn worker_adapter_bindings(
     architect_adapter: ArchitectAdapter,
     profiles: &SessionInvocationProfiles,
 ) -> (&'static str, &'static str) {
-    if architect_adapter == ArchitectAdapter::Codex {
-        (CODEX_APP_SERVER_ADAPTER, CODEX_APP_SERVER_ADAPTER)
-    } else {
-        (
-            profiles.developer_adapter_name(),
-            profiles.reviewer_adapter_name(),
-        )
-    }
+    // Adapter-independent: the worker lane is Codex-only for both entrypoints.
+    let _ = (architect_adapter, profiles);
+    (CODEX_APP_SERVER_ADAPTER, CODEX_APP_SERVER_ADAPTER)
 }
 
 fn validate_foreground_terminal() -> Result<()> {
@@ -2794,24 +2773,42 @@ mod tests {
     }
 
     #[test]
-    fn production_worker_adapter_metadata_distinguishes_app_server_from_retained_cli() {
-        let app_server =
-            SessionInvocationProfiles::for_codex_app_server_lane(ArchitectAdapter::Codex).unwrap();
-        assert_eq!(
-            worker_adapter_bindings(ArchitectAdapter::Codex, &app_server),
-            (CODEX_APP_SERVER_ADAPTER, CODEX_APP_SERVER_ADAPTER)
-        );
+    fn both_public_entrypoints_bind_the_same_codex_only_worker_lane() {
+        for adapter in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
+            let profiles = SessionInvocationProfiles::for_codex_app_server_lane(adapter).unwrap();
+            assert_eq!(
+                worker_adapter_bindings(adapter, &profiles),
+                (CODEX_APP_SERVER_ADAPTER, CODEX_APP_SERVER_ADAPTER),
+                "{adapter:?} must bind the Codex-only worker lane"
+            );
+        }
+    }
 
-        let retained = SessionInvocationProfiles::for_architect(ArchitectAdapter::Claude);
-        assert_eq!(
-            worker_adapter_bindings(ArchitectAdapter::Claude, &retained),
-            (
-                retained.developer_adapter_name(),
-                retained.reviewer_adapter_name()
-            )
-        );
-        assert_ne!(retained.developer_adapter_name(), CODEX_APP_SERVER_ADAPTER);
-        assert_ne!(retained.reviewer_adapter_name(), CODEX_APP_SERVER_ADAPTER);
+    #[test]
+    fn configured_claude_workers_fail_closed_for_both_entrypoints() {
+        for adapter in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
+            for section in ["developer", "reviewer"] {
+                let temp = tempfile::tempdir().unwrap();
+                let config = temp.path().join("config.toml");
+                std::fs::write(
+                    &config,
+                    format!(
+                        "[architect.{section}]\nadapter = \"claude\"\nmodel = \"opus\"\n\
+                         effort = \"xhigh\"\ndangerously_skip_permissions = true\n"
+                    ),
+                )
+                .unwrap();
+                std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+                let error = match load_codex_app_server_profiles(&config, adapter) {
+                    Ok(_) => panic!("{adapter:?}/{section}: Claude worker must be refused"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().to_lowercase().contains("claude"),
+                    "{adapter:?}/{section}: {error}"
+                );
+            }
+        }
     }
 
     #[test]
