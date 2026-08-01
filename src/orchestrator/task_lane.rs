@@ -1,4 +1,4 @@
-//! Effect driver for the `hcom arch codex` Codex App Server task lane.
+//! Effect driver for the `hcom arch codex` Codex exec worker task lane.
 //!
 //! The driver is the only owner of Git, filesystem, environment, and runtime
 //! I/O. Scheduling decisions remain in [`SupervisorCore`].
@@ -21,10 +21,10 @@ use crate::worker::exec_runtime::{
     codex_exec_contract_identity,
 };
 use crate::worker::runtime::{
-    AppServerWorkerProfiles, CODEX_APP_SERVER_ADAPTER, OutcomeContract, RoleSessionSpec,
-    RuntimeContractIdentity, RuntimeError, RuntimeErrorCode, RuntimeFailureClass, RuntimeOutcome,
-    RuntimeProfile, RuntimeSessionKey, RuntimeTurnKey, RuntimeTurnPoll, RuntimeTurnPurpose,
-    RuntimeTurnSpec, SanitizedRuntimeFailure, TaskWorkerRuntime,
+    CODEX_TASK_WORKER_ADAPTER, OutcomeContract, RoleSessionSpec, RuntimeContractIdentity,
+    RuntimeError, RuntimeErrorCode, RuntimeFailureClass, RuntimeOutcome, RuntimeProfile,
+    RuntimeSessionKey, RuntimeTurnKey, RuntimeTurnPoll, RuntimeTurnPurpose, RuntimeTurnSpec,
+    SanitizedRuntimeFailure, TaskWorkerProfiles, TaskWorkerRuntime,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
@@ -158,13 +158,13 @@ impl TaskRuntimePaths {
         task_key: &str,
         repository_root: &Path,
     ) -> Result<(TempDir, Self)> {
-        let workers = run_root.join("app-server-workers");
+        let workers = run_root.join("exec-workers");
         ensure_private_directory(&workers)?;
         let root = tempfile::Builder::new()
             .prefix(&format!("task-{task_ordinal}-{task_key}."))
             .permissions(fs::Permissions::from_mode(0o700))
             .tempdir_in(&workers)
-            .context("failed to create task-private App Server root")?;
+            .context("failed to create task-private exec worker root")?;
         let root_path = fs::canonicalize(root.path())?;
         let home = root_path.join("home");
         let paths = Self {
@@ -193,7 +193,7 @@ impl TaskRuntimePaths {
         ] {
             fs::create_dir(directory).with_context(|| {
                 format!(
-                    "failed to create task-private App Server directory {}",
+                    "failed to create task-private exec worker directory {}",
                     directory.display()
                 )
             })?;
@@ -230,7 +230,7 @@ struct ActiveTurn {
     prompt: String,
 }
 
-pub(crate) struct AppServerSessionSupervisor {
+pub(crate) struct TaskLaneSupervisor {
     startup: SessionStartup,
     epoch: String,
     core: SupervisorCore,
@@ -238,7 +238,7 @@ pub(crate) struct AppServerSessionSupervisor {
     lock_root: PathBuf,
     run_root: PathBuf,
     sources: SessionRuntimeSources,
-    profiles: AppServerWorkerProfiles,
+    profiles: TaskWorkerProfiles,
     developer_adapter: String,
     reviewer_adapter: String,
     factory: Box<dyn RuntimeFactory>,
@@ -249,7 +249,7 @@ pub(crate) struct AppServerSessionSupervisor {
     tasks_workspace: Option<TasksWorkspace>,
 }
 
-impl AppServerSessionSupervisor {
+impl TaskLaneSupervisor {
     pub(crate) fn open(
         run_id: String,
         project_root: PathBuf,
@@ -280,15 +280,15 @@ impl AppServerSessionSupervisor {
         let run_root = super::canonical_private_directory(&run_root, "session runtime root")?;
         let lock_root = super::canonical_private_directory(&lock_root, "repository lock root")?;
         let session_profiles = sources.profiles.clone().ok_or_else(|| {
-            anyhow!("Codex App Server production lane requires session-frozen profiles")
+            anyhow!("the Codex exec worker lane requires session-frozen profiles")
         })?;
-        let profiles = AppServerWorkerProfiles::from_session_profiles(&session_profiles)
+        let profiles = TaskWorkerProfiles::from_session_profiles(&session_profiles)
             .map_err(|error| anyhow!(error.detail))?;
         profiles.validate().map_err(|error| anyhow!(error.detail))?;
         let contract = factory.contract();
         contract.validate().map_err(|error| anyhow!(error.detail))?;
         let profile_hash = sha256_hex(&serde_json::to_vec(&(
-            "hcom-codex-app-server-session-binding-v1",
+            "hcom-codex-exec-session-binding-v1",
             session_profiles.canonical_hash(),
             profiles.canonical_hash(),
             contract.canonical_hash(),
@@ -301,15 +301,15 @@ impl AppServerSessionSupervisor {
             .map_err(|error| anyhow!(error.to_string()))?;
         Ok(Self {
             startup,
-            epoch: format!("app-server-supervisor-{}", Uuid::new_v4()),
+            epoch: format!("exec-supervisor-{}", Uuid::new_v4()),
             core,
             repositories: BTreeMap::new(),
             lock_root,
             run_root,
             sources,
             profiles,
-            developer_adapter: CODEX_APP_SERVER_ADAPTER.into(),
-            reviewer_adapter: CODEX_APP_SERVER_ADAPTER.into(),
+            developer_adapter: CODEX_TASK_WORKER_ADAPTER.into(),
+            reviewer_adapter: CODEX_TASK_WORKER_ADAPTER.into(),
             factory,
             task_runtime: None,
             active: None,
@@ -332,7 +332,7 @@ impl AppServerSessionSupervisor {
     ) -> Result<(u64, String)> {
         if developer_adapter != self.developer_adapter || reviewer_adapter != self.reviewer_adapter
         {
-            bail!("task plan adapters differ from the Codex App Server session binding");
+            bail!("task plan adapters differ from the Codex exec worker session binding");
         }
         if expected_session_version != self.core.version() {
             bail!("session version is stale");
@@ -475,7 +475,7 @@ impl AppServerSessionSupervisor {
         let active = self
             .active
             .clone()
-            .ok_or_else(|| anyhow!("active App Server turn disappeared"))?;
+            .ok_or_else(|| anyhow!("active exec worker turn disappeared"))?;
         let poll = {
             let task_runtime = self.require_task_runtime_mut(active.task_ordinal)?;
             task_runtime.runtime.poll_turn(active.local_turn)
@@ -709,13 +709,13 @@ impl AppServerSessionSupervisor {
         if self.task_runtime.is_some() || self.active.is_some() {
             return Err(RuntimeOpenFailure::new(
                 DriverFailureClass::Contract,
-                anyhow!("a task-local App Server runtime is already open"),
+                anyhow!("a task-local exec worker runtime is already open"),
             ));
         }
         let task = self.core.tasks().get(task_ordinal).ok_or_else(|| {
             RuntimeOpenFailure::new(
                 DriverFailureClass::Contract,
-                anyhow!("App Server runtime task ordinal is out of range"),
+                anyhow!("exec worker runtime task ordinal is out of range"),
             )
         })?;
         let repository_root = PathBuf::from(&task.spec.repository_root);
@@ -810,7 +810,7 @@ impl AppServerSessionSupervisor {
             .insert(logical, LocalSession { role, key: local })
             .is_some()
         {
-            bail!("logical App Server role session key collided");
+            bail!("logical exec worker role session key collided");
         }
         Ok(logical)
     }
@@ -823,7 +823,7 @@ impl AppServerSessionSupervisor {
         logical_session: RuntimeSessionKey,
     ) -> Result<(RuntimeTurnKey, String)> {
         if self.active.is_some() {
-            bail!("a second App Server turn cannot start");
+            bail!("a second exec worker turn cannot start");
         }
         let task = self
             .core
@@ -839,9 +839,9 @@ impl AppServerSessionSupervisor {
             .sessions
             .get(&logical_session)
             .copied()
-            .ok_or_else(|| anyhow!("logical App Server role session is not bound"))?;
+            .ok_or_else(|| anyhow!("logical exec worker role session is not bound"))?;
         if local_session.role != role {
-            bail!("logical App Server session belongs to the wrong role");
+            bail!("logical exec worker session belongs to the wrong role");
         }
         let local_turn = self
             .require_task_runtime_mut(task_ordinal)?
@@ -864,7 +864,7 @@ impl AppServerSessionSupervisor {
             )
             .map_err(|error| anyhow!(error.detail))?;
         let logical_turn = self.allocate_turn_key()?;
-        let completion_token = format!("app-server-turn-{}", Uuid::new_v4());
+        let completion_token = format!("exec-turn-{}", Uuid::new_v4());
         self.active = Some(ActiveTurn {
             task_ordinal,
             role,
@@ -885,7 +885,7 @@ impl AppServerSessionSupervisor {
             debug_assert_eq!(
                 (active.task_ordinal, active.logical_turn),
                 (task_ordinal, logical_turn),
-                "SupervisorCore emitted an interrupt for a different active App Server turn"
+                "SupervisorCore emitted an interrupt for a different active exec worker turn"
             );
             self.active = Some(active);
             return;
@@ -1016,13 +1016,13 @@ impl AppServerSessionSupervisor {
             ),
         ];
         let lease = ExecutionEnvironmentLease::capture_complete(
-            format!("app-server-lease-{}", Uuid::new_v4()),
+            format!("exec-lease-{}", Uuid::new_v4()),
             &self.epoch,
             &policy,
             &self.sources.parent_environment,
             overrides,
         )
-        .with_context(|| format!("failed to capture App Server environment for {task_key}"))?;
+        .with_context(|| format!("failed to capture exec worker environment for {task_key}"))?;
         let auth_source = self
             .sources
             .codex_auth_source
@@ -1148,9 +1148,9 @@ impl AppServerSessionSupervisor {
         let runtime = self
             .task_runtime
             .as_mut()
-            .ok_or_else(|| anyhow!("task-local App Server runtime is not open"))?;
+            .ok_or_else(|| anyhow!("task-local exec worker runtime is not open"))?;
         if runtime.task_ordinal != task_ordinal {
-            bail!("task-local App Server runtime belongs to another task");
+            bail!("task-local exec worker runtime belongs to another task");
         }
         Ok(runtime)
     }
@@ -1174,7 +1174,7 @@ impl AppServerSessionSupervisor {
     }
 }
 
-impl Drop for AppServerSessionSupervisor {
+impl Drop for TaskLaneSupervisor {
     fn drop(&mut self) {
         let _ = self.shutdown();
     }
@@ -1296,7 +1296,7 @@ fn capture_repository_observation(
         bail!("repository changed-path inventory exceeds 256 entries");
     }
     let identity_hash = sha256_hex(&serde_json::to_vec(&(
-        "hcom-app-server-repository-identity-v1",
+        "hcom-exec-repository-identity-v1",
         &repository.root,
         (
             repository.root_identity.device,
@@ -1641,7 +1641,7 @@ mod tests {
 
     impl RuntimeFactory for ScriptedFactory {
         fn contract(&self) -> RuntimeContractIdentity {
-            RuntimeContractIdentity::codex_app_server_0_146()
+            RuntimeContractIdentity::codex_exec_0_146()
         }
 
         fn open(
@@ -1755,7 +1755,7 @@ mod tests {
 
     impl RuntimeFactory for FailingFactory {
         fn contract(&self) -> RuntimeContractIdentity {
-            RuntimeContractIdentity::codex_app_server_0_146()
+            RuntimeContractIdentity::codex_exec_0_146()
         }
 
         fn open(
@@ -1813,10 +1813,8 @@ mod tests {
             let auth = fs::canonicalize(auth).unwrap();
 
             let mut sources = SessionRuntimeSources::fake(&toolchain);
-            sources.profiles = Some(
-                SessionInvocationProfiles::for_codex_app_server_lane(ArchitectAdapter::Codex)
-                    .unwrap(),
-            );
+            sources.profiles =
+                Some(SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Codex).unwrap());
             sources.codex_auth_source = Some(auth);
             sources.parent_environment = ParentEnvironment::from_os(vec![
                 (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
@@ -1876,8 +1874,8 @@ mod tests {
             &self,
             scripts: Vec<TaskScript>,
             audit: Arc<Mutex<Audit>>,
-        ) -> AppServerSessionSupervisor {
-            AppServerSessionSupervisor::open_with_factory(
+        ) -> TaskLaneSupervisor {
+            TaskLaneSupervisor::open_with_factory(
                 "run-driver-test".into(),
                 self.project_root.clone(),
                 self.run_root.clone(),
@@ -1941,8 +1939,7 @@ mod tests {
 
                 let home = std::env::var("HOME").expect("HOME");
                 let mut profiles =
-                    SessionInvocationProfiles::for_codex_app_server_lane(ArchitectAdapter::Codex)
-                        .unwrap();
+                    SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Codex).unwrap();
                 let cheap = CodexInvocationProfile {
                     model: TEST_MODEL.into(),
                     reasoning_effort: TEST_EFFORT.into(),
@@ -1973,8 +1970,8 @@ mod tests {
                 }
             }
 
-            pub(crate) fn supervisor(&self) -> AppServerSessionSupervisor {
-                AppServerSessionSupervisor::open(
+            pub(crate) fn supervisor(&self) -> TaskLaneSupervisor {
+                TaskLaneSupervisor::open(
                     "run-real-exec".into(),
                     self.project_root.clone(),
                     self.run_root.clone(),
@@ -1984,13 +1981,51 @@ mod tests {
                 .unwrap()
             }
 
+            /// Worker processes this fixture's own run leaves behind. A real
+            /// run must not outlive its supervisor: an orphaned worker keeps
+            /// burning tokens and pollutes whatever runs next, which is
+            /// exactly the failure mode stale processes cause.
+            pub(crate) fn stray_worker_pids(&self) -> Vec<u32> {
+                let marker = self.project_root.to_string_lossy().into_owned();
+                let mut strays = Vec::new();
+                let Ok(entries) = fs::read_dir("/proc") else {
+                    return strays;
+                };
+                for entry in entries.flatten() {
+                    let Some(pid) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.parse::<u32>().ok())
+                    else {
+                        continue;
+                    };
+                    let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+                        continue;
+                    };
+                    let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+                    if cmdline.contains(&marker) || {
+                        fs::read_link(format!("/proc/{pid}/cwd"))
+                            .map(|cwd| cwd.starts_with(&self.project_root))
+                            .unwrap_or(false)
+                    } {
+                        strays.push(pid);
+                    }
+                }
+                strays
+            }
+
             pub(crate) fn run(
                 &self,
-                supervisor: &mut AppServerSessionSupervisor,
+                supervisor: &mut TaskLaneSupervisor,
                 tasks: Vec<TaskDraft>,
             ) -> SessionStatusSnapshot {
                 let (plan_version, plan_hash) = supervisor
-                    .replace_plan(0, CODEX_APP_SERVER_ADAPTER, CODEX_APP_SERVER_ADAPTER, tasks)
+                    .replace_plan(
+                        0,
+                        CODEX_TASK_WORKER_ADAPTER,
+                        CODEX_TASK_WORKER_ADAPTER,
+                        tasks,
+                    )
                     .unwrap();
                 supervisor
                     .approve_and_start(1, plan_version, &plan_hash, true)
@@ -2133,9 +2168,14 @@ mod tests {
         }
     }
 
-    fn start(supervisor: &mut AppServerSessionSupervisor, tasks: Vec<TaskDraft>) {
+    fn start(supervisor: &mut TaskLaneSupervisor, tasks: Vec<TaskDraft>) {
         let (plan_version, plan_hash) = supervisor
-            .replace_plan(0, CODEX_APP_SERVER_ADAPTER, CODEX_APP_SERVER_ADAPTER, tasks)
+            .replace_plan(
+                0,
+                CODEX_TASK_WORKER_ADAPTER,
+                CODEX_TASK_WORKER_ADAPTER,
+                tasks,
+            )
             .unwrap();
         assert_eq!(supervisor.snapshot().state, SessionState::AwaitingApproval);
         supervisor
@@ -2144,7 +2184,7 @@ mod tests {
         assert_eq!(supervisor.snapshot().state, SessionState::Running);
     }
 
-    fn drive_terminal(supervisor: &mut AppServerSessionSupervisor) -> SessionStatusSnapshot {
+    fn drive_terminal(supervisor: &mut TaskLaneSupervisor) -> SessionStatusSnapshot {
         for _ in 0..64 {
             supervisor.poll_once().unwrap();
             let snapshot = supervisor.snapshot();
@@ -2152,7 +2192,7 @@ mod tests {
                 return snapshot;
             }
         }
-        panic!("scripted App Server supervisor did not become terminal");
+        panic!("scripted exec worker supervisor did not become terminal");
     }
 
     fn apply_mutation(repository: &Path, mutation: Mutation) -> Result<()> {
@@ -2271,9 +2311,9 @@ mod tests {
         let output = Command::new("/usr/bin/git")
             .args([
                 "-c",
-                "user.name=App Server Driver Fixture",
+                "user.name=exec worker Driver Fixture",
                 "-c",
-                "user.email=app-server-driver@example.invalid",
+                "user.email=exec-driver@example.invalid",
                 "commit",
                 "-m",
                 subject,
@@ -2409,12 +2449,12 @@ mod tests {
             audit
                 .profiles
                 .iter()
-                .all(|(_, _, profile)| profile == &RuntimeProfile::codex_app_server_default())
+                .all(|(_, _, profile)| profile == &RuntimeProfile::codex_exec_default())
         );
         assert!(
             !fixture
                 .run_root
-                .join("app-server-workers")
+                .join("exec-workers")
                 .read_dir()
                 .unwrap()
                 .any(|entry| entry.is_ok())
@@ -3549,8 +3589,8 @@ mod tests {
             supervisor
                 .replace_plan(
                     0,
-                    CODEX_APP_SERVER_ADAPTER,
-                    CODEX_APP_SERVER_ADAPTER,
+                    CODEX_TASK_WORKER_ADAPTER,
+                    CODEX_TASK_WORKER_ADAPTER,
                     vec![fixture.task("dirty", &["src"], 2)],
                 )
                 .is_err()
@@ -3569,8 +3609,8 @@ mod tests {
             supervisor
                 .replace_plan(
                     0,
-                    CODEX_APP_SERVER_ADAPTER,
-                    CODEX_APP_SERVER_ADAPTER,
+                    CODEX_TASK_WORKER_ADAPTER,
+                    CODEX_TASK_WORKER_ADAPTER,
                     vec![detached.task("detached", &["src"], 2)],
                 )
                 .is_err()
@@ -3585,8 +3625,8 @@ mod tests {
             supervisor
                 .replace_plan(
                     0,
-                    CODEX_APP_SERVER_ADAPTER,
-                    CODEX_APP_SERVER_ADAPTER,
+                    CODEX_TASK_WORKER_ADAPTER,
+                    CODEX_TASK_WORKER_ADAPTER,
                     vec![task],
                 )
                 .is_err()
@@ -3628,8 +3668,8 @@ mod tests {
         let (plan_version, plan_hash) = supervisor
             .replace_plan(
                 0,
-                CODEX_APP_SERVER_ADAPTER,
-                CODEX_APP_SERVER_ADAPTER,
+                CODEX_TASK_WORKER_ADAPTER,
+                CODEX_TASK_WORKER_ADAPTER,
                 vec![retained_task.clone()],
             )
             .unwrap();
@@ -3641,8 +3681,8 @@ mod tests {
         blocker
             .replace_plan(
                 0,
-                CODEX_APP_SERVER_ADAPTER,
-                CODEX_APP_SERVER_ADAPTER,
+                CODEX_TASK_WORKER_ADAPTER,
+                CODEX_TASK_WORKER_ADAPTER,
                 vec![blocked_task.clone()],
             )
             .unwrap();
@@ -3651,8 +3691,8 @@ mod tests {
             supervisor
                 .replace_plan(
                     before.version,
-                    CODEX_APP_SERVER_ADAPTER,
-                    CODEX_APP_SERVER_ADAPTER,
+                    CODEX_TASK_WORKER_ADAPTER,
+                    CODEX_TASK_WORKER_ADAPTER,
                     vec![blocked_task],
                 )
                 .is_err()
@@ -3664,8 +3704,8 @@ mod tests {
             probe
                 .replace_plan(
                     0,
-                    CODEX_APP_SERVER_ADAPTER,
-                    CODEX_APP_SERVER_ADAPTER,
+                    CODEX_TASK_WORKER_ADAPTER,
+                    CODEX_TASK_WORKER_ADAPTER,
                     vec![retained_task],
                 )
                 .is_err()
@@ -3680,7 +3720,7 @@ mod tests {
     #[test]
     fn runtime_factory_failure_is_distinct_from_environment_setup_and_is_sanitized() {
         let fixture = Fixture::new();
-        let mut supervisor = AppServerSessionSupervisor::open_with_factory(
+        let mut supervisor = TaskLaneSupervisor::open_with_factory(
             "run-factory-failure".into(),
             fixture.project_root.clone(),
             fixture.run_root.clone(),
@@ -3693,8 +3733,8 @@ mod tests {
         let (plan_version, plan_hash) = supervisor
             .replace_plan(
                 0,
-                CODEX_APP_SERVER_ADAPTER,
-                CODEX_APP_SERVER_ADAPTER,
+                CODEX_TASK_WORKER_ADAPTER,
+                CODEX_TASK_WORKER_ADAPTER,
                 vec![task],
             )
             .unwrap();
@@ -3717,7 +3757,7 @@ mod tests {
         assert!(
             !fixture
                 .run_root
-                .join("app-server-workers")
+                .join("exec-workers")
                 .read_dir()
                 .unwrap()
                 .any(|entry| entry.is_ok())
@@ -3733,8 +3773,8 @@ mod tests {
         let (plan_version, plan_hash) = supervisor
             .replace_plan(
                 0,
-                CODEX_APP_SERVER_ADAPTER,
-                CODEX_APP_SERVER_ADAPTER,
+                CODEX_TASK_WORKER_ADAPTER,
+                CODEX_TASK_WORKER_ADAPTER,
                 vec![task],
             )
             .unwrap();
@@ -3844,6 +3884,11 @@ mod real_exec_tests {
         assert_eq!(snapshot.tasks[0].state, TaskState::Lgtm);
         assert!(fixture.repository.join("fib.py").is_file());
         fixture.assert_artifacts("fib", &["developer", "reviewer"]);
+        assert!(
+            fixture.stray_worker_pids().is_empty(),
+            "workers outlived the run: {:?}",
+            fixture.stray_worker_pids()
+        );
     }
 
     /// End-to-end acceptance on a real Rust project: the developer writes and
@@ -3885,6 +3930,11 @@ mod real_exec_tests {
         let main = std::fs::read_to_string(fixture.repository.join("src/main.rs")).unwrap();
         assert!(main.contains("Hello, world!"), "{main}");
         fixture.assert_artifacts("hello", &["developer", "reviewer"]);
+        assert!(
+            fixture.stray_worker_pids().is_empty(),
+            "workers outlived the run: {:?}",
+            fixture.stray_worker_pids()
+        );
     }
 
     #[test]
@@ -3940,5 +3990,10 @@ mod real_exec_tests {
         assert!(fixture.repository.join("square.py").is_file());
         fixture.assert_artifacts("greet", &["developer", "reviewer"]);
         fixture.assert_artifacts("square", &["developer", "reviewer"]);
+        assert!(
+            fixture.stray_worker_pids().is_empty(),
+            "workers outlived the run: {:?}",
+            fixture.stray_worker_pids()
+        );
     }
 }

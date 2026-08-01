@@ -372,12 +372,12 @@ impl SessionInvocationProfiles {
         }
     }
 
-    /// Built-in profiles for the Codex App Server task-runtime lane.
+    /// Built-in profiles for the Codex exec worker task-runtime lane.
     ///
     /// This is intentionally separate from [`Self::for_architect`] while the
     /// released CLI worker path is retained. Production selects this resolver
-    /// only when the App Server integration phase is enabled.
-    pub fn for_codex_app_server_lane(adapter: ArchitectAdapter) -> Result<Self> {
+    /// only when the exec worker integration phase is enabled.
+    pub fn for_task_lane(adapter: ArchitectAdapter) -> Result<Self> {
         // Both `hcom arch codex` and `hcom arch claude` keep their own
         // foreground Architect adapter but share one Codex-only worker lane.
         let architect = match adapter {
@@ -514,9 +514,8 @@ mod tests {
     }
 
     #[test]
-    fn codex_app_server_lane_defaults_both_workers_to_exact_codex_profiles() {
-        let profiles =
-            SessionInvocationProfiles::for_codex_app_server_lane(ArchitectAdapter::Codex).unwrap();
+    fn codex_exec_worker_lane_defaults_both_workers_to_exact_codex_profiles() {
+        let profiles = SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Codex).unwrap();
         profiles.validate().unwrap();
         assert_eq!(profiles.developer_adapter_name(), CODEX_DEVELOPER_ADAPTER);
         assert_eq!(profiles.reviewer_adapter_name(), CODEX_REVIEWER_ADAPTER);
@@ -535,8 +534,7 @@ mod tests {
         );
         // A Claude Architect keeps its own foreground adapter but binds the
         // same Codex-only worker lane.
-        let claude =
-            SessionInvocationProfiles::for_codex_app_server_lane(ArchitectAdapter::Claude).unwrap();
+        let claude = SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Claude).unwrap();
         claude.validate().unwrap();
         assert!(matches!(
             claude.architect,

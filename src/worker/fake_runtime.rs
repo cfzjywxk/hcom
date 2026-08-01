@@ -73,7 +73,7 @@ pub struct FakeTaskWorkerRuntime {
 impl FakeTaskWorkerRuntime {
     pub fn new(scripts: impl IntoIterator<Item = FakeTurnScript>) -> Self {
         Self {
-            contract: RuntimeContractIdentity::codex_app_server_0_146(),
+            contract: RuntimeContractIdentity::codex_exec_0_146(),
             scripts: scripts.into_iter().collect(),
             sessions: BTreeMap::new(),
             active: BTreeMap::new(),
@@ -261,7 +261,7 @@ mod tests {
             role,
             task_key: "task-1".into(),
             cwd: PathBuf::from("/repo"),
-            profile: RuntimeProfile::codex_app_server_default(),
+            profile: RuntimeProfile::codex_exec_default(),
             developer_instructions: "closed role instructions".into(),
         }
     }
@@ -273,7 +273,7 @@ mod tests {
             purpose,
             cwd: PathBuf::from("/repo"),
             prompt: "bounded turn prompt".into(),
-            profile: RuntimeProfile::codex_app_server_default(),
+            profile: RuntimeProfile::codex_exec_default(),
             outcome_contract: match role {
                 WorkerRole::Developer => OutcomeContract::DeveloperV1,
                 WorkerRole::Reviewer => OutcomeContract::ReviewerV1,

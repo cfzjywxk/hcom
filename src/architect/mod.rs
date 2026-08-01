@@ -40,7 +40,7 @@ pub fn help_text() -> &'static str {
 Launch one blank, foreground Codex or Claude architect with capability-bound
 in-memory session-task tools. The invocation's exact current directory is the
 Architect's project context and does not need to be a Git repository. Every
-task separately binds an exact canonical Git root; App Server role threads use
+task separately binds an exact canonical Git root; exec worker role threads use
 that repository as their cwd.
 
 Profile configuration is read once from $HCOM_DIR/config.toml (default:
@@ -59,14 +59,11 @@ Architect CLI overrides (higher priority than TOML):
 
 Built-in Architect defaults are Codex gpt-5.6-sol/xhigh with
 danger-full-access/never, or Claude opus/xhigh with
-dangerously-skip-permissions. `hcom arch codex` uses one task-local
-codex-app-server-0.146.0 process per task; its Developer and Reviewer both
+dangerously-skip-permissions. Both entrypoints share one worker lane: a fresh
+codex-exec-0.146.0 process per task. Developer and Reviewer both
 default to Codex gpt-5.6-sol/xhigh with danger-full-access/never. Explicit
-worker tables in that lane must also select Codex with
-danger-full-access/never; Claude workers are unsupported and fail closed.
-`hcom arch claude` retains the existing CLI-worker lane, whose built-in
-Developer is Codex gpt-5.6-sol/xhigh and implicit Reviewer is Claude
-opus/xhigh with dangerously-skip-permissions.
+worker tables must also select Codex with danger-full-access/never; Claude
+workers are unsupported and fail closed.
 
 The capability-bound session-control MCP tools do not add a second native
 approval prompt. The Codex Architect's per-run private config records the
@@ -92,7 +89,7 @@ files, including SSH and cloud credentials, remain writable. Exact current-user
 credential sockets named by DBUS_SESSION_BUS_ADDRESS, SSH_AUTH_SOCK, and
 GPG_AGENT_INFO are identity-checked and rebound read-only after the host
 runtime mask, so keyring and agent-backed Git authentication retains the parent
-terminal's capability without exposing sibling hcom sockets. A Codex App Server
+terminal's capability without exposing sibling hcom sockets. A Codex exec worker
 Reviewer receives the same writable task envelope as its Developer so it can
 run builds and tests, but hcom accepts its verdict only when local pre/post
 branch, HEAD, index, tracked and non-ignored untracked Git evidence is exactly
@@ -103,7 +100,7 @@ hcom has no repository-root allowlist. An in-scope uncommitted developer result
 gets one exact-session recovery before review; out-of-scope changes, rewrite,
 external drift, or uncertain session identity stop the run without reset,
 rebase, merge, or final apply. The foreground parent owns every worker and
-task-local App Server; it keeps state only in memory and performs no daemon,
+task-local exec worker; it keeps state only in memory and performs no daemon,
 project store, cross-session recovery, push, or install. After dispatch, the
 Architect should check worker status only every 3 to 5 minutes unless the human
 asks or immediate intervention is required; the foreground supervisor monitors

@@ -1,8 +1,8 @@
 //! Foreground, in-memory task supervisor for one `hcom arch` invocation.
 
-#[cfg(target_os = "linux")]
-pub(crate) mod app_server;
 pub mod core;
+#[cfg(target_os = "linux")]
+pub(crate) mod task_lane;
 #[cfg(target_os = "linux")]
 pub mod workspace;
 

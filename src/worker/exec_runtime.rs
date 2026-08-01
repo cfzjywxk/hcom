@@ -14,11 +14,11 @@ use super::environment::{ExecutionEnvironmentLease, SecretRedactor};
 use super::process::{ProcessGroupBinding, configure_worker_child};
 use super::profile::validate_cli_help_contract;
 use super::runtime::{
-    CODEX_APP_SERVER_EXECUTABLE_SHA256, DeveloperOutcomeStatus, DeveloperOutcomeV1,
-    MAX_OUTCOME_SUMMARY_CHARS, MAX_REVIEW_FINDING_MESSAGE_CHARS, ReviewFindingSeverity,
-    ReviewFindingV1, ReviewerOutcomeV1, ReviewerVerdict, RoleSessionSpec, RuntimeContractIdentity,
-    RuntimeError, RuntimeOutcome, RuntimeSessionKey, RuntimeTelemetry, RuntimeTurnKey,
-    RuntimeTurnPoll, RuntimeTurnSpec, SanitizedRuntimeFailure, TaskWorkerRuntime,
+    CODEX_EXECUTABLE_SHA256, DeveloperOutcomeStatus, DeveloperOutcomeV1, MAX_OUTCOME_SUMMARY_CHARS,
+    MAX_REVIEW_FINDING_MESSAGE_CHARS, ReviewFindingSeverity, ReviewFindingV1, ReviewerOutcomeV1,
+    ReviewerVerdict, RoleSessionSpec, RuntimeContractIdentity, RuntimeError, RuntimeOutcome,
+    RuntimeSessionKey, RuntimeTelemetry, RuntimeTurnKey, RuntimeTurnPoll, RuntimeTurnSpec,
+    SanitizedRuntimeFailure, TaskWorkerRuntime,
 };
 use super::sandbox::{HostRootAccess, HostRootContract, HostRootMounts};
 use super::verdict::{Verdict, VerdictClassification, classify_verdict};
@@ -122,7 +122,7 @@ impl ExecPreflight {
         let codex = PathBuf::from(CODEX_EXECUTABLE);
         let digest = sha256_file(&codex)
             .map_err(|error| RuntimeError::invalid_contract(single_line(&error.to_string())))?;
-        if digest != CODEX_APP_SERVER_EXECUTABLE_SHA256 {
+        if digest != CODEX_EXECUTABLE_SHA256 {
             return Err(RuntimeError::invalid_contract(
                 "pinned codex executable bytes changed",
             ));
@@ -170,7 +170,7 @@ pub fn codex_exec_contract_identity() -> RuntimeContractIdentity {
     RuntimeContractIdentity {
         adapter: CODEX_EXEC_ADAPTER.into(),
         cli_version: CODEX_EXEC_VERSION.into(),
-        executable_sha256: CODEX_APP_SERVER_EXECUTABLE_SHA256.into(),
+        executable_sha256: CODEX_EXECUTABLE_SHA256.into(),
         schema_canonical_sha256: hex_digest(hasher),
         selected_methods: argv_contract,
         selected_fields: vec!["thread.started.thread_id".into()],
@@ -1242,7 +1242,7 @@ echo ===STDIN-END=== >> "$CAPTURE/stdin.log"
                 role,
                 task_key: "task-1".into(),
                 cwd: fixture.repo.clone(),
-                profile: RuntimeProfile::codex_app_server_default(),
+                profile: RuntimeProfile::codex_exec_default(),
                 developer_instructions: "You are the worker.".into(),
             })
             .expect("open session")
@@ -1260,7 +1260,7 @@ echo ===STDIN-END=== >> "$CAPTURE/stdin.log"
             purpose,
             cwd: repo.to_path_buf(),
             prompt: "do the task".into(),
-            profile: RuntimeProfile::codex_app_server_default(),
+            profile: RuntimeProfile::codex_exec_default(),
             outcome_contract: match role {
                 WorkerRole::Developer => OutcomeContract::DeveloperV1,
                 WorkerRole::Reviewer => OutcomeContract::ReviewerV1,

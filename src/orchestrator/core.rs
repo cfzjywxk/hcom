@@ -655,7 +655,7 @@ impl SupervisorCore {
         repositories: &[TaskRepositoryBinding],
     ) -> String {
         canonical_hash(&(
-            "hcom-codex-app-server-session-plan-v1",
+            "hcom-codex-exec-session-plan-v1",
             plan_version,
             &self.project_root,
             &self.profile_hash,

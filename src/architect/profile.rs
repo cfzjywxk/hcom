@@ -25,8 +25,8 @@ struct ArchitectToml {
     reviewer: Option<ReviewerInvocationProfile>,
 }
 
-/// Resolver for the production Codex App Server task-runtime lane.
-pub(super) fn load_codex_app_server_profiles(
+/// Resolver for the production Codex exec worker task-runtime lane.
+pub(super) fn load_task_lane_profiles(
     path: &Path,
     architect_adapter: ArchitectAdapter,
 ) -> Result<LoadedInvocationProfiles> {
@@ -36,11 +36,11 @@ pub(super) fn load_codex_app_server_profiles(
 fn load_invocation_profiles_with_defaults(
     path: &Path,
     architect_adapter: ArchitectAdapter,
-    codex_app_server_lane: bool,
+    codex_exec_worker_lane: bool,
 ) -> Result<LoadedInvocationProfiles> {
     let defaults = || {
-        if codex_app_server_lane {
-            SessionInvocationProfiles::for_codex_app_server_lane(architect_adapter)
+        if codex_exec_worker_lane {
+            SessionInvocationProfiles::for_task_lane(architect_adapter)
         } else {
             Ok(SessionInvocationProfiles::for_architect(architect_adapter))
         }
@@ -139,8 +139,8 @@ fn load_invocation_profiles_with_defaults(
         }
     }
     profiles.validate()?;
-    if codex_app_server_lane {
-        crate::worker::runtime::AppServerWorkerProfiles::from_session_profiles(&profiles)
+    if codex_exec_worker_lane {
+        crate::worker::runtime::TaskWorkerProfiles::from_session_profiles(&profiles)
             .map_err(|error| anyhow::anyhow!(error.detail))?;
     }
     Ok(LoadedInvocationProfiles {
@@ -167,11 +167,9 @@ mod tests {
     #[test]
     fn missing_file_uses_reviewed_defaults() {
         let temp = tempfile::tempdir().unwrap();
-        let loaded = load_codex_app_server_profiles(
-            &temp.path().join("missing.toml"),
-            ArchitectAdapter::Codex,
-        )
-        .unwrap();
+        let loaded =
+            load_task_lane_profiles(&temp.path().join("missing.toml"), ArchitectAdapter::Codex)
+                .unwrap();
         assert!(!loaded.loaded_from_file);
         assert_eq!(
             loaded.profiles.architect.codex().unwrap().sandbox,
@@ -191,11 +189,9 @@ mod tests {
     #[test]
     fn claude_architect_keeps_its_adapter_but_gets_codex_workers() {
         let temp = tempfile::tempdir().unwrap();
-        let loaded = load_codex_app_server_profiles(
-            &temp.path().join("missing.toml"),
-            ArchitectAdapter::Claude,
-        )
-        .unwrap();
+        let loaded =
+            load_task_lane_profiles(&temp.path().join("missing.toml"), ArchitectAdapter::Claude)
+                .unwrap();
         let architect = loaded.profiles.architect.claude().unwrap();
         assert_eq!(architect.model, "opus");
         assert_eq!(architect.effort, "xhigh");
@@ -210,13 +206,11 @@ mod tests {
     }
 
     #[test]
-    fn app_server_resolver_uses_codex_reviewer_when_config_is_absent() {
+    fn task_lane_resolver_uses_codex_reviewer_when_config_is_absent() {
         let temp = tempfile::tempdir().unwrap();
-        let loaded = load_codex_app_server_profiles(
-            &temp.path().join("missing.toml"),
-            ArchitectAdapter::Codex,
-        )
-        .unwrap();
+        let loaded =
+            load_task_lane_profiles(&temp.path().join("missing.toml"), ArchitectAdapter::Codex)
+                .unwrap();
         assert_eq!(
             loaded.profiles.developer_adapter_name(),
             CODEX_DEVELOPER_ADAPTER
@@ -232,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn app_server_resolver_rejects_explicit_claude_without_fallback() {
+    fn task_lane_resolver_rejects_explicit_claude_without_fallback() {
         let (_temp, path) = write_config(
             r#"
 [architect.reviewer]
@@ -242,18 +236,18 @@ effort = "xhigh"
 dangerously_skip_permissions = true
 "#,
         );
-        let error = match load_codex_app_server_profiles(&path, ArchitectAdapter::Codex) {
+        let error = match load_task_lane_profiles(&path, ArchitectAdapter::Codex) {
             Ok(_) => panic!("explicit Claude reviewer was accepted"),
             Err(error) => error,
         };
         assert_eq!(
             error.to_string(),
-            "Claude reviewer is unsupported in the Codex App Server runtime lane"
+            "Claude reviewer is unsupported in the Codex exec worker runtime lane"
         );
     }
 
     #[test]
-    fn app_server_resolver_applies_each_complete_role_override_independently() {
+    fn task_lane_resolver_applies_each_complete_role_override_independently() {
         let (_temp, path) = write_config(
             r#"
 [architect.developer]
@@ -271,7 +265,7 @@ sandbox = "danger-full-access"
 ask_for_approval = "never"
 "#,
         );
-        let loaded = load_codex_app_server_profiles(&path, ArchitectAdapter::Codex).unwrap();
+        let loaded = load_task_lane_profiles(&path, ArchitectAdapter::Codex).unwrap();
         let developer = loaded.profiles.developer.codex().unwrap();
         let reviewer = loaded.profiles.reviewer.codex().unwrap();
         assert_eq!(developer.model, "developer-override");
@@ -281,7 +275,7 @@ ask_for_approval = "never"
     }
 
     #[test]
-    fn app_server_role_sections_default_independently_and_partial_profiles_fail_closed() {
+    fn exec_worker_role_sections_default_independently_and_partial_profiles_fail_closed() {
         let (_temp, path) = write_config(
             r#"
 [architect.developer]
@@ -292,7 +286,7 @@ sandbox = "danger-full-access"
 ask_for_approval = "never"
 "#,
         );
-        let loaded = load_codex_app_server_profiles(&path, ArchitectAdapter::Codex).unwrap();
+        let loaded = load_task_lane_profiles(&path, ArchitectAdapter::Codex).unwrap();
         assert_eq!(
             loaded.profiles.developer.codex().unwrap().model,
             "developer-override"
@@ -309,7 +303,7 @@ adapter = "codex"
 model = "partial"
 "#,
         );
-        let error = match load_codex_app_server_profiles(&path, ArchitectAdapter::Codex) {
+        let error = match load_task_lane_profiles(&path, ArchitectAdapter::Codex) {
             Ok(_) => panic!("partial role profile was accepted"),
             Err(error) => error,
         };
@@ -338,7 +332,7 @@ ask_for_approval = "never"
 "#,
         );
         for architect_adapter in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
-            let loaded = load_codex_app_server_profiles(&path, architect_adapter).unwrap();
+            let loaded = load_task_lane_profiles(&path, architect_adapter).unwrap();
             assert_eq!(
                 loaded.profiles.developer_adapter_name(),
                 CODEX_DEVELOPER_ADAPTER
@@ -362,7 +356,7 @@ ask_for_approval = "never"
 "#,
         );
         for architect_adapter in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
-            let loaded = load_codex_app_server_profiles(&path, architect_adapter).unwrap();
+            let loaded = load_task_lane_profiles(&path, architect_adapter).unwrap();
             assert_eq!(
                 loaded.profiles.reviewer_adapter_name(),
                 CODEX_REVIEWER_ADAPTER
@@ -386,7 +380,7 @@ ask_for_approval = "never"
 args = ["--resume", "foreign-session"]
 "#,
         );
-        assert!(load_codex_app_server_profiles(&path, ArchitectAdapter::Codex).is_err());
+        assert!(load_task_lane_profiles(&path, ArchitectAdapter::Codex).is_err());
 
         fs::write(
             &path,
@@ -396,7 +390,7 @@ unknown = true
 "#,
         )
         .unwrap();
-        assert!(load_codex_app_server_profiles(&path, ArchitectAdapter::Codex).is_err());
+        assert!(load_task_lane_profiles(&path, ArchitectAdapter::Codex).is_err());
 
         fs::write(
             &path,
@@ -410,9 +404,9 @@ args = ["--resume", "foreign-session"]
 "#,
         )
         .unwrap();
-        assert!(load_codex_app_server_profiles(&path, ArchitectAdapter::Codex).is_err());
+        assert!(load_task_lane_profiles(&path, ArchitectAdapter::Codex).is_err());
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o622)).unwrap();
-        assert!(load_codex_app_server_profiles(&path, ArchitectAdapter::Codex).is_err());
+        assert!(load_task_lane_profiles(&path, ArchitectAdapter::Codex).is_err());
     }
 }

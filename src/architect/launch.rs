@@ -2,7 +2,7 @@ use super::bridge::{
     BridgeActivation, BridgeConfiguration, activate_bridge, configure_bridge,
     relay_runtime_scope_hash, sha256_hex,
 };
-use super::profile::{LoadedInvocationProfiles, load_codex_app_server_profiles};
+use super::profile::{LoadedInvocationProfiles, load_task_lane_profiles};
 use crate::control_api::ActionName;
 use crate::control_api::peer::{process_birth_identity, process_owns_foreground_tty};
 use crate::control_api::protocol::PROTOCOL_VERSION;
@@ -21,7 +21,7 @@ use crate::worker::profile::{
     validate_cli_help_contract,
 };
 use crate::worker::reviewer::{CLAUDE_REVIEWER_CLI_VERSION, CLAUDE_REVIEWER_EXECUTABLE};
-use crate::worker::runtime::CODEX_APP_SERVER_ADAPTER;
+use crate::worker::runtime::CODEX_TASK_WORKER_ADAPTER;
 use crate::worker::sandbox::{HostRootAccess, HostRootContract, HostRootMounts};
 use crate::worker::{ExecutableIdentity, ParentEnvironment};
 use anyhow::{Context, Result, bail};
@@ -88,9 +88,9 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
     // Both public entrypoints bind the same Codex-only task worker lane; a
     // configured Claude developer or reviewer fails closed inside the loader.
     let mut loaded = match config_path {
-        Some(path) => load_codex_app_server_profiles(path, architect_adapter)?,
+        Some(path) => load_task_lane_profiles(path, architect_adapter)?,
         None => LoadedInvocationProfiles {
-            profiles: SessionInvocationProfiles::for_codex_app_server_lane(architect_adapter)?,
+            profiles: SessionInvocationProfiles::for_task_lane(architect_adapter)?,
             config_path: PathBuf::from("<built-in defaults>"),
             loaded_from_file: false,
         },
@@ -116,7 +116,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         native_environment.runtime_home.clone(),
         loaded.profiles.clone(),
     )?;
-    let supervisor_endpoint = SessionSupervisorEndpoint::bind_app_server(
+    let supervisor_endpoint = SessionSupervisorEndpoint::bind(
         control_paths.clone(),
         run_id.clone(),
         project_root.clone(),
@@ -157,7 +157,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         if architect_adapter == ArchitectAdapter::Codex {
             writeln!(
                 stdout,
-                "worker runtime: codex-app-server-0.146.0 (one fresh process per task)"
+                "worker runtime: codex-exec-0.146.0 (one fresh process per task)"
             )?;
         }
         writeln!(
@@ -607,7 +607,7 @@ fn worker_adapter_bindings(
 ) -> (&'static str, &'static str) {
     // Adapter-independent: the worker lane is Codex-only for both entrypoints.
     let _ = (architect_adapter, profiles);
-    (CODEX_APP_SERVER_ADAPTER, CODEX_APP_SERVER_ADAPTER)
+    (CODEX_TASK_WORKER_ADAPTER, CODEX_TASK_WORKER_ADAPTER)
 }
 
 fn validate_foreground_terminal() -> Result<()> {
@@ -2775,10 +2775,10 @@ mod tests {
     #[test]
     fn both_public_entrypoints_bind_the_same_codex_only_worker_lane() {
         for adapter in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
-            let profiles = SessionInvocationProfiles::for_codex_app_server_lane(adapter).unwrap();
+            let profiles = SessionInvocationProfiles::for_task_lane(adapter).unwrap();
             assert_eq!(
                 worker_adapter_bindings(adapter, &profiles),
-                (CODEX_APP_SERVER_ADAPTER, CODEX_APP_SERVER_ADAPTER),
+                (CODEX_TASK_WORKER_ADAPTER, CODEX_TASK_WORKER_ADAPTER),
                 "{adapter:?} must bind the Codex-only worker lane"
             );
         }
@@ -2799,7 +2799,7 @@ mod tests {
                 )
                 .unwrap();
                 std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
-                let error = match load_codex_app_server_profiles(&config, adapter) {
+                let error = match load_task_lane_profiles(&config, adapter) {
                     Ok(_) => panic!("{adapter:?}/{section}: Claude worker must be refused"),
                     Err(error) => error,
                 };

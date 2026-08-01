@@ -17,17 +17,17 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 
-pub const CODEX_APP_SERVER_ADAPTER: &str = "codex-app-server-0.146.0";
-pub const CODEX_APP_SERVER_VERSION: &str = "0.146.0";
-pub const CODEX_APP_SERVER_EXECUTABLE_SHA256: &str =
+pub const CODEX_TASK_WORKER_ADAPTER: &str = "codex-exec-0.146.0";
+pub const CODEX_TASK_WORKER_VERSION: &str = "0.146.0";
+pub const CODEX_EXECUTABLE_SHA256: &str =
     "2e863156ed35ecc5253b1e2f907a9143077b9f7cb51942070c61996471ff6e04";
 /// Raw hash captured from the design-time generated stable v2 schema bundle.
 ///
 /// The 0.146 generator emits semantically identical `$defs` in nondeterministic
-/// map order, so runtime drift checks use [`CODEX_APP_SERVER_SCHEMA_CANONICAL_SHA256`].
-pub const CODEX_APP_SERVER_SCHEMA_EXEMPLAR_SHA256: &str =
+/// map order, so runtime drift checks use [`CODEX_SCHEMA_CANONICAL_SHA256`].
+pub const CODEX_SCHEMA_EXEMPLAR_SHA256: &str =
     "8a1e451c6244f9d954cc2b19aeef2cb33b03fbcd33d21002bd8875e4ead4bd40";
-pub const CODEX_APP_SERVER_SCHEMA_CANONICAL_SHA256: &str =
+pub const CODEX_SCHEMA_CANONICAL_SHA256: &str =
     "2f402b7d1356adccc1a4785c0656db457578ca9ea5d5b08953487a410c630ce8";
 
 pub const MAX_RUNTIME_KEY_BYTES: usize = 128;
@@ -50,25 +50,25 @@ const MAX_PATH_BYTES: usize = 4096;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeProvider {
-    CodexAppServer,
+    CodexExec,
 }
 
 impl RuntimeProvider {
     pub fn parse(value: &str) -> Result<Self, RuntimeError> {
         match value {
-            "codex-app-server" => Ok(Self::CodexAppServer),
+            "codex-exec" => Ok(Self::CodexExec),
             "codex" | "claude" => Err(RuntimeError::unsupported(format!(
-                "{value} CLI workers are unsupported in the Codex App Server runtime lane"
+                "{value} CLI workers are unsupported in the Codex exec worker lane"
             ))),
             _ => Err(RuntimeError::unsupported(format!(
-                "unknown worker runtime provider {value:?}; expected codex-app-server"
+                "unknown worker runtime provider {value:?}; expected codex-exec"
             ))),
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::CodexAppServer => "codex-app-server",
+            Self::CodexExec => "codex-exec",
         }
     }
 }
@@ -127,9 +127,9 @@ pub struct RuntimeTurnProfileFields<'a> {
 }
 
 impl RuntimeProfile {
-    pub fn codex_app_server_default() -> Self {
+    pub fn codex_exec_default() -> Self {
         Self {
-            provider: RuntimeProvider::CodexAppServer,
+            provider: RuntimeProvider::CodexExec,
             model: DEFAULT_MODEL.into(),
             reasoning_effort: DEFAULT_REASONING_EFFORT.into(),
             sandbox: RuntimeSandbox::DangerFullAccess,
@@ -143,7 +143,7 @@ impl RuntimeProfile {
             .map_err(|error| RuntimeError::invalid_profile(error.to_string()))?;
         if profile.sandbox != CodexSandbox::DangerFullAccess {
             return Err(RuntimeError::invalid_profile(format!(
-                "{label} must use danger-full-access in the Codex App Server runtime lane"
+                "{label} must use danger-full-access in the Codex exec worker lane"
             )));
         }
         if profile.approval_policy != CodexApprovalPolicy::Never {
@@ -152,7 +152,7 @@ impl RuntimeProfile {
             )));
         }
         Ok(Self {
-            provider: RuntimeProvider::CodexAppServer,
+            provider: RuntimeProvider::CodexExec,
             model: profile.model.clone(),
             reasoning_effort: profile.reasoning_effort.clone(),
             sandbox: RuntimeSandbox::DangerFullAccess,
@@ -173,7 +173,7 @@ impl RuntimeProfile {
         Ok(())
     }
 
-    /// The native CLI options whose semantics the App Server mapping must
+    /// The native CLI options whose semantics the exec invocation must
     /// preserve. This is diagnostic/test evidence, never a process argv.
     pub fn cli_equivalent_arguments(&self) -> Vec<String> {
         vec![
@@ -214,16 +214,16 @@ impl RuntimeProfile {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct AppServerWorkerProfiles {
+pub struct TaskWorkerProfiles {
     pub developer: RuntimeProfile,
     pub reviewer: RuntimeProfile,
 }
 
-impl AppServerWorkerProfiles {
+impl TaskWorkerProfiles {
     pub fn defaults() -> Self {
         Self {
-            developer: RuntimeProfile::codex_app_server_default(),
-            reviewer: RuntimeProfile::codex_app_server_default(),
+            developer: RuntimeProfile::codex_exec_default(),
+            reviewer: RuntimeProfile::codex_exec_default(),
         }
     }
 
@@ -236,7 +236,7 @@ impl AppServerWorkerProfiles {
             }
             DeveloperInvocationProfile::Claude { .. } => {
                 return Err(RuntimeError::unsupported(
-                    "Claude developer is unsupported in the Codex App Server runtime lane",
+                    "Claude developer is unsupported in the Codex exec worker runtime lane",
                 ));
             }
         };
@@ -246,7 +246,7 @@ impl AppServerWorkerProfiles {
             }
             ReviewerInvocationProfile::Claude { .. } => {
                 return Err(RuntimeError::unsupported(
-                    "Claude reviewer is unsupported in the Codex App Server runtime lane",
+                    "Claude reviewer is unsupported in the Codex exec worker runtime lane",
                 ));
             }
         };
@@ -262,7 +262,7 @@ impl AppServerWorkerProfiles {
     }
 
     pub fn canonical_hash(&self) -> String {
-        canonical_hash(&("hcom-app-server-worker-profiles-v1", self))
+        canonical_hash(&("hcom-exec-worker-profiles-v1", self))
     }
 }
 
@@ -278,12 +278,12 @@ pub struct RuntimeContractIdentity {
 }
 
 impl RuntimeContractIdentity {
-    pub fn codex_app_server_0_146() -> Self {
+    pub fn codex_exec_0_146() -> Self {
         Self {
-            adapter: CODEX_APP_SERVER_ADAPTER.into(),
-            cli_version: CODEX_APP_SERVER_VERSION.into(),
-            executable_sha256: CODEX_APP_SERVER_EXECUTABLE_SHA256.into(),
-            schema_canonical_sha256: CODEX_APP_SERVER_SCHEMA_CANONICAL_SHA256.into(),
+            adapter: CODEX_TASK_WORKER_ADAPTER.into(),
+            cli_version: CODEX_TASK_WORKER_VERSION.into(),
+            executable_sha256: CODEX_EXECUTABLE_SHA256.into(),
+            schema_canonical_sha256: CODEX_SCHEMA_CANONICAL_SHA256.into(),
             selected_methods: [
                 "initialize",
                 "initialized",
@@ -1096,11 +1096,11 @@ mod tests {
 
     #[test]
     fn exact_defaults_match_the_approved_cli_semantics_for_both_roles() {
-        let profiles = AppServerWorkerProfiles::defaults();
+        let profiles = TaskWorkerProfiles::defaults();
         profiles.validate().unwrap();
         assert_eq!(profiles.developer, profiles.reviewer);
         for profile in [&profiles.developer, &profiles.reviewer] {
-            assert_eq!(profile.provider, RuntimeProvider::CodexAppServer);
+            assert_eq!(profile.provider, RuntimeProvider::CodexExec);
             assert_eq!(profile.model, "gpt-5.6-sol");
             assert_eq!(profile.reasoning_effort, "xhigh");
             assert_eq!(profile.sandbox, RuntimeSandbox::DangerFullAccess);
@@ -1159,7 +1159,7 @@ mod tests {
             },
             ..SessionInvocationProfiles::default()
         };
-        let resolved = AppServerWorkerProfiles::from_session_profiles(&profiles).unwrap();
+        let resolved = TaskWorkerProfiles::from_session_profiles(&profiles).unwrap();
         assert_eq!(resolved.developer.model, "developer-override");
         assert_eq!(resolved.developer.reasoning_effort, "max");
         assert_eq!(resolved.reviewer.model, "reviewer-override");
@@ -1168,11 +1168,11 @@ mod tests {
         profiles.developer = DeveloperInvocationProfile::Claude {
             profile: ClaudeInvocationProfile::developer_default(),
         };
-        let error = AppServerWorkerProfiles::from_session_profiles(&profiles).unwrap_err();
+        let error = TaskWorkerProfiles::from_session_profiles(&profiles).unwrap_err();
         assert_eq!(error.code, RuntimeErrorCode::Unsupported);
         assert_eq!(
             error.detail,
-            "Claude developer is unsupported in the Codex App Server runtime lane"
+            "Claude developer is unsupported in the Codex exec worker runtime lane"
         );
 
         for invalid in [
@@ -1201,8 +1201,8 @@ mod tests {
     #[test]
     fn provider_parse_never_silently_falls_back() {
         assert_eq!(
-            RuntimeProvider::parse("codex-app-server").unwrap(),
-            RuntimeProvider::CodexAppServer
+            RuntimeProvider::parse("codex-exec").unwrap(),
+            RuntimeProvider::CodexExec
         );
         for unsupported in ["codex", "claude", "future"] {
             assert_eq!(
@@ -1214,11 +1214,11 @@ mod tests {
 
     #[test]
     fn contract_identity_and_outcome_schema_hashes_are_stable() {
-        let identity = RuntimeContractIdentity::codex_app_server_0_146();
+        let identity = RuntimeContractIdentity::codex_exec_0_146();
         identity.validate().unwrap();
         assert_eq!(
             identity.schema_canonical_sha256,
-            CODEX_APP_SERVER_SCHEMA_CANONICAL_SHA256
+            CODEX_SCHEMA_CANONICAL_SHA256
         );
         assert_eq!(
             identity.selected_fields,
@@ -1457,7 +1457,7 @@ mod tests {
     #[test]
     fn serde_rejects_unknown_profile_and_outcome_fields() {
         assert!(serde_json::from_str::<RuntimeProfile>(
-            r#"{"provider":"codex-app-server","model":"gpt-5.6-sol","reasoning_effort":"xhigh","sandbox":"danger-full-access","approval_policy":"never","extra":true}"#
+            r#"{"provider":"codex-exec","model":"gpt-5.6-sol","reasoning_effort":"xhigh","sandbox":"danger-full-access","approval_policy":"never","extra":true}"#
         )
         .is_err());
         assert!(

@@ -469,7 +469,7 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     assert!(stdout.contains("gpt-5.6-sol/xhigh"), "stdout={stdout}");
     assert!(stdout.contains("Claude opus/xhigh"), "stdout={stdout}");
     assert!(
-        stdout.contains("codex-app-server-0.146.0 process per task"),
+        stdout.contains("codex-exec-0.146.0 process per task"),
         "stdout={stdout}"
     );
     assert!(
@@ -479,11 +479,13 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
         ),
         "stdout={stdout}"
     );
+    // Both entrypoints bind the one Codex-only worker lane.
     assert!(
-        stdout.contains(
-            "Claude workers are unsupported and fail closed.\n\
-             `hcom arch claude` retains the existing CLI-worker lane"
-        ),
+        stdout.contains("Claude\nworkers are unsupported and fail closed."),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("Both entrypoints share one worker lane"),
         "stdout={stdout}"
     );
     let normalized_stdout = stdout.split_whitespace().collect::<Vec<_>>().join(" ");

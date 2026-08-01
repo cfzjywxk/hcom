@@ -16,7 +16,7 @@ use super::registration::{
     NATIVE_SESSION_REFUSAL_VERSION, REGISTRATION_REFUSAL_GENERIC, RegistrationAction,
     RegistrationCaller, RegistrationRequest, RegistrationResponse, validate_request_envelope,
 };
-use crate::orchestrator::app_server::AppServerSessionSupervisor;
+use crate::orchestrator::task_lane::TaskLaneSupervisor;
 use crate::orchestrator::{SessionRuntimeSources, SessionStartup};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -81,14 +81,13 @@ pub(crate) struct SessionSupervisorEndpoint {
 }
 
 impl SessionSupervisorEndpoint {
-    pub(crate) fn bind_app_server(
+    pub(crate) fn bind(
         paths: ControlPaths,
         run_id: String,
         project_root: PathBuf,
         sources: SessionRuntimeSources,
     ) -> Result<Self> {
-        let control =
-            SessionSupervisorControl::open_app_server(&paths, run_id, project_root, sources)?;
+        let control = SessionSupervisorControl::open(&paths, run_id, project_root, sources)?;
         let socket_guard = SocketGuard::bind(&paths.socket_path())?;
         let listener = socket_guard.listener.try_clone()?;
         let registration_socket_guard = SocketGuard::bind(&paths.registration_socket_path())?;
@@ -202,7 +201,7 @@ trait SupervisorBackend: Send {
     fn shutdown(&mut self) -> Result<()>;
 }
 
-impl SupervisorBackend for AppServerSessionSupervisor {
+impl SupervisorBackend for TaskLaneSupervisor {
     fn startup(&self) -> &SessionStartup {
         self.startup()
     }
@@ -286,7 +285,7 @@ struct ArchitectBinding {
 }
 
 impl SessionSupervisorControl {
-    fn open_app_server(
+    fn open(
         paths: &ControlPaths,
         run_id: String,
         project_root: PathBuf,
@@ -296,7 +295,7 @@ impl SessionSupervisorControl {
         let expected_uid = unsafe { libc::geteuid() };
         let parent_pid = std::process::id();
         let parent_birth = process_birth_identity(parent_pid)?;
-        let supervisor = AppServerSessionSupervisor::open(
+        let supervisor = TaskLaneSupervisor::open(
             run_id,
             project_root,
             paths.run_root().to_owned(),
@@ -1011,7 +1010,7 @@ mod tests {
             let mut sources = SessionRuntimeSources::fake(&toolchain);
             // The lane only opens against session-frozen profiles.
             sources.set_profiles_for_test(
-                crate::worker::profile::SessionInvocationProfiles::for_codex_app_server_lane(
+                crate::worker::profile::SessionInvocationProfiles::for_task_lane(
                     crate::worker::profile::ArchitectAdapter::Codex,
                 )
                 .unwrap(),
@@ -1050,7 +1049,7 @@ mod tests {
         let control_socket = fixture.paths.socket_path();
         let registration_socket = fixture.paths.registration_socket_path();
         {
-            let endpoint = SessionSupervisorEndpoint::bind_app_server(
+            let endpoint = SessionSupervisorEndpoint::bind(
                 fixture.paths.clone(),
                 "run-endpoint".into(),
                 fixture.repository.clone(),
@@ -1079,22 +1078,22 @@ mod tests {
     }
 
     #[test]
-    fn app_server_backend_uses_the_same_private_control_endpoint_contract() {
+    fn task_lane_backend_uses_the_same_private_control_endpoint_contract() {
         let mut fixture = Fixture::new();
         fixture.sources.set_profiles_for_test(
-            SessionInvocationProfiles::for_codex_app_server_lane(ArchitectAdapter::Codex).unwrap(),
+            SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Codex).unwrap(),
         );
         let control_socket = fixture.paths.socket_path();
         let registration_socket = fixture.paths.registration_socket_path();
         {
-            let endpoint = SessionSupervisorEndpoint::bind_app_server(
+            let endpoint = SessionSupervisorEndpoint::bind(
                 fixture.paths.clone(),
-                "run-app-server-endpoint".into(),
+                "run-exec-endpoint".into(),
                 fixture.repository.clone(),
                 fixture.sources.clone(),
             )
             .unwrap();
-            assert_eq!(endpoint.startup().run_id, "run-app-server-endpoint");
+            assert_eq!(endpoint.startup().run_id, "run-exec-endpoint");
             assert_eq!(endpoint.startup().project_root, fixture.repository);
             assert!(control_socket.exists());
             assert!(registration_socket.exists());
@@ -1168,7 +1167,7 @@ mod tests {
     #[test]
     fn architect_binding_is_exact_and_request_replay_is_payload_bound() {
         let fixture = Fixture::new();
-        let mut control = SessionSupervisorControl::open_app_server(
+        let mut control = SessionSupervisorControl::open(
             &fixture.paths,
             "run-binding".into(),
             fixture.repository,
@@ -1257,7 +1256,7 @@ mod tests {
     #[test]
     fn request_replay_memory_has_a_hard_session_bound() {
         let fixture = Fixture::new();
-        let mut control = SessionSupervisorControl::open_app_server(
+        let mut control = SessionSupervisorControl::open(
             &fixture.paths,
             "run-request-bound".into(),
             fixture.repository,

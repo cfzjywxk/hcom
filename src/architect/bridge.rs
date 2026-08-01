@@ -22,7 +22,7 @@ use crate::worker::profile::{
     CLAUDE_DEVELOPER_ADAPTER, CLAUDE_REVIEWER_ADAPTER, CODEX_DEVELOPER_ADAPTER,
     CODEX_REVIEWER_ADAPTER,
 };
-use crate::worker::runtime::CODEX_APP_SERVER_ADAPTER;
+use crate::worker::runtime::CODEX_TASK_WORKER_ADAPTER;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -278,8 +278,8 @@ fn validate_bridge_configuration(configuration: &BridgeConfiguration) -> Result<
 }
 
 fn validate_worker_adapter_binding(developer_adapter: &str, reviewer_adapter: &str) -> Result<()> {
-    let app_server_pair = developer_adapter == CODEX_APP_SERVER_ADAPTER
-        && reviewer_adapter == CODEX_APP_SERVER_ADAPTER;
+    let exec_worker_pair = developer_adapter == CODEX_TASK_WORKER_ADAPTER
+        && reviewer_adapter == CODEX_TASK_WORKER_ADAPTER;
     let retained_cli_pair = matches!(
         developer_adapter,
         CODEX_DEVELOPER_ADAPTER | CLAUDE_DEVELOPER_ADAPTER
@@ -287,7 +287,7 @@ fn validate_worker_adapter_binding(developer_adapter: &str, reviewer_adapter: &s
         reviewer_adapter,
         CODEX_REVIEWER_ADAPTER | CLAUDE_REVIEWER_ADAPTER
     );
-    if !(app_server_pair || retained_cli_pair) {
+    if !(exec_worker_pair || retained_cli_pair) {
         bail!("architect bridge received an unknown session-frozen worker adapter");
     }
     Ok(())
@@ -1036,16 +1036,16 @@ mod tests {
     }
 
     #[test]
-    fn bridge_accepts_exact_app_server_pair_without_mixing_runtime_families() {
-        validate_worker_adapter_binding(CODEX_APP_SERVER_ADAPTER, CODEX_APP_SERVER_ADAPTER)
+    fn bridge_accepts_exact_exec_worker_pair_without_mixing_runtime_families() {
+        validate_worker_adapter_binding(CODEX_TASK_WORKER_ADAPTER, CODEX_TASK_WORKER_ADAPTER)
             .unwrap();
         validate_worker_adapter_binding(CODEX_DEVELOPER_ADAPTER, CLAUDE_REVIEWER_ADAPTER).unwrap();
         assert!(
-            validate_worker_adapter_binding(CODEX_APP_SERVER_ADAPTER, CODEX_REVIEWER_ADAPTER,)
+            validate_worker_adapter_binding(CODEX_TASK_WORKER_ADAPTER, CODEX_REVIEWER_ADAPTER,)
                 .is_err()
         );
         assert!(
-            validate_worker_adapter_binding(CODEX_DEVELOPER_ADAPTER, CODEX_APP_SERVER_ADAPTER,)
+            validate_worker_adapter_binding(CODEX_DEVELOPER_ADAPTER, CODEX_TASK_WORKER_ADAPTER,)
                 .is_err()
         );
     }
