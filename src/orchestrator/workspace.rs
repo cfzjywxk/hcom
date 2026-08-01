@@ -220,6 +220,7 @@ fn write_exclusive_file(path: &Path, contents: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn temp_project() -> tempfile::TempDir {
         tempfile::tempdir().expect("temp project")
@@ -262,6 +263,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn world_writable_root_is_refused() {
         let project = temp_project();
         drop(TasksWorkspace::open(project.path(), "run-1").unwrap());
@@ -271,17 +273,55 @@ mod tests {
         assert!(error.to_string().contains("world-writable"), "{error}");
     }
 
+    /// Mutual exclusion is a cross-process property (two `hcom arch` runs in
+    /// one project), so it is asserted against a real second process. Testing
+    /// it inside this process would instead measure same-process flock
+    /// aliasing: `/tmp` recycles inodes fast enough that a sibling test
+    /// thread's not-yet-closed lock file can land on the inode this test just
+    /// created.
     #[test]
-    fn concurrent_open_fails_while_lock_is_held() {
+    #[serial]
+    fn a_second_process_cannot_open_the_workspace_while_it_is_locked() {
+        let project = temp_project();
+        let workspace = TasksWorkspace::open(project.path(), "run-1").unwrap();
+        let lock_path = workspace.root().join(LOCK_FILE);
+
+        let held = std::process::Command::new("/usr/bin/flock")
+            .args(["--nonblock", "--exclusive"])
+            .arg(&lock_path)
+            .args(["true"])
+            .status()
+            .expect("run flock(1)");
+        assert!(
+            !held.success(),
+            "a second process acquired the lock while this run holds it"
+        );
+
+        drop(workspace);
+        let free = std::process::Command::new("/usr/bin/flock")
+            .args(["--nonblock", "--exclusive"])
+            .arg(&lock_path)
+            .args(["true"])
+            .status()
+            .expect("run flock(1)");
+        assert!(
+            free.success(),
+            "the lock was not released when the workspace was dropped"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn opening_a_second_run_while_one_is_live_is_refused() {
         let project = temp_project();
         let first = TasksWorkspace::open(project.path(), "run-1").unwrap();
         let error = TasksWorkspace::open(project.path(), "run-2").unwrap_err();
         assert!(error.to_string().contains("already holds"), "{error}");
         drop(first);
-        TasksWorkspace::open(project.path(), "run-3").unwrap();
     }
 
     #[test]
+    #[serial]
     fn reuse_updates_latest_and_does_not_recreate_deleted_gitignore() {
         let project = temp_project();
         drop(TasksWorkspace::open(project.path(), "run-1").unwrap());
@@ -298,6 +338,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn duplicate_run_id_is_refused() {
         let project = temp_project();
         let first = TasksWorkspace::open(project.path(), "run-1").unwrap();

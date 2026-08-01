@@ -1158,7 +1158,10 @@ impl SupervisorCore {
         self.accepted_completion_tokens
             .insert(active.completion_token);
 
-        let (session_state, task_state, terminal_detail) = match failure.class {
+        // The runtime already sanitized `failure.detail`; keeping it is what
+        // makes a needs_human report actionable. Replacing it with a fixed
+        // string would destroy the only evidence of what actually failed.
+        let (session_state, task_state, label) = match failure.class {
             RuntimeFailureClass::Canceled => (
                 SessionState::Failed,
                 TaskState::Failed,
@@ -1185,7 +1188,13 @@ impl SupervisorCore {
                 "worker runtime contract failed",
             ),
         };
-        self.terminalize_current(session_state, task_state, terminal_detail, Vec::new())
+        let mut detail = if failure.detail.is_empty() {
+            label.to_string()
+        } else {
+            format!("{label}: {}", failure.detail)
+        };
+        truncate_utf8(&mut detail, MAX_CORE_DIAGNOSTIC_BYTES);
+        self.terminalize_current(session_state, task_state, &detail, Vec::new())
     }
 
     fn driver_failed(
@@ -3981,26 +3990,25 @@ mod tests {
             // recovery path — every contract failure is terminal for every
             // role, and `repository` stays unused routing context.
             let _ = repository;
+            let expected_detail =
+                "worker runtime contract failed: typed final outcome was missing or invalid";
             assert_eq!(
                 effects,
                 vec![
                     SupervisorEffect::CloseTaskRuntime { task_ordinal: 0 },
                     SupervisorEffect::FinishSession {
                         state: SessionState::NeedsHuman,
-                        detail: "worker runtime contract failed".into(),
+                        detail: expected_detail.into(),
                     },
                     SupervisorEffect::PublishStatus,
                 ]
             );
             let snapshot = core.snapshot();
             assert_eq!(snapshot.state, SessionState::NeedsHuman);
-            assert_eq!(
-                snapshot.terminal_detail.as_deref(),
-                Some("worker runtime contract failed")
-            );
+            assert_eq!(snapshot.terminal_detail.as_deref(), Some(expected_detail));
             assert_eq!(
                 snapshot.tasks[0].outcome_detail.as_deref(),
-                Some("worker runtime contract failed")
+                Some(expected_detail)
             );
         }
     }
@@ -4732,18 +4740,20 @@ mod tests {
                 session: active.session,
                 turn: active.turn,
                 completion_token: active.token.into(),
-                failure: runtime_failure(class, false, "RAW_SECRET_PROVIDER_DETAIL"),
+                failure: runtime_failure(class, false, "codex exec exited with status 7"),
             })
             .unwrap();
             let snapshot = core.snapshot();
             assert_eq!(snapshot.state, expected_state);
-            assert_eq!(snapshot.terminal_detail.as_deref(), Some(expected));
+            // The class label classifies; the runtime's already-sanitized
+            // detail is the evidence and must survive into the report.
+            let detail = snapshot.terminal_detail.clone().unwrap();
+            assert!(detail.starts_with(expected), "{detail}");
             assert!(
-                !serde_json::to_string(&snapshot)
-                    .unwrap()
-                    .contains("RAW_SECRET_PROVIDER_DETAIL")
+                detail.contains("codex exec exited with status 7"),
+                "{detail}"
             );
-            terminal_details.insert(expected.into());
+            terminal_details.insert(detail);
         }
         assert_eq!(terminal_details.len(), 8);
     }

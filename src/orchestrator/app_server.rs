@@ -2580,7 +2580,7 @@ mod tests {
         assert_eq!(snapshot.state, SessionState::NeedsHuman);
         assert_eq!(
             snapshot.terminal_detail.as_deref(),
-            Some("worker runtime contract failed")
+            Some("worker runtime contract failed: developer outcome was missing")
         );
         let audit = audit.lock().unwrap();
         assert_eq!(
@@ -2632,7 +2632,7 @@ mod tests {
                 vec![FakeTurnScript::new(
                     WorkerRole::Developer,
                     RuntimeTurnPurpose::InitialDevelopment,
-                    [failed(class, "provider-private-detail")],
+                    [failed(class, "sanitized-runtime-detail")],
                 )],
                 vec![Mutation::None],
             );
@@ -2640,11 +2640,12 @@ mod tests {
             start(&mut supervisor, vec![fixture.task(name, &["src"], 2)]);
             let snapshot = drive_terminal(&mut supervisor);
             assert_eq!(snapshot.state, SessionState::NeedsHuman);
-            assert_eq!(snapshot.terminal_detail.as_deref(), Some(expected_detail));
-            assert!(
-                !serde_json::to_string(&snapshot)
-                    .unwrap()
-                    .contains("provider-private-detail")
+            // The class label plus the runtime's sanitized detail: the report
+            // must stay actionable instead of collapsing to a fixed string.
+            let detail = snapshot.terminal_detail.clone().unwrap();
+            assert_eq!(
+                detail,
+                format!("{expected_detail}: sanitized-runtime-detail")
             );
             assert_eq!(audit.lock().unwrap().shutdowns, [name]);
         }
@@ -3441,10 +3442,13 @@ mod tests {
         start(&mut supervisor, vec![fixture.task("secret", &["src"], 2)]);
         let snapshot = drive_terminal(&mut supervisor);
         assert_eq!(snapshot.state, SessionState::NeedsHuman);
-        assert_eq!(
-            snapshot.terminal_detail.as_deref(),
-            Some("worker runtime contract failed")
+        let detail = snapshot.terminal_detail.clone().unwrap();
+        assert!(
+            detail.starts_with("worker runtime contract failed"),
+            "{detail}"
         );
+        // The leak screen fires before any outcome text is relayed, so the
+        // sentinel must not appear anywhere in the report.
         let encoded = serde_json::to_string(&snapshot).unwrap();
         assert!(!encoded.contains("environment-secret-sentinel"));
     }
