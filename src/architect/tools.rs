@@ -50,10 +50,10 @@ pub(crate) fn control_action(
 fn tool_description(action: ActionName) -> &'static str {
     match action {
         ActionName::SessionPlanReplace => {
-            "Draft or replace the bounded ordered task plan. Read the current project documentation first and set each task's repository_root to that task's real absolute canonical Git top level; it need not equal or live under the project directory. You must faithfully select the repository identified by the named source plan: hcom validates its Git identity and state but has no configured host-path allowlist. You may create or update architecture plans, current_todo, and discussion records before this call. If such an artifact is inside a task repository, leave that repository clean and committed before binding it; after this call, do not modify a bound task repository yourself. That exclusion is enforced by drift checks, not a second filesystem sandbox: an in-scope concurrent write could be included in a developer commit, while other drift may stop only after the developer has committed and leave that partial commit for the human. This call never starts a worker. Enumerate every returned task binding to the human with ordinal, task_key, repository_root, branch, and start HEAD (base_revision), then present the exact plan version and exact plan hash. Do not abbreviate or omit a writable repository binding. If the human's current message explicitly directs you to follow, implement, execute, proceed with, or complete a named existing detailed plan, specification, or current_todo (including an instruction meaning \"按照 current_todo\" or \"按照 <named plan> 推进完成开发\"), that message authorizes starting the faithfully derived plan in this same turn after you present these bindings; otherwise wait for a later explicit approval. An explicit instruction not to start always wins."
+            "Draft or replace the bounded ordered task plan. Read the current project documentation first and set each task's repository_root to the real absolute path of that task's source directory; it need not equal or live under the project directory. You must faithfully select the directory identified by the named source plan: hcom takes that path only as the source directory handed to the task's workers. It never runs Git and never inspects the directory's identity, history, or working-tree state, and it has no configured host-path allowlist; the only binding requirement is that the path is an existing directory. You may create or update architecture plans, current_todo, and discussion records before this call. After this call, do not modify a bound task directory yourself: hcom performs no drift or identity check, so a concurrent write there can be silently swept into the developer's commit and nothing will report it. This call never starts a worker. Enumerate every returned task binding to the human with ordinal, task_key, and repository_root, then present the exact plan version and exact plan hash. Do not abbreviate or omit a writable directory binding. If the human's current message explicitly directs you to follow, implement, execute, proceed with, or complete a named existing detailed plan, specification, or current_todo (including an instruction meaning \"按照 current_todo\" or \"按照 <named plan> 推进完成开发\"), that message authorizes starting the faithfully derived plan in this same turn after you present these bindings; otherwise wait for a later explicit approval. An explicit instruction not to start always wins."
         }
         ActionName::SessionApproveAndStart => {
-            "Start the exact draft only with explicit human execution authorization in this architect conversation. Authorization is valid either when the human approves the complete displayed task binding list (ordinal, task_key, repository_root, branch, and start HEAD/base_revision) with its plan version and plan hash, or when the human's current message explicitly directs you to follow, implement, execute, proceed with, or complete a named existing detailed plan, specification, or current_todo (including an instruction meaning \"按照 current_todo\" or \"按照 <named plan> 推进完成开发\") and this draft faithfully derives from that source. In the latter case, present the complete returned bindings, plan version, and plan hash, then call this tool in the same turn without requiring a second human reply. A request only to read, analyze, discuss, summarize, draft, or update a plan is not execution authorization. An explicit instruction not to start always wins. Never infer authorization from vague continuation language or from the existence of a plan. When this call returns a running worker, do not immediately poll session_status and never poll on a roughly 30-second cadence. The foreground supervisor monitors the worker without model calls; unless the human asks for status or immediate intervention is required, wait 180 to 300 seconds before the first status check and between later checks."
+            "Start the exact draft only with explicit human execution authorization in this architect conversation. Authorization is valid either when the human approves the complete displayed task binding list (ordinal, task_key, and repository_root) with its plan version and plan hash, or when the human's current message explicitly directs you to follow, implement, execute, proceed with, or complete a named existing detailed plan, specification, or current_todo (including an instruction meaning \"按照 current_todo\" or \"按照 <named plan> 推进完成开发\") and this draft faithfully derives from that source. In the latter case, present the complete returned bindings, plan version, and plan hash, then call this tool in the same turn without requiring a second human reply. A request only to read, analyze, discuss, summarize, draft, or update a plan is not execution authorization. An explicit instruction not to start always wins. Never infer authorization from vague continuation language or from the existence of a plan. When this call returns a running worker, do not immediately poll session_status and never poll on a roughly 30-second cadence. The foreground supervisor monitors the worker without model calls; unless the human asks for status or immediate intervention is required, wait 180 to 300 seconds before the first status check and between later checks."
         }
         ActionName::SessionStatus => {
             "Read the sanitized in-memory status of this foreground architect run. This tool is not a keepalive: the foreground supervisor monitors worker lifecycle internally without Architect model calls. While a developer or reviewer is running, do not poll on a roughly 30-second cadence. Unless the human explicitly asks for status or immediate intervention is required, wait at least 180 seconds and normally 180 to 300 seconds after dispatch and between status calls. Prefer one native wait or sleep over repeated tool calls so Architect requests and tokens are not wasted. Once a returned state is terminal or needs_human, stop polling."
@@ -205,7 +205,7 @@ fn absolute_path_schema() -> Value {
         "minLength":1,
         "maxLength":4096,
         "pattern":"^/[^\\r\\n]*$",
-        "description":"Real absolute canonical Git top level for this task, discovered from the current project's documentation; it may be outside or nested under the project directory."
+        "description":"Real absolute path of this task's source directory, discovered from the current project's documentation; it may be outside or nested under the project directory. hcom only requires that it exists and never inspects its Git state."
     })
 }
 
@@ -392,8 +392,6 @@ mod tests {
             "ordinal",
             "task_key",
             "repository_root",
-            "branch",
-            "base_revision",
             "plan version",
             "plan hash",
         ] {
@@ -412,8 +410,6 @@ mod tests {
         for required in [
             "task binding list",
             "repository_root",
-            "branch",
-            "base_revision",
             "plan version",
             "plan hash",
             "named existing detailed plan",
@@ -428,13 +424,11 @@ mod tests {
         }
         for required in [
             "current_todo",
-            "clean and committed",
-            "do not modify a bound task repository",
+            "do not modify a bound task directory",
             "按照 current_todo",
             "An explicit instruction not to start always wins",
             "no configured host-path allowlist",
-            "included in a developer commit",
-            "leave that partial commit for the human",
+            "swept into the developer's commit",
         ] {
             assert!(
                 plan.contains(required),
@@ -450,6 +444,47 @@ mod tests {
         assert_eq!(
             approve_tool["inputSchema"]["properties"]["approval_confirmed"]["const"],
             true
+        );
+    }
+
+    #[test]
+    fn architect_tool_descriptions_never_promise_git_inspection() {
+        // hcom takes only the task's source directory path. Any description
+        // that still promised branch/revision evidence or a drift check would
+        // make the Architect report guarantees the supervisor cannot give.
+        let tools = tool_definitions("codex-developer-0.145.0", "claude-reviewer-2.1.220");
+        for tool in &tools {
+            let description = tool["description"].as_str().unwrap();
+            for forbidden in [
+                "branch",
+                "base_revision",
+                "HEAD",
+                "Git top level",
+                "clean and committed",
+                "validates its Git identity",
+            ] {
+                assert!(
+                    !description.contains(forbidden),
+                    "{} description still claims Git observation: {forbidden}",
+                    tool["name"]
+                );
+            }
+        }
+
+        let plan = tools
+            .iter()
+            .find(|tool| tool["name"] == "session_plan_replace")
+            .unwrap();
+        let description = plan["description"].as_str().unwrap();
+        assert!(description.contains("It never runs Git"));
+        assert!(description.contains("no drift or identity check"));
+        assert!(description.contains("existing directory"));
+        assert!(
+            plan["inputSchema"]["properties"]["tasks"]["items"]["properties"]["repository_root"]
+                ["description"]
+                .as_str()
+                .unwrap()
+                .contains("never inspects its Git state")
         );
     }
 

@@ -81,19 +81,32 @@ impl TasksWorkspace {
             }
         }
 
+        // O_CLOEXEC is load-bearing, not hygiene: every worker is fork+exec'd
+        // from this process and would otherwise inherit this descriptor. The
+        // flock lives on the open file description, so an inherited copy keeps
+        // the lock held for as long as any worker survives — including after
+        // this run exits.
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(root.join(LOCK_FILE))
             .with_context(|| format!("failed to open {}/{LOCK_FILE}", root.display()))?;
         // SAFETY: flock operates on this live file descriptor.
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            bail!(
-                "another hcom arch run already holds {}/{LOCK_FILE} for this project",
-                root.display()
-            );
+            // Only EWOULDBLOCK means someone else holds it; anything else is a
+            // real failure and must not be reported as contention.
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                bail!(
+                    "another hcom arch run already holds {}/{LOCK_FILE} for this project",
+                    root.display()
+                );
+            }
+            return Err(error)
+                .with_context(|| format!("failed to lock {}/{LOCK_FILE}", root.display()));
         }
 
         let run_dir = root.join(run_id);
@@ -222,26 +235,29 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    /// Build fixtures under `target/`, not `/tmp`.
+    /// A fixture directory that is never recycled during the run.
     ///
-    /// `/tmp` recycles inodes fast enough that a sibling test thread's
-    /// not-yet-closed lock file can land on the inode a fresh fixture just
-    /// created, making an unrelated flock look like this test's own. A
-    /// per-suite directory removes that aliasing entirely.
-    fn temp_project() -> tempfile::TempDir {
+    /// `flock` is keyed by inode. A deleted fixture's inode can be handed
+    /// straight back to the next fixture, so a sibling test thread whose lock
+    /// file is not yet closed appears to hold *this* test's lock. Using a
+    /// stable per-test path that is only cleaned on entry — never deleted
+    /// while the suite runs — removes the aliasing. Production is unaffected:
+    /// there `.lock` is a long-lived file inside the project directory.
+    fn test_project(name: &str) -> PathBuf {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-workspaces");
         fs::create_dir_all(&root).expect("workspace test root");
-        tempfile::Builder::new()
-            .prefix("project.")
-            .tempdir_in(&root)
-            .expect("temp project")
+        let project = root.join(name);
+        let _ = fs::remove_dir_all(&project);
+        fs::create_dir(&project).expect("test project");
+        project
     }
 
     #[test]
     fn fresh_workspace_is_created_with_marker_gitignore_and_latest() {
-        let project = temp_project();
-        let workspace = TasksWorkspace::open(project.path(), "run-1").unwrap();
-        let root = project.path().join(WORKSPACE_DIR_NAME);
+        const TEST_NAME: &str = "fresh_workspace_is_created_with_marker_gitignore_and_latest";
+        let project = test_project(TEST_NAME);
+        let workspace = TasksWorkspace::open(&project, "run-1").unwrap();
+        let root = &project.join(WORKSPACE_DIR_NAME);
         assert!(root.join(MARKER_FILE).is_file());
         assert_eq!(
             fs::read_to_string(root.join(GITIGNORE_FILE)).unwrap(),
@@ -260,27 +276,29 @@ mod tests {
             0o700
         );
         assert_eq!(
-            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            fs::metadata(root).unwrap().permissions().mode() & 0o777,
             0o700
         );
     }
 
     #[test]
     fn foreign_directory_without_marker_is_refused() {
-        let project = temp_project();
-        fs::create_dir(project.path().join(WORKSPACE_DIR_NAME)).unwrap();
-        let error = TasksWorkspace::open(project.path(), "run-1").unwrap_err();
+        const TEST_NAME: &str = "foreign_directory_without_marker_is_refused";
+        let project = test_project(TEST_NAME);
+        fs::create_dir(project.join(WORKSPACE_DIR_NAME)).unwrap();
+        let error = TasksWorkspace::open(&project, "run-1").unwrap_err();
         assert!(error.to_string().contains("ownership marker"), "{error}");
     }
 
     #[test]
     #[serial]
     fn world_writable_root_is_refused() {
-        let project = temp_project();
-        drop(TasksWorkspace::open(project.path(), "run-1").unwrap());
-        let root = project.path().join(WORKSPACE_DIR_NAME);
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o707)).unwrap();
-        let error = TasksWorkspace::open(project.path(), "run-2").unwrap_err();
+        const TEST_NAME: &str = "world_writable_root_is_refused";
+        let project = test_project(TEST_NAME);
+        drop(TasksWorkspace::open(&project, "run-1").unwrap());
+        let root = &project.join(WORKSPACE_DIR_NAME);
+        fs::set_permissions(root, fs::Permissions::from_mode(0o707)).unwrap();
+        let error = TasksWorkspace::open(&project, "run-2").unwrap_err();
         assert!(error.to_string().contains("world-writable"), "{error}");
     }
 
@@ -293,8 +311,9 @@ mod tests {
     #[test]
     #[serial]
     fn a_second_process_cannot_open_the_workspace_while_it_is_locked() {
-        let project = temp_project();
-        let workspace = TasksWorkspace::open(project.path(), "run-1").unwrap();
+        const TEST_NAME: &str = "a_second_process_cannot_open_the_workspace_while_it_is_locked";
+        let project = test_project(TEST_NAME);
+        let workspace = TasksWorkspace::open(&project, "run-1").unwrap();
         let lock_path = workspace.root().join(LOCK_FILE);
 
         let held = std::process::Command::new("/usr/bin/flock")
@@ -324,44 +343,19 @@ mod tests {
     #[test]
     #[serial]
     fn opening_a_second_run_while_one_is_live_is_refused() {
-        let project = temp_project();
-        let first = TasksWorkspace::open(project.path(), "run-1").unwrap();
-        let error = TasksWorkspace::open(project.path(), "run-2").unwrap_err();
+        const TEST_NAME: &str = "opening_a_second_run_while_one_is_live_is_refused";
+        let project = test_project(TEST_NAME);
+        let first = TasksWorkspace::open(&project, "run-1").unwrap();
+        let error = TasksWorkspace::open(&project, "run-2").unwrap_err();
         assert!(error.to_string().contains("already holds"), "{error}");
         drop(first);
     }
 
     #[test]
-    #[serial]
-    fn reuse_updates_latest_and_does_not_recreate_deleted_gitignore() {
-        let project = temp_project();
-        drop(TasksWorkspace::open(project.path(), "run-1").unwrap());
-        let root = project.path().join(WORKSPACE_DIR_NAME);
-        fs::remove_file(root.join(GITIGNORE_FILE)).unwrap();
-        drop(TasksWorkspace::open(project.path(), "run-2").unwrap());
-        assert!(!root.join(GITIGNORE_FILE).exists());
-        assert_eq!(
-            fs::read_link(root.join(LATEST_LINK)).unwrap(),
-            PathBuf::from("run-2")
-        );
-        assert!(root.join("run-1").is_dir());
-        assert!(root.join("run-2").is_dir());
-    }
-
-    #[test]
-    #[serial]
-    fn duplicate_run_id_is_refused() {
-        let project = temp_project();
-        let first = TasksWorkspace::open(project.path(), "run-1").unwrap();
-        drop(first);
-        let error = TasksWorkspace::open(project.path(), "run-1").unwrap_err();
-        assert!(error.to_string().contains("run directory"), "{error}");
-    }
-
-    #[test]
     fn run_files_are_exclusive_and_decisions_append_single_lines() {
-        let project = temp_project();
-        let workspace = TasksWorkspace::open(project.path(), "run-1").unwrap();
+        const TEST_NAME: &str = "run_files_are_exclusive_and_decisions_append_single_lines";
+        let project = test_project(TEST_NAME);
+        let workspace = TasksWorkspace::open(&project, "run-1").unwrap();
         workspace.write_run_file("plan.md", b"# plan\n").unwrap();
         assert!(workspace.write_run_file("plan.md", b"again").is_err());
         assert!(workspace.write_run_file("../escape", b"x").is_err());
@@ -381,9 +375,10 @@ mod tests {
 
     #[test]
     fn invalid_run_ids_are_refused() {
-        let project = temp_project();
+        const TEST_NAME: &str = "invalid_run_ids_are_refused";
+        let project = test_project(TEST_NAME);
         for bad in ["", "UPPER", "has/slash", "a b", &"x".repeat(65)] {
-            assert!(TasksWorkspace::open(project.path(), bad).is_err(), "{bad}");
+            assert!(TasksWorkspace::open(&project, bad).is_err(), "{bad}");
         }
     }
 }

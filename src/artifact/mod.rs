@@ -1559,7 +1559,8 @@ mod tests {
         let native_on_disk = fs::read(attempt.artifact_path(ArtifactKind::NativeStdout)).unwrap();
         assert_eq!(receipt.bytes, native_on_disk.len() as u64);
         assert!(
-            String::from_utf8_lossy(&native_on_disk).contains("native partial must not be followed")
+            String::from_utf8_lossy(&native_on_disk)
+                .contains("native partial must not be followed")
         );
     }
 

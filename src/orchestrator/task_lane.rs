@@ -4,13 +4,12 @@
 //! I/O. Scheduling decisions remain in [`SupervisorCore`].
 
 use super::core::{
-    DriverFailure, DriverFailureClass, RepositoryObservation, SupervisorCore, SupervisorEffect,
-    SupervisorEvent, TaskRepositoryBinding,
+    DriverFailure, DriverFailureClass, SupervisorCore, SupervisorEffect, SupervisorEvent,
 };
 use super::workspace::TasksWorkspace;
 use super::{
-    GitRunner, ManagedRepository, SessionRuntimeSources, SessionStartup, ensure_private_directory,
-    path_value, prepare_auth_mount_target, sha256_hex,
+    SessionRuntimeSources, SessionStartup, ensure_private_directory, path_value,
+    prepare_auth_mount_target, sha256_hex,
 };
 use crate::control_api::{SessionState, SessionStatusSnapshot, TaskDraft, TaskState, WorkerRole};
 use crate::worker::environment::{
@@ -40,11 +39,6 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 const TURN_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
-/// The supervisor no longer hashes working-tree state, so the observation's
-/// content-digest fields carry a fixed placeholder. They remain in the type
-/// because the reducer's identity plumbing is shared.
-const EMPTY_OBSERVATION_HASH: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
 const MAX_AUTH_FILE_BYTES: usize = 1024 * 1024;
 const MAX_AUTH_REDACTION_VALUES: usize = 64;
 
@@ -238,8 +232,6 @@ pub(crate) struct TaskLaneSupervisor {
     startup: SessionStartup,
     epoch: String,
     core: SupervisorCore,
-    repositories: BTreeMap<PathBuf, ManagedRepository>,
-    lock_root: PathBuf,
     run_root: PathBuf,
     sources: SessionRuntimeSources,
     profiles: TaskWorkerProfiles,
@@ -282,7 +274,10 @@ impl TaskLaneSupervisor {
         crate::worker::validation::validate_opaque_id("run id", &run_id)?;
         let project_root = super::canonical_project_directory(&project_root)?;
         let run_root = super::canonical_private_directory(&run_root, "session runtime root")?;
-        let lock_root = super::canonical_private_directory(&lock_root, "repository lock root")?;
+        // The lock root is still validated at open time so an unsafe control
+        // root fails closed here, but nothing reads it any more: the lane takes
+        // no repository lock because it never opens a repository.
+        super::canonical_private_directory(&lock_root, "repository lock root")?;
         let session_profiles = sources.profiles.clone().ok_or_else(|| {
             anyhow!("the Codex exec worker lane requires session-frozen profiles")
         })?;
@@ -307,8 +302,6 @@ impl TaskLaneSupervisor {
             startup,
             epoch: format!("exec-supervisor-{}", Uuid::new_v4()),
             core,
-            repositories: BTreeMap::new(),
-            lock_root,
             run_root,
             sources,
             profiles,
@@ -348,56 +341,35 @@ impl TaskLaneSupervisor {
             bail!("task plan cannot change after this run starts");
         }
 
-        let roots: BTreeSet<PathBuf> = tasks
-            .iter()
-            .map(|task| PathBuf::from(&task.repository_root))
-            .collect();
-        let mut staged = BTreeMap::new();
-        for root in &roots {
-            if self.repositories.contains_key(root) {
-                continue;
-            }
-            let repository = ManagedRepository::open(root, &self.lock_root)
-                .with_context(|| format!("failed to bind task repository {}", root.display()))?;
-            if repository.repository.root != *root {
+        // A task's repository_root is just the source directory handed to its
+        // workers: hcom neither opens it, locks it, nor inspects its Git state.
+        for task in &tasks {
+            let root = PathBuf::from(&task.repository_root);
+            if !root.is_dir() {
                 bail!(
-                    "task repository_root must name the exact canonical Git top level: {}",
+                    "task {} names a source directory that does not exist: {}",
+                    task.task_key,
                     root.display()
                 );
             }
-            staged.insert(root.clone(), repository);
         }
-        let bindings = plan_bindings(&tasks, &self.repositories, &staged)?;
         let plan_version = self
             .core
             .plan_version()
             .unwrap_or(0)
             .checked_add(1)
             .ok_or_else(|| anyhow!("plan version overflow"))?;
-        let plan_hash = self
-            .core
-            .expected_plan_hash(plan_version, &tasks, &bindings);
+        let plan_hash = self.core.expected_plan_hash(plan_version, &tasks);
         let event = SupervisorEvent::PlanBound {
             expected_version: expected_session_version,
             plan_version,
             plan_hash: plan_hash.clone(),
             tasks,
-            repositories: bindings,
         };
         let effects = self
             .core
             .reduce(event)
             .map_err(|error| anyhow!(error.to_string()))?;
-        let mut previous = std::mem::take(&mut self.repositories);
-        let mut repositories = BTreeMap::new();
-        for root in roots {
-            let repository = previous
-                .remove(&root)
-                .or_else(|| staged.remove(&root))
-                .ok_or_else(|| anyhow!("staged task repository disappeared"))?;
-            repositories.insert(root, repository);
-        }
-        self.repositories = repositories;
         self.execute_effects(effects)?;
         Ok((plan_version, plan_hash))
     }
@@ -575,27 +547,6 @@ impl TaskLaneSupervisor {
             let follow_up = match effect {
                 SupervisorEffect::PublishStatus | SupervisorEffect::FinishSession { .. } => {
                     continue;
-                }
-                SupervisorEffect::ObserveRepository {
-                    task_ordinal,
-                    checkpoint,
-                } => {
-                    let observation = match self.observe_repository(task_ordinal) {
-                        Ok(observation) => observation,
-                        Err(error) => {
-                            return self.fail_driver_effect(
-                                task_ordinal,
-                                DriverFailureClass::Repository,
-                                error,
-                            );
-                        }
-                    };
-                    SupervisorEvent::RepositoryObserved {
-                        expected_version: self.core.version(),
-                        task_ordinal,
-                        checkpoint,
-                        observation,
-                    }
                 }
                 SupervisorEffect::OpenTaskRuntime { task_ordinal } => {
                     if let Err(failure) = self.open_task_runtime(task_ordinal) {
@@ -943,19 +894,6 @@ impl TaskLaneSupervisor {
         }
     }
 
-    fn observe_repository(&self, task_ordinal: usize) -> Result<RepositoryObservation> {
-        let task = self
-            .core
-            .tasks()
-            .get(task_ordinal)
-            .ok_or_else(|| anyhow!("repository observation task ordinal is out of range"))?;
-        let repository = self
-            .repositories
-            .get(Path::new(&task.spec.repository_root))
-            .ok_or_else(|| anyhow!("task repository binding disappeared"))?;
-        stable_repository_observation(repository, &task.expected_repository().head)
-    }
-
     fn task_environment(
         &self,
         task_key: &str,
@@ -1077,12 +1015,6 @@ impl TaskLaneSupervisor {
             spec.repository_root,
             self.startup.project_root.display()
         ));
-        if let Some(base) = task.base_revision.as_deref() {
-            prompt.push_str(&format!("- base revision: {base}\n"));
-        }
-        if let Some(head) = task.head_revision.as_deref() {
-            prompt.push_str(&format!("- current head: {head}\n"));
-        }
         if !spec.acceptance_criteria.is_empty() {
             prompt.push_str("\n## Acceptance criteria\n\n");
             for item in &spec.acceptance_criteria {
@@ -1120,7 +1052,13 @@ impl TaskLaneSupervisor {
                          changes. Their full message follows verbatim.\n\n---\n\n",
                     );
                     prompt.push_str(&bounded_relay(&review.summary));
-                    prompt.push_str("\n\n---\n\nAddress it, then commit and report as before.\n");
+                    prompt.push_str(
+                        "\n\n---\n\nAddress it, then fold the fix into the SAME commit you \
+                         created earlier in this task with `git commit --amend`, updating its \
+                         message so it still describes the whole task. This task must end as \
+                         exactly one commit. Do not amend anything older than your own commit. \
+                         Then report as before.\n",
+                    );
                 }
             }
             WorkerRole::Reviewer => {
@@ -1215,91 +1153,6 @@ fn successful_task_close(core: &SupervisorCore, effects: &[SupervisorEffect]) ->
             .get(*task_ordinal)
             .filter(|task| matches!(task.state, TaskState::Lgtm | TaskState::ReviewExhausted))
             .map(|_| *task_ordinal)
-    })
-}
-
-fn plan_bindings(
-    tasks: &[TaskDraft],
-    retained: &BTreeMap<PathBuf, ManagedRepository>,
-    staged: &BTreeMap<PathBuf, ManagedRepository>,
-) -> Result<Vec<TaskRepositoryBinding>> {
-    tasks
-        .iter()
-        .map(|task| {
-            let repository = retained
-                .get(Path::new(&task.repository_root))
-                .or_else(|| staged.get(Path::new(&task.repository_root)))
-                .ok_or_else(|| anyhow!("task repository binding disappeared"))?;
-            let observation = stable_repository_observation(repository, &repository.current_head)?;
-            Ok(TaskRepositoryBinding {
-                task_key: task.task_key.clone(),
-                observation,
-            })
-        })
-        .collect()
-}
-
-fn stable_repository_observation(
-    repository: &ManagedRepository,
-    expected_head: &str,
-) -> Result<RepositoryObservation> {
-    capture_repository_observation(repository, expected_head)
-}
-
-/// Routing data, not a verdict.
-///
-/// The task-agnostic supervisor needs one thing from Git: the revision to hand
-/// the reviewer as the base of its diff. It deliberately does NOT collect
-/// status, diffs, or changed-path sets — a dirty tree, an out-of-scope commit,
-/// a detached HEAD, or a rewritten history are all things the reviewer and the
-/// human judge, and collecting them here would make an unstable working tree
-/// fail the run instead of reaching review.
-fn capture_repository_observation(
-    managed: &ManagedRepository,
-    expected_head: &str,
-) -> Result<RepositoryObservation> {
-    crate::worker::validation::validate_git_oid("expected repository revision", expected_head)?;
-    let repository = &managed.repository;
-    repository.revalidate_identity()?;
-    let runner = GitRunner {
-        git: &repository.git,
-        root: &repository.root,
-    };
-    let head = repository.head()?;
-    // A detached HEAD is legitimate; report it as such instead of failing.
-    let branch = repository.branch().unwrap_or_else(|_| "HEAD".to_string());
-    let ancestry = runner.run(&["merge-base", "--is-ancestor", expected_head, &head])?;
-    if !ancestry.stderr.is_empty() || !matches!(ancestry.status.code(), Some(0) | Some(1)) {
-        bail!("failed to compare the task revision with HEAD");
-    }
-    let head_descends_from_expected = ancestry.status.success();
-    Ok(RepositoryObservation {
-        repository_root: path_value("task repository root", &repository.root)?,
-        identity_hash: sha256_hex(&serde_json::to_vec(&(
-            "hcom-exec-repository-identity-v1",
-            &repository.root,
-            (
-                repository.root_identity.device,
-                repository.root_identity.inode,
-                repository.root_identity.uid,
-                repository.root_identity.mode,
-            ),
-            (
-                repository.git_dir.device,
-                repository.git_dir.inode,
-                repository.git_dir.uid,
-                repository.git_dir.mode,
-            ),
-            &repository.git,
-        ))?),
-        branch,
-        head,
-        tracked_diff_hash: EMPTY_OBSERVATION_HASH.into(),
-        index_diff_hash: EMPTY_OBSERVATION_HASH.into(),
-        untracked_status_hash: EMPTY_OBSERVATION_HASH.into(),
-        clean: true,
-        changed_paths: Vec::new(),
-        head_descends_from_expected,
     })
 }
 
@@ -1411,10 +1264,10 @@ if you want independent evidence.
 fn role_instructions(role: WorkerRole) -> &'static str {
     match role {
         WorkerRole::Developer => {
-            "You are the task Developer. Work directly in the exact repository and complete the bounded task. Run whatever checks the task requires, commit your work, and do not push, install, or wait for interactive input. Your final message is your report to the reviewer: state what you changed, what you verified, and anything you left undone."
+            "You are the task Developer. Work directly in the exact repository and complete the bounded task. Run whatever checks the task requires, then commit your work as ONE NEW commit whose message describes this task as a whole. Never amend, squash, reword, or otherwise rewrite any commit that already existed when your turn began — earlier commits belong to earlier tasks and are not yours to touch. Do not push, install, or wait for interactive input. Your final message is your report to the reviewer: state what you changed, what you verified, and anything you left undone."
         }
         WorkerRole::Reviewer => {
-            "You are the task Reviewer. Independently inspect the committed task range and decide whether it is sound. You must not edit reviewed source, stage, commit, change branch or HEAD, push, or install; verifying by copying the tree into your own writable sandbox is allowed and encouraged when it helps."
+            "You are the task Reviewer. Independently inspect the committed task range and decide whether it is sound. Also confirm the developer left the work committed as a single commit for this task, with a message covering it; uncommitted work or a task split across several commits is a reason to request changes. You must not edit reviewed source, stage, commit, change branch or HEAD, push, or install; verifying by copying the tree into your own writable sandbox is allowed and encouraged when it helps."
         }
     }
 }
@@ -1567,7 +1420,6 @@ mod tests {
             path: &'static str,
             mode: u32,
         },
-        ReplaceGitDirectory,
     }
 
     struct TaskScript {
@@ -2235,22 +2087,6 @@ mod tests {
                 git_commit(repository, &format!("Change mode for {path}"));
                 Ok(())
             }
-            Mutation::ReplaceGitDirectory => {
-                let original = repository.join(".git");
-                let moved = repository.join(".git-replaced");
-                fs::rename(&original, &moved)?;
-                let output = Command::new("/bin/cp")
-                    .args(["-a", "--"])
-                    .arg(&moved)
-                    .arg(&original)
-                    .env_clear()
-                    .env("LC_ALL", "C")
-                    .output()?;
-                if !output.status.success() {
-                    bail!("failed to replace disposable Git directory");
-                }
-                Ok(())
-            }
         }
     }
 
@@ -2271,26 +2107,6 @@ mod tests {
             arguments,
             String::from_utf8_lossy(&output.stderr)
         );
-    }
-
-    fn git_output(repository: &Path, arguments: &[&str]) -> String {
-        let output = Command::new("/usr/bin/git")
-            .args(arguments)
-            .current_dir(repository)
-            .env_clear()
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("HOME", "/nonexistent")
-            .env("LC_ALL", "C")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            arguments,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
     fn git_commit(repository: &Path, subject: &str) {
@@ -3151,7 +2967,6 @@ mod tests {
         git(&second, &["add", "--", "src/seed.txt"]);
         git_commit(&second, "Initial second fixture");
         let second = fs::canonicalize(second).unwrap();
-        let second_base = git_output(&second, &["rev-parse", "HEAD"]);
 
         let scripts = vec![
             task_script(
@@ -3208,8 +3023,8 @@ mod tests {
         let snapshot = drive_terminal(&mut supervisor);
         assert_eq!(snapshot.state, SessionState::Completed);
         assert_eq!(
-            snapshot.tasks[1].base_revision.as_deref(),
-            Some(second_base.as_str())
+            snapshot.tasks[1].repository_root,
+            second.to_string_lossy().into_owned()
         );
         assert_eq!(
             audit.lock().unwrap().opens,
@@ -3531,41 +3346,6 @@ mod tests {
     }
 
     #[test]
-    fn repository_identity_replacement_is_a_driver_failure_not_a_worker_verdict() {
-        let fixture = Fixture::new();
-        let audit = Arc::new(Mutex::new(Audit::default()));
-        let script = task_script(
-            "identity-drift",
-            vec![FakeTurnScript::new(
-                WorkerRole::Developer,
-                RuntimeTurnPurpose::InitialDevelopment,
-                [ready("must not be accepted")],
-            )],
-            vec![Mutation::ReplaceGitDirectory],
-        );
-        let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
-        start(
-            &mut supervisor,
-            vec![fixture.task("identity-drift", &["src"], 2)],
-        );
-        assert!(supervisor.poll_once().is_err());
-        let snapshot = supervisor.snapshot();
-        assert_eq!(snapshot.state, SessionState::NeedsHuman);
-        assert_eq!(
-            snapshot.terminal_detail.as_deref(),
-            Some("repository observation failed")
-        );
-        assert!(
-            audit
-                .lock()
-                .unwrap()
-                .sessions
-                .iter()
-                .all(|(_, role, _)| *role == WorkerRole::Developer)
-        );
-    }
-
-    #[test]
     fn a_dirty_plan_still_runs_and_reaches_review() {
         // The supervisor does not police the working tree: a task that starts
         // from a dirty checkout runs, and the reviewer sees the result.
@@ -3613,8 +3393,10 @@ mod tests {
     }
 
     #[test]
-    fn a_detached_or_dirty_checkout_still_binds_but_a_non_top_level_root_does_not() {
+    fn a_detached_or_dirty_checkout_still_binds() {
         // Working-tree condition is the reviewer's and the human's business.
+        // hcom never inspects it: a task's repository_root is only a source
+        // directory path, and any existing directory binds.
         for prepare in [
             |repository: &Path| git(repository, &["checkout", "--detach"]),
             |repository: &Path| {
@@ -3636,11 +3418,33 @@ mod tests {
             assert_eq!(supervisor.snapshot().state, SessionState::AwaitingApproval);
         }
 
-        // Repository identity is still exact: a subdirectory is not a root.
+        // A subdirectory of a checkout is an ordinary existing directory, so it
+        // binds too — there is no Git top-level identity check any more.
         let nested = Fixture::new();
         let mut task = nested.task("nested-root", &["src"], 2);
         task.repository_root = nested.repository.join("src").to_string_lossy().into_owned();
         let mut supervisor = nested.supervisor(Vec::new(), Arc::new(Mutex::new(Audit::default())));
+        supervisor
+            .replace_plan(
+                0,
+                CODEX_TASK_WORKER_ADAPTER,
+                CODEX_TASK_WORKER_ADAPTER,
+                vec![task],
+            )
+            .expect("a subdirectory is a valid task source directory");
+        assert_eq!(supervisor.snapshot().state, SessionState::AwaitingApproval);
+    }
+
+    #[test]
+    fn a_task_source_directory_that_does_not_exist_is_rejected() {
+        let fixture = Fixture::new();
+        let mut task = fixture.task("missing-root", &["src"], 2);
+        task.repository_root = fixture
+            .repository
+            .join("does-not-exist")
+            .to_string_lossy()
+            .into_owned();
+        let mut supervisor = fixture.supervisor(Vec::new(), Arc::new(Mutex::new(Audit::default())));
         assert!(
             supervisor
                 .replace_plan(
@@ -3655,22 +3459,8 @@ mod tests {
     }
 
     #[test]
-    fn failed_plan_replacement_preserves_the_previous_plan_and_repository_lock() {
+    fn failed_plan_replacement_preserves_the_previous_plan() {
         let fixture = Fixture::new();
-        let second = fixture
-            .project_root
-            .parent()
-            .unwrap()
-            .join("replacement-locked-repository");
-        fs::create_dir(&second).unwrap();
-        fs::set_permissions(&second, fs::Permissions::from_mode(0o700)).unwrap();
-        git(&second, &["init", "-b", "master"]);
-        fs::create_dir(second.join("src")).unwrap();
-        fs::write(second.join("src/seed.txt"), "seed\n").unwrap();
-        git(&second, &["add", "--", "src/seed.txt"]);
-        git_commit(&second, "Initial replacement fixture");
-        let second = fs::canonicalize(second).unwrap();
-
         let audit = Arc::new(Mutex::new(Audit::default()));
         let script = task_script(
             "retained-plan",
@@ -3695,41 +3485,38 @@ mod tests {
             .unwrap();
         let before = supervisor.snapshot();
 
-        let mut blocker = fixture.supervisor(Vec::new(), Arc::new(Mutex::new(Audit::default())));
-        let mut blocked_task = fixture.task("blocked-root", &["src"], 2);
-        blocked_task.repository_root = second.to_string_lossy().into_owned();
-        blocker
-            .replace_plan(
-                0,
-                CODEX_TASK_WORKER_ADAPTER,
-                CODEX_TASK_WORKER_ADAPTER,
-                vec![blocked_task.clone()],
-            )
-            .unwrap();
-
+        // The only remaining plan-binding gate is that each task names an
+        // existing source directory; a rejected replacement must leave the
+        // previously bound plan byte-for-byte intact.
+        let mut rejected_task = fixture.task("missing-root", &["src"], 2);
+        rejected_task.repository_root = fixture
+            .repository
+            .join("does-not-exist")
+            .to_string_lossy()
+            .into_owned();
         assert!(
             supervisor
                 .replace_plan(
                     before.version,
                     CODEX_TASK_WORKER_ADAPTER,
                     CODEX_TASK_WORKER_ADAPTER,
-                    vec![blocked_task],
+                    vec![rejected_task],
                 )
                 .is_err()
         );
         assert_eq!(supervisor.snapshot(), before);
 
+        // A second live supervisor may bind the very same source directory:
+        // nothing locks it any more.
         let mut probe = fixture.supervisor(Vec::new(), Arc::new(Mutex::new(Audit::default())));
-        assert!(
-            probe
-                .replace_plan(
-                    0,
-                    CODEX_TASK_WORKER_ADAPTER,
-                    CODEX_TASK_WORKER_ADAPTER,
-                    vec![retained_task],
-                )
-                .is_err()
-        );
+        probe
+            .replace_plan(
+                0,
+                CODEX_TASK_WORKER_ADAPTER,
+                CODEX_TASK_WORKER_ADAPTER,
+                vec![retained_task],
+            )
+            .expect("task source directories are not locked");
 
         supervisor
             .approve_and_start(before.version, plan_version, &plan_hash, true)

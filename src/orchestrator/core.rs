@@ -15,96 +15,14 @@ use crate::worker::runtime::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
 const MAX_CORE_DIAGNOSTIC_BYTES: usize = 1024;
 const MAX_COMPLETION_TOKEN_BYTES: usize = 128;
-const MAX_REPOSITORY_PATHS: usize = 256;
 const MAX_REPOSITORY_PATH_BYTES: usize = 4096;
 const MAX_TASKS: usize = 64;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RepositoryObservation {
-    pub repository_root: String,
-    pub identity_hash: String,
-    pub branch: String,
-    pub head: String,
-    pub tracked_diff_hash: String,
-    pub index_diff_hash: String,
-    pub untracked_status_hash: String,
-    pub clean: bool,
-    /// Normalized paths changed from the checkpoint revision, including any
-    /// current worktree/index changes. The driver supplies a sorted unique
-    /// inventory; the core applies the task allowlist.
-    pub changed_paths: Vec<String>,
-    /// The driver-computed ancestry result against the checkpoint expected by
-    /// the effect that requested this observation.
-    pub head_descends_from_expected: bool,
-}
-
-impl RepositoryObservation {
-    fn validate(&self) -> Result<(), SupervisorError> {
-        validate_absolute_path("repository observation root", &self.repository_root)?;
-        validate_sha256("repository identity hash", &self.identity_hash).map_err(|_| {
-            SupervisorError::invalid_repository(
-                "repository identity hash must be a lowercase SHA-256 digest",
-            )
-        })?;
-        validate_single_line("repository branch", &self.branch, 512).map_err(|_| {
-            SupervisorError::invalid_repository("repository branch is not bounded single-line text")
-        })?;
-        validate_revision("repository HEAD", &self.head)?;
-        for (label, hash) in [
-            ("tracked diff hash", &self.tracked_diff_hash),
-            ("index diff hash", &self.index_diff_hash),
-            ("untracked status hash", &self.untracked_status_hash),
-        ] {
-            validate_sha256(label, hash).map_err(|_| {
-                SupervisorError::invalid_repository(format!(
-                    "{label} must be a lowercase SHA-256 digest"
-                ))
-            })?;
-        }
-        if self.changed_paths.len() > MAX_REPOSITORY_PATHS {
-            return Err(SupervisorError::invalid_repository(
-                "repository changed-path inventory exceeds 256 entries",
-            ));
-        }
-        let mut previous: Option<&str> = None;
-        for path in &self.changed_paths {
-            validate_relative_path(path)?;
-            if let Some(previous) = previous
-                && previous >= path.as_str()
-            {
-                return Err(SupervisorError::invalid_repository(
-                    "repository changed paths must be sorted and unique",
-                ));
-            }
-            previous = Some(path);
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct TaskRepositoryBinding {
-    pub task_key: String,
-    pub observation: RepositoryObservation,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub enum RepositoryCheckpoint {
-    TaskStart,
-    DeveloperCompletion,
-    DeveloperRecoveryPreflight,
-    ReviewerPreflight,
-    ReviewerPostflight,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SupervisorEventKind {
@@ -116,7 +34,6 @@ pub enum SupervisorEventKind {
     TurnCompleted,
     TurnFailed,
     DriverFailed,
-    RepositoryObserved,
     Timeout,
     CancelRequested,
     ParentStopping,
@@ -124,7 +41,7 @@ pub enum SupervisorEventKind {
 }
 
 impl SupervisorEventKind {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 12] = [
         Self::PlanBound,
         Self::ExecutionAuthorized,
         Self::TaskRuntimeOpened,
@@ -133,7 +50,6 @@ impl SupervisorEventKind {
         Self::TurnCompleted,
         Self::TurnFailed,
         Self::DriverFailed,
-        Self::RepositoryObserved,
         Self::Timeout,
         Self::CancelRequested,
         Self::ParentStopping,
@@ -148,7 +64,6 @@ pub enum SupervisorEvent {
         plan_version: u64,
         plan_hash: String,
         tasks: Vec<TaskDraft>,
-        repositories: Vec<TaskRepositoryBinding>,
     },
     ExecutionAuthorized {
         expected_version: u64,
@@ -197,12 +112,6 @@ pub enum SupervisorEvent {
         task_ordinal: usize,
         failure: DriverFailure,
     },
-    RepositoryObserved {
-        expected_version: u64,
-        task_ordinal: usize,
-        checkpoint: RepositoryCheckpoint,
-        observation: RepositoryObservation,
-    },
     Timeout {
         expected_version: u64,
         task_ordinal: usize,
@@ -232,7 +141,6 @@ impl SupervisorEvent {
             Self::TurnCompleted { .. } => SupervisorEventKind::TurnCompleted,
             Self::TurnFailed { .. } => SupervisorEventKind::TurnFailed,
             Self::DriverFailed { .. } => SupervisorEventKind::DriverFailed,
-            Self::RepositoryObserved { .. } => SupervisorEventKind::RepositoryObserved,
             Self::Timeout { .. } => SupervisorEventKind::Timeout,
             Self::CancelRequested { .. } => SupervisorEventKind::CancelRequested,
             Self::ParentStopping { .. } => SupervisorEventKind::ParentStopping,
@@ -264,9 +172,6 @@ impl SupervisorEvent {
                 expected_version, ..
             }
             | Self::DriverFailed {
-                expected_version, ..
-            }
-            | Self::RepositoryObserved {
                 expected_version, ..
             }
             | Self::Timeout {
@@ -313,10 +218,6 @@ pub enum SupervisorEffect {
         purpose: RuntimeTurnPurpose,
         session: RuntimeSessionKey,
     },
-    ObserveRepository {
-        task_ordinal: usize,
-        checkpoint: RepositoryCheckpoint,
-    },
     InterruptTurn {
         task_ordinal: usize,
         role: WorkerRole,
@@ -339,7 +240,6 @@ enum SupervisorEffectKind {
     OpenTaskRuntime,
     OpenRoleSession,
     StartTurn,
-    ObserveRepository,
     InterruptTurn,
     CloseTaskRuntime,
     FinishSession,
@@ -348,11 +248,10 @@ enum SupervisorEffectKind {
 
 #[cfg(test)]
 impl SupervisorEffectKind {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 7] = [
         Self::OpenTaskRuntime,
         Self::OpenRoleSession,
         Self::StartTurn,
-        Self::ObserveRepository,
         Self::InterruptTurn,
         Self::CloseTaskRuntime,
         Self::FinishSession,
@@ -367,7 +266,6 @@ impl SupervisorEffect {
             Self::OpenTaskRuntime { .. } => SupervisorEffectKind::OpenTaskRuntime,
             Self::OpenRoleSession { .. } => SupervisorEffectKind::OpenRoleSession,
             Self::StartTurn { .. } => SupervisorEffectKind::StartTurn,
-            Self::ObserveRepository { .. } => SupervisorEffectKind::ObserveRepository,
             Self::InterruptTurn { .. } => SupervisorEffectKind::InterruptTurn,
             Self::CloseTaskRuntime { .. } => SupervisorEffectKind::CloseTaskRuntime,
             Self::FinishSession { .. } => SupervisorEffectKind::FinishSession,
@@ -450,43 +348,25 @@ pub struct CoreTask {
     pub spec: TaskDraft,
     pub state: TaskState,
     pub review_round: u32,
-    pub branch: Option<String>,
-    pub base_revision: Option<String>,
-    pub head_revision: Option<String>,
     pub developer_session: Option<RuntimeSessionKey>,
     pub reviewer_session: Option<RuntimeSessionKey>,
-    pub recovery_used: bool,
     pub outcome_detail: Option<String>,
-    expected_repository: RepositoryObservation,
-    reviewer_pre_repository: Option<RepositoryObservation>,
     last_developer_outcome: Option<DeveloperOutcomeV1>,
     last_reviewer_outcome: Option<ReviewerOutcomeV1>,
-    recovery_checkpoint: Option<RepositoryObservation>,
 }
 
 impl CoreTask {
-    fn new(spec: TaskDraft, binding: RepositoryObservation) -> Self {
+    fn new(spec: TaskDraft) -> Self {
         Self {
-            branch: Some(binding.branch.clone()),
-            base_revision: Some(binding.head.clone()),
-            expected_repository: binding,
             spec,
             state: TaskState::Pending,
             review_round: 0,
-            head_revision: None,
             developer_session: None,
             reviewer_session: None,
-            recovery_used: false,
             outcome_detail: None,
-            reviewer_pre_repository: None,
             last_developer_outcome: None,
             last_reviewer_outcome: None,
-            recovery_checkpoint: None,
         }
-    }
-
-    pub fn expected_repository(&self) -> &RepositoryObservation {
-        &self.expected_repository
     }
 
     pub fn last_developer_outcome(&self) -> Option<&DeveloperOutcomeV1> {
@@ -495,10 +375,6 @@ impl CoreTask {
 
     pub fn last_reviewer_outcome(&self) -> Option<&ReviewerOutcomeV1> {
         self.last_reviewer_outcome.as_ref()
-    }
-
-    pub fn recovery_checkpoint(&self) -> Option<&RepositoryObservation> {
-        self.recovery_checkpoint.as_ref()
     }
 }
 
@@ -527,13 +403,6 @@ struct CoreActiveTurn {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PendingRepository {
-    task_ordinal: usize,
-    checkpoint: RepositoryCheckpoint,
-    outcome: Option<RuntimeOutcome>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupervisorCore {
     run_id: String,
     project_root: PathBuf,
@@ -551,7 +420,6 @@ pub struct SupervisorCore {
     pending_session_open: Option<ExpectedSessionOpen>,
     pending_turn_start: Option<ExpectedTurnStart>,
     active_turn: Option<CoreActiveTurn>,
-    pending_repository: Option<PendingRepository>,
     used_sessions: BTreeSet<RuntimeSessionKey>,
     used_turns: BTreeSet<RuntimeTurnKey>,
     accepted_completion_tokens: BTreeSet<String>,
@@ -586,7 +454,6 @@ impl SupervisorCore {
             pending_session_open: None,
             pending_turn_start: None,
             active_turn: None,
-            pending_repository: None,
             used_sessions: BTreeSet::new(),
             used_turns: BTreeSet::new(),
             accepted_completion_tokens: BTreeSet::new(),
@@ -637,19 +504,13 @@ impl SupervisorCore {
         self.plan_hash.as_deref()
     }
 
-    pub fn expected_plan_hash(
-        &self,
-        plan_version: u64,
-        tasks: &[TaskDraft],
-        repositories: &[TaskRepositoryBinding],
-    ) -> String {
+    pub fn expected_plan_hash(&self, plan_version: u64, tasks: &[TaskDraft]) -> String {
         canonical_hash(&(
-            "hcom-codex-exec-session-plan-v1",
+            "hcom-codex-exec-session-plan-v2",
             plan_version,
             &self.project_root,
             &self.profile_hash,
             tasks,
-            repositories,
         ))
     }
 
@@ -674,11 +535,11 @@ impl SupervisorCore {
                     ordinal: u32::try_from(index).unwrap_or(u32::MAX),
                     state: task.state,
                     repository_root: task.spec.repository_root.clone(),
-                    branch: task.branch.clone(),
+                    branch: None,
                     review_round: task.review_round,
                     max_review_rounds: task.spec.max_review_rounds,
-                    base_revision: task.base_revision.clone(),
-                    head_revision: task.head_revision.clone(),
+                    base_revision: None,
+                    head_revision: None,
                     developer_session_bound: task.developer_session.is_some(),
                     reviewer_session_bound: task.reviewer_session.is_some(),
                     outcome_detail: task.outcome_detail.clone(),
@@ -733,9 +594,8 @@ impl SupervisorCore {
                 plan_version,
                 plan_hash,
                 tasks,
-                repositories,
                 ..
-            } => self.bind_plan(plan_version, plan_hash, tasks, repositories),
+            } => self.bind_plan(plan_version, plan_hash, tasks),
             SupervisorEvent::ExecutionAuthorized {
                 plan_version,
                 plan_hash,
@@ -796,12 +656,6 @@ impl SupervisorCore {
                 failure,
                 ..
             } => self.driver_failed(task_ordinal, failure),
-            SupervisorEvent::RepositoryObserved {
-                task_ordinal,
-                checkpoint,
-                observation,
-                ..
-            } => self.repository_observed(task_ordinal, checkpoint, observation),
             SupervisorEvent::Timeout {
                 task_ordinal,
                 role,
@@ -821,7 +675,6 @@ impl SupervisorCore {
         plan_version: u64,
         plan_hash: String,
         tasks: Vec<TaskDraft>,
-        repositories: Vec<TaskRepositoryBinding>,
     ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
         if !matches!(
             self.session_state,
@@ -843,15 +696,8 @@ impl SupervisorCore {
                 "ordered plan must contain between 1 and 64 tasks",
             ));
         }
-        if repositories.len() != tasks.len() {
-            return Err(SupervisorError::invalid_plan(
-                "plan repository bindings must match the ordered task count",
-            ));
-        }
-
         let mut keys = BTreeSet::new();
-        let mut roots: BTreeMap<&str, &RepositoryObservation> = BTreeMap::new();
-        for (task, binding) in tasks.iter().zip(&repositories) {
+        for task in &tasks {
             task.validate()
                 .map_err(|error| SupervisorError::invalid_plan(error.to_string()))?;
             if !keys.insert(task.task_key.as_str()) {
@@ -859,21 +705,9 @@ impl SupervisorCore {
                     "ordered plan task keys must be unique",
                 ));
             }
-            if binding.task_key != task.task_key
-                || binding.observation.repository_root != task.repository_root
-            {
-                return Err(SupervisorError::invalid_plan(
-                    "task repository binding identity or order does not match the plan",
-                ));
-            }
-            binding.observation.validate()?;
-            roots.insert(
-                binding.observation.repository_root.as_str(),
-                &binding.observation,
-            );
         }
 
-        let expected_hash = self.expected_plan_hash(plan_version, &tasks, &repositories);
+        let expected_hash = self.expected_plan_hash(plan_version, &tasks);
         if plan_hash != expected_hash {
             return Err(SupervisorError::invalid_plan(
                 "plan hash does not match the exact ordered plan binding",
@@ -883,11 +717,7 @@ impl SupervisorCore {
             .checked_add(1)
             .ok_or_else(|| SupervisorError::overflow("plan version overflow"))?;
 
-        self.tasks = tasks
-            .into_iter()
-            .zip(repositories)
-            .map(|(task, binding)| CoreTask::new(task, binding.observation))
-            .collect();
+        self.tasks = tasks.into_iter().map(CoreTask::new).collect();
         self.plan_version = Some(plan_version);
         self.plan_hash = Some(plan_hash);
         self.next_plan_version = next_plan_version;
@@ -931,7 +761,23 @@ impl SupervisorCore {
 
         self.session_state = SessionState::Running;
         self.current_task = Some(0);
-        self.schedule_repository(0, RepositoryCheckpoint::TaskStart, None)
+        self.schedule_runtime_open(0)
+    }
+
+    /// Open the task's worker runtime. There is no Git observation before it:
+    /// the supervisor only sequences processes.
+    fn schedule_runtime_open(
+        &mut self,
+        task_ordinal: usize,
+    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        self.require_no_pending_operation()?;
+        if self.tasks[task_ordinal].state != TaskState::Pending {
+            return Err(SupervisorError::invalid_transition(
+                "task runtime open requires a pending task",
+            ));
+        }
+        self.pending_runtime_open = Some(task_ordinal);
+        Ok(vec![SupervisorEffect::OpenTaskRuntime { task_ordinal }])
     }
 
     fn task_runtime_opened(
@@ -1089,11 +935,21 @@ impl SupervisorCore {
 
         match outcome {
             RuntimeOutcome::Developer(developer) => match developer.status {
-                DeveloperOutcomeStatus::Ready => self.schedule_repository(
-                    task_ordinal,
-                    RepositoryCheckpoint::DeveloperCompletion,
-                    Some(RuntimeOutcome::Developer(developer)),
-                ),
+                // The developer's exit routes straight to review. The
+                // supervisor inspects nothing about the work itself.
+                DeveloperOutcomeStatus::Ready => {
+                    if self.tasks[task_ordinal].state != TaskState::Developing {
+                        return Err(SupervisorError::invalid_transition(
+                            "developer completion requires a developing task",
+                        ));
+                    }
+                    let task = &mut self.tasks[task_ordinal];
+                    task.last_developer_outcome = Some(developer);
+                    task.state = TaskState::Reviewing;
+                    task.outcome_detail =
+                        Some("developer turn completed; routing to review".into());
+                    self.start_reviewer(task_ordinal)
+                }
                 DeveloperOutcomeStatus::NeedsHuman => {
                     self.tasks[task_ordinal].last_developer_outcome = Some(developer);
                     self.terminalize_current(
@@ -1205,49 +1061,6 @@ impl SupervisorCore {
         )
     }
 
-    fn repository_observed(
-        &mut self,
-        task_ordinal: usize,
-        checkpoint: RepositoryCheckpoint,
-        observation: RepositoryObservation,
-    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
-        self.require_running_task(task_ordinal)?;
-        observation.validate()?;
-        let pending = self.pending_repository.as_ref().ok_or_else(|| {
-            SupervisorError::invalid_transition(
-                "repository observation arrived without an outstanding checkpoint",
-            )
-        })?;
-        if pending.task_ordinal != task_ordinal || pending.checkpoint != checkpoint {
-            return Err(SupervisorError::invalid_identity(
-                "repository observation does not match the exact pending checkpoint",
-            ));
-        }
-        let pending = self
-            .pending_repository
-            .take()
-            .expect("pending repository was just validated");
-        match checkpoint {
-            RepositoryCheckpoint::TaskStart => self.handle_task_start(task_ordinal, observation),
-            RepositoryCheckpoint::DeveloperCompletion => {
-                let Some(RuntimeOutcome::Developer(outcome)) = pending.outcome else {
-                    return Err(SupervisorError::invariant(
-                        "developer checkpoint lost its typed outcome",
-                    ));
-                };
-                self.handle_developer_repository(task_ordinal, observation, outcome)
-            }
-            RepositoryCheckpoint::DeveloperRecoveryPreflight => Err(SupervisorError::invariant(
-                "developer completion recovery is retired in the task-agnostic lane",
-            )),
-            RepositoryCheckpoint::ReviewerPreflight | RepositoryCheckpoint::ReviewerPostflight => {
-                Err(SupervisorError::invariant(
-                    "reviewer repository checkpoints are retired in the task-agnostic lane",
-                ))
-            }
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn timeout(
         &mut self,
@@ -1295,50 +1108,6 @@ impl SupervisorCore {
             "foreground Architect parent stopped",
             effects,
         )
-    }
-
-    fn handle_task_start(
-        &mut self,
-        task_ordinal: usize,
-        observation: RepositoryObservation,
-    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
-        let task = &mut self.tasks[task_ordinal];
-        if task.state != TaskState::Pending {
-            return Err(SupervisorError::invalid_transition(
-                "task-start observation requires a pending task",
-            ));
-        }
-        // Task-agnostic supervisor: the observation is routing data (base for
-        // the review diff), never a quality gate.
-        task.branch = Some(observation.branch.clone());
-        task.base_revision = Some(observation.head.clone());
-        task.expected_repository = observation;
-        self.pending_runtime_open = Some(task_ordinal);
-        Ok(vec![SupervisorEffect::OpenTaskRuntime { task_ordinal }])
-    }
-
-    fn handle_developer_repository(
-        &mut self,
-        task_ordinal: usize,
-        observation: RepositoryObservation,
-        outcome: DeveloperOutcomeV1,
-    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
-        if self.tasks[task_ordinal].state != TaskState::Developing {
-            return Err(SupervisorError::invalid_transition(
-                "developer completion checkpoint requires a developing task",
-            ));
-        }
-        // Task-agnostic supervisor: the developer's exit routes to review
-        // unconditionally. The observation is captured as routing data (head
-        // for the review diff range and status snapshots); repository quality,
-        // scope, and cleanliness are the reviewer's and the human's judgment.
-        let task = &mut self.tasks[task_ordinal];
-        task.head_revision = Some(observation.head.clone());
-        task.expected_repository = observation;
-        task.last_developer_outcome = Some(outcome);
-        task.state = TaskState::Reviewing;
-        task.outcome_detail = Some("developer turn completed; routing to review".into());
-        self.start_reviewer(task_ordinal)
     }
 
     /// Start (or resume) the reviewer for a task already in review.
@@ -1432,30 +1201,16 @@ impl SupervisorCore {
                 "completed task lost its task-local runtime",
             ));
         }
-        let repository = self.tasks[task_ordinal].expected_repository.clone();
-        let repository_root = repository.repository_root.clone();
-        for future in self.tasks.iter_mut().skip(task_ordinal + 1) {
-            if future.spec.repository_root == repository_root {
-                future.expected_repository = repository.clone();
-                future.branch = Some(repository.branch.clone());
-                future.base_revision = Some(repository.head.clone());
-            }
-        }
         self.runtime_open = None;
         self.pending_session_open = None;
         self.pending_turn_start = None;
         self.active_turn = None;
-        self.pending_repository = None;
 
         let mut effects = vec![SupervisorEffect::CloseTaskRuntime { task_ordinal }];
         if task_ordinal + 1 < self.tasks.len() {
             let next = task_ordinal + 1;
             self.current_task = Some(next);
-            effects.extend(self.schedule_repository(
-                next,
-                RepositoryCheckpoint::TaskStart,
-                None,
-            )?);
+            effects.extend(self.schedule_runtime_open(next)?);
         } else {
             self.session_state = SessionState::Completed;
             self.terminal_detail =
@@ -1469,24 +1224,6 @@ impl SupervisorCore {
             });
         }
         Ok(effects)
-    }
-
-    fn schedule_repository(
-        &mut self,
-        task_ordinal: usize,
-        checkpoint: RepositoryCheckpoint,
-        outcome: Option<RuntimeOutcome>,
-    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
-        self.require_no_pending_operation()?;
-        self.pending_repository = Some(PendingRepository {
-            task_ordinal,
-            checkpoint,
-            outcome,
-        });
-        Ok(vec![SupervisorEffect::ObserveRepository {
-            task_ordinal,
-            checkpoint,
-        }])
     }
 
     fn schedule_session_open(
@@ -1534,7 +1271,6 @@ impl SupervisorCore {
             || self.pending_session_open.is_some()
             || self.pending_turn_start.is_some()
             || self.active_turn.is_some()
-            || self.pending_repository.is_some()
         {
             return Err(SupervisorError::invariant(
                 "cannot schedule two supervisor operations at once",
@@ -1641,7 +1377,6 @@ impl SupervisorCore {
         self.pending_session_open = None;
         self.pending_turn_start = None;
         self.active_turn = None;
-        self.pending_repository = None;
         self.session_state = session_state;
         self.terminal_detail = Some(detail.into());
         effects.push(SupervisorEffect::FinishSession {
@@ -1657,7 +1392,6 @@ impl SupervisorCore {
         self.pending_session_open = None;
         self.pending_turn_start = None;
         self.active_turn = None;
-        self.pending_repository = None;
         self.used_sessions.clear();
         self.used_turns.clear();
         self.accepted_completion_tokens.clear();
@@ -1733,8 +1467,7 @@ impl SupervisorCore {
                 || self.runtime_open.is_some()
                 || self.pending_session_open.is_some()
                 || self.pending_turn_start.is_some()
-                || self.active_turn.is_some()
-                || self.pending_repository.is_some())
+                || self.active_turn.is_some())
         {
             return Err(SupervisorError::invariant(
                 "terminal session retains a live runtime operation",
@@ -1750,7 +1483,6 @@ impl SupervisorCore {
             self.pending_session_open.is_some(),
             self.pending_turn_start.is_some(),
             self.active_turn.is_some(),
-            self.pending_repository.is_some(),
         ]
         .into_iter()
         .filter(|present| *present)
@@ -1824,16 +1556,8 @@ impl SupervisorCore {
                     "task review round exceeds its maximum",
                 ));
             }
-            if task.expected_repository.repository_root != task.spec.repository_root
-                || task.branch.as_deref() != Some(task.expected_repository.branch.as_str())
-            {
-                return Err(SupervisorError::invariant(
-                    "task repository binding disagrees with its normalized evidence",
-                ));
-            }
             if task.state == TaskState::Reviewing
-                && (task.head_revision.is_none()
-                    || task.developer_session.is_none()
+                && (task.developer_session.is_none()
                     || task.review_round >= u32::from(task.spec.max_review_rounds))
             {
                 return Err(SupervisorError::invariant(
@@ -1915,42 +1639,6 @@ impl SupervisorCore {
                 ));
             }
         }
-        if let Some(pending) = &self.pending_repository {
-            if self.current_task != Some(pending.task_ordinal) {
-                return Err(SupervisorError::invariant(
-                    "repository checkpoint does not belong to the current task",
-                ));
-            }
-            let task = &self.tasks[pending.task_ordinal];
-            let valid = match (&pending.checkpoint, &pending.outcome) {
-                (RepositoryCheckpoint::TaskStart, None) => {
-                    task.state == TaskState::Pending && self.runtime_open.is_none()
-                }
-                (RepositoryCheckpoint::DeveloperCompletion, Some(RuntimeOutcome::Developer(_))) => {
-                    task.state == TaskState::Developing
-                        && self.runtime_open == Some(pending.task_ordinal)
-                }
-                (RepositoryCheckpoint::DeveloperRecoveryPreflight, None) => {
-                    task.state == TaskState::Developing
-                        && !task.recovery_used
-                        && self.runtime_open == Some(pending.task_ordinal)
-                }
-                (RepositoryCheckpoint::ReviewerPreflight, None) => {
-                    task.state == TaskState::Reviewing
-                        && self.runtime_open == Some(pending.task_ordinal)
-                }
-                (RepositoryCheckpoint::ReviewerPostflight, Some(RuntimeOutcome::Reviewer(_))) => {
-                    task.state == TaskState::Reviewing
-                        && self.runtime_open == Some(pending.task_ordinal)
-                }
-                _ => false,
-            };
-            if !valid {
-                return Err(SupervisorError::invariant(
-                    "repository checkpoint type does not match task state and outcome",
-                ));
-            }
-        }
         Ok(())
     }
 }
@@ -2004,19 +1692,6 @@ fn validate_sha256(label: &str, value: &str) -> Result<(), SupervisorError> {
     Ok(())
 }
 
-fn validate_revision(label: &str, value: &str) -> Result<(), SupervisorError> {
-    if !matches!(value.len(), 40 | 64)
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(SupervisorError::invalid_repository(format!(
-            "{label} must be a full lowercase Git object ID"
-        )));
-    }
-    Ok(())
-}
-
 fn validate_absolute_path(label: &str, value: &str) -> Result<(), SupervisorError> {
     if value.is_empty() || value.len() > MAX_REPOSITORY_PATH_BYTES {
         return Err(SupervisorError::invalid_repository(format!(
@@ -2032,25 +1707,6 @@ fn validate_absolute_path(label: &str, value: &str) -> Result<(), SupervisorErro
         return Err(SupervisorError::invalid_repository(format!(
             "{label} must be absolute and lexically normalized"
         )));
-    }
-    Ok(())
-}
-
-fn validate_relative_path(value: &str) -> Result<(), SupervisorError> {
-    if value.is_empty() || value.len() > MAX_REPOSITORY_PATH_BYTES || value.contains('\\') {
-        return Err(SupervisorError::invalid_repository(
-            "repository changed path is empty, unbounded, or non-portable",
-        ));
-    }
-    let path = Path::new(value);
-    if path.is_absolute()
-        || !path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
-    {
-        return Err(SupervisorError::invalid_repository(
-            "repository changed path must be normalized and relative",
-        ));
     }
     Ok(())
 }
@@ -2082,11 +1738,6 @@ mod tests {
     use super::*;
 
     const PROFILE_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const CLEAN_HASH: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-
-    fn revision(character: char) -> String {
-        character.to_string().repeat(40)
-    }
 
     fn task(key: &str, root: &str, max_review_rounds: u8) -> TaskDraft {
         TaskDraft {
@@ -2100,40 +1751,6 @@ mod tests {
             forbidden_actions: vec!["do not push".into()],
             max_review_rounds,
         }
-    }
-
-    fn observation(root: &str, head: char) -> RepositoryObservation {
-        RepositoryObservation {
-            repository_root: root.into(),
-            identity_hash: "1".repeat(64),
-            branch: "master".into(),
-            head: revision(head),
-            tracked_diff_hash: CLEAN_HASH.into(),
-            index_diff_hash: CLEAN_HASH.into(),
-            untracked_status_hash: CLEAN_HASH.into(),
-            clean: true,
-            changed_paths: Vec::new(),
-            head_descends_from_expected: true,
-        }
-    }
-
-    fn developer_observation(
-        prior: &RepositoryObservation,
-        head: char,
-        clean: bool,
-        paths: &[&str],
-    ) -> RepositoryObservation {
-        let mut observation = prior.clone();
-        observation.head = revision(head);
-        observation.clean = clean;
-        observation.changed_paths = paths.iter().map(|path| (*path).into()).collect();
-        observation.tracked_diff_hash = head.to_string().repeat(64);
-        observation.index_diff_hash = if clean {
-            CLEAN_HASH.into()
-        } else {
-            "c".repeat(64)
-        };
-        observation
     }
 
     fn ready() -> RuntimeOutcome {
@@ -2202,27 +1819,14 @@ mod tests {
         .unwrap()
     }
 
-    fn bind(
-        core: &mut SupervisorCore,
-        tasks: Vec<TaskDraft>,
-        observations: Vec<RepositoryObservation>,
-    ) -> Vec<SupervisorEffect> {
+    fn bind(core: &mut SupervisorCore, tasks: Vec<TaskDraft>) -> Vec<SupervisorEffect> {
         let plan_version = core.next_plan_version;
-        let repositories = tasks
-            .iter()
-            .zip(observations)
-            .map(|(task, observation)| TaskRepositoryBinding {
-                task_key: task.task_key.clone(),
-                observation,
-            })
-            .collect::<Vec<_>>();
-        let plan_hash = core.expected_plan_hash(plan_version, &tasks, &repositories);
+        let plan_hash = core.expected_plan_hash(plan_version, &tasks);
         core.reduce(SupervisorEvent::PlanBound {
             expected_version: core.version(),
             plan_version,
             plan_hash,
             tasks,
-            repositories,
         })
         .unwrap()
     }
@@ -2232,21 +1836,6 @@ mod tests {
             expected_version: core.version(),
             plan_version: core.plan_version(),
             plan_hash: core.plan_hash().map(str::to_owned),
-        })
-        .unwrap()
-    }
-
-    fn observe(
-        core: &mut SupervisorCore,
-        task_ordinal: usize,
-        checkpoint: RepositoryCheckpoint,
-        observation: RepositoryObservation,
-    ) -> Vec<SupervisorEffect> {
-        core.reduce(SupervisorEvent::RepositoryObserved {
-            expected_version: core.version(),
-            task_ordinal,
-            checkpoint,
-            observation,
         })
         .unwrap()
     }
@@ -2346,18 +1935,10 @@ mod tests {
     fn start_first_developer(
         core: &mut SupervisorCore,
         task_ordinal: usize,
-        start: RepositoryObservation,
         session_counter: u64,
         turn_counter: u64,
         token: &'static str,
     ) -> ActiveIdentity {
-        assert_eq!(
-            observe(core, task_ordinal, RepositoryCheckpoint::TaskStart, start),
-            vec![
-                SupervisorEffect::OpenTaskRuntime { task_ordinal },
-                SupervisorEffect::PublishStatus,
-            ]
-        );
         assert_eq!(
             open_runtime(core, task_ordinal),
             vec![
@@ -2403,36 +1984,15 @@ mod tests {
         }
     }
 
-    fn complete_developer_ready(
-        core: &mut SupervisorCore,
-        active: ActiveIdentity,
-        repository: RepositoryObservation,
-    ) {
-        assert_eq!(
-            complete_turn(
-                core,
-                active.task,
-                active.role,
-                active.session,
-                active.turn,
-                active.token,
-                ready(),
-            ),
-            vec![
-                SupervisorEffect::ObserveRepository {
-                    task_ordinal: active.task,
-                    checkpoint: RepositoryCheckpoint::DeveloperCompletion,
-                },
-                SupervisorEffect::PublishStatus,
-            ]
-        );
-        // Developer completion goes straight to opening (or resuming) the
-        // reviewer; the lane takes no observation around review.
-        let effects = observe(
+    fn complete_developer_ready(core: &mut SupervisorCore, active: ActiveIdentity) {
+        let effects = complete_turn(
             core,
             active.task,
-            RepositoryCheckpoint::DeveloperCompletion,
-            repository,
+            active.role,
+            active.session,
+            active.turn,
+            active.token,
+            ready(),
         );
         assert!(
             matches!(
@@ -2452,7 +2012,6 @@ mod tests {
     fn start_reviewer(
         core: &mut SupervisorCore,
         task_ordinal: usize,
-        repository: RepositoryObservation,
         session_counter: u64,
         turn_counter: u64,
         token: &'static str,
@@ -2460,7 +2019,6 @@ mod tests {
     ) -> ActiveIdentity {
         // The OpenRoleSession / StartTurn effect was already emitted by the
         // developer's completion; this helper only drives what follows.
-        let _ = &repository;
         let session = if first {
             let session = RuntimeSessionKey::from_counter(session_counter).unwrap();
             assert_eq!(
@@ -2512,9 +2070,7 @@ mod tests {
         core: &mut SupervisorCore,
         active: ActiveIdentity,
         outcome: RuntimeOutcome,
-        repository: RepositoryObservation,
     ) -> Vec<SupervisorEffect> {
-        let _ = repository;
         complete_turn(
             core,
             active.task,
@@ -2526,17 +2082,14 @@ mod tests {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn correct_and_start_rereview(
         core: &mut SupervisorCore,
         task_ordinal: usize,
-        prior: &RepositoryObservation,
-        next_head: char,
         developer_turn_counter: u64,
         reviewer_turn_counter: u64,
         developer_token: &'static str,
         reviewer_token: &'static str,
-    ) -> (RepositoryObservation, ActiveIdentity) {
+    ) -> ActiveIdentity {
         let developer_session = core.tasks[task_ordinal].developer_session.unwrap();
         let developer_turn = RuntimeTurnKey::from_counter(developer_turn_counter).unwrap();
         start_turn(
@@ -2557,79 +2110,68 @@ mod tests {
             developer_token,
             ready(),
         );
-        let committed = developer_observation(prior, next_head, true, &["src/lib.rs"]);
-        observe(
-            core,
-            task_ordinal,
-            RepositoryCheckpoint::DeveloperCompletion,
-            committed.clone(),
-        );
         let reviewer_session_counter = core.tasks[task_ordinal].reviewer_session.unwrap().counter();
-        let reviewer = start_reviewer(
+        start_reviewer(
             core,
             task_ordinal,
-            committed.clone(),
             reviewer_session_counter,
             reviewer_turn_counter,
             reviewer_token,
             false,
-        );
-        (committed, reviewer)
+        )
     }
 
-    fn bound_core() -> (SupervisorCore, RepositoryObservation) {
+    fn bound_core() -> SupervisorCore {
         let mut core = new_core();
-        let base = observation("/repo", '1');
-        bind(&mut core, vec![task("one", "/repo", 3)], vec![base.clone()]);
-        (core, base)
+        bind(&mut core, vec![task("one", "/repo", 3)]);
+        core
     }
 
-    fn authorized_core() -> (SupervisorCore, RepositoryObservation) {
-        let (mut core, base) = bound_core();
+    fn authorized_core() -> SupervisorCore {
+        let mut core = bound_core();
         authorize(&mut core);
-        (core, base)
+        core
     }
 
-    fn pending_runtime_core() -> (SupervisorCore, RepositoryObservation) {
-        let (mut core, base) = authorized_core();
-        observe(&mut core, 0, RepositoryCheckpoint::TaskStart, base.clone());
-        (core, base)
+    /// Authorization already schedules the runtime open; there is no Git
+    /// observation between them any more.
+    fn pending_runtime_core() -> SupervisorCore {
+        authorized_core()
     }
 
-    fn pending_session_core() -> (SupervisorCore, RepositoryObservation) {
-        let (mut core, base) = pending_runtime_core();
+    fn pending_session_core() -> SupervisorCore {
+        let mut core = pending_runtime_core();
         open_runtime(&mut core, 0);
-        (core, base)
+        core
     }
 
-    fn pending_turn_core() -> (SupervisorCore, RepositoryObservation) {
-        let (mut core, base) = pending_session_core();
+    fn pending_turn_core() -> SupervisorCore {
+        let mut core = pending_session_core();
         open_session(
             &mut core,
             0,
             WorkerRole::Developer,
             RuntimeSessionKey::from_counter(1).unwrap(),
         );
-        (core, base)
+        core
     }
 
-    fn active_core() -> (SupervisorCore, RepositoryObservation, ActiveIdentity) {
-        let (mut core, base) = authorized_core();
-        let active = start_first_developer(&mut core, 0, base.clone(), 1, 1, "active");
-        (core, base, active)
+    fn active_core() -> (SupervisorCore, ActiveIdentity) {
+        let mut core = authorized_core();
+        let active = start_first_developer(&mut core, 0, 1, 1, "active");
+        (core, active)
     }
 
     fn completed_core() -> SupervisorCore {
-        let (mut core, base, developer) = active_core();
-        let committed = developer_observation(&base, '2', true, &["src/lib.rs"]);
-        complete_developer_ready(&mut core, developer, committed.clone());
-        let reviewer = start_reviewer(&mut core, 0, committed.clone(), 2, 2, "review", true);
-        complete_review(&mut core, reviewer, lgtm(), committed);
+        let (mut core, developer) = active_core();
+        complete_developer_ready(&mut core, developer);
+        let reviewer = start_reviewer(&mut core, 0, 2, 2, "review", true);
+        complete_review(&mut core, reviewer, lgtm());
         core
     }
 
     fn needs_human_core() -> SupervisorCore {
-        let (mut core, _base, developer) = active_core();
+        let (mut core, developer) = active_core();
         complete_turn(
             &mut core,
             developer.task,
@@ -2643,7 +2185,7 @@ mod tests {
     }
 
     fn failed_core() -> SupervisorCore {
-        let (mut core, _base, developer) = active_core();
+        let (mut core, developer) = active_core();
         core.reduce(SupervisorEvent::TurnFailed {
             expected_version: core.version(),
             task_ordinal: 0,
@@ -2671,76 +2213,43 @@ mod tests {
         core
     }
 
-    fn active_reviewer_core(
-        max_review_rounds: u8,
-    ) -> (SupervisorCore, RepositoryObservation, ActiveIdentity) {
+    fn active_reviewer_core(max_review_rounds: u8) -> (SupervisorCore, ActiveIdentity) {
         let mut core = new_core();
-        let base = observation("/repo", '1');
-        bind(
-            &mut core,
-            vec![task("one", "/repo", max_review_rounds)],
-            vec![base.clone()],
-        );
+        bind(&mut core, vec![task("one", "/repo", max_review_rounds)]);
         authorize(&mut core);
-        let developer = start_first_developer(&mut core, 0, base.clone(), 1, 1, "developer");
-        let committed = developer_observation(&base, '2', true, &["src/lib.rs"]);
-        complete_developer_ready(&mut core, developer, committed.clone());
-        let reviewer = start_reviewer(&mut core, 0, committed.clone(), 2, 2, "reviewer", true);
-        (core, committed, reviewer)
+        let developer = start_first_developer(&mut core, 0, 1, 1, "developer");
+        complete_developer_ready(&mut core, developer);
+        let reviewer = start_reviewer(&mut core, 0, 2, 2, "reviewer", true);
+        (core, reviewer)
     }
 
-    fn pending_developer_repository_core() -> (SupervisorCore, RepositoryObservation) {
-        let (mut core, base, developer) = active_core();
-        complete_turn(
-            &mut core,
-            0,
-            WorkerRole::Developer,
-            developer.session,
-            developer.turn,
-            developer.token,
-            ready(),
-        );
-        (
-            core,
-            developer_observation(&base, '2', true, &["src/lib.rs"]),
-        )
+    /// The developer's `Ready` completion already scheduled the reviewer's
+    /// session open, so this is the reviewing task with that open still pending.
+    fn reviewing_pending_session_core() -> SupervisorCore {
+        let (mut core, developer) = active_core();
+        complete_developer_ready(&mut core, developer);
+        core
     }
 
-    fn reviewing_preflight_core() -> (SupervisorCore, RepositoryObservation) {
-        let (mut core, committed) = pending_developer_repository_core();
-        observe(
-            &mut core,
-            0,
-            RepositoryCheckpoint::DeveloperCompletion,
-            committed.clone(),
-        );
-        (core, committed)
-    }
-
-    fn reviewing_pending_session_core() -> (SupervisorCore, RepositoryObservation) {
-        let (core, committed) = reviewing_preflight_core();
-        (core, committed)
-    }
-
-    fn reviewing_pending_turn_core() -> (SupervisorCore, RepositoryObservation) {
-        let (mut core, committed) = reviewing_pending_session_core();
+    fn reviewing_pending_turn_core() -> SupervisorCore {
+        let mut core = reviewing_pending_session_core();
         open_session(
             &mut core,
             0,
             WorkerRole::Reviewer,
             RuntimeSessionKey::from_counter(2).unwrap(),
         );
-        (core, committed)
+        core
     }
 
     fn review_exhausted_core() -> SupervisorCore {
-        let (mut core, committed, reviewer) = active_reviewer_core(1);
-        complete_review(&mut core, reviewer, request_changes(), committed);
+        let (mut core, reviewer) = active_reviewer_core(1);
+        complete_review(&mut core, reviewer, request_changes());
         core
     }
 
     fn active_canceled_core() -> SupervisorCore {
-        let (mut core, _base, _active) = active_core();
+        let (mut core, _active) = active_core();
         core.reduce(SupervisorEvent::CancelRequested {
             expected_version: core.version(),
             reason: "stop active task".into(),
@@ -2750,54 +2259,23 @@ mod tests {
     }
 
     fn plan_event(core: &SupervisorCore, key: &str) -> SupervisorEvent {
+        plan_event_for(core, vec![task(key, "/replacement", 2)])
+    }
+
+    fn plan_event_for(core: &SupervisorCore, tasks: Vec<TaskDraft>) -> SupervisorEvent {
         let plan_version = core.next_plan_version;
-        let task = task(key, "/replacement", 2);
-        let binding = TaskRepositoryBinding {
-            task_key: key.into(),
-            observation: observation("/replacement", '5'),
-        };
-        let tasks = vec![task];
-        let repositories = vec![binding];
-        let plan_hash = core.expected_plan_hash(plan_version, &tasks, &repositories);
+        let plan_hash = core.expected_plan_hash(plan_version, &tasks);
         SupervisorEvent::PlanBound {
             expected_version: core.version(),
             plan_version,
             plan_hash,
             tasks,
-            repositories,
         }
-    }
-
-    fn plan_event_for(
-        core: &SupervisorCore,
-        tasks: Vec<TaskDraft>,
-        repositories: Vec<TaskRepositoryBinding>,
-    ) -> SupervisorEvent {
-        let plan_version = core.next_plan_version;
-        let plan_hash = core.expected_plan_hash(plan_version, &tasks, &repositories);
-        SupervisorEvent::PlanBound {
-            expected_version: core.version(),
-            plan_version,
-            plan_hash,
-            tasks,
-            repositories,
-        }
-    }
-
-    fn bindings_for(tasks: &[TaskDraft]) -> Vec<TaskRepositoryBinding> {
-        tasks
-            .iter()
-            .map(|task| TaskRepositoryBinding {
-                task_key: task.task_key.clone(),
-                observation: observation(&task.repository_root, '1'),
-            })
-            .collect()
     }
 
     fn plan_result(tasks: Vec<TaskDraft>) -> Result<SupervisorCore, SupervisorError> {
         let mut core = new_core();
-        let repositories = bindings_for(&tasks);
-        let event = plan_event_for(&core, tasks, repositories);
+        let event = plan_event_for(&core, tasks);
         core.reduce(event)?;
         Ok(core)
     }
@@ -2855,12 +2333,6 @@ mod tests {
                     detail: "bounded driver failure".into(),
                 },
             },
-            SupervisorEventKind::RepositoryObserved => SupervisorEvent::RepositoryObserved {
-                expected_version: core.version(),
-                task_ordinal: 0,
-                checkpoint: RepositoryCheckpoint::TaskStart,
-                observation: observation("/repo", '1'),
-            },
             SupervisorEventKind::Timeout => SupervisorEvent::Timeout {
                 expected_version: core.version(),
                 task_ordinal: 0,
@@ -2883,34 +2355,29 @@ mod tests {
     fn running_fixture(kind: SupervisorEventKind) -> (SupervisorCore, SupervisorEvent) {
         match kind {
             SupervisorEventKind::TaskRuntimeOpened => {
-                let (core, _) = pending_runtime_core();
+                let core = pending_runtime_core();
                 let event = generic_event(&core, kind);
                 (core, event)
             }
             SupervisorEventKind::RoleSessionOpened => {
-                let (core, _) = pending_session_core();
+                let core = pending_session_core();
                 let event = generic_event(&core, kind);
                 (core, event)
             }
             SupervisorEventKind::TurnStarted => {
-                let (core, _) = pending_turn_core();
+                let core = pending_turn_core();
                 let event = generic_event(&core, kind);
                 (core, event)
             }
             SupervisorEventKind::TurnCompleted
             | SupervisorEventKind::TurnFailed
             | SupervisorEventKind::Timeout => {
-                let (core, _, _) = active_core();
-                let event = generic_event(&core, kind);
-                (core, event)
-            }
-            SupervisorEventKind::RepositoryObserved => {
-                let (core, _) = authorized_core();
+                let (core, _) = active_core();
                 let event = generic_event(&core, kind);
                 (core, event)
             }
             _ => {
-                let (core, _) = authorized_core();
+                let core = authorized_core();
                 let event = generic_event(&core, kind);
                 (core, event)
             }
@@ -2927,57 +2394,42 @@ mod tests {
             SupervisorEventKind::TurnStarted,
             SupervisorEventKind::TurnCompleted,
             SupervisorEventKind::TurnFailed,
-            SupervisorEventKind::RepositoryObserved,
             SupervisorEventKind::Timeout,
         ];
         assert!(relevant.contains(&kind));
 
         match state {
             TaskState::Pending => {
-                let (core, _) = if kind == SupervisorEventKind::TaskRuntimeOpened {
+                let core = if kind == SupervisorEventKind::TaskRuntimeOpened {
                     pending_runtime_core()
                 } else {
                     authorized_core()
                 };
                 let event = generic_event(&core, kind);
-                let accepted = matches!(
-                    kind,
-                    SupervisorEventKind::TaskRuntimeOpened
-                        | SupervisorEventKind::RepositoryObserved
-                );
+                let accepted = kind == SupervisorEventKind::TaskRuntimeOpened;
                 (core, event, accepted)
             }
             TaskState::Developing => {
                 let (core, event) = match kind {
                     SupervisorEventKind::RoleSessionOpened => {
-                        let (core, _) = pending_session_core();
+                        let core = pending_session_core();
                         let event = generic_event(&core, kind);
                         (core, event)
                     }
                     SupervisorEventKind::TurnStarted => {
-                        let (core, _) = pending_turn_core();
+                        let core = pending_turn_core();
                         let event = generic_event(&core, kind);
                         (core, event)
                     }
                     SupervisorEventKind::TurnCompleted
                     | SupervisorEventKind::TurnFailed
                     | SupervisorEventKind::Timeout => {
-                        let (core, _, _) = active_core();
+                        let (core, _) = active_core();
                         let event = generic_event(&core, kind);
                         (core, event)
                     }
-                    SupervisorEventKind::RepositoryObserved => {
-                        let (core, committed) = pending_developer_repository_core();
-                        let event = SupervisorEvent::RepositoryObserved {
-                            expected_version: core.version(),
-                            task_ordinal: 0,
-                            checkpoint: RepositoryCheckpoint::DeveloperCompletion,
-                            observation: committed,
-                        };
-                        (core, event)
-                    }
                     SupervisorEventKind::TaskRuntimeOpened => {
-                        let (core, _, _) = active_core();
+                        let (core, _) = active_core();
                         let event = generic_event(&core, kind);
                         (core, event)
                     }
@@ -2988,7 +2440,7 @@ mod tests {
             TaskState::Reviewing => {
                 let (core, event) = match kind {
                     SupervisorEventKind::RoleSessionOpened => {
-                        let (core, _) = reviewing_pending_session_core();
+                        let core = reviewing_pending_session_core();
                         let event = SupervisorEvent::RoleSessionOpened {
                             expected_version: core.version(),
                             task_ordinal: 0,
@@ -2998,7 +2450,7 @@ mod tests {
                         (core, event)
                     }
                     SupervisorEventKind::TurnStarted => {
-                        let (core, _) = reviewing_pending_turn_core();
+                        let core = reviewing_pending_turn_core();
                         let event = SupervisorEvent::TurnStarted {
                             expected_version: core.version(),
                             task_ordinal: 0,
@@ -3013,7 +2465,7 @@ mod tests {
                     SupervisorEventKind::TurnCompleted
                     | SupervisorEventKind::TurnFailed
                     | SupervisorEventKind::Timeout => {
-                        let (core, _, _) = active_reviewer_core(2);
+                        let (core, _) = active_reviewer_core(2);
                         let event = match kind {
                             SupervisorEventKind::TurnCompleted => SupervisorEvent::TurnCompleted {
                                 expected_version: core.version(),
@@ -3049,32 +2501,15 @@ mod tests {
                         };
                         (core, event)
                     }
-                    SupervisorEventKind::RepositoryObserved => {
-                        // Review takes no Git observation at all, so this must
-                        // be rejected rather than accepted.
-                        let (core, committed) = reviewing_preflight_core();
-                        let event = SupervisorEvent::RepositoryObserved {
-                            expected_version: core.version(),
-                            task_ordinal: 0,
-                            checkpoint: RepositoryCheckpoint::DeveloperCompletion,
-                            observation: committed,
-                        };
-                        (core, event)
-                    }
                     SupervisorEventKind::TaskRuntimeOpened => {
-                        let (core, _, _) = active_reviewer_core(2);
+                        let (core, _) = active_reviewer_core(2);
                         let event = generic_event(&core, kind);
                         (core, event)
                     }
                     _ => unreachable!(),
                 };
-                // A reviewing task accepts no repository observation and no
-                // second runtime open.
-                let accepted = !matches!(
-                    kind,
-                    SupervisorEventKind::TaskRuntimeOpened
-                        | SupervisorEventKind::RepositoryObserved
-                );
+                // A reviewing task accepts no second runtime open.
+                let accepted = kind != SupervisorEventKind::TaskRuntimeOpened;
                 (core, event, accepted)
             }
             TaskState::Lgtm => {
@@ -3175,7 +2610,7 @@ mod tests {
                         (core, event, should_accept)
                     }
                     SessionState::AwaitingApproval => {
-                        let (core, _) = bound_core();
+                        let core = bound_core();
                         let event = generic_event(&core, kind);
                         let should_accept = matches!(
                             kind,
@@ -3241,8 +2676,8 @@ mod tests {
         }
 
         assert_eq!(rows, 7 * SupervisorEventKind::ALL.len());
-        assert_eq!(accepted, 24);
-        assert_eq!(rejected, 67);
+        assert_eq!(accepted, 23);
+        assert_eq!(rejected, 61);
     }
 
     #[test]
@@ -3252,9 +2687,8 @@ mod tests {
             observed.extend(effects.iter().map(SupervisorEffect::kind));
         };
 
-        let (mut core, base) = bound_core();
+        let mut core = bound_core();
         record(authorize(&mut core));
-        record(observe(&mut core, 0, RepositoryCheckpoint::TaskStart, base));
         record(open_runtime(&mut core, 0));
         let session = RuntimeSessionKey::from_counter(1).unwrap();
         record(open_session(&mut core, 0, WorkerRole::Developer, session));
@@ -3302,15 +2736,16 @@ mod tests {
             TaskState::Canceled => "canceled",
         };
 
-        let (mut pending, _) = pending_runtime_core();
+        let mut pending = pending_runtime_core();
         observed_states.insert(name(pending.tasks[0].state));
         let before = pending.tasks[0].state;
         open_runtime(&mut pending, 0);
         let after = pending.tasks[0].state;
         edges.insert((name(before), "runtime_opened", name(after)));
 
-        let (mut developing, base, active) = active_core();
+        let (mut developing, active) = active_core();
         observed_states.insert(name(developing.tasks[0].state));
+        let before = developing.tasks[0].state;
         complete_turn(
             &mut developing,
             0,
@@ -3320,46 +2755,14 @@ mod tests {
             active.token,
             ready(),
         );
-        let dirty = developer_observation(&base, '1', false, &["src/lib.rs"]);
-        let before = developing.tasks[0].state;
-        observe(
-            &mut developing,
-            0,
-            RepositoryCheckpoint::DeveloperCompletion,
-            dirty,
-        );
         edges.insert((
             name(before),
-            "dirty_completion",
-            name(developing.tasks[0].state),
-        ));
-
-        let (mut developing, base, active) = active_core();
-        let committed = developer_observation(&base, '2', true, &["src/lib.rs"]);
-        complete_turn(
-            &mut developing,
-            0,
-            WorkerRole::Developer,
-            active.session,
-            active.turn,
-            active.token,
-            ready(),
-        );
-        let before = developing.tasks[0].state;
-        observe(
-            &mut developing,
-            0,
-            RepositoryCheckpoint::DeveloperCompletion,
-            committed,
-        );
-        edges.insert((
-            name(before),
-            "clean_commit",
+            "developer_ready",
             name(developing.tasks[0].state),
         ));
         observed_states.insert(name(developing.tasks[0].state));
 
-        let (mut blocked_core, _base, active) = active_core();
+        let (mut blocked_core, active) = active_core();
         let before = blocked_core.tasks[0].state;
         complete_turn(
             &mut blocked_core,
@@ -3377,52 +2780,30 @@ mod tests {
         ));
         observed_states.insert(name(blocked_core.tasks[0].state));
 
-        let (mut changes, committed, reviewer) = active_reviewer_core(3);
+        let (mut changes, reviewer) = active_reviewer_core(3);
         let before = changes.tasks[0].state;
-        complete_review(&mut changes, reviewer, request_changes(), committed);
+        complete_review(&mut changes, reviewer, request_changes());
         edges.insert((
             name(before),
             "request_changes",
             name(changes.tasks[0].state),
         ));
 
-        let (mut approved, committed, reviewer) = active_reviewer_core(3);
+        let (mut approved, reviewer) = active_reviewer_core(3);
         let before = approved.tasks[0].state;
-        complete_review(&mut approved, reviewer, lgtm(), committed);
+        complete_review(&mut approved, reviewer, lgtm());
         edges.insert((name(before), "lgtm", name(approved.tasks[0].state)));
         observed_states.insert(name(approved.tasks[0].state));
 
-        let (mut exhausted, committed, reviewer) = active_reviewer_core(1);
+        let (mut exhausted, reviewer) = active_reviewer_core(1);
         let before = exhausted.tasks[0].state;
-        complete_review(&mut exhausted, reviewer, request_changes(), committed);
+        complete_review(&mut exhausted, reviewer, request_changes());
         edges.insert((
             name(before),
             "max_round_request_changes",
             name(exhausted.tasks[0].state),
         ));
         observed_states.insert(name(exhausted.tasks[0].state));
-
-        let (mut mutation, committed, reviewer) = active_reviewer_core(2);
-        complete_turn(
-            &mut mutation,
-            0,
-            WorkerRole::Reviewer,
-            reviewer.session,
-            reviewer.turn,
-            reviewer.token,
-            lgtm(),
-        );
-        let mut changed = committed;
-        changed.untracked_status_hash = "d".repeat(64);
-        changed.clean = false;
-        changed.changed_paths = vec!["src/reviewer-edit.rs".into()];
-        let before = mutation.tasks[0].state;
-        let _ = changed;
-        edges.insert((
-            name(before),
-            "reviewer_mutation_ignored",
-            name(mutation.tasks[0].state),
-        ));
 
         let failed = failed_core();
         observed_states.insert(name(failed.tasks[0].state));
@@ -3446,17 +2827,13 @@ mod tests {
             edges,
             BTreeSet::from([
                 ("pending", "runtime_opened", "developing"),
-                // Task-agnostic lane: a dirty developer completion routes to
-                // review like any other exit; quality is the reviewer's call.
-                ("developing", "dirty_completion", "reviewing"),
-                ("developing", "clean_commit", "reviewing"),
+                // Task-agnostic lane: the developer's exit routes straight to
+                // review; the supervisor inspects nothing about the work.
+                ("developing", "developer_ready", "reviewing"),
                 ("developing", "developer_blocked", "needs_human"),
                 ("reviewing", "request_changes", "developing"),
                 ("reviewing", "lgtm", "lgtm"),
                 ("reviewing", "max_round_request_changes", "review_exhausted",),
-                // Reviewer-side repository mutation is not observed at all;
-                // the verdict has already landed by then.
-                ("lgtm", "reviewer_mutation_ignored", "lgtm"),
             ])
         );
 
@@ -3474,7 +2851,6 @@ mod tests {
                 SupervisorEventKind::TurnStarted,
                 SupervisorEventKind::TurnCompleted,
                 SupervisorEventKind::TurnFailed,
-                SupervisorEventKind::RepositoryObserved,
                 SupervisorEventKind::Timeout,
             ] {
                 let mut core = terminal.clone();
@@ -3508,7 +2884,6 @@ mod tests {
             SupervisorEventKind::TurnStarted,
             SupervisorEventKind::TurnCompleted,
             SupervisorEventKind::TurnFailed,
-            SupervisorEventKind::RepositoryObserved,
             SupervisorEventKind::Timeout,
         ];
         let mut rows = 0;
@@ -3537,36 +2912,31 @@ mod tests {
                 }
             }
         }
-        assert_eq!(rows, 8 * 7);
-        assert_eq!(accepted, 13);
-        assert_eq!(rejected, 43);
+        assert_eq!(rows, 8 * 6);
+        assert_eq!(accepted, 11);
+        assert_eq!(rejected, 37);
     }
 
     #[test]
     fn one_task_first_review_lgtm_has_exact_effects_and_status() {
         let mut core = new_core();
-        let base = observation("/repo", '1');
         assert_eq!(
-            bind(&mut core, vec![task("one", "/repo", 3)], vec![base.clone()]),
+            bind(&mut core, vec![task("one", "/repo", 3)]),
             vec![SupervisorEffect::PublishStatus]
         );
         assert_eq!(core.session_state(), SessionState::AwaitingApproval);
         assert_eq!(
             authorize(&mut core),
             vec![
-                SupervisorEffect::ObserveRepository {
-                    task_ordinal: 0,
-                    checkpoint: RepositoryCheckpoint::TaskStart,
-                },
+                SupervisorEffect::OpenTaskRuntime { task_ordinal: 0 },
                 SupervisorEffect::PublishStatus,
             ]
         );
-        let developer = start_first_developer(&mut core, 0, base.clone(), 1, 1, "dev-1");
-        let committed = developer_observation(&base, '2', true, &["src/lib.rs"]);
-        complete_developer_ready(&mut core, developer, committed.clone());
-        let reviewer = start_reviewer(&mut core, 0, committed.clone(), 2, 2, "review-1", true);
+        let developer = start_first_developer(&mut core, 0, 1, 1, "dev-1");
+        complete_developer_ready(&mut core, developer);
+        let reviewer = start_reviewer(&mut core, 0, 2, 2, "review-1", true);
         assert_eq!(
-            complete_review(&mut core, reviewer, lgtm(), committed.clone()),
+            complete_review(&mut core, reviewer, lgtm()),
             vec![
                 SupervisorEffect::CloseTaskRuntime { task_ordinal: 0 },
                 SupervisorEffect::FinishSession {
@@ -3583,7 +2953,7 @@ mod tests {
             SessionStatusSnapshot {
                 run_id: "run-1".into(),
                 state: SessionState::Completed,
-                version: 11,
+                version: 9,
                 project_root: "/project".into(),
                 plan_version: Some(1),
                 plan_hash: core.plan_hash.clone(),
@@ -3594,11 +2964,13 @@ mod tests {
                     ordinal: 0,
                     state: TaskState::Lgtm,
                     repository_root: "/repo".into(),
-                    branch: Some("master".into()),
+                    // hcom no longer observes Git, so the snapshot carries no
+                    // branch or revision evidence at all.
+                    branch: None,
                     review_round: 1,
                     max_review_rounds: 3,
-                    base_revision: Some(revision('1')),
-                    head_revision: Some(revision('2')),
+                    base_revision: None,
+                    head_revision: None,
                     developer_session_bound: true,
                     reviewer_session_bound: true,
                     outcome_detail: Some("Reviewer approved the exact clean revision".into()),
@@ -3614,39 +2986,31 @@ mod tests {
     }
 
     #[test]
-    fn two_task_journey_closes_before_next_and_rebinds_same_repository_head() {
+    fn two_task_journey_closes_each_runtime_before_the_next_task_opens() {
         let mut core = new_core();
-        let base = observation("/repo", '1');
         bind(
             &mut core,
             vec![task("one", "/repo", 2), task("two", "/repo", 2)],
-            vec![base.clone(), base.clone()],
         );
         authorize(&mut core);
 
-        let developer = start_first_developer(&mut core, 0, base.clone(), 1, 1, "d1");
-        let head_one = developer_observation(&base, '2', true, &["src/one.rs"]);
-        complete_developer_ready(&mut core, developer, head_one.clone());
-        let reviewer = start_reviewer(&mut core, 0, head_one.clone(), 2, 2, "r1", true);
+        let developer = start_first_developer(&mut core, 0, 1, 1, "d1");
+        complete_developer_ready(&mut core, developer);
+        let reviewer = start_reviewer(&mut core, 0, 2, 2, "r1", true);
         assert_eq!(
-            complete_review(&mut core, reviewer, lgtm(), head_one.clone()),
+            complete_review(&mut core, reviewer, lgtm()),
             vec![
                 SupervisorEffect::CloseTaskRuntime { task_ordinal: 0 },
-                SupervisorEffect::ObserveRepository {
-                    task_ordinal: 1,
-                    checkpoint: RepositoryCheckpoint::TaskStart,
-                },
+                SupervisorEffect::OpenTaskRuntime { task_ordinal: 1 },
                 SupervisorEffect::PublishStatus,
             ]
         );
         assert_eq!(core.current_task(), Some(1));
-        assert_eq!(core.tasks[1].base_revision, Some(revision('2')));
 
-        let developer = start_first_developer(&mut core, 1, head_one.clone(), 3, 3, "d2");
-        let head_two = developer_observation(&head_one, '3', true, &["tests/two.rs"]);
-        complete_developer_ready(&mut core, developer, head_two.clone());
-        let reviewer = start_reviewer(&mut core, 1, head_two.clone(), 4, 4, "r2", true);
-        complete_review(&mut core, reviewer, lgtm(), head_two);
+        let developer = start_first_developer(&mut core, 1, 3, 3, "d2");
+        complete_developer_ready(&mut core, developer);
+        let reviewer = start_reviewer(&mut core, 1, 4, 4, "r2", true);
+        complete_review(&mut core, reviewer, lgtm());
         assert_eq!(core.session_state(), SessionState::Completed);
         assert_eq!(
             core.tasks.iter().map(|task| task.state).collect::<Vec<_>>(),
@@ -3663,15 +3027,13 @@ mod tests {
     #[test]
     fn request_changes_reuses_exact_role_sessions_then_lgtm() {
         let mut core = new_core();
-        let base = observation("/repo", '1');
-        bind(&mut core, vec![task("one", "/repo", 3)], vec![base.clone()]);
+        bind(&mut core, vec![task("one", "/repo", 3)]);
         authorize(&mut core);
-        let developer = start_first_developer(&mut core, 0, base.clone(), 1, 1, "d1");
-        let head_one = developer_observation(&base, '2', true, &["src/lib.rs"]);
-        complete_developer_ready(&mut core, developer, head_one.clone());
-        let reviewer = start_reviewer(&mut core, 0, head_one.clone(), 2, 2, "r1", true);
+        let developer = start_first_developer(&mut core, 0, 1, 1, "d1");
+        complete_developer_ready(&mut core, developer);
+        let reviewer = start_reviewer(&mut core, 0, 2, 2, "r1", true);
         assert_eq!(
-            complete_review(&mut core, reviewer, request_changes(), head_one.clone()),
+            complete_review(&mut core, reviewer, request_changes()),
             vec![
                 SupervisorEffect::StartTurn {
                     task_ordinal: 0,
@@ -3701,15 +3063,8 @@ mod tests {
             "d2",
             ready(),
         );
-        let head_two = developer_observation(&head_one, '3', true, &["src/lib.rs"]);
-        observe(
-            &mut core,
-            0,
-            RepositoryCheckpoint::DeveloperCompletion,
-            head_two.clone(),
-        );
-        let rereviewer = start_reviewer(&mut core, 0, head_two.clone(), 2, 4, "r2", false);
-        complete_review(&mut core, rereviewer, lgtm(), head_two);
+        let rereviewer = start_reviewer(&mut core, 0, 2, 4, "r2", false);
+        complete_review(&mut core, rereviewer, lgtm());
 
         assert_eq!(core.session_state(), SessionState::Completed);
         assert_eq!(core.tasks[0].review_round, 2);
@@ -3727,144 +3082,50 @@ mod tests {
 
     #[test]
     fn multiple_request_changes_can_reach_max_minus_one_then_lgtm() {
-        let (mut core, mut committed, mut reviewer) = active_reviewer_core(3);
+        let (mut core, mut reviewer) = active_reviewer_core(3);
         assert!(matches!(
-            complete_review(&mut core, reviewer, request_changes(), committed.clone()).first(),
+            complete_review(&mut core, reviewer, request_changes()).first(),
             Some(SupervisorEffect::StartTurn {
                 purpose: RuntimeTurnPurpose::DeveloperCorrection,
                 ..
             })
         ));
-        (committed, reviewer) = correct_and_start_rereview(
-            &mut core,
-            0,
-            &committed,
-            '3',
-            3,
-            4,
-            "developer-2",
-            "reviewer-2",
-        );
-        complete_review(&mut core, reviewer, request_changes(), committed.clone());
-        (committed, reviewer) = correct_and_start_rereview(
-            &mut core,
-            0,
-            &committed,
-            '4',
-            5,
-            6,
-            "developer-3",
-            "reviewer-3",
-        );
-        complete_review(&mut core, reviewer, lgtm(), committed);
+        reviewer = correct_and_start_rereview(&mut core, 0, 3, 4, "developer-2", "reviewer-2");
+        complete_review(&mut core, reviewer, request_changes());
+        reviewer = correct_and_start_rereview(&mut core, 0, 5, 6, "developer-3", "reviewer-3");
+        complete_review(&mut core, reviewer, lgtm());
 
         assert_eq!(core.session_state(), SessionState::Completed);
         assert_eq!(core.tasks[0].state, TaskState::Lgtm);
         assert_eq!(core.tasks[0].review_round, 3);
-        assert_eq!(core.tasks[0].head_revision, Some(revision('4')));
     }
 
     #[test]
-    fn request_changes_at_exact_max_exhausts_then_next_task_uses_terminal_head() {
+    fn request_changes_at_exact_max_exhausts_then_opens_the_next_task() {
         let mut core = new_core();
-        let base = observation("/repo", '1');
         bind(
             &mut core,
             vec![task("one", "/repo", 2), task("two", "/repo", 2)],
-            vec![base.clone(), base.clone()],
         );
         authorize(&mut core);
-        let developer = start_first_developer(&mut core, 0, base.clone(), 1, 1, "d1");
-        let mut committed = developer_observation(&base, '2', true, &["src/lib.rs"]);
-        complete_developer_ready(&mut core, developer, committed.clone());
-        let mut reviewer = start_reviewer(&mut core, 0, committed.clone(), 2, 2, "r1", true);
-        complete_review(&mut core, reviewer, request_changes(), committed.clone());
-        (committed, reviewer) =
-            correct_and_start_rereview(&mut core, 0, &committed, '3', 3, 4, "d2", "r2");
+        let developer = start_first_developer(&mut core, 0, 1, 1, "d1");
+        complete_developer_ready(&mut core, developer);
+        let mut reviewer = start_reviewer(&mut core, 0, 2, 2, "r1", true);
+        complete_review(&mut core, reviewer, request_changes());
+        reviewer = correct_and_start_rereview(&mut core, 0, 3, 4, "d2", "r2");
         assert_eq!(
-            complete_review(&mut core, reviewer, request_changes(), committed.clone()),
+            complete_review(&mut core, reviewer, request_changes()),
             vec![
                 SupervisorEffect::CloseTaskRuntime { task_ordinal: 0 },
-                SupervisorEffect::ObserveRepository {
-                    task_ordinal: 1,
-                    checkpoint: RepositoryCheckpoint::TaskStart,
-                },
+                SupervisorEffect::OpenTaskRuntime { task_ordinal: 1 },
                 SupervisorEffect::PublishStatus,
             ]
         );
         assert_eq!(core.tasks[0].state, TaskState::ReviewExhausted);
         assert_eq!(core.tasks[0].review_round, 2);
         assert_eq!(core.current_task(), Some(1));
-        assert_eq!(core.tasks[1].base_revision, Some(revision('3')));
-        start_first_developer(&mut core, 1, committed, 3, 5, "next-developer");
+        start_first_developer(&mut core, 1, 3, 5, "next-developer");
         assert_eq!(core.tasks[1].state, TaskState::Developing);
-    }
-
-    #[test]
-    fn different_repository_task_keeps_its_bound_base_until_ordered_start() {
-        let mut core = new_core();
-        let first_base = observation("/repo-one", '1');
-        let second_base = observation("/repo-two", '7');
-        bind(
-            &mut core,
-            vec![task("one", "/repo-one", 2), task("two", "/repo-two", 2)],
-            vec![first_base.clone(), second_base.clone()],
-        );
-        authorize(&mut core);
-        let developer = start_first_developer(&mut core, 0, first_base.clone(), 1, 1, "d1");
-        let committed = developer_observation(&first_base, '2', true, &["src/lib.rs"]);
-        complete_developer_ready(&mut core, developer, committed.clone());
-        let reviewer = start_reviewer(&mut core, 0, committed.clone(), 2, 2, "r1", true);
-        complete_review(&mut core, reviewer, lgtm(), committed);
-
-        assert_eq!(core.current_task(), Some(1));
-        assert_eq!(core.tasks[1].base_revision, Some(revision('7')));
-        start_first_developer(&mut core, 1, second_base, 3, 3, "d2");
-        assert_eq!(core.tasks[1].state, TaskState::Developing);
-    }
-
-    #[test]
-    fn dirty_or_unchanged_developer_completion_routes_to_review() {
-        // Task-agnostic lane: no completion quality gate and no recovery
-        // machinery — any developer completion observation routes to review,
-        // and the checkpoint only records routing data.
-        let base = observation("/repo", '1');
-        let mut core = new_core();
-        bind(
-            &mut core,
-            vec![task("routes", "/repo", 2)],
-            vec![base.clone()],
-        );
-        authorize(&mut core);
-        let developer = start_first_developer(&mut core, 0, base.clone(), 1, 1, "d1");
-        complete_turn(
-            &mut core,
-            0,
-            WorkerRole::Developer,
-            developer.session,
-            developer.turn,
-            developer.token,
-            ready(),
-        );
-        let dirty = developer_observation(&base, '1', false, &["src/lib.rs"]);
-        assert_eq!(
-            observe(
-                &mut core,
-                0,
-                RepositoryCheckpoint::DeveloperCompletion,
-                dirty
-            ),
-            vec![
-                SupervisorEffect::OpenRoleSession {
-                    task_ordinal: 0,
-                    role: WorkerRole::Reviewer,
-                },
-                SupervisorEffect::PublishStatus,
-            ]
-        );
-        assert_eq!(core.tasks[0].state, TaskState::Reviewing);
-        assert!(!core.tasks[0].recovery_used);
-        assert_eq!(core.tasks[0].head_revision, Some(revision('1')));
     }
 
     #[test]
@@ -3875,7 +3136,7 @@ mod tests {
             (WorkerRole::Reviewer, false),
             (WorkerRole::Reviewer, true),
         ] {
-            let (mut core, repository, active) = match role {
+            let (mut core, active) = match role {
                 WorkerRole::Developer => active_core(),
                 WorkerRole::Reviewer => active_reviewer_core(2),
             };
@@ -3912,8 +3173,7 @@ mod tests {
                 .unwrap();
             // Task-agnostic lane: the retryable flag no longer triggers any
             // recovery path — every contract failure is terminal for every
-            // role, and `repository` stays unused routing context.
-            let _ = repository;
+            // role.
             let expected_detail =
                 "worker runtime contract failed: typed final outcome was missing or invalid";
             assert_eq!(
@@ -3939,7 +3199,7 @@ mod tests {
 
     #[test]
     fn completion_identity_ordering_and_at_most_once_are_transactional() {
-        let (core, _base, active) = active_core();
+        let (core, active) = active_core();
         let wrong_events = [
             SupervisorEvent::TurnCompleted {
                 expected_version: core.version(),
@@ -3997,7 +3257,7 @@ mod tests {
             assert_eq!(candidate, before);
         }
 
-        let (mut before_start, _) = pending_turn_core();
+        let mut before_start = pending_turn_core();
         let before = before_start.clone();
         let error = before_start
             .reduce(SupervisorEvent::TurnCompleted {
@@ -4037,7 +3297,7 @@ mod tests {
         assert_eq!(error.code, SupervisorErrorCode::DuplicateCompletion);
         assert_eq!(accepted, before);
 
-        let (mut wrong_role, _base, active) = active_core();
+        let (mut wrong_role, active) = active_core();
         let before = wrong_role.clone();
         let error = wrong_role
             .reduce(SupervisorEvent::TurnCompleted {
@@ -4055,21 +3315,8 @@ mod tests {
     }
 
     #[test]
-    fn stale_checkpoint_second_active_turn_and_cross_task_session_reuse_are_rejected() {
-        let (mut checkpoint, base) = authorized_core();
-        let before = checkpoint.clone();
-        let error = checkpoint
-            .reduce(SupervisorEvent::RepositoryObserved {
-                expected_version: checkpoint.version(),
-                task_ordinal: 0,
-                checkpoint: RepositoryCheckpoint::DeveloperCompletion,
-                observation: base,
-            })
-            .unwrap_err();
-        assert_eq!(error.code, SupervisorErrorCode::InvalidIdentity);
-        assert_eq!(checkpoint, before);
-
-        let (mut active_core, _base, _active) = active_core();
+    fn second_active_turn_and_cross_task_session_reuse_are_rejected() {
+        let (mut active_core, _active) = active_core();
         let before = active_core.clone();
         let error = active_core
             .reduce(SupervisorEvent::TurnStarted {
@@ -4086,19 +3333,15 @@ mod tests {
         assert_eq!(active_core, before);
 
         let mut core = new_core();
-        let base = observation("/repo", '1');
         bind(
             &mut core,
             vec![task("one", "/repo", 1), task("two", "/repo", 1)],
-            vec![base.clone(), base.clone()],
         );
         authorize(&mut core);
-        let developer = start_first_developer(&mut core, 0, base.clone(), 1, 1, "d1");
-        let committed = developer_observation(&base, '2', true, &["src/lib.rs"]);
-        complete_developer_ready(&mut core, developer, committed.clone());
-        let reviewer = start_reviewer(&mut core, 0, committed.clone(), 2, 2, "r1", true);
-        complete_review(&mut core, reviewer, lgtm(), committed.clone());
-        observe(&mut core, 1, RepositoryCheckpoint::TaskStart, committed);
+        let developer = start_first_developer(&mut core, 0, 1, 1, "d1");
+        complete_developer_ready(&mut core, developer);
+        let reviewer = start_reviewer(&mut core, 0, 2, 2, "r1", true);
+        complete_review(&mut core, reviewer, lgtm());
         open_runtime(&mut core, 1);
         let before = core.clone();
         let error = core
@@ -4115,7 +3358,7 @@ mod tests {
 
     #[test]
     fn cancel_completion_and_parent_failure_races_have_one_deterministic_winner() {
-        let (mut cancel_first, _base, active) = active_core();
+        let (mut cancel_first, active) = active_core();
         assert_eq!(
             cancel_first
                 .reduce(SupervisorEvent::CancelRequested {
@@ -4151,7 +3394,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, SupervisorErrorCode::Terminal);
 
-        let (mut completion_first, _base, active) = active_core();
+        let (mut completion_first, active) = active_core();
         complete_turn(
             &mut completion_first,
             0,
@@ -4169,7 +3412,7 @@ mod tests {
             .unwrap();
         assert_eq!(completion_first.session_state(), SessionState::Canceled);
 
-        let (mut parent_first, _base, active) = active_core();
+        let (mut parent_first, active) = active_core();
         parent_first
             .reduce(SupervisorEvent::ParentStopping {
                 expected_version: parent_first.version(),
@@ -4191,7 +3434,7 @@ mod tests {
             SupervisorErrorCode::Terminal
         );
 
-        let (mut failure_first, _base, active) = active_core();
+        let (mut failure_first, active) = active_core();
         failure_first
             .reduce(SupervisorEvent::TurnFailed {
                 expected_version: failure_first.version(),
@@ -4431,66 +3674,8 @@ mod tests {
     }
 
     #[test]
-    fn repository_observation_bounds_ordering_fail_closed_and_dirty_binding_accepted() {
-        let base_task = task("one", "/repo", 1);
-        let invalid_observations = {
-            let mut values = Vec::new();
-            let mut invalid = observation("/repo", '1');
-            invalid.identity_hash = "short".into();
-            values.push(invalid);
-            let mut invalid = observation("/repo", '1');
-            invalid.branch = "bad\nbranch".into();
-            values.push(invalid);
-            let mut invalid = observation("/repo", '1');
-            invalid.head = "a".repeat(39);
-            values.push(invalid);
-            let mut invalid = observation("/repo", '1');
-            invalid.changed_paths = vec!["src/z.rs".into(), "src/a.rs".into()];
-            values.push(invalid);
-            let mut invalid = observation("/repo", '1');
-            invalid.changed_paths = vec!["../escape".into()];
-            values.push(invalid);
-            let mut invalid = observation("/repo", '1');
-            invalid.changed_paths = (0..257)
-                .map(|index| format!("src/file-{index:03}.rs"))
-                .collect();
-            values.push(invalid);
-            values
-        };
-        for invalid in invalid_observations {
-            let mut core = new_core();
-            let tasks = vec![base_task.clone()];
-            let bindings = vec![TaskRepositoryBinding {
-                task_key: "one".into(),
-                observation: invalid,
-            }];
-            let event = plan_event_for(&core, tasks, bindings);
-            let before = core.clone();
-            assert!(core.reduce(event).is_err());
-            assert_eq!(core, before);
-        }
-
-        // Task-agnostic lane: a dirty repository binding is routing data, not
-        // a plan gate — binding succeeds and awaits approval.
-        let mut dirty = observation("/repo", '1');
-        dirty.clean = false;
-        dirty.changed_paths = vec!["src/lib.rs".into()];
-        let mut core = new_core();
-        let event = plan_event_for(
-            &core,
-            vec![base_task],
-            vec![TaskRepositoryBinding {
-                task_key: "one".into(),
-                observation: dirty,
-            }],
-        );
-        core.reduce(event).unwrap();
-        assert_eq!(core.session_state(), SessionState::AwaitingApproval);
-    }
-
-    #[test]
     fn typed_outcome_cross_field_failures_are_rejected_without_consuming_the_turn() {
-        let (developer_core, _base, active) = active_core();
+        let (developer_core, active) = active_core();
         let invalid_developer = [
             DeveloperOutcomeV1 {
                 status: DeveloperOutcomeStatus::Ready,
@@ -4531,7 +3716,7 @@ mod tests {
             assert_eq!(core, before);
         }
 
-        let (reviewer_core, _committed, active) = active_reviewer_core(2);
+        let (reviewer_core, active) = active_reviewer_core(2);
         let RuntimeOutcome::Reviewer(request_changes_outcome) = request_changes() else {
             unreachable!()
         };
@@ -4584,7 +3769,7 @@ mod tests {
             (needs_human(), "developer requested human input"),
             (blocked(), "developer reported an unrecoverable block"),
         ] {
-            let (mut core, _base, active) = active_core();
+            let (mut core, active) = active_core();
             complete_turn(
                 &mut core,
                 0,
@@ -4599,7 +3784,7 @@ mod tests {
             terminal_details.insert(expected.to_owned());
         }
 
-        let (mut timed_out, _base, active) = active_core();
+        let (mut timed_out, active) = active_core();
         let effects = timed_out
             .reduce(SupervisorEvent::Timeout {
                 expected_version: timed_out.version(),
@@ -4656,7 +3841,7 @@ mod tests {
                 "worker runtime canceled without a supervisor cancel request",
             ),
         ] {
-            let (mut core, _base, active) = active_core();
+            let (mut core, active) = active_core();
             core.reduce(SupervisorEvent::TurnFailed {
                 expected_version: core.version(),
                 task_ordinal: 0,
@@ -4706,7 +3891,7 @@ mod tests {
                 "task worker runtime cleanup failed",
             ),
         ] {
-            let (mut core, _base) = authorized_core();
+            let mut core = authorized_core();
             core.reduce(SupervisorEvent::DriverFailed {
                 expected_version: core.version(),
                 task_ordinal: 0,
@@ -4732,7 +3917,7 @@ mod tests {
             MAX_CORE_DIAGNOSTIC_BYTES,
             MAX_CORE_DIAGNOSTIC_BYTES + 1,
         ] {
-            let (mut core, _base) = authorized_core();
+            let mut core = authorized_core();
             let before = core.clone();
             let result = core.reduce(SupervisorEvent::DriverFailed {
                 expected_version: core.version(),
@@ -4753,76 +3938,8 @@ mod tests {
     }
 
     #[test]
-    fn git_failure_diagnostics_are_distinct_and_snapshots_exclude_raw_outcomes() {
-        let base = observation("/repo", '1');
-
-        // Task-agnostic lane: a dirty task-start observation proceeds to the
-        // runtime open instead of terminalizing.
-        let mut dirty_start = new_core();
-        bind(
-            &mut dirty_start,
-            vec![task("dirty", "/repo", 1)],
-            vec![base.clone()],
-        );
-        authorize(&mut dirty_start);
-        let mut dirty = base.clone();
-        dirty.clean = false;
-        dirty.changed_paths = vec!["src/lib.rs".into()];
-        dirty.index_diff_hash = "c".repeat(64);
-        assert_eq!(
-            observe(&mut dirty_start, 0, RepositoryCheckpoint::TaskStart, dirty),
-            vec![
-                SupervisorEffect::OpenTaskRuntime { task_ordinal: 0 },
-                SupervisorEffect::PublishStatus,
-            ]
-        );
-        assert_eq!(dirty_start.session_state(), SessionState::Running);
-
-        // Out-of-scope and non-fast-forward completions route to review; the
-        // reviewer and the human judge scope and history, not the supervisor.
-        for case in [developer_observation(&base, '2', true, &["Cargo.toml"]), {
-            let mut non_ff = developer_observation(&base, '2', true, &["src/lib.rs"]);
-            non_ff.head_descends_from_expected = false;
-            non_ff
-        }] {
-            let (mut core, _base, active) = active_core();
-            complete_turn(
-                &mut core,
-                0,
-                WorkerRole::Developer,
-                active.session,
-                active.turn,
-                active.token,
-                ready(),
-            );
-            observe(
-                &mut core,
-                0,
-                RepositoryCheckpoint::DeveloperCompletion,
-                case,
-            );
-            assert_eq!(core.tasks[0].state, TaskState::Reviewing);
-        }
-
-        // Reviewer-side repository mutation no longer rejects the verdict.
-        let (mut reviewer_mutation, committed, reviewer) = active_reviewer_core(1);
-        complete_turn(
-            &mut reviewer_mutation,
-            0,
-            WorkerRole::Reviewer,
-            reviewer.session,
-            reviewer.turn,
-            reviewer.token,
-            lgtm(),
-        );
-        let mut changed = committed;
-        changed.tracked_diff_hash = "d".repeat(64);
-        changed.clean = false;
-        changed.changed_paths = vec!["src/lib.rs".into()];
-        let _ = changed;
-        assert_eq!(reviewer_mutation.tasks[0].state, TaskState::Lgtm);
-
-        let (mut raw_outcome, _base, active) = active_core();
+    fn snapshots_exclude_raw_developer_outcomes() {
+        let (mut raw_outcome, active) = active_core();
         complete_turn(
             &mut raw_outcome,
             0,
@@ -4845,20 +3962,14 @@ mod tests {
     fn plan_replacement_and_hashing_are_deterministic_and_order_sensitive() {
         let mut first = new_core();
         let tasks = vec![task("one", "/one", 2), task("two", "/two", 2)];
-        let bindings = bindings_for(&tasks);
-        let hash = first.expected_plan_hash(1, &tasks, &bindings);
-        assert_eq!(hash, first.expected_plan_hash(1, &tasks, &bindings));
+        let hash = first.expected_plan_hash(1, &tasks);
+        assert_eq!(hash, first.expected_plan_hash(1, &tasks));
 
         let mut reversed_tasks = tasks.clone();
-        let mut reversed_bindings = bindings.clone();
         reversed_tasks.reverse();
-        reversed_bindings.reverse();
-        assert_ne!(
-            hash,
-            first.expected_plan_hash(1, &reversed_tasks, &reversed_bindings)
-        );
+        assert_ne!(hash, first.expected_plan_hash(1, &reversed_tasks));
 
-        let event = plan_event_for(&first, tasks.clone(), bindings);
+        let event = plan_event_for(&first, tasks.clone());
         let mut second = first.clone();
         let effects_first = first.reduce(event.clone()).unwrap();
         let effects_second = second.reduce(event).unwrap();
@@ -4889,73 +4000,44 @@ mod tests {
     }
 
     #[test]
-    fn plan_repository_binding_order_is_exact_but_snapshots_may_differ() {
-        let tasks = vec![task("one", "/repo", 1), task("two", "/repo", 1)];
-        let mut mismatched_order = bindings_for(&tasks);
-        mismatched_order.swap(0, 1);
-        let mut core = new_core();
-        let event = plan_event_for(&core, tasks.clone(), mismatched_order);
-        assert_eq!(
-            core.reduce(event).unwrap_err().code,
-            SupervisorErrorCode::InvalidPlan
-        );
-
-        // Two tasks may name one repository whose routing snapshots were taken
-        // at different moments; that is data, not a contract violation.
-        let mut differing = bindings_for(&tasks);
-        differing[1].observation.head = revision('2');
-        let mut core = new_core();
-        let event = plan_event_for(&core, tasks.clone(), differing);
-        core.reduce(event).unwrap();
-        assert_eq!(core.session_state(), SessionState::AwaitingApproval);
-
-        assert!(plan_result(tasks).is_ok());
-    }
-
-    #[test]
     fn future_task_events_are_rejected_before_their_turn() {
-        let base = observation("/repo", '1');
         let mut core = new_core();
         bind(
             &mut core,
             vec![task("one", "/repo", 2), task("two", "/repo", 2)],
-            vec![base.clone(), base.clone()],
         );
         authorize(&mut core);
         let before = core.clone();
         let error = core
-            .reduce(SupervisorEvent::RepositoryObserved {
+            .reduce(SupervisorEvent::TaskRuntimeOpened {
                 expected_version: core.version(),
                 task_ordinal: 1,
-                checkpoint: RepositoryCheckpoint::TaskStart,
-                observation: base.clone(),
             })
             .unwrap_err();
         assert_eq!(error.code, SupervisorErrorCode::InvalidIdentity);
         assert_eq!(core, before);
 
-        // The retired recovery checkpoint is rejected outright.
-        let developer = start_first_developer(&mut core, 0, base.clone(), 1, 1, "developer");
-        let _ = developer;
+        let developer = start_first_developer(&mut core, 0, 1, 1, "developer");
+        let before = core.clone();
         let error = core
-            .reduce(SupervisorEvent::RepositoryObserved {
+            .reduce(SupervisorEvent::TurnCompleted {
                 expected_version: core.version(),
-                task_ordinal: 0,
-                checkpoint: RepositoryCheckpoint::DeveloperRecoveryPreflight,
-                observation: base,
+                task_ordinal: 1,
+                role: WorkerRole::Developer,
+                session: developer.session,
+                turn: developer.turn,
+                completion_token: developer.token.into(),
+                outcome: ready(),
             })
             .unwrap_err();
-        // Nothing schedules the retired checkpoint, so the event can never
-        // match a pending observation slot.
-        assert_eq!(error.code, SupervisorErrorCode::InvalidTransition);
+        assert_eq!(error.code, SupervisorErrorCode::InvalidIdentity);
+        assert_eq!(core, before);
     }
 
     #[test]
     fn accepted_completion_token_cannot_be_reused_for_a_later_role_turn() {
-        let (mut core, base, developer) = active_core();
-        let committed = developer_observation(&base, '2', true, &["src/lib.rs"]);
-        complete_developer_ready(&mut core, developer, committed.clone());
-        let _ = committed;
+        let (mut core, developer) = active_core();
+        complete_developer_ready(&mut core, developer);
         open_session(
             &mut core,
             0,
@@ -4979,7 +4061,7 @@ mod tests {
     }
 
     #[test]
-    fn core_owned_identifier_diagnostic_and_repository_bounds_are_exact() {
+    fn core_owned_identifier_and_diagnostic_bounds_are_exact() {
         for (length, accepted) in [
             (0, false),
             (1, true),
@@ -5013,7 +4095,7 @@ mod tests {
             (128, true),
             (129, false),
         ] {
-            let (mut core, _) = pending_turn_core();
+            let mut core = pending_turn_core();
             let event = SupervisorEvent::TurnStarted {
                 expected_version: core.version(),
                 task_ordinal: 0,
@@ -5056,7 +4138,7 @@ mod tests {
                     (1024, true),
                     (1025, false),
                 ] {
-                    let (mut core, _repository, active) = match role {
+                    let (mut core, active) = match role {
                         WorkerRole::Developer => active_core(),
                         WorkerRole::Reviewer => active_reviewer_core(2),
                     };
@@ -5083,32 +4165,6 @@ mod tests {
             }
         }
 
-        for (length, accepted) in [(511, true), (512, true), (513, false)] {
-            let mut value = observation("/repo", '1');
-            value.branch = "b".repeat(length);
-            assert_eq!(value.validate().is_ok(), accepted, "branch length {length}");
-        }
-        for (length, accepted) in [(4095, true), (4096, true), (4097, false)] {
-            let mut value = observation("/repo", '1');
-            value.changed_paths = vec![format!("src/{}", "p".repeat(length - 4))];
-            assert_eq!(
-                value.validate().is_ok(),
-                accepted,
-                "repository changed path length {length}"
-            );
-        }
-        for (count, accepted) in [(255, true), (256, true), (257, false)] {
-            let mut value = observation("/repo", '1');
-            value.changed_paths = (0..count)
-                .map(|index| format!("src/{index:03}.rs"))
-                .collect();
-            assert_eq!(
-                value.validate().is_ok(),
-                accepted,
-                "repository changed-path count {count}"
-            );
-        }
-
         let error = SupervisorError::new(
             SupervisorErrorCode::InvalidEvent,
             "界".repeat(MAX_CORE_DIAGNOSTIC_BYTES),
@@ -5121,24 +4177,22 @@ mod tests {
     fn invariant_audit_rejects_corrupted_operation_task_identity_and_terminal_state() {
         let mut cases = Vec::new();
 
-        let (mut missing_current, _) = authorized_core();
+        let mut missing_current = authorized_core();
         missing_current.current_task = None;
         cases.push(("running without current task", missing_current));
 
-        let (mut active_without_runtime, _base, _active) = active_core();
+        let (mut active_without_runtime, _active) = active_core();
         active_without_runtime.runtime_open = None;
         cases.push(("active turn without runtime", active_without_runtime));
 
-        let (mut excessive_round, _committed, _active) = active_reviewer_core(1);
+        let (mut excessive_round, _active) = active_reviewer_core(1);
         excessive_round.tasks[0].review_round = 2;
         cases.push(("review round above maximum", excessive_round));
 
         let mut future_advanced = new_core();
-        let base = observation("/repo", '1');
         bind(
             &mut future_advanced,
             vec![task("one", "/repo", 1), task("two", "/repo", 1)],
-            vec![base.clone(), base],
         );
         authorize(&mut future_advanced);
         future_advanced.tasks[1].state = TaskState::Developing;
@@ -5148,7 +4202,7 @@ mod tests {
         terminal_live.runtime_open = Some(0);
         cases.push(("terminal session with live runtime", terminal_live));
 
-        let (mut duplicate_session, _) = bound_core();
+        let mut duplicate_session = bound_core();
         let session = RuntimeSessionKey::from_counter(1).unwrap();
         duplicate_session.tasks[0].developer_session = Some(session);
         duplicate_session.tasks[0].reviewer_session = Some(session);

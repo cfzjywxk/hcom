@@ -10,7 +10,6 @@ use crate::worker::profile::{
     ReviewerInvocationProfile, SessionInvocationProfiles,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
@@ -490,7 +489,6 @@ impl OutcomeContract {
             Self::ReviewerV1 => "hcom-reviewer-outcome-v1",
         }
     }
-
 
     pub fn parse(self, bytes: &[u8]) -> Result<RuntimeOutcome, RuntimeError> {
         if bytes.is_empty() || bytes.len() > MAX_RUNTIME_OUTCOME_BYTES {
