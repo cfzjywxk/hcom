@@ -290,6 +290,18 @@ the private prompt. Ordinary PWD, PATH, shell, locale, and workdir evidence
 remains readable and admissible in structured results. `HCOM_DIR` changes hcom
 state/config only; it does not redirect Codex or Claude login state.
 
+For the interactive Architect, parent authentication can also depend on
+Unix-domain IPC rather than a token-valued environment entry. Existing,
+canonical, current-user sockets named by `SSH_AUTH_SOCK`, `GPG_AGENT_INFO`,
+and filesystem-backed `DBUS_SESSION_BUS_ADDRESS` endpoints are captured and
+revalidated together with their private parent directories, then rebound
+read-only at their exact paths after the host runtime mask. This preserves
+SSH-agent, GPG-agent, desktop keyring, `gh`, and Git credential-helper
+capability from the launching terminal. Missing endpoints stay missing,
+non-socket/symlink/public-parent endpoints fail closed, and no other host
+runtime or sibling hcom socket is exposed. Task workers retain their narrower
+mount contract and do not receive this Architect-only IPC exception.
+
 Complete inheritance may carry marker-shaped values such as `HCOM_AGENT`,
 terminal IDs, or stale outer-session names. They remain plain data: worker
 namespaces expose no retained hcom state/control socket or interactive TTY, the
@@ -311,10 +323,11 @@ Profile configuration changes native policy, not the outer containment:
   it can create and maintain `current_todo`, technical plans, and discussion
   records at their real paths; `/tmp`, the host XDG runtime, all
   current/sibling architect session roots, and hcom control sockets remain
-  masked, while the exact project and this Architect's private state are
-  rebound writable as needed; live default/explicit hcom state, parent
-  `.codex`/`.claude` configuration, the launching hcom executable, pinned
-  Architect/MCP executables, and the exact credential source remain read-only;
+  masked, except for the exact inherited credential sockets described above;
+  the exact project and this Architect's private state are rebound writable as
+  needed; live default/explicit hcom state, parent `.codex`/`.claude`
+  configuration, the launching hcom executable, pinned Architect/MCP
+  executables, and exact credential files/sockets remain read-only;
 - `HCOM_DIR` inside the Architect points to private per-run state, so invoking
   hcom there cannot message or wake retained interactive agents through the
   live v24 store;
@@ -338,8 +351,10 @@ Profile configuration changes native policy, not the outer containment:
   while the complete parent environment may itself contain caller-provided
   token, SSH-agent, or other credential variables;
 - hcom never invents a push credential or performs a push. Complete
-  environment inheritance is deliberately not a credential-reduction
-  boundary;
+  environment plus exact parent credential-IPC inheritance is deliberately
+  not a credential-reduction boundary; an Architect acting on explicit human
+  authorization may therefore use the same Git authentication capability as
+  the launching terminal;
 - Codex delegation, hooks, plugins, apps, and arbitrary MCP servers remain
   disabled for session workers;
 - in the retained CLI lane, an external task repository is declared to native

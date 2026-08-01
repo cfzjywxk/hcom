@@ -46,6 +46,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const MAX_BWRAP_INFO_BYTES: usize = 4096;
+const MAX_INHERITED_CREDENTIAL_SOCKETS: usize = 8;
 
 #[derive(Parser)]
 #[command(
@@ -305,6 +306,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         paths: paths.clone(),
         auth_source,
         adapter: architect_adapter,
+        control_root: control_paths.run_root().to_owned(),
         host_runtime: native_environment.runtime_home.clone(),
         host_root: HostRootContract::capture(
             &native_environment.cargo_bin_source,
@@ -1090,6 +1092,173 @@ impl PrivateFileIdentity {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+struct PrivateSocketIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    uid: u32,
+    mode: u32,
+    changed_seconds: i64,
+    changed_nanos: i64,
+    parent_device: u64,
+    parent_inode: u64,
+    parent_uid: u32,
+    parent_mode: u32,
+}
+
+impl PrivateSocketIdentity {
+    fn capture_if_present(path: &Path) -> Result<Option<Self>> {
+        let link = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).context("failed to inspect inherited credential socket");
+            }
+        };
+        if link.file_type().is_symlink() || !link.file_type().is_socket() {
+            bail!("inherited credential endpoint must be a non-symlink Unix socket");
+        }
+        let canonical = fs::canonicalize(path)?;
+        if canonical != path {
+            bail!("inherited credential socket must already use its canonical path");
+        }
+        path_text("inherited credential socket", &canonical)?;
+        let parent = canonical
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("inherited credential socket has no parent"))?;
+        let parent_link = fs::symlink_metadata(parent)?;
+        let parent_canonical = fs::canonicalize(parent)?;
+        if parent_link.file_type().is_symlink()
+            || !parent_link.is_dir()
+            || parent_canonical != parent
+        {
+            bail!("inherited credential socket parent must be a canonical real directory");
+        }
+        let metadata = fs::metadata(&canonical)?;
+        let parent_metadata = fs::metadata(parent)?;
+        // SAFETY: geteuid has no preconditions.
+        let current_uid = unsafe { libc::geteuid() };
+        if metadata.dev() != link.dev()
+            || metadata.ino() != link.ino()
+            || metadata.uid() != current_uid
+            || parent_metadata.uid() != current_uid
+            || parent_metadata.permissions().mode() & 0o077 != 0
+        {
+            bail!(
+                "inherited credential socket and its parent must be stable, private, and current-user owned"
+            );
+        }
+        Ok(Some(Self {
+            path: canonical,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+            mode: metadata.permissions().mode() & 0o777,
+            changed_seconds: metadata.ctime(),
+            changed_nanos: metadata.ctime_nsec(),
+            parent_device: parent_metadata.dev(),
+            parent_inode: parent_metadata.ino(),
+            parent_uid: parent_metadata.uid(),
+            parent_mode: parent_metadata.permissions().mode() & 0o777,
+        }))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn revalidate(&self) -> Result<()> {
+        if Self::capture_if_present(&self.path)?.as_ref() != Some(self) {
+            bail!("inherited credential socket identity drifted before architect launch");
+        }
+        Ok(())
+    }
+}
+
+fn decode_dbus_address_value(value: &str) -> Result<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            bail!("DBUS_SESSION_BUS_ADDRESS contains an incomplete escape");
+        }
+        let nibble = |byte: u8| -> Result<u8> {
+            match byte {
+                b'0'..=b'9' => Ok(byte - b'0'),
+                b'a'..=b'f' => Ok(byte - b'a' + 10),
+                b'A'..=b'F' => Ok(byte - b'A' + 10),
+                _ => bail!("DBUS_SESSION_BUS_ADDRESS contains an invalid escape"),
+            }
+        };
+        decoded.push(nibble(bytes[index + 1])? << 4 | nibble(bytes[index + 2])?);
+        index += 3;
+    }
+    let decoded = String::from_utf8(decoded)
+        .context("DBUS_SESSION_BUS_ADDRESS socket path is not valid UTF-8")?;
+    validate_environment_value("DBUS_SESSION_BUS_ADDRESS", &decoded)?;
+    Ok(decoded)
+}
+
+fn dbus_session_socket_paths(address: &str) -> Result<Vec<PathBuf>> {
+    validate_environment_value("DBUS_SESSION_BUS_ADDRESS", address)?;
+    let mut paths = Vec::new();
+    for endpoint in address.split(';') {
+        let Some(options) = endpoint.strip_prefix("unix:") else {
+            continue;
+        };
+        for option in options.split(',') {
+            let Some(value) = option.strip_prefix("path=") else {
+                continue;
+            };
+            paths.push(PathBuf::from(decode_dbus_address_value(value)?));
+            if paths.len() > MAX_INHERITED_CREDENTIAL_SOCKETS {
+                bail!("DBUS_SESSION_BUS_ADDRESS exposes too many filesystem sockets");
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn capture_inherited_credential_sockets(
+    environment: &ParentEnvironment,
+) -> Result<Vec<PrivateSocketIdentity>> {
+    let mut candidates = BTreeSet::new();
+    if let Some(value) = environment.unicode("SSH_AUTH_SOCK")?
+        && !value.is_empty()
+    {
+        candidates.insert(PathBuf::from(value));
+    }
+    if let Some(value) = environment.unicode("GPG_AGENT_INFO")?
+        && let Some(path) = value.split(':').next()
+        && !path.is_empty()
+    {
+        candidates.insert(PathBuf::from(path));
+    }
+    if let Some(value) = environment.unicode("DBUS_SESSION_BUS_ADDRESS")? {
+        candidates.extend(dbus_session_socket_paths(value)?);
+    }
+    if candidates.len() > MAX_INHERITED_CREDENTIAL_SOCKETS {
+        bail!("parent environment exposes too many credential sockets");
+    }
+    candidates
+        .into_iter()
+        .filter_map(
+            |path| match PrivateSocketIdentity::capture_if_present(&path) {
+                Ok(Some(identity)) => Some(Ok(identity)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            },
+        )
+        .collect()
+}
+
+#[derive(Clone, PartialEq, Eq)]
 struct ProtectedDirectoryIdentity {
     path: PathBuf,
     device: u64,
@@ -1386,6 +1555,7 @@ fn validate_path_isolation(
 struct ArchitectEnvironment {
     parent_environment: ParentEnvironment,
     control_environment: BTreeMap<String, String>,
+    inherited_credential_sockets: Vec<PrivateSocketIdentity>,
     runtime_home: PathBuf,
     cargo_bin_source: PathBuf,
     rustup_home_source: PathBuf,
@@ -1401,6 +1571,8 @@ impl ArchitectEnvironment {
             .map(PathBuf::from)
             .ok_or_else(|| anyhow::anyhow!("XDG_RUNTIME_DIR is required"))?;
         let runtime_home = canonical_private_runtime(&runtime_home)?;
+        let inherited_credential_sockets =
+            capture_inherited_credential_sockets(&parent_environment)?;
         let mut control_environment: BTreeMap<String, String> = BTreeMap::new();
         control_environment.insert(
             "XDG_STATE_HOME".into(),
@@ -1486,6 +1658,7 @@ impl ArchitectEnvironment {
         Ok(Self {
             parent_environment,
             control_environment,
+            inherited_credential_sockets,
             runtime_home,
             cargo_bin_source,
             rustup_home_source,
@@ -1657,6 +1830,7 @@ struct ArchitectSandbox {
     paths: ArchitectLaunchPaths,
     auth_source: PrivateFileIdentity,
     adapter: ArchitectAdapter,
+    control_root: PathBuf,
     host_runtime: PathBuf,
     host_root: HostRootContract,
     protected_roots: Vec<ProtectedDirectoryIdentity>,
@@ -1681,6 +1855,22 @@ impl ArchitectSandbox {
         tools.revalidate()?;
         for root in &self.protected_roots {
             root.revalidate("architect control root")?;
+        }
+        for socket in &environment.inherited_credential_sockets {
+            socket.revalidate()?;
+            if socket.path().starts_with(&self.paths.state)
+                || socket.path().starts_with(&self.paths.runtime)
+                || socket.path().starts_with(&self.control_root)
+                || self
+                    .protected_roots
+                    .iter()
+                    .any(|root| socket.path().starts_with(root.path()))
+                || socket
+                    .path()
+                    .starts_with(self.host_runtime.join("hcom-architect-repository-locks"))
+            {
+                bail!("inherited credential socket overlaps hcom architect control state");
+            }
         }
         if !matches!(
             (&tools.architect, self.adapter),
@@ -1719,6 +1909,12 @@ impl ArchitectSandbox {
                 .hcom_executables
                 .iter()
                 .map(|executable| executable.canonical_path.as_path()),
+        );
+        read_only_files.extend(
+            environment
+                .inherited_credential_sockets
+                .iter()
+                .map(PrivateSocketIdentity::path),
         );
         read_only_files.sort_unstable();
         read_only_files.dedup();
@@ -2360,6 +2556,49 @@ mod tests {
     }
 
     #[test]
+    fn dbus_session_socket_paths_are_strict_and_bounded() {
+        assert_eq!(
+            dbus_session_socket_paths(
+                "tcp:host=localhost;unix:path=/run/user/1000/keyring%2Cbus%3Bprimary,guid=abcd"
+            )
+            .unwrap(),
+            vec![PathBuf::from("/run/user/1000/keyring,bus;primary")]
+        );
+        assert!(dbus_session_socket_paths("unix:path=/run/user/1000/%").is_err());
+        assert!(dbus_session_socket_paths("unix:path=/run/user/1000/%GG").is_err());
+        let oversized = (0..=MAX_INHERITED_CREDENTIAL_SOCKETS)
+            .map(|index| format!("unix:path=/run/user/1000/bus-{index}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        assert!(dbus_session_socket_paths(&oversized).is_err());
+    }
+
+    #[test]
+    fn inherited_credential_socket_identity_rejects_replacement_and_public_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = temp.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let identity = PrivateSocketIdentity::capture_if_present(&socket)
+            .unwrap()
+            .unwrap();
+        identity.revalidate().unwrap();
+
+        drop(listener);
+        fs::remove_file(&socket).unwrap();
+        let _replacement = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(identity.revalidate().is_err());
+
+        let public = temp.path().join("public");
+        fs::create_dir(&public).unwrap();
+        fs::set_permissions(&public, fs::Permissions::from_mode(0o777)).unwrap();
+        let public_socket = public.join("agent.sock");
+        let _public_listener = UnixListener::bind(&public_socket).unwrap();
+        assert!(PrivateSocketIdentity::capture_if_present(&public_socket).is_err());
+    }
+
+    #[test]
     fn pinned_codex_root_help_matches_architect_command_contract_when_installed() {
         let path = Path::new(CODEX_DEVELOPER_EXECUTABLE);
         if path.exists() {
@@ -2657,6 +2896,7 @@ mod tests {
             paths,
             auth_source: PrivateFileIdentity::capture(&auth).unwrap(),
             adapter: ArchitectAdapter::Claude,
+            control_root: root.join("control"),
             host_runtime: root.clone(),
             host_root: HostRootContract::capture(&cargo_bin, &rustup_home).unwrap(),
             protected_roots: Vec::new(),
@@ -2748,12 +2988,16 @@ mod tests {
                 .unwrap(),
             ],
         };
+        let parent_environment = ParentEnvironment::capture_current();
+        let inherited_credential_sockets =
+            capture_inherited_credential_sockets(&parent_environment).unwrap();
         let environment = ArchitectEnvironment {
-            parent_environment: ParentEnvironment::capture_current(),
+            parent_environment,
             control_environment: BTreeMap::from([(
                 "HOME".into(),
                 control_home.to_string_lossy().into_owned(),
             )]),
+            inherited_credential_sockets,
             runtime_home: host_runtime.clone(),
             cargo_bin_source: cargo_bin_source.clone(),
             rustup_home_source: rustup_home_source.clone(),
@@ -2763,6 +3007,7 @@ mod tests {
             paths,
             auth_source: PrivateFileIdentity::capture(&root.join("auth.json")).unwrap(),
             adapter: ArchitectAdapter::Codex,
+            control_root: root.join("session-control"),
             host_runtime,
             host_root: HostRootContract::capture(&cargo_bin_source, &rustup_home_source).unwrap(),
             protected_roots: [
@@ -2845,6 +3090,9 @@ mod tests {
         let installed_hcom = installed_bin.join("hcom");
         let host_runtime = root.join("run");
         let control_root = host_runtime.join("legacy-control-sentinel");
+        let session_bus_socket = host_runtime.join("session-bus");
+        let ssh_agent_socket = host_runtime.join("ssh-agent.sock");
+        let gpg_agent_socket = host_runtime.join("gpg-agent.sock");
         let architect_root = root.join("session-runtime");
         let runtime = architect_root.join("launch");
         let other_runtime = architect_root.join("other-launch");
@@ -2912,6 +3160,9 @@ mod tests {
         let listeners: Vec<_> = [
             &control_socket,
             &registration_socket,
+            &session_bus_socket,
+            &ssh_agent_socket,
+            &gpg_agent_socket,
             &relay_socket,
             &other_relay_socket,
             &sibling_relay_socket,
@@ -2977,6 +3228,12 @@ if os.environ.get("CODEX_HOME") != {isolated_codex_home}:
     raise SystemExit(71)
 if os.environ.get("HOME") != {isolated_parent_home}:
     raise SystemExit(72)
+if os.environ.get("DBUS_SESSION_BUS_ADDRESS") != {dbus_address}:
+    raise SystemExit(73)
+if os.environ.get("SSH_AUTH_SOCK") != {ssh_agent_socket}:
+    raise SystemExit(74)
+if os.environ.get("GPG_AGENT_INFO") != {gpg_agent_info}:
+    raise SystemExit(75)
 with open({write_probe}, "x", encoding="utf-8") as output:
     output.write("architect project write\n")
 
@@ -3025,6 +3282,15 @@ for hidden in {hidden_sockets}:
     finally:
         probe.close()
 
+for inherited in {inherited_sockets}:
+    probe = socket.socket(socket.AF_UNIX)
+    try:
+        probe.connect(inherited)
+    except OSError:
+        raise SystemExit(76)
+    finally:
+        probe.close()
+
 relay = socket.socket(socket.AF_UNIX)
 relay.connect({relay_socket})
 relay.close()
@@ -3036,6 +3302,12 @@ with open({report}, "w", encoding="utf-8") as output:
                 serde_json::to_string(&state.join("hcom").to_string_lossy()).unwrap(),
             isolated_codex_home = serde_json::to_string(&codex_home).unwrap(),
             isolated_parent_home = serde_json::to_string(&control_home).unwrap(),
+            dbus_address =
+                serde_json::to_string(&format!("unix:path={}", session_bus_socket.display()))
+                    .unwrap(),
+            ssh_agent_socket = serde_json::to_string(&ssh_agent_socket).unwrap(),
+            gpg_agent_info =
+                serde_json::to_string(&format!("{}:0:1", gpg_agent_socket.display())).unwrap(),
             write_probe = serde_json::to_string(&repository.join("architect-write-probe")).unwrap(),
             external_source = serde_json::to_string(&external_source.join("source.txt")).unwrap(),
             external_write_probe = serde_json::to_string(&external_write_probe).unwrap(),
@@ -3053,6 +3325,12 @@ with open({report}, "w", encoding="utf-8") as output:
                 registration_socket.to_string_lossy().into_owned(),
                 other_relay_socket.to_string_lossy().into_owned(),
                 sibling_relay_socket.to_string_lossy().into_owned(),
+            ])
+            .unwrap(),
+            inherited_sockets = serde_json::to_string(&[
+                session_bus_socket.to_string_lossy().into_owned(),
+                ssh_agent_socket.to_string_lossy().into_owned(),
+                gpg_agent_socket.to_string_lossy().into_owned(),
             ])
             .unwrap(),
             relay_socket = serde_json::to_string(&relay_socket).unwrap(),
@@ -3076,6 +3354,15 @@ with open({report}, "w", encoding="utf-8") as output:
             .env("XDG_CONFIG_HOME", root.join("xdg-config"))
             .env("XDG_RUNTIME_DIR", &host_runtime)
             .env("XDG_STATE_HOME", root.join("xdg-state"))
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", session_bus_socket.display()),
+            )
+            .env("SSH_AUTH_SOCK", &ssh_agent_socket)
+            .env(
+                "GPG_AGENT_INFO",
+                format!("{}:0:1", gpg_agent_socket.display()),
+            )
             .env("CARGO_HOME", root.join("cargo"))
             .env("RUSTUP_HOME", &rustup_home_source)
             .env("ARBITRARY_PARENT_VALUE", "arbitrary-value")

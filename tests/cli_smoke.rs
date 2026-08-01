@@ -486,11 +486,17 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
         ),
         "stdout={stdout}"
     );
+    let normalized_stdout = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        stdout.contains(
-            "Reviewer receives the same writable task envelope as its\n\
-             Developer"
-        ) && stdout.contains("Git\nevidence is exactly unchanged"),
+        normalized_stdout
+            .contains("Reviewer receives the same writable task envelope as its Developer")
+            && normalized_stdout.contains("Git evidence is exactly unchanged"),
+        "stdout={stdout}"
+    );
+    assert!(
+        normalized_stdout.contains(
+            "DBUS_SESSION_BUS_ADDRESS, SSH_AUTH_SOCK, and GPG_AGENT_INFO are identity-checked and rebound read-only"
+        ) && normalized_stdout.contains("without exposing sibling hcom sockets"),
         "stdout={stdout}"
     );
     assert!(
