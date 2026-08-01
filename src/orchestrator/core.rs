@@ -1113,11 +1113,9 @@ impl SupervisorCore {
                     )
                 }
             },
-            RuntimeOutcome::Reviewer(reviewer) => self.schedule_repository(
-                task_ordinal,
-                RepositoryCheckpoint::ReviewerPostflight,
-                Some(RuntimeOutcome::Reviewer(reviewer)),
-            ),
+            RuntimeOutcome::Reviewer(reviewer) => {
+                self.handle_reviewer_verdict(task_ordinal, reviewer)
+            }
         }
     }
 
@@ -1242,21 +1240,10 @@ impl SupervisorCore {
             RepositoryCheckpoint::DeveloperRecoveryPreflight => Err(SupervisorError::invariant(
                 "developer completion recovery is retired in the task-agnostic lane",
             )),
-            RepositoryCheckpoint::ReviewerPreflight => {
-                if pending.outcome.is_some() {
-                    return Err(SupervisorError::invariant(
-                        "reviewer preflight unexpectedly carried an outcome",
-                    ));
-                }
-                self.handle_reviewer_preflight(task_ordinal, observation)
-            }
-            RepositoryCheckpoint::ReviewerPostflight => {
-                let Some(RuntimeOutcome::Reviewer(outcome)) = pending.outcome else {
-                    return Err(SupervisorError::invariant(
-                        "reviewer postflight lost its typed outcome",
-                    ));
-                };
-                self.handle_reviewer_postflight(task_ordinal, observation, outcome)
+            RepositoryCheckpoint::ReviewerPreflight | RepositoryCheckpoint::ReviewerPostflight => {
+                Err(SupervisorError::invariant(
+                    "reviewer repository checkpoints are retired in the task-agnostic lane",
+                ))
             }
         }
     }
@@ -1351,22 +1338,21 @@ impl SupervisorCore {
         task.last_developer_outcome = Some(outcome);
         task.state = TaskState::Reviewing;
         task.outcome_detail = Some("developer turn completed; routing to review".into());
-        self.schedule_repository(task_ordinal, RepositoryCheckpoint::ReviewerPreflight, None)
+        self.start_reviewer(task_ordinal)
     }
 
-    fn handle_reviewer_preflight(
+    /// Start (or resume) the reviewer for a task already in review.
+    ///
+    /// Deliberately takes no Git observation: the diff base and head were
+    /// captured at task start and developer completion, which is everything
+    /// routing needs. Re-inspecting the repository here would reintroduce a
+    /// quality gate — whether the tree drifted is the reviewer's and the
+    /// human's call.
+    fn start_reviewer(
         &mut self,
         task_ordinal: usize,
-        observation: RepositoryObservation,
     ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
         let task = &mut self.tasks[task_ordinal];
-        if task.state != TaskState::Reviewing {
-            return Err(SupervisorError::invalid_transition(
-                "reviewer preflight requires a reviewing task",
-            ));
-        }
-        // Routing data only; drift is the reviewer's to notice, not a gate.
-        task.reviewer_pre_repository = Some(observation);
         if let Some(session) = task.reviewer_session {
             let purpose = if task.review_round == 0 {
                 RuntimeTurnPurpose::InitialReview
@@ -1379,23 +1365,16 @@ impl SupervisorCore {
         }
     }
 
-    fn handle_reviewer_postflight(
+    fn handle_reviewer_verdict(
         &mut self,
         task_ordinal: usize,
-        observation: RepositoryObservation,
         outcome: ReviewerOutcomeV1,
     ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
         if self.tasks[task_ordinal].state != TaskState::Reviewing {
             return Err(SupervisorError::invalid_transition(
-                "reviewer postflight requires a reviewing task",
+                "a reviewer verdict requires a reviewing task",
             ));
         }
-        if self.tasks[task_ordinal].reviewer_pre_repository.is_none() {
-            return Err(SupervisorError::invariant(
-                "reviewer preflight state disappeared",
-            ));
-        }
-        let _ = observation; // routing/diagnostic data only, never a gate
         let next_round = self.tasks[task_ordinal]
             .review_round
             .checked_add(1)
@@ -1409,7 +1388,6 @@ impl SupervisorCore {
             let task = &mut self.tasks[task_ordinal];
             task.review_round = next_round;
             task.last_reviewer_outcome = Some(outcome.clone());
-            task.reviewer_pre_repository = None;
         }
 
         match outcome.verdict {
@@ -2448,20 +2426,26 @@ mod tests {
                 SupervisorEffect::PublishStatus,
             ]
         );
-        assert_eq!(
-            observe(
-                core,
-                active.task,
-                RepositoryCheckpoint::DeveloperCompletion,
-                repository
+        // Developer completion goes straight to opening (or resuming) the
+        // reviewer; the lane takes no observation around review.
+        let effects = observe(
+            core,
+            active.task,
+            RepositoryCheckpoint::DeveloperCompletion,
+            repository,
+        );
+        assert!(
+            matches!(
+                effects.first(),
+                Some(SupervisorEffect::OpenRoleSession {
+                    role: WorkerRole::Reviewer,
+                    ..
+                }) | Some(SupervisorEffect::StartTurn {
+                    role: WorkerRole::Reviewer,
+                    ..
+                })
             ),
-            vec![
-                SupervisorEffect::ObserveRepository {
-                    task_ordinal: active.task,
-                    checkpoint: RepositoryCheckpoint::ReviewerPreflight,
-                },
-                SupervisorEffect::PublishStatus,
-            ]
+            "{effects:?}"
         );
     }
 
@@ -2474,22 +2458,10 @@ mod tests {
         token: &'static str,
         first: bool,
     ) -> ActiveIdentity {
+        // The OpenRoleSession / StartTurn effect was already emitted by the
+        // developer's completion; this helper only drives what follows.
+        let _ = &repository;
         let session = if first {
-            assert_eq!(
-                observe(
-                    core,
-                    task_ordinal,
-                    RepositoryCheckpoint::ReviewerPreflight,
-                    repository
-                ),
-                vec![
-                    SupervisorEffect::OpenRoleSession {
-                        task_ordinal,
-                        role: WorkerRole::Reviewer,
-                    },
-                    SupervisorEffect::PublishStatus,
-                ]
-            );
             let session = RuntimeSessionKey::from_counter(session_counter).unwrap();
             assert_eq!(
                 open_session(core, task_ordinal, WorkerRole::Reviewer, session),
@@ -2505,25 +2477,7 @@ mod tests {
             );
             session
         } else {
-            let session = core.tasks[task_ordinal].reviewer_session.unwrap();
-            assert_eq!(
-                observe(
-                    core,
-                    task_ordinal,
-                    RepositoryCheckpoint::ReviewerPreflight,
-                    repository
-                ),
-                vec![
-                    SupervisorEffect::StartTurn {
-                        task_ordinal,
-                        role: WorkerRole::Reviewer,
-                        purpose: RuntimeTurnPurpose::ReviewerRereview,
-                        session,
-                    },
-                    SupervisorEffect::PublishStatus,
-                ]
-            );
-            session
+            core.tasks[task_ordinal].reviewer_session.unwrap()
         };
         let purpose = if first {
             RuntimeTurnPurpose::InitialReview
@@ -2552,35 +2506,23 @@ mod tests {
         }
     }
 
+    /// A reviewer verdict lands directly from its completed turn: the lane
+    /// takes no Git observation around review.
     fn complete_review(
         core: &mut SupervisorCore,
         active: ActiveIdentity,
         outcome: RuntimeOutcome,
         repository: RepositoryObservation,
     ) -> Vec<SupervisorEffect> {
-        assert_eq!(
-            complete_turn(
-                core,
-                active.task,
-                active.role,
-                active.session,
-                active.turn,
-                active.token,
-                outcome,
-            ),
-            vec![
-                SupervisorEffect::ObserveRepository {
-                    task_ordinal: active.task,
-                    checkpoint: RepositoryCheckpoint::ReviewerPostflight,
-                },
-                SupervisorEffect::PublishStatus,
-            ]
-        );
-        observe(
+        let _ = repository;
+        complete_turn(
             core,
             active.task,
-            RepositoryCheckpoint::ReviewerPostflight,
-            repository,
+            active.role,
+            active.session,
+            active.turn,
+            active.token,
+            outcome,
         )
     }
 
@@ -2776,13 +2718,7 @@ mod tests {
     }
 
     fn reviewing_pending_session_core() -> (SupervisorCore, RepositoryObservation) {
-        let (mut core, committed) = reviewing_preflight_core();
-        observe(
-            &mut core,
-            0,
-            RepositoryCheckpoint::ReviewerPreflight,
-            committed.clone(),
-        );
+        let (core, committed) = reviewing_preflight_core();
         (core, committed)
     }
 
@@ -3114,11 +3050,13 @@ mod tests {
                         (core, event)
                     }
                     SupervisorEventKind::RepositoryObserved => {
+                        // Review takes no Git observation at all, so this must
+                        // be rejected rather than accepted.
                         let (core, committed) = reviewing_preflight_core();
                         let event = SupervisorEvent::RepositoryObserved {
                             expected_version: core.version(),
                             task_ordinal: 0,
-                            checkpoint: RepositoryCheckpoint::ReviewerPreflight,
+                            checkpoint: RepositoryCheckpoint::DeveloperCompletion,
                             observation: committed,
                         };
                         (core, event)
@@ -3130,7 +3068,14 @@ mod tests {
                     }
                     _ => unreachable!(),
                 };
-                (core, event, kind != SupervisorEventKind::TaskRuntimeOpened)
+                // A reviewing task accepts no repository observation and no
+                // second runtime open.
+                let accepted = !matches!(
+                    kind,
+                    SupervisorEventKind::TaskRuntimeOpened
+                        | SupervisorEventKind::RepositoryObserved
+                );
+                (core, event, accepted)
             }
             TaskState::Lgtm => {
                 let core = completed_core();
@@ -3472,12 +3417,7 @@ mod tests {
         changed.clean = false;
         changed.changed_paths = vec!["src/reviewer-edit.rs".into()];
         let before = mutation.tasks[0].state;
-        observe(
-            &mut mutation,
-            0,
-            RepositoryCheckpoint::ReviewerPostflight,
-            changed,
-        );
+        let _ = changed;
         edges.insert((
             name(before),
             "reviewer_mutation_ignored",
@@ -3514,9 +3454,9 @@ mod tests {
                 ("reviewing", "request_changes", "developing"),
                 ("reviewing", "lgtm", "lgtm"),
                 ("reviewing", "max_round_request_changes", "review_exhausted",),
-                // Reviewer-side repository mutation is diagnostic data, not a
-                // verdict gate.
-                ("reviewing", "reviewer_mutation_ignored", "lgtm"),
+                // Reviewer-side repository mutation is not observed at all;
+                // the verdict has already landed by then.
+                ("lgtm", "reviewer_mutation_ignored", "lgtm"),
             ])
         );
 
@@ -3598,8 +3538,8 @@ mod tests {
             }
         }
         assert_eq!(rows, 8 * 7);
-        assert_eq!(accepted, 14);
-        assert_eq!(rejected, 42);
+        assert_eq!(accepted, 13);
+        assert_eq!(rejected, 43);
     }
 
     #[test]
@@ -3643,7 +3583,7 @@ mod tests {
             SessionStatusSnapshot {
                 run_id: "run-1".into(),
                 state: SessionState::Completed,
-                version: 13,
+                version: 11,
                 project_root: "/project".into(),
                 plan_version: Some(1),
                 plan_hash: core.plan_hash.clone(),
@@ -3915,9 +3855,9 @@ mod tests {
                 dirty
             ),
             vec![
-                SupervisorEffect::ObserveRepository {
+                SupervisorEffect::OpenRoleSession {
                     task_ordinal: 0,
-                    checkpoint: RepositoryCheckpoint::ReviewerPreflight,
+                    role: WorkerRole::Reviewer,
                 },
                 SupervisorEffect::PublishStatus,
             ]
@@ -4879,12 +4819,7 @@ mod tests {
         changed.tracked_diff_hash = "d".repeat(64);
         changed.clean = false;
         changed.changed_paths = vec!["src/lib.rs".into()];
-        observe(
-            &mut reviewer_mutation,
-            0,
-            RepositoryCheckpoint::ReviewerPostflight,
-            changed,
-        );
+        let _ = changed;
         assert_eq!(reviewer_mutation.tasks[0].state, TaskState::Lgtm);
 
         let (mut raw_outcome, _base, active) = active_core();
@@ -5020,12 +4955,7 @@ mod tests {
         let (mut core, base, developer) = active_core();
         let committed = developer_observation(&base, '2', true, &["src/lib.rs"]);
         complete_developer_ready(&mut core, developer, committed.clone());
-        observe(
-            &mut core,
-            0,
-            RepositoryCheckpoint::ReviewerPreflight,
-            committed,
-        );
+        let _ = committed;
         open_session(
             &mut core,
             0,

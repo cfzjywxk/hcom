@@ -182,14 +182,22 @@ fi
 mkdir -p "$WORK/c4c/project" "$WORK/c4c/home"
 export CODEX_HOME="$WORK/c4c/home"
 cp ~/.codex/auth.json "$CODEX_HOME/auth.json" 2>/dev/null
-cp "$WORK/c4/project/probe.sh" "$WORK/c4c/project/probe.sh"
+cat > "$WORK/c4c/project/probe.sh" <<'PROBE'
+#!/bin/sh
+printf 'NONUTF8_HEX=' > probe.txt
+printf '%s' "$SMOKE_NON_UTF8" | od -An -tx1 | tr -d ' \n' >> probe.txt
+printf '\n' >> probe.txt
+PROBE
 export SMOKE_NON_UTF8=$'\xff\xfe-nonutf8'
+expected_hex=$(printf '%s' "$SMOKE_NON_UTF8" | od -An -tx1 | tr -d ' \n')
 printf 'Use your shell tool to run: sh probe.sh
 Then reply with a final message of exactly: SMOKE-C4C' \
   | closed_shape "$WORK/c4c/project" "$WORK/c4c/last.md" >/dev/null 2>&1
 unset SMOKE_NON_UTF8
-[ -f "$WORK/c4c/project/probe.txt" ]
-report_block "C4c non-UTF-8 env keeps tools working" $? \
+# Layer 1 (hcom -> worker) is asserted byte-for-byte in the unit tests; this
+# probes layer 2 (codex -> tool command) with the raw bytes themselves.
+grep -q "NONUTF8_HEX=$expected_hex" "$WORK/c4c/project/probe.txt" 2>/dev/null
+report_block "C4c non-UTF-8 env value reaches tools" $? \
   "upstream codex panics on non-UTF-8 env values"
 
 # --- C5: private CODEX_HOME keeps exactly one session -----------------------
@@ -199,6 +207,15 @@ report "C5 private CODEX_HOME session store" $? "state files: $sessions"
 
 printf '\n%d passed, %d failed, %d known-blocked\n' "$pass" "$fail" "$block"
 if [ "$block" -ne 0 ]; then
-  printf 'known upstream blocks are recorded above and are not treated as passes\n'
+  printf 'A known upstream block is NOT a pass: the lane cannot honour complete\n'
+  printf 'environment inheritance while it stands. Releasing anyway requires an\n'
+  printf 'explicit human decision to narrow that requirement; set\n'
+  printf 'SMOKE_ACCEPT_KNOWN_BLOCKS=1 to record that decision.\n'
 fi
-[ "$fail" -eq 0 ]
+if [ "$fail" -ne 0 ]; then
+  exit 1
+fi
+if [ "$block" -ne 0 ] && [ -z "${SMOKE_ACCEPT_KNOWN_BLOCKS:-}" ]; then
+  exit 2
+fi
+exit 0

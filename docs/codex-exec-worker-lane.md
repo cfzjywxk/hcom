@@ -81,9 +81,13 @@ A turn routes onward only when all three hold:
 - a `thread.started` proof was captured;
 - the native final-message file is non-empty.
 
-Plus two integrity conditions: the drain threads must report no read/write/seal
+Plus three integrity conditions: the prompt must have been delivered in full (a
+partial prompt means the worker answered a different question), the drain threads must report no read/write/seal
 error (losing evidence stops the run rather than routing an incomplete record),
-and the process group must have no surviving descendants. A background child of
+and the process group must have no surviving descendants. Descendants are
+signalled individually after verifying each one's session *and* group id, never
+via `kill(-pgid)`: a bare group id can be recycled between the scan and the
+signal. A background child of
 the worker would otherwise hold the pipes open — blocking the drain joins — or
 outlive the run as an orphan that keeps burning tokens.
 
@@ -113,6 +117,14 @@ attempts keep their artifacts, and the relayed outcome carries the original
 findings *and* the clarified verdict. A second failure stops for a human with
 the full text.
 
+## Repository observation
+
+Exactly two, both routing data: the head at task start (the reviewer's diff
+base) and the head at developer completion. Review takes **no** observation at
+all — whether the tree drifted, went detached, or is dirty is the reviewer's
+and the human's judgment, and observing it here would turn an untidy checkout
+into a failed run.
+
 ## Evidence
 
 Durable evidence lives in `<project>/hcom-tasks/<run-id>/…`
@@ -123,11 +135,18 @@ CLI writing it and hcom ingesting it, no unredacted bytes ever land in the
 project directory. Ingestion reads the file bounded, redacts it, writes the
 sealed copy atomically, and deletes the raw one.
 
-Truncation is guarded: when a final message exceeds the ingestion bound the cut
-drops `max-secret-length` extra bytes, because a credential straddling the
-boundary would otherwise survive as a plaintext prefix the redactor can no
-longer recognize. Prompts are streamed as bounded artifacts rather than written
-as adapter control files, so a legal full-size prompt cannot fail the turn.
+The final message is redacted by **streaming the whole file**: memory is
+bounded, the file is not, so a legal long message keeps its tail. Chunks overlap
+by `max-secret-length` bytes so a credential straddling a read boundary is still
+matched. Only a leading window is quoted onward; the sealed artifact holds
+everything.
+
+Prompts are streamed as bounded artifacts rather than written as adapter control
+files, so a legal full-size prompt cannot fail the turn — and the prompt is
+**not** used to seed the redactor. It is an hcom-generated task description, not
+a credential; seeding with it would replace prompt.md with `[REDACTED]` and
+destroy reproducibility. Real secrets come from the environment inventory and
+are redacted everywhere regardless.
 
 The workspace is handoff material, not a recovery store. A restarted hcom never
 reads it to resume; a human reads `latest/`, then authorizes a new run.
@@ -141,7 +160,9 @@ the exact defect that made the previous protocol lane's failures unreadable.
 
 Per-turn wall clock is 6 hours, monotonic, never reset by output; on expiry the
 whole process group is terminated, evidence is drained and redacted, and the
-turn fails as a timeout.
+turn fails as a timeout. If the group survives SIGKILL the failure says so and
+the drain threads are left detached rather than joined — joining an unkillable
+group would hang the supervisor itself.
 
 ## Testing
 
@@ -152,16 +173,19 @@ turn fails as a timeout.
 - **Contract smokes** (`scripts/codex-exec-contract-smokes`) — the external
   assumptions, against the real pinned binary. Unit tests structurally cannot
   cover these: a fake CLI reproduces whatever hcom already believes. Run before
-  every release and after every pin bump. The environment probe reads only
+  every release and after every pin bump. A known upstream block exits 2 and
+  fails the gate: releasing over it needs an explicit human decision
+  (`SMOKE_ACCEPT_KNOWN_BLOCKS=1`) to narrow the inheritance requirement. The environment probe reads only
   allowlisted synthetic variables; dumping the real environment would ship live
   credentials into the model context and to the provider.
 - **Real acceptance** (`cargo test --lib real_exec -- --ignored`) — four runs
   against the real binary on disposable projects: a single task, a Rust
-  hello-world, a two-task run (both tasks must reach LGTM; exhaustion is not
-  success), and the full review loop — REQUEST_CHANGES, an exact developer
-  resume, an exact reviewer re-review, then LGTM. The loop test reads the
-  native thread ids back out of the sealed stdout evidence to prove each role
-  resumed its own session and that tasks never share one. Every run also
+  hello-world, a two-task run, and **Gate 1**: one run whose first task goes
+  through a real REQUEST_CHANGES with an exact developer resume and an exact
+  reviewer re-review, whose second task is approved on its first review, and
+  whose four role sessions are all fresh. Every task must reach LGTM —
+  exhaustion is not success. Gate 1 reads the native thread ids back out of the
+  sealed stdout evidence rather than trusting the runtime's own bookkeeping. Every run also
   asserts it left no stray worker processes behind.
 
 Known upstream limitation: Codex 0.146's tool executor panics when the

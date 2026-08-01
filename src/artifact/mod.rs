@@ -196,11 +196,38 @@ pub struct ArtifactAttempt {
 }
 
 impl ArtifactAttempt {
+    /// Create an attempt whose redactor also treats the turn prompt as
+    /// sensitive. Use this when the prompt itself may carry private material.
     pub fn create(
         root: &ArtifactRoot,
         scope: ArtifactScope,
         environment: &ExecutionEnvironmentLease,
         prompt: &[u8],
+    ) -> Result<Self> {
+        Self::create_with_prompt_secrecy(root, scope, environment, prompt, true)
+    }
+
+    /// Create an attempt that redacts only the environment's secrets.
+    ///
+    /// The exec lane's prompt is an hcom-generated task description, not a
+    /// credential: seeding the redactor with it would replace the prompt
+    /// evidence with `[REDACTED]` and destroy reproducibility. Real secrets
+    /// live in the environment inventory and are still redacted everywhere.
+    pub fn create_with_environment_secrets_only(
+        root: &ArtifactRoot,
+        scope: ArtifactScope,
+        environment: &ExecutionEnvironmentLease,
+        prompt: &[u8],
+    ) -> Result<Self> {
+        Self::create_with_prompt_secrecy(root, scope, environment, prompt, false)
+    }
+
+    fn create_with_prompt_secrecy(
+        root: &ArtifactRoot,
+        scope: ArtifactScope,
+        environment: &ExecutionEnvironmentLease,
+        prompt: &[u8],
+        prompt_is_secret: bool,
     ) -> Result<Self> {
         scope.validate()?;
         environment.descriptor().validate()?;
@@ -243,7 +270,11 @@ impl ArtifactAttempt {
             directory: Arc::new(parent),
             supervisor_epoch: environment.descriptor().supervisor_epoch.clone(),
             environment_hash: environment.descriptor().environment_hash.clone(),
-            redactor: Arc::new(environment.redactor().with_value(prompt)),
+            redactor: Arc::new(if prompt_is_secret {
+                environment.redactor().with_value(prompt)
+            } else {
+                environment.redactor()
+            }),
             registry: Arc::new(Mutex::new(ReceiptRegistry::default())),
         })
     }

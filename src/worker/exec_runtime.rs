@@ -72,7 +72,10 @@ const RESUME_HELP_REQUIREMENTS: &[&str] = &[
 const THREAD_STARTED_LINE_CAP: usize = 8 * 1024;
 const PIPE_CHUNK: usize = 32 * 1024;
 const NATIVE_STREAM_CAP: u64 = 1024 * 1024;
-const RAW_FINAL_READ_CAP: usize = 1024 * 1024;
+const RAW_FINAL_CHUNK: usize = 64 * 1024;
+/// How much of a final message the supervisor may quote onward. The full text
+/// is always sealed into the artifacts regardless of this bound.
+const RELAY_WINDOW_BYTES: usize = 256 * 1024;
 const MAX_HELP_OUTPUT: usize = 128 * 1024;
 const STDERR_TAIL_BYTES: usize = 320;
 const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -190,6 +193,13 @@ struct ExecSession {
     turn_sequence: u32,
 }
 
+/// What a poll observed about the child.
+enum PollOutcome {
+    Exited(ExitStatus),
+    /// Timed out; carries the kill failure when the group survived SIGKILL.
+    TimedOut(Option<String>),
+}
+
 enum TurnState {
     Running(Box<RunningTurn>),
     Done(RuntimeTurnPoll),
@@ -223,7 +233,7 @@ struct RunningTurn {
     expected_thread: Option<String>,
     stdout_thread: Option<JoinHandle<StdoutDrained>>,
     stderr_thread: Option<JoinHandle<StderrDrained>>,
-    stdin_thread: Option<JoinHandle<()>>,
+    stdin_thread: Option<JoinHandle<Option<String>>>,
     clarification_used: bool,
     /// The pre-clarification final message, carried forward so the relayed
     /// outcome keeps the reviewer's original findings alongside the verdict.
@@ -423,12 +433,13 @@ impl ExecTaskWorkerRuntime {
             turn_sequence: session.turn_sequence,
             attempt: attempt_no,
         };
-        let redaction_seed = utf8_prefix(&full_prompt, 200 * 1024);
-        let attempt = ArtifactAttempt::create(
+        // The prompt is evidence, not a credential: seeding the redactor with
+        // it would turn prompt.md into "[REDACTED]".
+        let attempt = ArtifactAttempt::create_with_environment_secrets_only(
             &self.artifact_root,
             scope,
             &self.config.lease,
-            redaction_seed.as_bytes(),
+            utf8_prefix(&full_prompt, 200 * 1024).as_bytes(),
         )
         .map_err(|error| RuntimeError::internal(single_line(&error.to_string())))?;
         let mut prompt_writer = attempt
@@ -438,7 +449,7 @@ impl ExecTaskWorkerRuntime {
             .write_chunk(full_prompt.as_bytes())
             .and_then(|_| prompt_writer.finish())
             .map_err(|error| RuntimeError::internal(single_line(&error.to_string())))?;
-        let redactor = self.config.lease.redactor().with_value(redaction_seed);
+        let redactor = self.config.lease.redactor();
 
         // Raw --output-last-message target lives in the private runtime dir,
         // never inside the durable tree; identity is pinned before spawn.
@@ -495,12 +506,20 @@ impl ExecTaskWorkerRuntime {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
+        // A partially delivered prompt would make the worker answer a
+        // different question, so the transport result is checked, never
+        // discarded.
         let stdin_thread = stdin.map(|mut pipe| {
             let bytes = full_prompt.into_bytes();
-            std::thread::spawn(move || {
+            std::thread::spawn(move || -> Option<String> {
                 use std::io::Write;
-                let _ = pipe.write_all(&bytes);
-                let _ = pipe.flush();
+                if let Err(error) = pipe.write_all(&bytes) {
+                    return Some(format!("prompt delivery failed: {error}"));
+                }
+                if let Err(error) = pipe.flush() {
+                    return Some(format!("prompt flush failed: {error}"));
+                }
+                None
             })
         });
         let stdout_thread =
@@ -536,9 +555,15 @@ impl ExecTaskWorkerRuntime {
         // The leader exited; any descendant still holding the pipes must go
         // first, or the drain joins below never return.
         let settled = running.group.settle_after_exit(CANCEL_GRACE);
-        if let Some(handle) = running.stdin_thread.take() {
-            let _ = handle.join();
-        }
+        let prompt_error = running
+            .stdin_thread
+            .take()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Some("prompt delivery thread panicked".into()))
+            })
+            .unwrap_or(None);
         let stdout = running
             .stdout_thread
             .take()
@@ -567,22 +592,26 @@ impl ExecTaskWorkerRuntime {
 
         // Ingest the raw final message: pin identity, bound the read, seal a
         // redacted copy into the durable artifacts, and remove the raw file.
+        let mut final_writer = running
+            .attempt
+            .start_native_stream(ArtifactKind::NativeFinal, NATIVE_STREAM_CAP)
+            .map_err(|error| RuntimeError::internal(single_line(&error.to_string())))?;
         let raw = ingest_raw_final(
             &running.raw_final,
             running.raw_final_identity,
             running.redactor.trailing_guard_bytes(),
+            &running.redactor,
+            &mut final_writer,
         );
-        let sealed = match &raw {
-            Ok(Some(bytes)) => {
-                let mut writer = running
-                    .attempt
-                    .start_native_stream(ArtifactKind::NativeFinal, NATIVE_STREAM_CAP)
-                    .map_err(|error| RuntimeError::internal(single_line(&error.to_string())))?;
-                writer
-                    .write_chunk(bytes)
-                    .and_then(|_| writer.finish())
-                    .map_err(|error| RuntimeError::internal(single_line(&error.to_string())))?;
-                Some(running.redactor.redact(&String::from_utf8_lossy(bytes)))
+        let sealed_result = final_writer.finish();
+        let sealed = match (&raw, sealed_result) {
+            (Ok(Some(text)), Ok(_)) => Some(text.clone()),
+            (Ok(_), Err(error)) => {
+                return fail(
+                    RuntimeFailureClass::Process,
+                    single_line(&format!("final message evidence seal failed: {error}")),
+                    telemetry,
+                );
             }
             _ => None,
         };
@@ -598,7 +627,10 @@ impl ExecTaskWorkerRuntime {
         // Routing preconditions: exit 0 AND session proof AND non-empty final
         // message. Anything else is a process-level failure; artifacts stay as
         // evidence but never route.
-        if let Some(error) = stdout.io_error.clone().or(stderr_io_error) {
+        if let Some(error) = prompt_error
+            .or_else(|| stdout.io_error.clone())
+            .or(stderr_io_error)
+        {
             return fail(RuntimeFailureClass::Process, single_line(&error), telemetry);
         }
         if !status.success() {
@@ -757,15 +789,21 @@ impl Drop for RunningTurn {
     /// (an error return, a panic, or a supervisor teardown): the process group
     /// dies with the run rather than becoming an orphan.
     fn drop(&mut self) {
-        let _ = self.group.terminate_and_reap(&mut self.child, CANCEL_GRACE);
-        if let Some(handle) = self.stdin_thread.take() {
-            let _ = handle.join();
-        }
-        if let Some(handle) = self.stdout_thread.take() {
-            let _ = handle.join();
-        }
-        if let Some(handle) = self.stderr_thread.take() {
-            let _ = handle.join();
+        if self
+            .group
+            .terminate_and_reap(&mut self.child, CANCEL_GRACE)
+            .is_ok()
+        {
+            // Joining is only bounded once the group is actually gone.
+            if let Some(handle) = self.stdin_thread.take() {
+                let _ = handle.join();
+            }
+            if let Some(handle) = self.stdout_thread.take() {
+                let _ = handle.join();
+            }
+            if let Some(handle) = self.stderr_thread.take() {
+                let _ = handle.join();
+            }
         }
         let _ = fs::remove_file(&self.raw_final);
     }
@@ -851,13 +889,18 @@ impl TaskWorkerRuntime for ExecTaskWorkerRuntime {
                 TurnState::Done(poll) => return Ok(poll.clone()),
                 TurnState::Running(running) => {
                     if running.started.elapsed() >= running.spec.timeout {
-                        let _ = running
-                            .group
-                            .terminate_and_reap(&mut running.child, CANCEL_GRACE);
-                        Some(None)
+                        // Record whether the group actually died: a failed kill
+                        // must not lead into unbounded waits below.
+                        Some(PollOutcome::TimedOut(
+                            running
+                                .group
+                                .terminate_and_reap(&mut running.child, CANCEL_GRACE)
+                                .err()
+                                .map(|error| single_line(&error.to_string())),
+                        ))
                     } else {
                         match running.child.try_wait() {
-                            Ok(Some(status)) => Some(Some(status)),
+                            Ok(Some(status)) => Some(PollOutcome::Exited(status)),
                             Ok(None) => None,
                             Err(error) => {
                                 return Err(RuntimeError::internal(single_line(&format!(
@@ -890,28 +933,46 @@ impl TaskWorkerRuntime for ExecTaskWorkerRuntime {
         };
 
         let poll = match exit {
-            Some(status) => self.finalize(turn, status, running)?,
-            None => {
-                // Timeout path: the group was already terminated above.
+            PollOutcome::Exited(status) => self.finalize(turn, status, running)?,
+            PollOutcome::TimedOut(kill_error) => {
                 let mut running = running;
-                let _ = running.child.wait();
-                if let Some(handle) = running.stdin_thread.take() {
-                    let _ = handle.join();
-                }
-                if let Some(handle) = running.stdout_thread.take() {
-                    let _ = handle.join();
-                }
-                if let Some(handle) = running.stderr_thread.take() {
-                    let _ = handle.join();
-                }
-                let _ = fs::remove_file(&running.raw_final);
-                RuntimeTurnPoll::Failed {
-                    failure: SanitizedRuntimeFailure::new(
-                        RuntimeFailureClass::Timeout,
+                let detail = match &kill_error {
+                    // The group is gone, so the drains are guaranteed to end;
+                    // joining them keeps the evidence complete.
+                    None => {
+                        if let Some(handle) = running.stdin_thread.take() {
+                            let _ = handle.join();
+                        }
+                        if let Some(handle) = running.stdout_thread.take() {
+                            let _ = handle.join();
+                        }
+                        if let Some(handle) = running.stderr_thread.take() {
+                            let _ = handle.join();
+                        }
                         format!(
                             "exec turn exceeded its {}s wall-clock limit",
                             running.spec.timeout.as_secs()
-                        ),
+                        )
+                    }
+                    // The group survived SIGKILL. Joining could block forever,
+                    // so report and leave the threads detached rather than
+                    // hanging the supervisor's own watchdog.
+                    Some(error) => single_line(&format!(
+                        "exec turn exceeded its {}s wall-clock limit and its process group \
+                         could not be terminated: {error}",
+                        running.spec.timeout.as_secs()
+                    )),
+                };
+                let _ = fs::remove_file(&running.raw_final);
+                if kill_error.is_some() {
+                    // Skip Drop's terminate/join: it would block on the same
+                    // unkillable group.
+                    std::mem::forget(running);
+                }
+                RuntimeTurnPoll::Failed {
+                    failure: SanitizedRuntimeFailure::new(
+                        RuntimeFailureClass::Timeout,
+                        detail,
                         false,
                     )?,
                     telemetry: RuntimeTelemetry::default(),
@@ -938,17 +999,20 @@ impl TaskWorkerRuntime for ExecTaskWorkerRuntime {
             .get_mut(&turn)
             .ok_or_else(|| RuntimeError::invalid_identity("unknown runtime turn"))?;
         if let TurnState::Running(running) = &mut entry.state {
-            let _ = running
+            let killed = running
                 .group
                 .terminate_and_reap(&mut running.child, CANCEL_GRACE);
-            if let Some(handle) = running.stdin_thread.take() {
-                let _ = handle.join();
-            }
-            if let Some(handle) = running.stdout_thread.take() {
-                let _ = handle.join();
-            }
-            if let Some(handle) = running.stderr_thread.take() {
-                let _ = handle.join();
+            if killed.is_ok() {
+                // Only safe to join once the group is gone.
+                if let Some(handle) = running.stdin_thread.take() {
+                    let _ = handle.join();
+                }
+                if let Some(handle) = running.stdout_thread.take() {
+                    let _ = handle.join();
+                }
+                if let Some(handle) = running.stderr_thread.take() {
+                    let _ = handle.join();
+                }
             }
             let _ = fs::remove_file(&running.raw_final);
             entry.state = TurnState::Done(RuntimeTurnPoll::Failed {
@@ -1079,14 +1143,19 @@ fn parse_thread_started(line: &[u8]) -> Option<String> {
     Some(thread.to_owned())
 }
 
-/// Bounded raw-final ingestion with identity pinning: the pre-created target
-/// must still be the same inode and a regular file.
-/// Read the CLI's final-message file, then delete it.
+/// Stream the CLI's final-message file through the redactor, then delete it.
 ///
-/// A truncated read must drop `guard` trailing bytes: a credential straddling
-/// the cut would otherwise survive as a plaintext prefix that the redactor can
-/// no longer recognize.
-fn ingest_raw_final(path: &Path, expected: (u64, u64), guard: usize) -> Result<Option<Vec<u8>>> {
+/// Identity is pinned (same inode, still a regular file). Memory is bounded,
+/// not the file: the whole message is redacted and sealed, so a legal long
+/// final message keeps its tail. Chunks overlap by `guard` bytes so a
+/// credential straddling a read boundary is still recognized.
+fn ingest_raw_final(
+    path: &Path,
+    expected: (u64, u64),
+    guard: usize,
+    redactor: &SecretRedactor,
+    sink: &mut crate::artifact::BoundedArtifactWriter,
+) -> Result<Option<String>> {
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -1103,19 +1172,58 @@ fn ingest_raw_final(path: &Path, expected: (u64, u64), guard: usize) -> Result<O
     if (metadata.dev(), metadata.ino()) != expected {
         bail!("raw final message file identity changed since it was created");
     }
-    let mut bytes = Vec::new();
-    let mut bounded = file.take(RAW_FINAL_READ_CAP as u64 + 1);
-    bounded.read_to_end(&mut bytes)?;
-    if bytes.len() > RAW_FINAL_READ_CAP {
-        bytes.truncate(RAW_FINAL_READ_CAP.saturating_sub(guard));
-        bytes.extend_from_slice(b"\n[hcom: truncated at the ingestion bound]\n");
+    // Read in bounded chunks, carrying `guard` bytes forward so a secret split
+    // across a boundary is still matched. `relayed` keeps only the leading
+    // window the supervisor may quote; the sealed artifact gets everything.
+    let mut reader = std::io::BufReader::new(file);
+    let mut carry: Vec<u8> = Vec::new();
+    let mut chunk = vec![0_u8; RAW_FINAL_CHUNK];
+    let mut relayed = String::new();
+    let mut total: u64 = 0;
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        carry.extend_from_slice(&chunk[..read]);
+        // Hold back the guard window; it may be the head of a secret whose
+        // tail arrives in the next chunk.
+        let emit_len = carry.len().saturating_sub(guard);
+        if emit_len == 0 {
+            continue;
+        }
+        let mut boundary = emit_len;
+        while boundary > 0 && !is_utf8_boundary(&carry, boundary) {
+            boundary -= 1;
+        }
+        if boundary == 0 {
+            continue;
+        }
+        let piece: Vec<u8> = carry.drain(..boundary).collect();
+        let redacted = redactor.redact(&String::from_utf8_lossy(&piece));
+        sink.write_chunk(redacted.as_bytes())?;
+        if relayed.len() < RELAY_WINDOW_BYTES {
+            relayed.push_str(&redacted);
+        }
+    }
+    if !carry.is_empty() {
+        let redacted = redactor.redact(&String::from_utf8_lossy(&carry));
+        sink.write_chunk(redacted.as_bytes())?;
+        if relayed.len() < RELAY_WINDOW_BYTES {
+            relayed.push_str(&redacted);
+        }
     }
     let _ = fs::remove_file(path);
-    if bytes.is_empty() {
+    if total == 0 {
         Ok(None)
     } else {
-        Ok(Some(bytes))
+        Ok(Some(relayed))
     }
+}
+
+fn is_utf8_boundary(bytes: &[u8], index: usize) -> bool {
+    index == bytes.len() || (bytes[index] & 0xC0) != 0x80
 }
 
 fn exit_failure_detail(
@@ -1991,7 +2099,7 @@ echo "$!" > "$CAPTURE/descendant.pid"
     }
 
     #[test]
-    fn a_secret_straddling_the_ingestion_bound_is_not_leaked() {
+    fn a_long_final_message_keeps_its_tail_and_hides_a_straddling_secret() {
         // The final message is padded so the synthetic secret lands exactly on
         // the truncation boundary; the guard must drop the surviving prefix.
         let mut fixture = fixture(&format!(
@@ -2001,7 +2109,7 @@ head -c {pad} /dev/zero | tr '\0' 'a' > "$OUT"
 printf '%s' "$FAKE_SECRET_TOKEN" >> "$OUT"
 head -c 4096 /dev/zero | tr '\0' 'b' >> "$OUT"
 "#,
-            pad = RAW_FINAL_READ_CAP - 8
+            pad = RAW_FINAL_CHUNK - 8
         ));
         let (_key, turn) = start(
             &mut fixture,
@@ -2029,6 +2137,36 @@ head -c 4096 /dev/zero | tr '\0' 'b' >> "$OUT"
         )
         .unwrap();
         assert!(!sealed.contains(&SECRET_VALUE[..SECRET_VALUE.len() / 2]));
+        // The message continues past the chunk boundary; the tail must survive
+        // rather than being silently dropped.
+        assert!(
+            sealed.contains("bbbb"),
+            "the tail after the secret was lost"
+        );
+    }
+
+    #[test]
+    fn the_prompt_artifact_stays_readable() {
+        let mut fixture = fixture(HAPPY_DEVELOPER);
+        let (_key, turn) = start(
+            &mut fixture,
+            WorkerRole::Developer,
+            RuntimeTurnPurpose::InitialDevelopment,
+        );
+        assert!(matches!(
+            poll_terminal(&mut fixture, turn),
+            RuntimeTurnPoll::Completed { .. }
+        ));
+        let prompt = fs::read_to_string(
+            fixture
+                .artifacts
+                .join("run-1/task-1/developer/session-1/turn-1/attempt-1/prompt.md"),
+        )
+        .unwrap();
+        // The prompt is the reproducibility record: it must survive as text.
+        assert!(prompt.contains("You are the worker."), "{prompt}");
+        assert!(prompt.contains("do the task"), "{prompt}");
+        assert!(!prompt.contains("[REDACTED"), "{prompt}");
     }
 
     #[test]

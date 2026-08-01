@@ -784,8 +784,16 @@ fn process_identity_is_live(identity: &ProcessIdentity) -> Result<bool> {
 /// made the leader its own session and group leader, and only its children
 /// can carry that id.
 fn reaped_group_has_live_descendants(process_group: u32) -> Result<bool> {
+    Ok(!owned_descendants(process_group)?.is_empty())
+}
+
+/// Live, non-zombie processes of this user whose session *and* process group
+/// are both the worker's. `configure_worker_child` made the leader a session
+/// leader, so both ids match only for processes it started.
+fn owned_descendants(process_group: u32) -> Result<Vec<u32>> {
     // SAFETY: geteuid has no preconditions.
     let expected_uid = unsafe { libc::geteuid() };
+    let mut found = Vec::new();
     for entry in fs::read_dir("/proc")? {
         let entry = entry?;
         let Some(pid) = entry
@@ -817,12 +825,18 @@ fn reaped_group_has_live_descendants(process_group: u32) -> Result<bool> {
         let Some(group) = fields.next().and_then(|v| v.parse::<u32>().ok()) else {
             continue;
         };
-        // Zombies hold no resources and are reaped by init.
-        if group == process_group && pid != process_group && state != "Z" {
-            return Ok(true);
+        let session = fields.next().and_then(|v| v.parse::<u32>().ok());
+        // Zombies hold no resources and are reaped by init. Requiring the
+        // session id as well makes a recycled group id insufficient on its own.
+        if group == process_group
+            && session == Some(process_group)
+            && pid != process_group
+            && state != "Z"
+        {
+            found.push(pid);
         }
     }
-    Ok(false)
+    Ok(found)
 }
 
 /// Kill and reap descendants left behind by a leader that already exited.
@@ -831,10 +845,19 @@ pub(crate) fn settle_reaped_group(process_group: u32, grace: Duration) -> Result
     if !reaped_group_has_live_descendants(process_group)? {
         return Ok(false);
     }
-    let group = i32::try_from(process_group).context("worker process group exceeds pid_t")?;
     for signal in [libc::SIGTERM, libc::SIGKILL] {
-        // SAFETY: the negative PID targets the exact worker process group.
-        unsafe { libc::kill(-group, signal) };
+        // Signal each verified descendant individually. A group-wide
+        // `kill(-pgid)` would race with pid reuse: between the scan and the
+        // signal the id can be recycled by an unrelated group of the same
+        // user.
+        for pid in owned_descendants(process_group)? {
+            let Ok(target) = i32::try_from(pid) else {
+                continue;
+            };
+            // SAFETY: `owned_descendants` verified this pid is a live process
+            // of this user in the worker's own session and group.
+            unsafe { libc::kill(target, signal) };
+        }
         let deadline = Instant::now() + grace;
         loop {
             if !reaped_group_has_live_descendants(process_group)? {

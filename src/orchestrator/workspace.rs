@@ -222,8 +222,19 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    /// Build fixtures under `target/`, not `/tmp`.
+    ///
+    /// `/tmp` recycles inodes fast enough that a sibling test thread's
+    /// not-yet-closed lock file can land on the inode a fresh fixture just
+    /// created, making an unrelated flock look like this test's own. A
+    /// per-suite directory removes that aliasing entirely.
     fn temp_project() -> tempfile::TempDir {
-        tempfile::tempdir().expect("temp project")
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-workspaces");
+        fs::create_dir_all(&root).expect("workspace test root");
+        tempfile::Builder::new()
+            .prefix("project.")
+            .tempdir_in(&root)
+            .expect("temp project")
     }
 
     #[test]

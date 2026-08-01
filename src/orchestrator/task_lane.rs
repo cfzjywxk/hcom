@@ -538,10 +538,20 @@ impl TaskLaneSupervisor {
             },
         };
         self.active = None;
-        let effects = self
-            .core
+        // Two-phase commit, same as `execute_effects`: a verdict that closes a
+        // task must not be committed unless the runtime actually closes. The
+        // reviewer's verdict now lands here directly, so the guard has to live
+        // here too.
+        let mut next_core = self.core.clone();
+        let effects = next_core
             .reduce(event)
             .map_err(|error| anyhow!(error.to_string()))?;
+        if let Some(task_ordinal) = successful_task_close(&next_core, &effects)
+            && let Err(error) = self.close_task_runtime(task_ordinal)
+        {
+            return self.fail_driver_effect(task_ordinal, DriverFailureClass::Cleanup, error);
+        }
+        self.core = next_core;
         self.execute_effects(effects)
     }
 
@@ -3893,77 +3903,109 @@ mod real_exec_tests {
         );
     }
 
-    /// Gate 1: the full review loop against the real binary — an initial
-    /// REQUEST_CHANGES, an exact developer resume, an exact reviewer
-    /// re-review, then LGTM. The brief tells the developer to land the work in
-    /// two steps so the first round has something concrete to reject.
+    /// Gate 1: one run, two ordered tasks — the first goes through a real
+    /// REQUEST_CHANGES with an exact developer resume and an exact reviewer
+    /// re-review, the second is approved on its first review, and all four
+    /// role sessions are fresh.
     #[test]
     #[ignore = "requires the pinned real codex binary, auth, and network"]
-    fn real_request_changes_round_resumes_both_roles_and_then_reaches_lgtm() {
-        let fixture = RealFixture::new("loop");
+    fn real_gate_one_review_loop_then_direct_approval_in_one_run() {
+        let fixture = RealFixture::new("gate1");
         let mut supervisor = fixture.supervisor();
-        let task = TaskDraft {
-            task_key: "loop".into(),
-            title: "Add add() with its test".into(),
-            objective: "Create calc.py in the repository root containing a function \
-                        add(a, b) that returns a + b, and commit it. On this first \
-                        turn create ONLY calc.py — do not write any test file yet; \
-                        a later turn covers the tests."
-                .into(),
-            repository_root: fixture.repository.to_string_lossy().into_owned(),
-            acceptance_criteria: vec![
-                "calc.py defines add(a, b) returning a + b".into(),
-                "test_calc.py exists and asserts add(2, 3) == 5; the task is \
-                 incomplete without it and must be rejected"
+        let repository = fixture.repository.to_string_lossy().into_owned();
+        let tasks = vec![
+            TaskDraft {
+                task_key: "staged".into(),
+                title: "Add add() with its test".into(),
+                objective: "Create calc.py in the repository root containing a function \
+                            add(a, b) that returns a + b, and commit it. On this first \
+                            turn create ONLY calc.py — do not write any test file yet; \
+                            a later turn covers the tests."
                     .into(),
-            ],
-            required_checks: vec!["python3 test_calc.py".into()],
-            allowed_paths: vec!["calc.py".into(), "test_calc.py".into()],
-            forbidden_actions: vec!["do not push".into()],
-            max_review_rounds: 3,
-        };
-        let snapshot = fixture.run(&mut supervisor, vec![task]);
+                repository_root: repository.clone(),
+                acceptance_criteria: vec![
+                    "calc.py defines add(a, b) returning a + b".into(),
+                    "test_calc.py exists and asserts add(2, 3) == 5; the task is \
+                     incomplete without it and must be rejected"
+                        .into(),
+                ],
+                required_checks: vec!["python3 test_calc.py".into()],
+                allowed_paths: vec!["calc.py".into(), "test_calc.py".into()],
+                forbidden_actions: vec!["do not push".into()],
+                max_review_rounds: 3,
+            },
+            TaskDraft {
+                task_key: "direct".into(),
+                title: "Add a greeting helper".into(),
+                objective: "Create greet.py in the repository root with a function \
+                            greet(name) returning the string \"hello <name>\", and \
+                            commit it."
+                    .into(),
+                repository_root: repository,
+                acceptance_criteria: vec!["greet.py defines greet(name)".into()],
+                required_checks: vec!["python3 -c \"import greet\"".into()],
+                allowed_paths: vec!["greet.py".into()],
+                forbidden_actions: vec!["do not push".into()],
+                max_review_rounds: 3,
+            },
+        ];
+        let snapshot = fixture.run(&mut supervisor, tasks);
         assert_eq!(
             snapshot.state,
             SessionState::Completed,
             "terminal detail: {:?}",
             snapshot.terminal_detail
         );
-        assert_eq!(
-            snapshot.tasks[0].state,
-            TaskState::Lgtm,
-            "the loop must end in LGTM, not exhaustion"
-        );
+        assert_eq!(snapshot.tasks.len(), 2);
+        for task in &snapshot.tasks {
+            assert_eq!(
+                task.state,
+                TaskState::Lgtm,
+                "task {} ended as {:?}; exhaustion is not success",
+                task.task_key,
+                task.state
+            );
+        }
         assert!(
             snapshot.tasks[0].review_round >= 2,
-            "expected a rejected round before approval, got {}",
+            "task 1 must have been rejected once first, got {}",
             snapshot.tasks[0].review_round
         );
-
-        // Both roles resumed their own exact native session across rounds.
-        let developer = fixture.thread_ids("loop", "developer");
-        let reviewer = fixture.thread_ids("loop", "reviewer");
-        assert!(developer.len() >= 2, "developer did not run twice");
-        assert!(reviewer.len() >= 2, "reviewer did not run twice");
-        assert!(
-            developer.windows(2).all(|w| w[0] == w[1]),
-            "developer changed native session: {developer:?}"
-        );
-        assert!(
-            reviewer.windows(2).all(|w| w[0] == w[1]),
-            "reviewer changed native session: {reviewer:?}"
-        );
-        assert_ne!(
-            developer[0], reviewer[0],
-            "developer and reviewer must not share a native session"
+        assert_eq!(
+            snapshot.tasks[1].review_round, 1,
+            "task 2 must be approved on its first review"
         );
 
-        let calc = std::fs::read_to_string(fixture.repository.join("calc.py")).unwrap();
-        assert!(calc.contains("def add"), "{calc}");
+        // Each role resumed its own exact native session within its task, and
+        // no session was carried across the task boundary: four fresh ones.
+        let mut first_of_each = Vec::new();
+        for (task, role) in [
+            ("staged", "developer"),
+            ("staged", "reviewer"),
+            ("direct", "developer"),
+            ("direct", "reviewer"),
+        ] {
+            let ids = fixture.thread_ids(task, role);
+            assert!(!ids.is_empty(), "{task}/{role} produced no evidence");
+            assert!(
+                ids.windows(2).all(|w| w[0] == w[1]),
+                "{task}/{role} changed native session: {ids:?}"
+            );
+            first_of_each.push(ids[0].clone());
+        }
         assert!(
-            fixture.repository.join("test_calc.py").is_file(),
-            "the correction round must have added the missing test"
+            fixture.thread_ids("staged", "developer").len() >= 2,
+            "task 1 developer did not run a correction turn"
         );
+        let unique: std::collections::BTreeSet<_> = first_of_each.iter().collect();
+        assert_eq!(
+            unique.len(),
+            4,
+            "all four role sessions must be fresh: {first_of_each:?}"
+        );
+
+        assert!(fixture.repository.join("test_calc.py").is_file());
+        assert!(fixture.repository.join("greet.py").is_file());
         assert!(
             fixture.stray_worker_pids().is_empty(),
             "workers outlived the run: {:?}",
