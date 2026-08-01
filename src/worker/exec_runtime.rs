@@ -212,6 +212,9 @@ struct RunningTurn {
     stderr_thread: Option<JoinHandle<(u64, Vec<u8>)>>,
     stdin_thread: Option<JoinHandle<()>>,
     clarification_used: bool,
+    /// The pre-clarification final message, carried forward so the relayed
+    /// outcome keeps the reviewer's original findings alongside the verdict.
+    prior_text: Option<String>,
     attempt_no: u32,
 }
 
@@ -366,6 +369,7 @@ impl ExecTaskWorkerRuntime {
         attempt_no: u32,
         prompt_override: Option<String>,
         clarification_used: bool,
+        prior_text: Option<String>,
     ) -> Result<RunningTurn, RuntimeError> {
         let session = self
             .sessions
@@ -484,6 +488,7 @@ impl ExecTaskWorkerRuntime {
             stderr_thread,
             stdin_thread,
             clarification_used,
+            prior_text,
             attempt_no,
         })
     }
@@ -595,29 +600,42 @@ impl ExecTaskWorkerRuntime {
         }
         let role = session.role;
 
+        // After a format clarification the relayed text keeps BOTH turns: the
+        // original findings and the clarified verdict. Relaying only the
+        // second (usually a bare `VERDICT:` line) would drop the substance the
+        // developer needs.
+        let relay_text = match &running.prior_text {
+            Some(prior) => format!(
+                "{}\n\n---\n[hcom: verdict clarification follow-up]\n\n{}",
+                prior.trim_end(),
+                final_text.trim_start()
+            ),
+            None => final_text.clone(),
+        };
+
         let outcome = match role {
             WorkerRole::Developer => RuntimeOutcome::Developer(DeveloperOutcomeV1 {
                 status: DeveloperOutcomeStatus::Ready,
-                summary: truncate_chars(&final_text, MAX_OUTCOME_SUMMARY_CHARS),
+                summary: truncate_chars(&relay_text, MAX_OUTCOME_SUMMARY_CHARS),
                 questions: Vec::new(),
             }),
             WorkerRole::Reviewer => match classify_verdict(&final_text) {
                 VerdictClassification::Determined(Verdict::Lgtm) => {
                     RuntimeOutcome::Reviewer(ReviewerOutcomeV1 {
                         verdict: ReviewerVerdict::Lgtm,
-                        summary: truncate_chars(&final_text, MAX_OUTCOME_SUMMARY_CHARS),
+                        summary: truncate_chars(&relay_text, MAX_OUTCOME_SUMMARY_CHARS),
                         findings: Vec::new(),
                     })
                 }
                 VerdictClassification::Determined(Verdict::RequestChanges) => {
                     RuntimeOutcome::Reviewer(ReviewerOutcomeV1 {
                         verdict: ReviewerVerdict::RequestChanges,
-                        summary: truncate_chars(&final_text, MAX_OUTCOME_SUMMARY_CHARS),
+                        summary: truncate_chars(&relay_text, MAX_OUTCOME_SUMMARY_CHARS),
                         findings: vec![ReviewFindingV1 {
                             severity: ReviewFindingSeverity::Major,
                             path: None,
                             line: None,
-                            message: truncate_chars(&final_text, MAX_REVIEW_FINDING_MESSAGE_CHARS),
+                            message: truncate_chars(&relay_text, MAX_REVIEW_FINDING_MESSAGE_CHARS),
                         }],
                     })
                 }
@@ -644,6 +662,7 @@ impl ExecTaskWorkerRuntime {
                         next_attempt,
                         Some(CLARIFICATION_PROMPT.to_string()),
                         true,
+                        Some(final_text.clone()),
                     )?;
                     let turn = self
                         .turns
@@ -725,7 +744,7 @@ impl TaskWorkerRuntime for ExecTaskWorkerRuntime {
                 .checked_add(1)
                 .ok_or_else(|| RuntimeError::internal("turn sequence overflow"))?;
         }
-        let running = self.spawn_invocation(session, spec, 1, None, false)?;
+        let running = self.spawn_invocation(session, spec, 1, None, false, None)?;
         self.next_turn += 1;
         let key = RuntimeTurnKey::from_counter(self.next_turn)?;
         self.turns.insert(

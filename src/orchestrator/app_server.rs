@@ -1037,48 +1037,83 @@ impl AppServerSessionSupervisor {
         role: WorkerRole,
         purpose: RuntimeTurnPurpose,
     ) -> Result<String> {
-        #[derive(Serialize)]
-        struct Prompt<'a> {
-            contract: &'static str,
-            role: &'static str,
-            purpose: RuntimeTurnPurpose,
-            task_ordinal: usize,
-            project_root: &'a Path,
-            task: &'a TaskDraft,
-            base_revision: Option<&'a str>,
-            head_revision: Option<&'a str>,
-            expected_repository: &'a RepositoryObservation,
-            developer_outcome: Option<&'a crate::worker::runtime::DeveloperOutcomeV1>,
-            reviewer_outcome: Option<&'a crate::worker::runtime::ReviewerOutcomeV1>,
-            recovery_checkpoint: Option<&'a RepositoryObservation>,
-        }
         let task = self
             .core
             .tasks()
             .get(task_ordinal)
             .ok_or_else(|| anyhow!("turn prompt task ordinal is out of range"))?;
-        let prompt = Prompt {
-            contract: "hcom-app-server-turn-envelope-v1",
-            role: match role {
-                WorkerRole::Developer => "developer",
-                WorkerRole::Reviewer => "reviewer",
-            },
-            purpose,
-            task_ordinal,
-            project_root: &self.startup.project_root,
-            task: &task.spec,
-            base_revision: task.base_revision.as_deref(),
-            head_revision: task.head_revision.as_deref(),
-            expected_repository: task.expected_repository(),
-            developer_outcome: task.last_developer_outcome(),
-            reviewer_outcome: task.last_reviewer_outcome(),
-            recovery_checkpoint: task.recovery_checkpoint(),
-        };
-        let encoded = serde_json::to_string(&prompt)?;
-        if encoded.len() > crate::worker::runtime::MAX_RUNTIME_PROMPT_BYTES {
+        let spec = &task.spec;
+        let mut prompt = String::new();
+        prompt.push_str(&format!(
+            "# Task {task_ordinal}: {}\n\n{}\n\n## Context\n\n- repository: {}\n- project directory: {}\n",
+            spec.title,
+            spec.objective,
+            spec.repository_root,
+            self.startup.project_root.display()
+        ));
+        if let Some(base) = task.base_revision.as_deref() {
+            prompt.push_str(&format!("- base revision: {base}\n"));
+        }
+        if let Some(head) = task.head_revision.as_deref() {
+            prompt.push_str(&format!("- current head: {head}\n"));
+        }
+        if !spec.acceptance_criteria.is_empty() {
+            prompt.push_str("\n## Acceptance criteria\n\n");
+            for item in &spec.acceptance_criteria {
+                prompt.push_str(&format!("- {item}\n"));
+            }
+        }
+        if !spec.required_checks.is_empty() {
+            prompt.push_str("\n## Required checks\n\n");
+            for item in &spec.required_checks {
+                prompt.push_str(&format!("- {item}\n"));
+            }
+        }
+        if !spec.allowed_paths.is_empty() {
+            prompt.push_str("\n## Paths in scope\n\n");
+            for item in &spec.allowed_paths {
+                prompt.push_str(&format!("- {item}\n"));
+            }
+        }
+        if !spec.forbidden_actions.is_empty() {
+            prompt.push_str("\n## Forbidden actions\n\n");
+            for item in &spec.forbidden_actions {
+                prompt.push_str(&format!("- {item}\n"));
+            }
+        }
+
+        // Relay the peer's previous message verbatim (already redacted and
+        // bounded upstream). hcom does not interpret it.
+        match role {
+            WorkerRole::Developer => {
+                if purpose == RuntimeTurnPurpose::DeveloperCorrection
+                    && let Some(review) = task.last_reviewer_outcome()
+                {
+                    prompt.push_str(
+                        "\n## Reviewer response to your previous work\n\nThe reviewer requested \
+                         changes. Their full message follows verbatim.\n\n---\n\n",
+                    );
+                    prompt.push_str(&bounded_relay(&review.summary));
+                    prompt.push_str("\n\n---\n\nAddress it, then commit and report as before.\n");
+                }
+            }
+            WorkerRole::Reviewer => {
+                if let Some(developer) = task.last_developer_outcome() {
+                    prompt.push_str(
+                        "\n## Developer report\n\nThe developer's full final message follows \
+                         verbatim.\n\n---\n\n",
+                    );
+                    prompt.push_str(&bounded_relay(&developer.summary));
+                    prompt.push_str("\n\n---\n");
+                }
+                prompt.push_str(REVIEWER_OUTPUT_CONTRACT);
+            }
+        }
+
+        if prompt.len() > crate::worker::runtime::MAX_RUNTIME_PROMPT_BYTES {
             bail!("rendered task turn prompt exceeds its 256 KiB bound");
         }
-        Ok(encoded)
+        Ok(prompt)
     }
 
     fn outcome_contains_sensitive_value(
@@ -1392,15 +1427,49 @@ fn materialized_environment(
         .collect()
 }
 
+/// The reviewer's only output obligation. Deliberately narrow: hcom parses one
+/// anchored line and treats everything else as opaque payload.
+const REVIEWER_OUTPUT_CONTRACT: &str = "
+## Required output format
+
+The FIRST line of your final message must be exactly one of:
+
+VERDICT: LGTM
+VERDICT: REQUEST_CHANGES
+
+on its own line, with no decoration and no other text on that line. After it,
+write your findings as free-form markdown (path:line references are helpful but
+not required). Judge how deeply to verify: the repository is read-only to you,
+but your sandbox is writable, so you may copy it elsewhere and build or test it
+if you want independent evidence.
+";
+
 fn role_instructions(role: WorkerRole) -> &'static str {
     match role {
         WorkerRole::Developer => {
-            "You are the task Developer. Work directly in the exact repository and complete the bounded task. Change and commit only allowed paths, run the required checks, do not push/install or seek interactive input, and return only the required DeveloperV1 outcome."
+            "You are the task Developer. Work directly in the exact repository and complete the bounded task. Run whatever checks the task requires, commit your work, and do not push, install, or wait for interactive input. Your final message is your report to the reviewer: state what you changed, what you verified, and anything you left undone."
         }
         WorkerRole::Reviewer => {
-            "You are the task Reviewer. Independently inspect the exact committed task range and run the checks needed for review. The sandbox is writable so tools and ignored caches work, but you must not edit reviewed source, stage, commit, change branch or HEAD, push, install, or repair findings. Return only the required ReviewerV1 outcome."
+            "You are the task Reviewer. Independently inspect the committed task range and decide whether it is sound. You must not edit reviewed source, stage, commit, change branch or HEAD, push, or install; verifying by copying the tree into your own writable sandbox is allowed and encouraged when it helps."
         }
     }
+}
+
+/// Relay a peer message into the next prompt: bounded view of an already
+/// redacted string, truncated with an explicit marker rather than rejected.
+fn bounded_relay(text: &str) -> String {
+    const RELAY_CAP: usize = 64 * 1024;
+    if text.len() <= RELAY_CAP {
+        return text.to_string();
+    }
+    let mut end = RELAY_CAP;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n[hcom: truncated at {end} bytes; the full message is on disk in this run's artifacts]",
+        &text[..end]
+    )
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {
@@ -1559,6 +1628,7 @@ mod tests {
         opens: Vec<String>,
         sessions: Vec<(String, WorkerRole, u64)>,
         turns: Vec<(String, WorkerRole, RuntimeTurnPurpose, u64)>,
+        prompts: Vec<(WorkerRole, RuntimeTurnPurpose, String)>,
         shutdowns: Vec<String>,
         environments: Vec<Vec<(OsString, OsString)>>,
         profiles: Vec<(String, WorkerRole, RuntimeProfile)>,
@@ -1638,13 +1708,14 @@ mod tests {
         ) -> Result<RuntimeTurnKey, RuntimeError> {
             let role = spec.role;
             let purpose = spec.purpose;
+            let prompt = spec.prompt.clone();
             let turn = self.inner.start_turn(session, spec)?;
-            self.audit.lock().unwrap().turns.push((
-                self.task_key.clone(),
-                role,
-                purpose,
-                session.counter(),
-            ));
+            let mut audit = self.audit.lock().unwrap();
+            audit
+                .turns
+                .push((self.task_key.clone(), role, purpose, session.counter()));
+            audit.prompts.push((role, purpose, prompt));
+            drop(audit);
             Ok(turn)
         }
 
@@ -1818,6 +1889,168 @@ mod tests {
                 }),
             )
             .unwrap()
+        }
+    }
+
+    /// Support for the opt-in real-Codex acceptance tests: a disposable
+    /// project + repository driven by the production runtime factory.
+    pub(super) mod real_support {
+        use super::super::*;
+        use crate::worker::environment::ParentEnvironment;
+        use crate::worker::profile::{
+            ArchitectAdapter, CodexInvocationProfile, DeveloperInvocationProfile,
+            ReviewerInvocationProfile, SessionInvocationProfiles,
+        };
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        /// Cheap model for acceptance runs; production defaults stay untouched.
+        const TEST_MODEL: &str = "gpt-5.3-codex-spark";
+        const TEST_EFFORT: &str = "medium";
+
+        pub(crate) struct RealFixture {
+            pub(crate) _temp: tempfile::TempDir,
+            pub(crate) project_root: PathBuf,
+            pub(crate) repository: PathBuf,
+            run_root: PathBuf,
+            lock_root: PathBuf,
+            sources: SessionRuntimeSources,
+        }
+
+        impl RealFixture {
+            pub(crate) fn new(label: &str) -> Self {
+                let temp = tempfile::Builder::new()
+                    .prefix(&format!("hcom-real-exec-{label}."))
+                    .tempdir()
+                    .unwrap();
+                let root = fs::canonicalize(temp.path()).unwrap();
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+                let run_root = root.join("run");
+                let lock_root = root.join("locks");
+                let project_root = root.join("project");
+                let repository = project_root.join("repository");
+                for directory in [&run_root, &lock_root, &project_root, &repository] {
+                    fs::create_dir_all(directory).unwrap();
+                    fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+                }
+                super::git(&repository, &["init", "-b", "master"]);
+                fs::write(repository.join("README.md"), "# fixture\n").unwrap();
+                super::git(&repository, &["add", "--", "README.md"]);
+                super::git_commit(&repository, "Initial acceptance fixture");
+                let repository = fs::canonicalize(repository).unwrap();
+
+                let home = std::env::var("HOME").expect("HOME");
+                let mut profiles =
+                    SessionInvocationProfiles::for_codex_app_server_lane(ArchitectAdapter::Codex)
+                        .unwrap();
+                let cheap = CodexInvocationProfile {
+                    model: TEST_MODEL.into(),
+                    reasoning_effort: TEST_EFFORT.into(),
+                    sandbox: crate::worker::profile::CodexSandbox::DangerFullAccess,
+                    approval_policy: crate::worker::profile::CodexApprovalPolicy::Never,
+                };
+                profiles.developer = DeveloperInvocationProfile::Codex {
+                    profile: cheap.clone(),
+                };
+                profiles.reviewer = ReviewerInvocationProfile::Codex { profile: cheap };
+
+                let mut sources = SessionRuntimeSources::fake(Path::new(&home));
+                sources.set_profiles_for_test(profiles);
+                sources.codex_auth_source =
+                    Some(fs::canonicalize(format!("{home}/.codex/auth.json")).unwrap());
+                sources.cargo_bin_source = PathBuf::from(format!("{home}/.cargo/bin"));
+                sources.rustup_home_source = PathBuf::from(format!("{home}/.rustup"));
+                // Complete parent inheritance, exactly like production.
+                sources.parent_environment = ParentEnvironment::capture_current();
+
+                Self {
+                    _temp: temp,
+                    project_root,
+                    repository,
+                    run_root,
+                    lock_root,
+                    sources,
+                }
+            }
+
+            pub(crate) fn supervisor(&self) -> AppServerSessionSupervisor {
+                AppServerSessionSupervisor::open(
+                    "run-real-exec".into(),
+                    self.project_root.clone(),
+                    self.run_root.clone(),
+                    self.lock_root.clone(),
+                    self.sources.clone(),
+                )
+                .unwrap()
+            }
+
+            pub(crate) fn run(
+                &self,
+                supervisor: &mut AppServerSessionSupervisor,
+                tasks: Vec<TaskDraft>,
+            ) -> SessionStatusSnapshot {
+                let (plan_version, plan_hash) = supervisor
+                    .replace_plan(0, CODEX_APP_SERVER_ADAPTER, CODEX_APP_SERVER_ADAPTER, tasks)
+                    .unwrap();
+                supervisor
+                    .approve_and_start(1, plan_version, &plan_hash, true)
+                    .unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20 * 60);
+                loop {
+                    supervisor.poll_once().unwrap();
+                    let snapshot = supervisor.snapshot();
+                    if snapshot.state.is_terminal() {
+                        return snapshot;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "real acceptance run did not finish within 20 minutes"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+
+            /// Every role of a task left durable evidence in `hcom-tasks/`.
+            pub(crate) fn assert_artifacts(&self, task_key: &str, roles: &[&str]) {
+                let task_dir = self
+                    .project_root
+                    .join("hcom-tasks/run-real-exec")
+                    .join(task_key);
+                for role in roles {
+                    let role_dir = task_dir.join(role);
+                    assert!(role_dir.is_dir(), "missing artifacts for {task_key}/{role}");
+                    let final_files: Vec<_> = walk_files(&role_dir)
+                        .into_iter()
+                        .filter(|path| {
+                            path.file_name().and_then(|name| name.to_str())
+                                == Some("native-final.partial")
+                        })
+                        .collect();
+                    assert!(
+                        !final_files.is_empty(),
+                        "no sealed final message for {task_key}/{role}"
+                    );
+                }
+            }
+        }
+
+        fn walk_files(root: &Path) -> Vec<PathBuf> {
+            let mut out = Vec::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                let Ok(entries) = fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else {
+                        out.push(path);
+                    }
+                }
+            }
+            out
         }
     }
 
@@ -2512,6 +2745,216 @@ mod tests {
         let audit = audit.lock().unwrap();
         assert_eq!(audit.opens, ["cancel-review"]);
         assert_eq!(audit.shutdowns, ["cancel-review"]);
+    }
+
+    #[test]
+    fn request_changes_round_relays_the_full_reviewer_message_to_the_developer() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script(
+            "review-loop",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("first attempt: added the module")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [request_changes("the overflow case is unhandled")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::DeveloperCorrection,
+                    [ready("second attempt: handled overflow")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::ReviewerRereview,
+                    [lgtm("overflow handling is correct now")],
+                ),
+            ],
+            vec![
+                Mutation::Commit {
+                    path: "src/task.txt",
+                    contents: "one\n",
+                },
+                Mutation::None,
+                Mutation::Commit {
+                    path: "src/task.txt",
+                    contents: "two\n",
+                },
+                Mutation::None,
+            ],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
+        start(
+            &mut supervisor,
+            vec![fixture.task("review-loop", &["src"], 3)],
+        );
+        let snapshot = drive_terminal(&mut supervisor);
+        assert_eq!(snapshot.state, SessionState::Completed);
+        assert_eq!(snapshot.tasks[0].state, TaskState::Lgtm);
+        assert_eq!(snapshot.tasks[0].review_round, 2);
+
+        let audit = audit.lock().unwrap();
+        // One developer session and one reviewer session, each resumed.
+        assert_eq!(
+            audit
+                .sessions
+                .iter()
+                .filter(|(_, role, _)| *role == WorkerRole::Developer)
+                .count(),
+            1
+        );
+        assert_eq!(
+            audit
+                .sessions
+                .iter()
+                .filter(|(_, role, _)| *role == WorkerRole::Reviewer)
+                .count(),
+            1
+        );
+        // The reviewer sees the developer's report; the correction turn sees
+        // the reviewer's message verbatim.
+        let review_prompt = audit
+            .prompts
+            .iter()
+            .find(|(role, purpose, _)| {
+                *role == WorkerRole::Reviewer && *purpose == RuntimeTurnPurpose::InitialReview
+            })
+            .map(|(_, _, prompt)| prompt.clone())
+            .expect("initial review prompt");
+        assert!(review_prompt.contains("first attempt: added the module"));
+        assert!(review_prompt.contains("VERDICT: LGTM"));
+        assert!(review_prompt.contains("VERDICT: REQUEST_CHANGES"));
+        let correction_prompt = audit
+            .prompts
+            .iter()
+            .find(|(role, purpose, _)| {
+                *role == WorkerRole::Developer
+                    && *purpose == RuntimeTurnPurpose::DeveloperCorrection
+            })
+            .map(|(_, _, prompt)| prompt.clone())
+            .expect("correction prompt");
+        assert!(correction_prompt.contains("changes required"));
+        let rereview_prompt = audit
+            .prompts
+            .iter()
+            .find(|(role, purpose, _)| {
+                *role == WorkerRole::Reviewer && *purpose == RuntimeTurnPurpose::ReviewerRereview
+            })
+            .map(|(_, _, prompt)| prompt.clone())
+            .expect("re-review prompt");
+        assert!(rereview_prompt.contains("second attempt: handled overflow"));
+    }
+
+    #[test]
+    fn review_exhausted_advances_without_pretending_to_be_lgtm() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script(
+            "exhausted",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("attempt")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [request_changes("still wrong")],
+                ),
+            ],
+            vec![
+                Mutation::Commit {
+                    path: "src/task.txt",
+                    contents: "one\n",
+                },
+                Mutation::None,
+            ],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
+        start(
+            &mut supervisor,
+            vec![fixture.task("exhausted", &["src"], 1)],
+        );
+        let snapshot = drive_terminal(&mut supervisor);
+        assert_eq!(snapshot.state, SessionState::Completed);
+        assert_eq!(snapshot.tasks[0].state, TaskState::ReviewExhausted);
+        assert!(
+            snapshot.tasks[0]
+                .outcome_detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("exhausted")
+        );
+    }
+
+    #[test]
+    fn each_task_gets_fresh_developer_and_reviewer_sessions() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let scripts = [("task-one", "first\n"), ("task-two", "second\n")]
+            .iter()
+            .map(|(key, contents)| {
+                task_script(
+                    key,
+                    vec![
+                        FakeTurnScript::new(
+                            WorkerRole::Developer,
+                            RuntimeTurnPurpose::InitialDevelopment,
+                            [ready("done")],
+                        ),
+                        FakeTurnScript::new(
+                            WorkerRole::Reviewer,
+                            RuntimeTurnPurpose::InitialReview,
+                            [lgtm("sound")],
+                        ),
+                    ],
+                    vec![
+                        Mutation::Commit {
+                            path: "src/task.txt",
+                            contents,
+                        },
+                        Mutation::None,
+                    ],
+                )
+            })
+            .collect();
+        let mut supervisor = fixture.supervisor(scripts, Arc::clone(&audit));
+        start(
+            &mut supervisor,
+            vec![
+                fixture.task("task-one", &["src"], 2),
+                fixture.task("task-two", &["src"], 2),
+            ],
+        );
+        assert_eq!(
+            drive_terminal(&mut supervisor).state,
+            SessionState::Completed
+        );
+        let audit = audit.lock().unwrap();
+        assert_eq!(audit.opens, ["task-one", "task-two"]);
+        assert_eq!(audit.shutdowns, ["task-one", "task-two"]);
+        // Four sessions total, two per task, each opened against that task's
+        // own fresh runtime — nothing is carried across the task boundary.
+        assert_eq!(audit.sessions.len(), 4);
+        for task in ["task-one", "task-two"] {
+            let roles: BTreeSet<WorkerRole> = audit
+                .sessions
+                .iter()
+                .filter(|(key, _, _)| key == task)
+                .map(|(_, role, _)| *role)
+                .collect();
+            assert_eq!(
+                roles,
+                BTreeSet::from([WorkerRole::Developer, WorkerRole::Reviewer]),
+                "{task} must open exactly one developer and one reviewer session"
+            );
+        }
     }
 
     #[test]
@@ -3353,5 +3796,104 @@ mod tests {
             Some("task worker runtime cleanup failed")
         );
         assert_eq!(audit.lock().unwrap().shutdowns, ["cleanup-failure"]);
+    }
+}
+
+/// Real-Codex acceptance for the exec lane.
+///
+/// Opt-in; runs the pinned 0.146 binary against a disposable project with the
+/// cheap test model. Never touches an existing user terminal or session.
+///
+///   cargo test --lib real_exec -- --ignored --nocapture --test-threads=1
+#[cfg(test)]
+mod real_exec_tests {
+    use super::tests::real_support::*;
+    use super::*;
+    use crate::control_api::TaskState;
+
+    #[test]
+    #[ignore = "requires the pinned real codex binary, auth, and network"]
+    fn real_single_task_developer_then_reviewer_reaches_lgtm() {
+        let fixture = RealFixture::new("fib");
+        let mut supervisor = fixture.supervisor();
+        let task = TaskDraft {
+            task_key: "fib".into(),
+            title: "Add a fibonacci function".into(),
+            objective: "Create fib.py in the repository root containing a function \
+                        fib(n) that returns the nth Fibonacci number (fib(0)=0, fib(1)=1). \
+                        Commit it with git."
+                .into(),
+            repository_root: fixture.repository.to_string_lossy().into_owned(),
+            acceptance_criteria: vec!["fib.py exists and is committed".into()],
+            required_checks: vec!["python3 -c \"import fib; print(fib.fib(10))\"".into()],
+            allowed_paths: vec!["fib.py".into()],
+            forbidden_actions: vec!["do not push".into()],
+            max_review_rounds: 2,
+        };
+        let snapshot = fixture.run(&mut supervisor, vec![task]);
+        assert_eq!(
+            snapshot.state,
+            SessionState::Completed,
+            "terminal detail: {:?}",
+            snapshot.terminal_detail
+        );
+        assert_eq!(snapshot.tasks[0].state, TaskState::Lgtm);
+        assert!(fixture.repository.join("fib.py").is_file());
+        fixture.assert_artifacts("fib", &["developer", "reviewer"]);
+    }
+
+    #[test]
+    #[ignore = "requires the pinned real codex binary, auth, and network"]
+    fn real_two_task_run_advances_automatically() {
+        let fixture = RealFixture::new("two");
+        let mut supervisor = fixture.supervisor();
+        let tasks = vec![
+            TaskDraft {
+                task_key: "greet".into(),
+                title: "Add a greeting module".into(),
+                objective: "Create greet.py in the repository root with a function \
+                            greet(name) returning the string \"hello <name>\". Commit it."
+                    .into(),
+                repository_root: fixture.repository.to_string_lossy().into_owned(),
+                acceptance_criteria: vec!["greet.py exists and is committed".into()],
+                required_checks: vec!["python3 -c \"import greet\"".into()],
+                allowed_paths: vec!["greet.py".into()],
+                forbidden_actions: vec!["do not push".into()],
+                max_review_rounds: 2,
+            },
+            TaskDraft {
+                task_key: "square".into(),
+                title: "Add a square module".into(),
+                objective: "Create square.py in the repository root with a function \
+                            square(n) returning n*n. Commit it."
+                    .into(),
+                repository_root: fixture.repository.to_string_lossy().into_owned(),
+                acceptance_criteria: vec!["square.py exists and is committed".into()],
+                required_checks: vec!["python3 -c \"import square\"".into()],
+                allowed_paths: vec!["square.py".into()],
+                forbidden_actions: vec!["do not push".into()],
+                max_review_rounds: 2,
+            },
+        ];
+        let snapshot = fixture.run(&mut supervisor, tasks);
+        assert_eq!(
+            snapshot.state,
+            SessionState::Completed,
+            "terminal detail: {:?}",
+            snapshot.terminal_detail
+        );
+        assert_eq!(snapshot.tasks.len(), 2);
+        for task in &snapshot.tasks {
+            assert!(
+                matches!(task.state, TaskState::Lgtm | TaskState::ReviewExhausted),
+                "task {} ended as {:?}",
+                task.task_key,
+                task.state
+            );
+        }
+        assert!(fixture.repository.join("greet.py").is_file());
+        assert!(fixture.repository.join("square.py").is_file());
+        fixture.assert_artifacts("greet", &["developer", "reviewer"]);
+        fixture.assert_artifacts("square", &["developer", "reviewer"]);
     }
 }
