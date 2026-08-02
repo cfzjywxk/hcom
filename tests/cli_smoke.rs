@@ -505,7 +505,11 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
         normalized_stdout.contains(
             "Codex Architect and every Codex exec worker inherit the complete parent environment, real HOME/CODEX_HOME, native config"
         ) && normalized_stdout.contains(
-            "hcom overrides only private HCOM_DIR and its own run/task/role identity"
+            "hcom does not replace any parent environment variable, including HCOM_DIR"
+        ) && normalized_stdout.contains(
+            "does not add role/run/task environment variables to Codex worker processes"
+        ) && normalized_stdout.contains(
+            "hcom does not inspect, register, or freeze a native Codex Architect session"
         ),
         "stdout={stdout}"
     );
@@ -515,7 +519,7 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
         ) && normalized_stdout.contains(
             "trust, AGENTS.md, rules, hooks, skills, plugins, feature flags, providers, and MCP servers remain loaded"
         ) && normalized_stdout.contains(
-            "project directory as native cwd and receive that repository through --add-dir"
+            "project directory as native cwd and receive that directory through --add-dir"
         ),
         "stdout={stdout}"
     );
@@ -531,7 +535,10 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
         stdout.contains("exact current directory"),
         "stdout={stdout}"
     );
-    assert!(stdout.contains("canonical Git root"), "stdout={stdout}");
+    assert!(
+        stdout.contains("canonical source directory"),
+        "stdout={stdout}"
+    );
     assert!(stdout.contains("$HCOM_DIR/config.toml"), "stdout={stdout}");
     assert!(stdout.contains("[architect.profile]"), "stdout={stdout}");
     assert!(stdout.contains("[architect.developer]"), "stdout={stdout}");

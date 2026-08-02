@@ -9,30 +9,26 @@ use crate::control_api::peer::{
 };
 use crate::control_api::protocol::PROTOCOL_VERSION;
 use crate::control_api::registration::{
-    CONTROL_REFUSAL_TRANSPORT, NATIVE_SESSION_REFUSAL_CHANGED, NATIVE_SESSION_REFUSAL_DISCOVERY,
-    NATIVE_SESSION_REFUSAL_REGISTRATION_TRANSPORT, NATIVE_SESSION_REFUSAL_REGISTRATION_VERSION,
-    RegistrationAction, RegistrationCaller, RegistrationClient, RegistrationRequest,
-    TOOL_REFUSAL_ACTION, TOOL_REFUSAL_ENVELOPE, closed_native_session_refusal_code,
+    CONTROL_REFUSAL_TRANSPORT, RegistrationAction, RegistrationCaller, RegistrationClient,
+    RegistrationRequest, TOOL_REFUSAL_ACTION, TOOL_REFUSAL_ENVELOPE,
 };
 use crate::control_api::supervisor::ControlPaths;
 use crate::control_api::{CallerAuth, ControlRequest, ControlResponse};
 use crate::worker::ExecutableIdentity;
-use crate::worker::contract::validate_native_session_id;
 use crate::worker::profile::{
     CLAUDE_DEVELOPER_ADAPTER, CLAUDE_REVIEWER_ADAPTER, CODEX_DEVELOPER_ADAPTER,
     CODEX_REVIEWER_ADAPTER,
 };
 use crate::worker::runtime::CODEX_TASK_WORKER_ADAPTER;
+use crate::worker::validation::validate_opaque_id;
 use anyhow::{Context, Result, bail};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{FromRawFd, RawFd};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -42,22 +38,17 @@ const MAX_MCP_LINE_BYTES: usize = 256 * 1024;
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const RELAY_SOCKET_NAME: &str = "relay.sock";
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const MAX_CODEX_SESSION_TREE_ENTRIES: usize = 32 * 1024;
-// 8192 fixed-width identities encode to under 175 KiB, leaving ample room in
-// the existing 256 KiB bootstrap frame. A JSON array of decimal u64 tuples
-// would not have that property.
-const MAX_CODEX_SESSION_FILES: usize = 8 * 1024;
 
 #[derive(Debug)]
-struct NativeSessionBindingRefusal(&'static str);
+struct ToolCallRefusal(&'static str);
 
-impl std::fmt::Display for NativeSessionBindingRefusal {
+impl std::fmt::Display for ToolCallRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.0)
     }
 }
 
-impl std::error::Error for NativeSessionBindingRefusal {}
+impl std::error::Error for ToolCallRefusal {}
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -67,79 +58,13 @@ pub(super) struct BridgeConfiguration {
     pub capability: String,
     pub project_root: PathBuf,
     pub run_root: PathBuf,
-    pub lock_root: PathBuf,
     pub relay_socket_path: PathBuf,
     pub registration_socket_path: PathBuf,
     pub control_socket_path: PathBuf,
-    pub native_session_source: ArchitectNativeSessionSource,
     pub relay_executable: ExecutableIdentity,
     pub relay_runtime_scope_hash: String,
     pub developer_adapter: String,
     pub reviewer_adapter: String,
-}
-
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "adapter", rename_all = "lowercase", deny_unknown_fields)]
-pub(super) enum ArchitectNativeSessionSource {
-    Codex {
-        codex_home: PathBuf,
-        baseline: CodexSessionBaseline,
-    },
-    Claude {
-        native_session_id: String,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct CodexSessionFileIdentity(pub(super) u64, pub(super) u64);
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(super) struct CodexSessionBaseline {
-    identities_base64: String,
-}
-
-impl CodexSessionBaseline {
-    fn empty() -> Self {
-        Self {
-            identities_base64: String::new(),
-        }
-    }
-
-    fn from_identities(identities: &[CodexSessionFileIdentity]) -> Result<Self> {
-        if identities.len() > MAX_CODEX_SESSION_FILES
-            || !identities.windows(2).all(|pair| pair[0] < pair[1])
-        {
-            bail!("native Codex session baseline is invalid");
-        }
-        let mut bytes = Vec::with_capacity(identities.len() * 16);
-        for CodexSessionFileIdentity(device, inode) in identities {
-            bytes.extend_from_slice(&device.to_be_bytes());
-            bytes.extend_from_slice(&inode.to_be_bytes());
-        }
-        Ok(Self {
-            identities_base64: URL_SAFE_NO_PAD.encode(bytes),
-        })
-    }
-
-    fn identities(&self) -> Result<Vec<CodexSessionFileIdentity>> {
-        let bytes = URL_SAFE_NO_PAD
-            .decode(&self.identities_base64)
-            .context("native Codex session baseline encoding is invalid")?;
-        if bytes.len() % 16 != 0 || bytes.len() / 16 > MAX_CODEX_SESSION_FILES {
-            bail!("native Codex session baseline is invalid");
-        }
-        let mut identities = Vec::with_capacity(bytes.len() / 16);
-        for pair in bytes.chunks_exact(16) {
-            let device = u64::from_be_bytes(pair[..8].try_into().expect("eight-byte device"));
-            let inode = u64::from_be_bytes(pair[8..].try_into().expect("eight-byte inode"));
-            identities.push(CodexSessionFileIdentity(device, inode));
-        }
-        if !identities.windows(2).all(|pair| pair[0] < pair[1]) {
-            bail!("native Codex session baseline is invalid");
-        }
-        Ok(identities)
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -294,7 +219,7 @@ pub(super) fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn validate_bridge_configuration(configuration: &BridgeConfiguration) -> Result<()> {
-    validate_native_session_id(&configuration.binding_id)?;
+    validate_opaque_id("architect binding id", &configuration.binding_id)?;
     validate_secret(&configuration.launch_nonce)?;
     validate_secret(&configuration.capability)?;
     validate_canonical_directory(
@@ -313,30 +238,12 @@ fn validate_bridge_configuration(configuration: &BridgeConfiguration) -> Result<
     if scope_hash != configuration.relay_runtime_scope_hash {
         bail!("architect relay runtime scope drifted before bridge start");
     }
-    match &configuration.native_session_source {
-        ArchitectNativeSessionSource::Codex {
-            codex_home,
-            baseline,
-        } => {
-            validate_canonical_directory("native Codex home", codex_home, None)?;
-            baseline.identities()?;
-        }
-        ArchitectNativeSessionSource::Claude { native_session_id } => {
-            validate_native_session_id(native_session_id)?;
-            let canonical = Uuid::parse_str(native_session_id)
-                .context("Claude architect native session id is not a UUID")?
-                .to_string();
-            if &canonical != native_session_id {
-                bail!("Claude architect native session id is not canonical lowercase");
-            }
-        }
-    }
     configuration.relay_executable.revalidate()?;
     validate_worker_adapter_binding(
         &configuration.developer_adapter,
         &configuration.reviewer_adapter,
     )?;
-    let paths = ControlPaths::new(&configuration.run_root, &configuration.lock_root)?;
+    let paths = ControlPaths::new(&configuration.run_root)?;
     if paths.socket_path() != configuration.control_socket_path
         || paths.registration_socket_path() != configuration.registration_socket_path
     {
@@ -356,7 +263,7 @@ fn validate_worker_adapter_binding(developer_adapter: &str, reviewer_adapter: &s
         CODEX_REVIEWER_ADAPTER | CLAUDE_REVIEWER_ADAPTER
     );
     if !(exec_worker_pair || retained_cli_pair) {
-        bail!("architect bridge received an unknown session-frozen worker adapter");
+        bail!("architect bridge received an unknown worker adapter");
     }
     Ok(())
 }
@@ -395,8 +302,7 @@ fn serve_bridge(
     activation: BridgeActivation,
 ) -> Result<()> {
     socket.listener.set_nonblocking(true)?;
-    let mut binding_version = activation.binding_version;
-    let mut native_session_id = None;
+    let binding_version = activation.binding_version;
     loop {
         if !matches!(
             process_is_live_identity(
@@ -422,12 +328,7 @@ fn serve_bridge(
         if authorize_relay_peer(&stream, &configuration, &activation).is_err() {
             continue;
         }
-        if let Err(_error) = serve_mcp_connection(
-            &mut stream,
-            &configuration,
-            &mut binding_version,
-            &mut native_session_id,
-        ) {
+        if let Err(_error) = serve_mcp_connection(&mut stream, &configuration) {
             continue;
         }
     }
@@ -513,8 +414,6 @@ fn relay_executable_matches(
 fn serve_mcp_connection(
     stream: &mut UnixStream,
     configuration: &BridgeConfiguration,
-    binding_version: &mut u64,
-    native_session_id: &mut Option<String>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     while let Some(line) = read_bounded_line(&mut reader)? {
@@ -561,13 +460,7 @@ fn serve_mcp_connection(
                 let Some(id) = request.id else {
                     continue;
                 };
-                Some(handle_tool_call(
-                    id,
-                    request.params,
-                    configuration,
-                    binding_version,
-                    native_session_id,
-                ))
+                Some(handle_tool_call(id, request.params, configuration))
             }
             _ => request
                 .id
@@ -584,69 +477,20 @@ fn handle_tool_call(
     id: Value,
     params: Option<Value>,
     configuration: &BridgeConfiguration,
-    binding_version: &mut u64,
-    native_session_id: &mut Option<String>,
 ) -> Value {
     let result = (|| -> Result<ControlResponse> {
         let params: ToolCallParams = serde_json::from_value(
             params.ok_or_else(|| anyhow::anyhow!("tool call omitted params"))?,
         )
         .context("invalid typed tool call")
-        .map_err(|_| NativeSessionBindingRefusal(TOOL_REFUSAL_ENVELOPE))?;
+        .map_err(|_| ToolCallRefusal(TOOL_REFUSAL_ENVELOPE))?;
         let action = control_action(
             &params.name,
             params.arguments,
             &configuration.developer_adapter,
             &configuration.reviewer_adapter,
         )
-        .map_err(|_| NativeSessionBindingRefusal(TOOL_REFUSAL_ACTION))?;
-        let observed =
-            discover_architect_native_session(configuration, native_session_id.as_deref())
-                .map_err(|_| NativeSessionBindingRefusal(NATIVE_SESSION_REFUSAL_DISCOVERY))?;
-        match native_session_id {
-            Some(expected) if expected != &observed => {
-                bail!(NativeSessionBindingRefusal(NATIVE_SESSION_REFUSAL_CHANGED))
-            }
-            Some(_) => {}
-            None => {
-                let response = RegistrationClient::new(&configuration.registration_socket_path)
-                    .request(&RegistrationRequest {
-                        protocol_version: PROTOCOL_VERSION,
-                        request_id: format!("observe-{}", Uuid::new_v4()),
-                        caller: RegistrationCaller::Bridge {
-                            binding_id: configuration.binding_id.clone(),
-                            launch_nonce: configuration.launch_nonce.clone(),
-                            capability: configuration.capability.clone(),
-                        },
-                        action: RegistrationAction::ObserveNativeSession {
-                            binding_id: configuration.binding_id.clone(),
-                            expected_version: *binding_version,
-                            native_session_id: observed.clone(),
-                        },
-                    })
-                    .map_err(|_| {
-                        NativeSessionBindingRefusal(NATIVE_SESSION_REFUSAL_REGISTRATION_TRANSPORT)
-                    })?;
-                if !response.ok {
-                    bail!(NativeSessionBindingRefusal(
-                        closed_native_session_refusal_code(response.error.as_deref())
-                    ));
-                }
-                let next_version =
-                    binding_version
-                        .checked_add(1)
-                        .ok_or(NativeSessionBindingRefusal(
-                            NATIVE_SESSION_REFUSAL_REGISTRATION_VERSION,
-                        ))?;
-                if response.binding_version != Some(next_version) {
-                    bail!(NativeSessionBindingRefusal(
-                        NATIVE_SESSION_REFUSAL_REGISTRATION_VERSION
-                    ));
-                }
-                *binding_version = next_version;
-                *native_session_id = Some(observed.clone());
-            }
-        }
+        .map_err(|_| ToolCallRefusal(TOOL_REFUSAL_ACTION))?;
         let request = ControlRequest {
             protocol_version: PROTOCOL_VERSION,
             request_id: format!("architect-{}", Uuid::new_v4()),
@@ -654,13 +498,12 @@ fn handle_tool_call(
                 binding_id: configuration.binding_id.clone(),
                 launch_nonce: configuration.launch_nonce.clone(),
                 capability: configuration.capability.clone(),
-                native_session_id: Some(observed),
             },
             action,
         };
         Ok(ControlClient::new(&configuration.control_socket_path)
             .request(&request)
-            .map_err(|_| NativeSessionBindingRefusal(CONTROL_REFUSAL_TRANSPORT))?)
+            .map_err(|_| ToolCallRefusal(CONTROL_REFUSAL_TRANSPORT))?)
     })();
 
     match result {
@@ -689,205 +532,11 @@ fn handle_tool_call(
     }
 }
 
-fn discover_architect_native_session(
-    configuration: &BridgeConfiguration,
-    expected: Option<&str>,
-) -> Result<String> {
-    match &configuration.native_session_source {
-        ArchitectNativeSessionSource::Codex {
-            codex_home,
-            baseline,
-        } => discover_codex_native_session(
-            codex_home,
-            &configuration.project_root,
-            baseline,
-            expected,
-        ),
-        ArchitectNativeSessionSource::Claude { native_session_id } => {
-            validate_native_session_id(native_session_id)?;
-            Ok(native_session_id.clone())
-        }
-    }
-}
-
 fn tool_call_refusal_text(error: &anyhow::Error) -> String {
-    match error.downcast_ref::<NativeSessionBindingRefusal>() {
+    match error.downcast_ref::<ToolCallRefusal>() {
         Some(error) => format!("architect control request was refused: {}", error.0),
         None => "architect control request was refused".into(),
     }
-}
-
-pub(super) fn snapshot_codex_session_files(codex_home: &Path) -> Result<CodexSessionBaseline> {
-    let sessions = codex_home.join("sessions");
-    if !sessions.exists() {
-        return Ok(CodexSessionBaseline::empty());
-    }
-    let mut files = Vec::new();
-    let mut entries = 0;
-    collect_session_files(&sessions, &mut files, 0, &mut entries)?;
-    let mut identities = Vec::with_capacity(files.len());
-    for path in files {
-        let metadata = fs::symlink_metadata(&path)?;
-        // SAFETY: geteuid has no preconditions.
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || metadata.nlink() != 1
-            || metadata.uid() != unsafe { libc::geteuid() }
-        {
-            bail!("native Codex session baseline contains an invalid file");
-        }
-        identities.push(CodexSessionFileIdentity(metadata.dev(), metadata.ino()));
-    }
-    identities.sort_unstable();
-    identities.dedup();
-    if identities.len() > MAX_CODEX_SESSION_FILES {
-        bail!("native Codex session baseline exceeds its bounded file count");
-    }
-    CodexSessionBaseline::from_identities(&identities)
-}
-
-fn discover_codex_native_session(
-    codex_home: &Path,
-    project_root: &Path,
-    baseline: &CodexSessionBaseline,
-    expected: Option<&str>,
-) -> Result<String> {
-    let baseline = baseline.identities()?;
-    let sessions = codex_home.join("sessions");
-    let mut files = Vec::new();
-    let mut entries = 0;
-    collect_session_files(&sessions, &mut files, 0, &mut entries)?;
-    let mut candidates = Vec::new();
-    for path in files {
-        let metadata = fs::symlink_metadata(&path)?;
-        let identity = CodexSessionFileIdentity(metadata.dev(), metadata.ino());
-        if baseline.binary_search(&identity).is_ok() {
-            continue;
-        }
-        let Some(id) = inspect_codex_session_file(&path, project_root)? else {
-            continue;
-        };
-        candidates.push(id);
-    }
-    candidates.sort();
-    candidates.dedup();
-    if let Some(expected) = expected
-        && candidates
-            .binary_search_by(|candidate| candidate.as_str().cmp(expected))
-            .is_ok()
-    {
-        return Ok(expected.to_owned());
-    }
-    if candidates.len() != 1 {
-        bail!("architect native session is not uniquely observable");
-    }
-    Ok(candidates.pop().expect("one candidate"))
-}
-
-fn inspect_codex_session_file(path: &Path, project_root: &Path) -> Result<Option<String>> {
-    let metadata = fs::symlink_metadata(path)?;
-    // SAFETY: geteuid has no preconditions.
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.nlink() != 1
-        || metadata.uid() != unsafe { libc::geteuid() }
-    {
-        bail!("architect native session record has an invalid identity");
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
-    let opened = file.metadata()?;
-    if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
-        bail!("architect native session record changed before it was opened");
-    }
-    let mut first_line = Vec::new();
-    let mut reader = BufReader::new(file);
-    reader
-        .by_ref()
-        .take((128 * 1024 + 1) as u64)
-        .read_until(b'\n', &mut first_line)?;
-    if first_line.is_empty() || first_line.len() > 128 * 1024 {
-        bail!("architect native session metadata exceeds its bound");
-    }
-    let metadata: CodexSessionMetadata =
-        serde_json::from_slice(trim_line(&first_line)).context("invalid Codex session metadata")?;
-    if metadata.kind != "session_meta" || metadata.payload.cwd != project_root {
-        return Ok(None);
-    }
-    let id = Uuid::parse_str(&metadata.payload.id)
-        .context("architect native session id is not a canonical UUID")?
-        .to_string();
-    if id != metadata.payload.id {
-        bail!("architect native session id is not canonical lowercase");
-    }
-    validate_native_session_id(&id)?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow::anyhow!("architect native session filename is invalid"))?;
-    if !name.ends_with(&format!("-{id}.jsonl")) {
-        bail!("architect native session filename does not bind its metadata id");
-    }
-    let current = fs::symlink_metadata(path)?;
-    let final_opened = reader.get_ref().metadata()?;
-    if current.file_type().is_symlink()
-        || current.dev() != opened.dev()
-        || current.ino() != opened.ino()
-        || final_opened.dev() != opened.dev()
-        || final_opened.ino() != opened.ino()
-    {
-        bail!("architect native session record changed during observation");
-    }
-    Ok(Some(id))
-}
-
-fn collect_session_files(
-    directory: &Path,
-    files: &mut Vec<PathBuf>,
-    depth: usize,
-    entries: &mut usize,
-) -> Result<()> {
-    if depth > 6 {
-        bail!("architect session tree exceeds its bounded depth");
-    }
-    let metadata = fs::symlink_metadata(directory).with_context(|| {
-        format!(
-            "architect session directory is unavailable: {}",
-            directory.display()
-        )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        bail!("architect session tree contains a non-directory");
-    }
-    let mut children = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
-    children.sort_by_key(|entry| entry.file_name());
-    for child in children {
-        *entries += 1;
-        if *entries > MAX_CODEX_SESSION_TREE_ENTRIES {
-            bail!("architect session tree exceeds its bounded entry count");
-        }
-        let path = child.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() {
-            bail!("architect session tree contains a symlink");
-        }
-        if metadata.is_dir() {
-            collect_session_files(&path, files, depth + 1, entries)?;
-        } else if metadata.is_file()
-            && path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
-        {
-            files.push(path);
-            if files.len() > MAX_CODEX_SESSION_FILES {
-                bail!("architect session tree exceeds its bounded file count");
-            }
-        }
-    }
-    Ok(())
 }
 
 fn read_bootstrap(stream: &mut UnixStream) -> Result<BootstrapRequest> {
@@ -1085,30 +734,11 @@ fn empty_object() -> Value {
     json!({})
 }
 
-#[derive(Deserialize)]
-struct CodexSessionMetadata {
-    #[serde(rename = "type")]
-    kind: String,
-    payload: CodexSessionPayload,
-}
-
-#[derive(Deserialize)]
-struct CodexSessionPayload {
-    id: String,
-    cwd: PathBuf,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::control_api::registration::{
-        CONTROL_REFUSAL_TRANSPORT, NATIVE_SESSION_REFUSAL_ARCHITECT_LIVENESS,
-        NATIVE_SESSION_REFUSAL_BRIDGE_PROCESS, NATIVE_SESSION_REFUSAL_CAPABILITY,
-        NATIVE_SESSION_REFUSAL_CHANGED, NATIVE_SESSION_REFUSAL_DISCOVERY,
-        NATIVE_SESSION_REFUSAL_IDENTITY, NATIVE_SESSION_REFUSAL_REGISTRATION_TRANSPORT,
-        NATIVE_SESSION_REFUSAL_REGISTRATION_VERSION, NATIVE_SESSION_REFUSAL_STATE,
-        NATIVE_SESSION_REFUSAL_UNAVAILABLE, NATIVE_SESSION_REFUSAL_VERSION, RegistrationResponse,
-        TOOL_REFUSAL_ACTION, TOOL_REFUSAL_ENVELOPE,
+        CONTROL_REFUSAL_TRANSPORT, TOOL_REFUSAL_ACTION, TOOL_REFUSAL_ENVELOPE,
     };
     use crate::control_api::{
         ActionName, ControlAction, ControlErrorCode, ControlResult, SessionState,
@@ -1120,27 +750,18 @@ mod tests {
     use std::time::Instant;
 
     const RELAY_NAMESPACE_HELPER: &str = "HCOM_PHASE9_RELAY_NAMESPACE_HELPER";
-    const TEST_NATIVE_SESSION_ID: &str = "019fa976-e270-7a92-b5f0-6d3d8a0ad3f4";
-
     struct BridgeTestFixture {
         _temp: tempfile::TempDir,
         configuration: BridgeConfiguration,
-        _session_path: PathBuf,
     }
 
     impl BridgeTestFixture {
-        fn new(with_session: bool) -> Self {
+        fn new() -> Self {
             let temp = tempfile::tempdir().unwrap();
             let root = fs::canonicalize(temp.path()).unwrap();
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
             let repo_root = root.join("repo");
-            let codex_home = root.join("codex");
             fs::create_dir(&repo_root).unwrap();
-            fs::create_dir(&codex_home).unwrap();
-            let session_path = codex_session_path(&codex_home, TEST_NATIVE_SESSION_ID);
-            if with_session {
-                write_codex_session(&codex_home, &repo_root, TEST_NATIVE_SESSION_ID);
-            }
             let executable = ExecutableIdentity::capture(
                 fs::canonicalize(std::env::current_exe().unwrap()).unwrap(),
             )
@@ -1153,20 +774,14 @@ mod tests {
                     capability: "capability-session-test".into(),
                     project_root: repo_root,
                     run_root: root.clone(),
-                    lock_root: root.clone(),
                     relay_socket_path: root.join(RELAY_SOCKET_NAME),
                     registration_socket_path: root.join("registration.sock"),
                     control_socket_path: root.join("control.sock"),
-                    native_session_source: ArchitectNativeSessionSource::Codex {
-                        codex_home,
-                        baseline: CodexSessionBaseline::empty(),
-                    },
                     relay_executable: executable,
                     relay_runtime_scope_hash: relay_runtime_scope_hash(&root).unwrap(),
                     developer_adapter: "codex-developer".into(),
                     reviewer_adapter: "claude-reviewer-2.1.220".into(),
                 },
-                _session_path: session_path,
             }
         }
     }
@@ -1186,44 +801,10 @@ mod tests {
         );
     }
 
-    fn codex_session_path(codex_home: &Path, id: &str) -> PathBuf {
-        codex_home
-            .join("sessions/2026/07/29")
-            .join(format!("rollout-2026-07-29T00-00-00-{id}.jsonl"))
-    }
-
-    fn write_codex_session(codex_home: &Path, project_root: &Path, id: &str) -> PathBuf {
-        let path = codex_session_path(codex_home, id);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            format!(
-                "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{},\"cli_version\":\"test-cli\",\"originator\":\"codex_cli_rs\"}}}}\n",
-                serde_json::to_string(project_root).unwrap()
-            ),
-        )
-        .unwrap();
-        path
-    }
-
     fn bind_private_listener(path: &Path) -> UnixListener {
         let listener = UnixListener::bind(path).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
         listener
-    }
-
-    fn spawn_registration_server(
-        listener: UnixListener,
-        respond: impl FnOnce(&RegistrationRequest) -> RegistrationResponse + Send + 'static,
-    ) -> JoinHandle<RegistrationRequest> {
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let frame = read_request_frame(&mut stream).unwrap();
-            let request: RegistrationRequest = serde_json::from_slice(&frame).unwrap();
-            let response = respond(&request);
-            write_response_frame(&mut stream, &serde_json::to_vec(&response).unwrap()).unwrap();
-            request
-        })
     }
 
     fn spawn_control_server(
@@ -1298,14 +879,9 @@ mod tests {
             capability: "capability-namespace-test".into(),
             project_root: root.clone(),
             run_root: root.clone(),
-            lock_root: root.clone(),
             relay_socket_path: socket_path.clone(),
             registration_socket_path: root.join("registration.sock"),
             control_socket_path: root.join("control.sock"),
-            native_session_source: ArchitectNativeSessionSource::Codex {
-                codex_home: root.clone(),
-                baseline: CodexSessionBaseline::empty(),
-            },
             relay_executable: executable,
             relay_runtime_scope_hash: "unused-by-authorization".into(),
             developer_adapter: "codex-developer".into(),
@@ -1435,36 +1011,18 @@ mod tests {
     }
 
     #[test]
-    fn native_binding_refusal_exposes_only_closed_stage_codes() {
+    fn tool_refusal_exposes_only_closed_stage_codes() {
         for code in [
             TOOL_REFUSAL_ENVELOPE,
             TOOL_REFUSAL_ACTION,
-            NATIVE_SESSION_REFUSAL_DISCOVERY,
-            NATIVE_SESSION_REFUSAL_CHANGED,
-            NATIVE_SESSION_REFUSAL_REGISTRATION_TRANSPORT,
-            NATIVE_SESSION_REFUSAL_REGISTRATION_VERSION,
-            NATIVE_SESSION_REFUSAL_UNAVAILABLE,
-            NATIVE_SESSION_REFUSAL_BRIDGE_PROCESS,
-            NATIVE_SESSION_REFUSAL_ARCHITECT_LIVENESS,
-            NATIVE_SESSION_REFUSAL_CAPABILITY,
-            NATIVE_SESSION_REFUSAL_IDENTITY,
-            NATIVE_SESSION_REFUSAL_VERSION,
-            NATIVE_SESSION_REFUSAL_STATE,
             CONTROL_REFUSAL_TRANSPORT,
         ] {
-            let error = anyhow::Error::new(NativeSessionBindingRefusal(code));
+            let error = anyhow::Error::new(ToolCallRefusal(code));
             assert_eq!(
                 tool_call_refusal_text(&error),
                 format!("architect control request was refused: {code}")
             );
         }
-        let unknown = anyhow::Error::new(NativeSessionBindingRefusal(
-            closed_native_session_refusal_code(Some("must-not-echo-value")),
-        ));
-        assert_eq!(
-            tool_call_refusal_text(&unknown),
-            "architect control request was refused: architect_registration"
-        );
         assert_eq!(
             tool_call_refusal_text(&anyhow::anyhow!("must-not-echo-value")),
             "architect control request was refused"
@@ -1505,28 +1063,15 @@ mod tests {
     }
 
     #[test]
-    fn exact_codex_mcp_fixture_reaches_private_registration_and_control_sockets() {
-        let fixture = BridgeTestFixture::new(true);
-        let registration = bind_private_listener(&fixture.configuration.registration_socket_path);
+    fn exact_codex_mcp_fixture_reaches_private_control_socket() {
+        let fixture = BridgeTestFixture::new();
         let control = bind_private_listener(&fixture.configuration.control_socket_path);
-        let registration_thread = spawn_registration_server(registration, |request| {
-            RegistrationResponse::success(&request.request_id, 2)
-        });
         let control_thread = spawn_control_server(control, successful_status_response);
 
         let (mut server, mut client) = UnixStream::pair().unwrap();
         let configuration = fixture.configuration.clone();
         let bridge_thread = std::thread::spawn(move || {
-            let mut binding_version = 1;
-            let mut native_session_id = None;
-            serve_mcp_connection(
-                &mut server,
-                &configuration,
-                &mut binding_version,
-                &mut native_session_id,
-            )
-            .unwrap();
-            (binding_version, native_session_id)
+            serve_mcp_connection(&mut server, &configuration).unwrap();
         });
         for request in [
             json!({
@@ -1602,18 +1147,7 @@ mod tests {
             Value::Bool(true)
         );
 
-        let (mut binding_version, mut native_session_id) = bridge_thread.join().unwrap();
-        assert_eq!(binding_version, 2);
-        assert_eq!(native_session_id.as_deref(), Some(TEST_NATIVE_SESSION_ID));
-        let registration_request = registration_thread.join().unwrap();
-        assert!(matches!(
-            registration_request.action,
-            RegistrationAction::ObserveNativeSession {
-                expected_version: 1,
-                ref native_session_id,
-                ..
-            } if native_session_id == TEST_NATIVE_SESSION_ID
-        ));
+        bridge_thread.join().unwrap();
         let control_request = control_thread.join().unwrap();
         assert!(matches!(
             control_request.action,
@@ -1630,13 +1164,9 @@ mod tests {
         ));
         assert!(matches!(
             control_request.caller,
-            CallerAuth::Architect {
-                native_session_id: Some(ref native_session_id),
-                ..
-            } if native_session_id == TEST_NATIVE_SESSION_ID
+            CallerAuth::Architect { .. }
         ));
 
-        fs::remove_file(&fixture.configuration.registration_socket_path).unwrap();
         fs::remove_file(&fixture.configuration.control_socket_path).unwrap();
         let control = bind_private_listener(&fixture.configuration.control_socket_path);
         let control_thread = spawn_control_server(control, successful_status_response);
@@ -1648,12 +1178,8 @@ mod tests {
                 "_meta":{"progressToken":"same-session"}
             })),
             &fixture.configuration,
-            &mut binding_version,
-            &mut native_session_id,
         );
         assert_eq!(response["result"]["isError"], false);
-        assert_eq!(binding_version, 2);
-        assert_eq!(native_session_id.as_deref(), Some(TEST_NATIVE_SESSION_ID));
         assert!(matches!(
             control_thread.join().unwrap().action,
             ControlAction::SessionStatus
@@ -1661,10 +1187,8 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_failure_stages_are_distinct_before_registration() {
-        let missing_session = BridgeTestFixture::new(false);
-        let mut binding_version = 1;
-        let mut native_session_id = None;
+    fn tool_call_failure_stages_are_distinct_before_control_transport() {
+        let fixture = BridgeTestFixture::new();
         let envelope = handle_tool_call(
             json!(1),
             Some(json!({
@@ -1672,9 +1196,7 @@ mod tests {
                 "arguments":{},
                 "unexpected":true
             })),
-            &missing_session.configuration,
-            &mut binding_version,
-            &mut native_session_id,
+            &fixture.configuration,
         );
         assert_eq!(
             tool_refusal(&envelope),
@@ -1683,140 +1205,26 @@ mod tests {
         let action = handle_tool_call(
             json!(2),
             Some(json!({"name":"not-a-tool","arguments":{}})),
-            &missing_session.configuration,
-            &mut binding_version,
-            &mut native_session_id,
+            &fixture.configuration,
         );
         assert_eq!(
             tool_refusal(&action),
             "architect control request was refused: architect_tool_action"
         );
-        let discovery = handle_tool_call(
-            json!(3),
-            Some(json!({"name":"session_status","arguments":{}})),
-            &missing_session.configuration,
-            &mut binding_version,
-            &mut native_session_id,
-        );
-        assert_eq!(
-            tool_refusal(&discovery),
-            "architect control request was refused: native_session_discovery"
-        );
-
-        let changed_session = BridgeTestFixture::new(true);
-        let mut native_session_id = Some("019fa976-e270-7a92-b5f0-6d3d8a0ad3f5".to_owned());
-        let changed = handle_tool_call(
-            json!(4),
-            Some(json!({"name":"session_status","arguments":{}})),
-            &changed_session.configuration,
-            &mut binding_version,
-            &mut native_session_id,
-        );
-        assert_eq!(
-            tool_refusal(&changed),
-            "architect control request was refused: native_session_changed"
-        );
-    }
-
-    #[test]
-    fn registration_transport_rejection_and_version_fail_closed() {
-        let missing_socket = BridgeTestFixture::new(true);
-        let mut binding_version = 1;
-        let mut native_session_id = None;
-        let response = handle_tool_call(
-            json!(1),
-            Some(json!({"name":"session_status","arguments":{}})),
-            &missing_socket.configuration,
-            &mut binding_version,
-            &mut native_session_id,
-        );
-        assert_eq!(
-            tool_refusal(&response),
-            "architect control request was refused: native_session_registration_transport"
-        );
-
-        let rejected = BridgeTestFixture::new(true);
-        let registration = bind_private_listener(&rejected.configuration.registration_socket_path);
-        let thread = spawn_registration_server(registration, |request| {
-            RegistrationResponse::error(&request.request_id, NATIVE_SESSION_REFUSAL_CAPABILITY)
-        });
-        let response = handle_tool_call(
-            json!(2),
-            Some(json!({"name":"session_status","arguments":{}})),
-            &rejected.configuration,
-            &mut binding_version,
-            &mut native_session_id,
-        );
-        assert_eq!(
-            tool_refusal(&response),
-            "architect control request was refused: native_session_capability"
-        );
-        thread.join().unwrap();
-
-        let unknown = BridgeTestFixture::new(true);
-        let registration = bind_private_listener(&unknown.configuration.registration_socket_path);
-        let thread = spawn_registration_server(registration, |request| {
-            RegistrationResponse::error(&request.request_id, "must-not-echo-value")
-        });
-        let response = handle_tool_call(
-            json!(3),
-            Some(json!({"name":"session_status","arguments":{}})),
-            &unknown.configuration,
-            &mut binding_version,
-            &mut native_session_id,
-        );
-        assert_eq!(
-            tool_refusal(&response),
-            "architect control request was refused: architect_registration"
-        );
-        thread.join().unwrap();
-
-        let wrong_version = BridgeTestFixture::new(true);
-        let registration =
-            bind_private_listener(&wrong_version.configuration.registration_socket_path);
-        let thread = spawn_registration_server(registration, |request| {
-            RegistrationResponse::success(&request.request_id, 99)
-        });
-        let response = handle_tool_call(
-            json!(4),
-            Some(json!({"name":"session_status","arguments":{}})),
-            &wrong_version.configuration,
-            &mut binding_version,
-            &mut native_session_id,
-        );
-        assert_eq!(
-            tool_refusal(&response),
-            "architect control request was refused: native_session_registration_version"
-        );
-        assert_eq!(binding_version, 1);
-        assert_eq!(native_session_id, None);
-        thread.join().unwrap();
     }
 
     #[test]
     fn control_transport_recovers_and_structured_control_errors_pass_through() {
-        let fixture = BridgeTestFixture::new(true);
-        let registration = bind_private_listener(&fixture.configuration.registration_socket_path);
-        let registration_thread = spawn_registration_server(registration, |request| {
-            RegistrationResponse::success(&request.request_id, 2)
-        });
-        let mut binding_version = 1;
-        let mut native_session_id = None;
+        let fixture = BridgeTestFixture::new();
         let response = handle_tool_call(
             json!(1),
             Some(json!({"name":"session_status","arguments":{}})),
             &fixture.configuration,
-            &mut binding_version,
-            &mut native_session_id,
         );
         assert_eq!(
             tool_refusal(&response),
             "architect control request was refused: architect_control_transport"
         );
-        assert_eq!(binding_version, 2);
-        assert_eq!(native_session_id.as_deref(), Some(TEST_NATIVE_SESSION_ID));
-        registration_thread.join().unwrap();
-        fs::remove_file(&fixture.configuration.registration_socket_path).unwrap();
 
         let control = bind_private_listener(&fixture.configuration.control_socket_path);
         let control_thread = spawn_control_server(control, successful_status_response);
@@ -1824,18 +1232,12 @@ mod tests {
             json!(2),
             Some(json!({"name":"session_status","arguments":{}})),
             &fixture.configuration,
-            &mut binding_version,
-            &mut native_session_id,
         );
         assert_eq!(response["result"]["isError"], false);
         control_thread.join().unwrap();
 
-        let error = BridgeTestFixture::new(true);
-        let registration = bind_private_listener(&error.configuration.registration_socket_path);
+        let error = BridgeTestFixture::new();
         let control = bind_private_listener(&error.configuration.control_socket_path);
-        let registration_thread = spawn_registration_server(registration, |request| {
-            RegistrationResponse::success(&request.request_id, 2)
-        });
         let control_thread = spawn_control_server(control, |request| {
             ControlResponse::error(
                 request.request_id.clone(),
@@ -1843,14 +1245,10 @@ mod tests {
                 "expected test conflict",
             )
         });
-        let mut binding_version = 1;
-        let mut native_session_id = None;
         let response = handle_tool_call(
             json!(3),
             Some(json!({"name":"session_status","arguments":{}})),
             &error.configuration,
-            &mut binding_version,
-            &mut native_session_id,
         );
         assert_eq!(response["result"]["isError"], true);
         assert_eq!(
@@ -1861,141 +1259,7 @@ mod tests {
             response["result"]["structuredContent"]["error"]["message"],
             "expected test conflict"
         );
-        registration_thread.join().unwrap();
         control_thread.join().unwrap();
-    }
-
-    #[test]
-    fn native_session_requires_one_exact_project_directory_machine_record() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo = temp.path().join("repo");
-        let codex = temp.path().join("codex");
-        let sessions = codex.join("sessions/2026/07/29");
-        fs::create_dir_all(&repo).unwrap();
-        fs::create_dir_all(&sessions).unwrap();
-        let id = "019fa976-e270-7a92-b5f0-6d3d8a0ad3f4";
-        let path = sessions.join(format!("rollout-2026-07-29T00-00-00-{id}.jsonl"));
-        fs::write(
-            &path,
-            format!(
-                "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{},\"cli_version\":\"test-cli\",\"originator\":\"codex_cli_rs\"}}}}\n",
-                serde_json::to_string(&repo).unwrap()
-            ),
-        )
-        .unwrap();
-        assert_eq!(
-            discover_codex_native_session(&codex, &repo, &CodexSessionBaseline::empty(), None,)
-                .unwrap(),
-            id
-        );
-
-        fs::write(
-            &path,
-            format!(
-                "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{},\"cli_version\":\"test-cli\",\"originator\":\"codex_cli_rs\"}}}}\n",
-                serde_json::to_string("/wrong/project-directory").unwrap()
-            ),
-        )
-        .unwrap();
-        assert!(
-            discover_codex_native_session(&codex, &repo, &CodexSessionBaseline::empty(), None,)
-                .is_err()
-        );
-        fs::write(
-            &path,
-            format!(
-                "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{},\"cli_version\":\"test-cli\",\"originator\":\"codex_cli_rs\"}}}}\n",
-                serde_json::to_string(&repo).unwrap()
-            ),
-        )
-        .unwrap();
-
-        fs::write(
-            sessions.join("rollout-other-019fa976-e270-7a92-b5f0-6d3d8a0ad3f5.jsonl"),
-            "{}\n",
-        )
-        .unwrap();
-        assert!(
-            discover_codex_native_session(&codex, &repo, &CodexSessionBaseline::empty(), None,)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn native_session_baseline_excludes_old_rollouts_and_keeps_the_bound_session() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo = temp.path().join("repo");
-        let codex = temp.path().join("codex");
-        fs::create_dir_all(&repo).unwrap();
-        fs::create_dir_all(&codex).unwrap();
-        let old_id = "019fa976-e270-7a92-b5f0-6d3d8a0ad3f3";
-        let expected_id = "019fa976-e270-7a92-b5f0-6d3d8a0ad3f4";
-        let concurrent_id = "019fa976-e270-7a92-b5f0-6d3d8a0ad3f5";
-
-        write_codex_session(&codex, &repo, old_id);
-        let baseline = snapshot_codex_session_files(&codex).unwrap();
-        write_codex_session(&codex, &repo, expected_id);
-        assert_eq!(
-            discover_codex_native_session(&codex, &repo, &baseline, None).unwrap(),
-            expected_id
-        );
-
-        write_codex_session(&codex, &repo, concurrent_id);
-        assert!(
-            discover_codex_native_session(&codex, &repo, &baseline, None).is_err(),
-            "two post-launch sessions are ambiguous before the first binding"
-        );
-        assert_eq!(
-            discover_codex_native_session(&codex, &repo, &baseline, Some(expected_id)).unwrap(),
-            expected_id,
-            "later same-project sessions must not displace the established binding"
-        );
-    }
-
-    #[test]
-    fn maximum_native_session_baseline_fits_the_bootstrap_frame() {
-        let identities = (1..=MAX_CODEX_SESSION_FILES as u64)
-            .map(|inode| CodexSessionFileIdentity(u64::MAX, inode))
-            .collect::<Vec<_>>();
-        let baseline = CodexSessionBaseline::from_identities(&identities).unwrap();
-        assert_eq!(baseline.identities().unwrap(), identities);
-
-        let mut fixture = BridgeTestFixture::new(false);
-        let codex_home = match &fixture.configuration.native_session_source {
-            ArchitectNativeSessionSource::Codex { codex_home, .. } => codex_home.clone(),
-            ArchitectNativeSessionSource::Claude { .. } => unreachable!(),
-        };
-        fixture.configuration.native_session_source = ArchitectNativeSessionSource::Codex {
-            codex_home,
-            baseline,
-        };
-        let frame = serde_json::to_vec(&BootstrapRequest::Configure {
-            configuration: Box::new(fixture.configuration),
-        })
-        .unwrap();
-        assert!(
-            frame.len() <= crate::control_api::protocol::MAX_REQUEST_BYTES,
-            "encoded bootstrap frame is {} bytes",
-            frame.len()
-        );
-    }
-
-    #[test]
-    fn claude_native_session_is_preassigned_and_canonical() {
-        let mut fixture = BridgeTestFixture::new(false);
-        fixture.configuration.native_session_source = ArchitectNativeSessionSource::Claude {
-            native_session_id: TEST_NATIVE_SESSION_ID.into(),
-        };
-        validate_bridge_configuration(&fixture.configuration).unwrap();
-        assert_eq!(
-            discover_architect_native_session(&fixture.configuration, None).unwrap(),
-            TEST_NATIVE_SESSION_ID
-        );
-
-        fixture.configuration.native_session_source = ArchitectNativeSessionSource::Claude {
-            native_session_id: "NOT-A-UUID".into(),
-        };
-        assert!(validate_bridge_configuration(&fixture.configuration).is_err());
     }
 
     #[test]
@@ -2017,11 +1281,9 @@ mod tests {
         let root = fs::canonicalize(temp.path()).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let run_root = root.join("run");
-        let lock_root = root.join("locks");
         let repo_root = root.join("repo");
-        let codex_home = root.join("codex");
         let relay_root = root.join("relay");
-        for path in [&run_root, &lock_root, &repo_root, &codex_home, &relay_root] {
+        for path in [&run_root, &repo_root, &relay_root] {
             fs::create_dir(path).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
@@ -2035,14 +1297,9 @@ mod tests {
             capability: "capability-session-test".into(),
             project_root: repo_root,
             run_root: run_root.clone(),
-            lock_root: lock_root.clone(),
             relay_socket_path: relay_root.join(RELAY_SOCKET_NAME),
             registration_socket_path: run_root.join("registration.sock"),
             control_socket_path: run_root.join("control.sock"),
-            native_session_source: ArchitectNativeSessionSource::Codex {
-                codex_home,
-                baseline: CodexSessionBaseline::empty(),
-            },
             relay_executable: executable,
             relay_runtime_scope_hash: relay_runtime_scope_hash(&relay_root).unwrap(),
             developer_adapter: "codex-developer".into(),

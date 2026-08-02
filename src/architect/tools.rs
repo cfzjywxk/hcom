@@ -42,7 +42,7 @@ pub(crate) fn control_action(
     } = &action
         && (requested_developer != developer_adapter || requested_reviewer != reviewer_adapter)
     {
-        bail!("architect plan adapters differ from the session-frozen profiles");
+        bail!("architect plan adapters differ from the profiles loaded for this run");
     }
     Ok(action)
 }

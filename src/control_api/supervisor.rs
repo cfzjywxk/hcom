@@ -10,11 +10,8 @@ use super::protocol::{
     ControlResult, canonical_action_set, parse_canonical_action_set,
 };
 use super::registration::{
-    NATIVE_SESSION_REFUSAL_ARCHITECT_LIVENESS, NATIVE_SESSION_REFUSAL_BRIDGE_PROCESS,
-    NATIVE_SESSION_REFUSAL_CAPABILITY, NATIVE_SESSION_REFUSAL_IDENTITY,
-    NATIVE_SESSION_REFUSAL_STATE, NATIVE_SESSION_REFUSAL_UNAVAILABLE,
-    NATIVE_SESSION_REFUSAL_VERSION, REGISTRATION_REFUSAL_GENERIC, RegistrationAction,
-    RegistrationCaller, RegistrationRequest, RegistrationResponse, validate_request_envelope,
+    REGISTRATION_REFUSAL_GENERIC, RegistrationAction, RegistrationCaller, RegistrationRequest,
+    RegistrationResponse, validate_request_envelope,
 };
 use crate::orchestrator::task_lane::TaskLaneSupervisor;
 use crate::orchestrator::{SessionRuntimeSources, SessionStartup};
@@ -34,17 +31,12 @@ const MAX_REQUEST_RECORDS: usize = 1024;
 #[derive(Debug, Clone)]
 pub struct ControlPaths {
     run_root: PathBuf,
-    lock_root: PathBuf,
 }
 
 impl ControlPaths {
-    pub fn new(run_root: impl AsRef<Path>, lock_root: impl AsRef<Path>) -> Result<Self> {
+    pub fn new(run_root: impl AsRef<Path>) -> Result<Self> {
         let run_root = canonical_private_directory(run_root.as_ref(), "session runtime root")?;
-        let lock_root = canonical_private_directory(lock_root.as_ref(), "repository lock root")?;
-        Ok(Self {
-            run_root,
-            lock_root,
-        })
+        Ok(Self { run_root })
     }
 
     pub fn socket_path(&self) -> PathBuf {
@@ -65,10 +57,6 @@ impl ControlPaths {
 
     pub fn run_root(&self) -> &Path {
         &self.run_root
-    }
-
-    pub fn lock_root(&self) -> &Path {
-        &self.lock_root
     }
 }
 
@@ -262,7 +250,6 @@ struct RequestRecord {
 enum BindingState {
     Pending,
     ProcessBound,
-    NativeBound,
     Closed,
 }
 
@@ -281,7 +268,6 @@ struct ArchitectBinding {
     bridge_process_birth: Option<String>,
     relay_executable_contract_hash: Option<String>,
     relay_runtime_scope_hash: Option<String>,
-    native_session_id: Option<String>,
 }
 
 impl SessionSupervisorControl {
@@ -295,13 +281,8 @@ impl SessionSupervisorControl {
         let expected_uid = unsafe { libc::geteuid() };
         let parent_pid = std::process::id();
         let parent_birth = process_birth_identity(parent_pid)?;
-        let supervisor = TaskLaneSupervisor::open(
-            run_id,
-            project_root,
-            paths.run_root().to_owned(),
-            paths.lock_root().to_owned(),
-            sources,
-        )?;
+        let supervisor =
+            TaskLaneSupervisor::open(run_id, project_root, paths.run_root().to_owned(), sources)?;
         Ok(Self {
             supervisor: Box::new(supervisor),
             expected_uid,
@@ -331,10 +312,9 @@ impl SessionSupervisorControl {
             .and_then(|()| self.handle_registration_request(peer, &request))
         {
             Ok(version) => RegistrationResponse::success(&request.request_id, version),
-            Err(error) => RegistrationResponse::error(
-                &request.request_id,
-                registration_refusal_code(&request.action, &error),
-            ),
+            Err(_) => {
+                RegistrationResponse::error(&request.request_id, REGISTRATION_REFUSAL_GENERIC)
+            }
         };
         write_registration_response(stream, &response)
     }
@@ -390,7 +370,6 @@ impl SessionSupervisorControl {
                     bridge_process_birth: None,
                     relay_executable_contract_hash: None,
                     relay_runtime_scope_hash: None,
-                    native_session_id: None,
                 };
                 self.bindings.insert(binding_id.clone(), binding);
                 Ok(0)
@@ -439,34 +418,6 @@ impl SessionSupervisorControl {
                     Some(relay_executable_contract_hash.clone());
                 binding.relay_runtime_scope_hash = Some(relay_runtime_scope_hash.clone());
                 binding.state = BindingState::ProcessBound;
-                binding.version = binding
-                    .version
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("binding version overflow"))?;
-                Ok(binding.version)
-            }
-            (
-                RegistrationCaller::Bridge {
-                    binding_id,
-                    launch_nonce,
-                    capability,
-                },
-                RegistrationAction::ObserveNativeSession {
-                    binding_id: action_binding,
-                    expected_version,
-                    native_session_id,
-                },
-            ) if binding_id == action_binding => {
-                self.authorize_bridge(peer, binding_id, launch_nonce, capability, true)?;
-                validate_text(native_session_id, 256)?;
-                let binding = self.binding_mut(binding_id, *expected_version)?;
-                if binding.state != BindingState::ProcessBound
-                    || binding.native_session_id.is_some()
-                {
-                    bail!("architect native session can bind exactly once");
-                }
-                binding.native_session_id = Some(native_session_id.clone());
-                binding.state = BindingState::NativeBound;
                 binding.version = binding
                     .version
                     .checked_add(1)
@@ -678,17 +629,14 @@ impl SessionSupervisorControl {
                 binding_id,
                 launch_nonce,
                 capability,
-                native_session_id,
             } => {
                 self.authorize_bridge(peer, binding_id, launch_nonce, capability, true)?;
                 let binding = self
                     .bindings
                     .get(binding_id)
                     .ok_or_else(|| anyhow::anyhow!("architect binding disappeared"))?;
-                if binding.state != BindingState::NativeBound
-                    || binding.native_session_id.as_ref() != native_session_id.as_ref()
-                {
-                    bail!("architect native session binding mismatch");
+                if binding.state != BindingState::ProcessBound {
+                    bail!("architect process binding is unavailable");
                 }
                 let actions = parse_canonical_action_set(&binding.action_set_json)
                     .map_err(|error| anyhow::anyhow!(error))?;
@@ -782,33 +730,6 @@ impl SessionSupervisorControl {
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("binding version overflow"))?;
         Ok(binding.version)
-    }
-}
-
-fn registration_refusal_code(action: &RegistrationAction, error: &anyhow::Error) -> &'static str {
-    if !matches!(action, RegistrationAction::ObserveNativeSession { .. }) {
-        return REGISTRATION_REFUSAL_GENERIC;
-    }
-    let has = |message: &str| error.chain().any(|cause| cause.to_string() == message);
-    if has("architect binding is unavailable") {
-        NATIVE_SESSION_REFUSAL_UNAVAILABLE
-    } else if has("bridge process binding mismatch") {
-        NATIVE_SESSION_REFUSAL_BRIDGE_PROCESS
-    } else if has("architect PID is unavailable")
-        || has("architect birth is unavailable")
-        || has("architect process is no longer live")
-    {
-        NATIVE_SESSION_REFUSAL_ARCHITECT_LIVENESS
-    } else if has("architect binding secret mismatch") {
-        NATIVE_SESSION_REFUSAL_CAPABILITY
-    } else if has("invalid bounded registration text") {
-        NATIVE_SESSION_REFUSAL_IDENTITY
-    } else if has("architect binding version is stale") {
-        NATIVE_SESSION_REFUSAL_VERSION
-    } else if has("architect native session can bind exactly once") {
-        NATIVE_SESSION_REFUSAL_STATE
-    } else {
-        REGISTRATION_REFUSAL_GENERIC
     }
 }
 
@@ -985,10 +906,9 @@ mod tests {
             let root = fs::canonicalize(temp.path()).unwrap();
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
             let run = root.join("run");
-            let locks = root.join("locks");
             let repository = root.join("repo");
             let toolchain = root.join("toolchain");
-            for path in [&run, &locks, &repository, &toolchain] {
+            for path in [&run, &repository, &toolchain] {
                 fs::create_dir(path).unwrap();
                 fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
             }
@@ -1008,7 +928,7 @@ mod tests {
                 ],
             );
             let mut sources = SessionRuntimeSources::fake(&toolchain);
-            // The lane only opens against session-frozen profiles.
+            // The lane only opens against the profiles loaded for this run.
             sources.set_profiles_for_test(
                 crate::worker::profile::SessionInvocationProfiles::for_task_lane(
                     crate::worker::profile::ArchitectAdapter::Codex,
@@ -1017,7 +937,7 @@ mod tests {
             );
             Self {
                 _temp: temp,
-                paths: ControlPaths::new(&run, &locks).unwrap(),
+                paths: ControlPaths::new(&run).unwrap(),
                 repository: fs::canonicalize(repository).unwrap(),
                 sources,
             }
@@ -1103,69 +1023,7 @@ mod tests {
     }
 
     #[test]
-    fn native_session_registration_refusal_codes_are_closed_and_non_secret() {
-        let action = RegistrationAction::ObserveNativeSession {
-            binding_id: "binding-refusal-code".into(),
-            expected_version: 1,
-            native_session_id: "native-refusal-code".into(),
-        };
-        for (message, expected) in [
-            (
-                "architect binding is unavailable",
-                NATIVE_SESSION_REFUSAL_UNAVAILABLE,
-            ),
-            (
-                "bridge process binding mismatch",
-                NATIVE_SESSION_REFUSAL_BRIDGE_PROCESS,
-            ),
-            (
-                "architect process is no longer live",
-                NATIVE_SESSION_REFUSAL_ARCHITECT_LIVENESS,
-            ),
-            (
-                "architect binding secret mismatch",
-                NATIVE_SESSION_REFUSAL_CAPABILITY,
-            ),
-            (
-                "invalid bounded registration text",
-                NATIVE_SESSION_REFUSAL_IDENTITY,
-            ),
-            (
-                "architect binding version is stale",
-                NATIVE_SESSION_REFUSAL_VERSION,
-            ),
-            (
-                "architect native session can bind exactly once",
-                NATIVE_SESSION_REFUSAL_STATE,
-            ),
-        ] {
-            assert_eq!(
-                registration_refusal_code(&action, &anyhow::anyhow!(message)),
-                expected
-            );
-        }
-        assert_eq!(
-            registration_refusal_code(
-                &action,
-                &anyhow::anyhow!("unclassified must-not-echo-value")
-            ),
-            REGISTRATION_REFUSAL_GENERIC
-        );
-        let unrelated = RegistrationAction::CloseBinding {
-            binding_id: "binding-refusal-code".into(),
-            expected_version: 1,
-        };
-        assert_eq!(
-            registration_refusal_code(
-                &unrelated,
-                &anyhow::anyhow!("architect binding secret mismatch")
-            ),
-            REGISTRATION_REFUSAL_GENERIC
-        );
-    }
-
-    #[test]
-    fn architect_binding_is_exact_and_request_replay_is_payload_bound() {
+    fn architect_process_binding_is_exact_and_request_replay_is_payload_bound() {
         let fixture = Fixture::new();
         let mut control = SessionSupervisorControl::open(
             &fixture.paths,
@@ -1177,7 +1035,6 @@ mod tests {
         let binding_id = "binding-session-test";
         let launch_nonce = "launch-nonce-session-test";
         let capability = "capability-session-test";
-        let native_session_id = "native-session-test";
         let (action_set_json, _) = canonical_action_set(ActionName::ARCHITECT).unwrap();
         let birth = process_birth_identity(std::process::id()).unwrap();
         control.bindings.insert(
@@ -1189,15 +1046,14 @@ mod tests {
                 capability_hash: secret_hash(b"hcom-session/capability/v1", capability),
                 action_set_hash: sha256_hex(action_set_json.as_bytes()),
                 action_set_json,
-                state: BindingState::NativeBound,
-                version: 2,
+                state: BindingState::ProcessBound,
+                version: 1,
                 architect_pid: Some(std::process::id()),
                 architect_process_birth: Some(birth.clone()),
                 bridge_pid: Some(std::process::id()),
                 bridge_process_birth: Some(birth),
                 relay_executable_contract_hash: Some("a".repeat(64)),
                 relay_runtime_scope_hash: Some("b".repeat(64)),
-                native_session_id: Some(native_session_id.into()),
             },
         );
         // SAFETY: geteuid/getegid have no preconditions.
@@ -1213,7 +1069,6 @@ mod tests {
                 binding_id: binding_id.into(),
                 launch_nonce: launch_nonce.into(),
                 capability: capability.into(),
-                native_session_id: Some(native_session_id.into()),
             },
             action: ControlAction::SessionCancel {
                 expected_session_version: 0,
@@ -1235,17 +1090,14 @@ mod tests {
             ControlErrorCode::Conflict
         );
 
-        let mut wrong_native = request;
-        let CallerAuth::Architect {
-            native_session_id, ..
-        } = &mut wrong_native.caller
-        else {
+        let mut wrong_capability = request;
+        let CallerAuth::Architect { capability, .. } = &mut wrong_capability.caller else {
             unreachable!()
         };
-        *native_session_id = Some("native-session-other".into());
+        *capability = "capability-session-other".into();
         assert_eq!(
             control
-                .handle_request(peer, &wrong_native)
+                .handle_request(peer, &wrong_capability)
                 .error
                 .unwrap()
                 .code,
@@ -1266,7 +1118,6 @@ mod tests {
         let binding_id = "binding-request-bound";
         let launch_nonce = "launch-nonce-request-bound";
         let capability = "capability-request-bound";
-        let native_session_id = "native-session-request-bound";
         let (action_set_json, _) = canonical_action_set(ActionName::ARCHITECT).unwrap();
         let birth = process_birth_identity(std::process::id()).unwrap();
         control.bindings.insert(
@@ -1278,15 +1129,14 @@ mod tests {
                 capability_hash: secret_hash(b"hcom-session/capability/v1", capability),
                 action_set_hash: sha256_hex(action_set_json.as_bytes()),
                 action_set_json,
-                state: BindingState::NativeBound,
-                version: 2,
+                state: BindingState::ProcessBound,
+                version: 1,
                 architect_pid: Some(std::process::id()),
                 architect_process_birth: Some(birth.clone()),
                 bridge_pid: Some(std::process::id()),
                 bridge_process_birth: Some(birth),
                 relay_executable_contract_hash: Some("a".repeat(64)),
                 relay_runtime_scope_hash: Some("b".repeat(64)),
-                native_session_id: Some(native_session_id.into()),
             },
         );
         for index in 0..MAX_REQUEST_RECORDS {
@@ -1316,7 +1166,6 @@ mod tests {
                     binding_id: binding_id.into(),
                     launch_nonce: launch_nonce.into(),
                     capability: capability.into(),
-                    native_session_id: Some(native_session_id.into()),
                 },
                 action: ControlAction::SessionCancel {
                     expected_session_version: 0,
@@ -1339,7 +1188,6 @@ mod tests {
                     binding_id: binding_id.into(),
                     launch_nonce: launch_nonce.into(),
                     capability: capability.into(),
-                    native_session_id: Some(native_session_id.into()),
                 },
                 action: ControlAction::SessionStatus,
             },

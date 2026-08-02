@@ -155,7 +155,6 @@ impl EnvironmentLeaseDescriptor {
 pub struct ExecutionEnvironmentLease {
     descriptor: EnvironmentLeaseDescriptor,
     values: BTreeMap<OsString, OsString>,
-    redaction_values: Vec<String>,
 }
 
 impl ExecutionEnvironmentLease {
@@ -216,7 +215,6 @@ impl ExecutionEnvironmentLease {
         Ok(Self {
             descriptor,
             values: captured,
-            redaction_values: Vec::new(),
         })
     }
 
@@ -244,12 +242,14 @@ impl ExecutionEnvironmentLease {
     pub(crate) fn materialize_task_runtime(
         &self,
         supervisor_epoch: &str,
-        run_id: &str,
-        task_id: &str,
     ) -> Result<MaterializedWorkerEnvironment> {
-        validate_opaque_id("worker run id", run_id)?;
-        validate_opaque_id("worker task id", task_id)?;
-        self.materialize_with_identity(supervisor_epoch, "task-runtime", run_id, task_id)
+        self.descriptor.require_supervisor_epoch(supervisor_epoch)?;
+        if environment_hash(&self.values) != self.descriptor.environment_hash {
+            bail!("in-memory environment lease no longer matches its descriptor");
+        }
+        Ok(MaterializedWorkerEnvironment {
+            values: self.values.clone(),
+        })
     }
 
     fn materialize_with_identity(
@@ -288,36 +288,8 @@ impl ExecutionEnvironmentLease {
             }
             collect_proxy_credentials(value, &mut sensitive);
         }
-        for value in &self.redaction_values {
-            collect_sensitive_value(value, &mut sensitive);
-        }
         SecretRedactor::from_sensitive_values(sensitive)
     }
-
-    pub(crate) fn with_secret_redaction_values(mut self, values: Vec<String>) -> Result<Self> {
-        validate_secret_redaction_values(&values)?;
-        let mut unique = BTreeSet::new();
-        for value in values {
-            unique.insert(value);
-        }
-        self.redaction_values = unique.into_iter().collect();
-        Ok(self)
-    }
-}
-
-pub(crate) fn validate_secret_redaction_values(values: &[String]) -> Result<()> {
-    if values.len() > MAX_POLICY_ENTRIES {
-        bail!("secret redaction inventory exceeds its bounded entry count");
-    }
-    for value in values {
-        if value.len() < MIN_ENVIRONMENT_REDACTION_BYTES
-            || value.len() > MAX_ENVIRONMENT_VALUE_BYTES
-            || value.chars().any(char::is_control)
-        {
-            bail!("secret redaction value has an unsafe or ineffective shape");
-        }
-    }
-    Ok(())
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1154,44 +1126,6 @@ mod tests {
                 ],
             )
             .is_err()
-        );
-    }
-
-    #[test]
-    fn adapter_private_secrets_are_redacted_without_entering_the_environment() {
-        let lease = fixture_lease("http://proxy.invalid:8080")
-            .with_secret_redaction_values(vec![
-                "session-access-token-v1".into(),
-                "session-refresh-token-v1".into(),
-            ])
-            .unwrap();
-        let materialized = lease
-            .materialize(
-                "epoch-1",
-                &WorkerEnvironmentIdentity {
-                    role: WorkerRole::Reviewer,
-                    run_id: "run-1".into(),
-                    task_id: "task-1".into(),
-                },
-            )
-            .unwrap();
-        assert!(
-            materialized
-                .iter()
-                .filter_map(|(_, value)| value.to_str())
-                .all(|value| !value.contains("session-access-token-v1"))
-        );
-        let redacted = lease
-            .redactor()
-            .redact("access=session-access-token-v1 refresh=session-refresh-token-v1");
-        assert!(!redacted.contains("session-access-token-v1"));
-        assert!(!redacted.contains("session-refresh-token-v1"));
-        assert!(redacted.contains("[REDACTED]"));
-
-        assert!(
-            fixture_lease("http://proxy.invalid:8080")
-                .with_secret_redaction_values(vec!["short".into()])
-                .is_err()
         );
     }
 

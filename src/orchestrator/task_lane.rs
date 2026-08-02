@@ -7,9 +7,7 @@ use super::core::{
     DriverFailure, DriverFailureClass, SupervisorCore, SupervisorEffect, SupervisorEvent,
 };
 use super::workspace::TasksWorkspace;
-use super::{
-    SessionRuntimeSources, SessionStartup, ensure_private_directory, path_value, sha256_hex,
-};
+use super::{SessionRuntimeSources, SessionStartup, ensure_private_directory, sha256_hex};
 use crate::control_api::{SessionState, SessionStatusSnapshot, TaskDraft, TaskState, WorkerRole};
 use crate::worker::environment::{
     EnvironmentPolicy, ExecutionEnvironmentLease, MaterializedWorkerEnvironment,
@@ -25,19 +23,16 @@ use crate::worker::runtime::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
-use std::io::Read;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
 
 const TURN_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
-const MAX_AUTH_FILE_BYTES: usize = 1024 * 1024;
-const MAX_AUTH_REDACTION_VALUES: usize = 64;
 
 trait RuntimeFactory: Send {
     fn contract(&self) -> RuntimeContractIdentity;
@@ -115,7 +110,6 @@ impl RuntimeOpenFailure {
 
 struct TaskRuntimePaths {
     runtime: PathBuf,
-    hcom: PathBuf,
 }
 
 impl TaskRuntimePaths {
@@ -135,17 +129,14 @@ impl TaskRuntimePaths {
         let root_path = fs::canonicalize(root.path())?;
         let paths = Self {
             runtime: root_path.join("run"),
-            hcom: root_path.join("hcom"),
         };
-        for directory in [&paths.runtime, &paths.hcom] {
-            fs::create_dir(directory).with_context(|| {
-                format!(
-                    "failed to create task-private exec worker directory {}",
-                    directory.display()
-                )
-            })?;
-            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
-        }
+        fs::create_dir(&paths.runtime).with_context(|| {
+            format!(
+                "failed to create task-private exec worker directory {}",
+                paths.runtime.display()
+            )
+        })?;
+        fs::set_permissions(&paths.runtime, fs::Permissions::from_mode(0o700))?;
         Ok((root, paths))
     }
 }
@@ -197,14 +188,12 @@ impl TaskLaneSupervisor {
         run_id: String,
         project_root: PathBuf,
         run_root: PathBuf,
-        lock_root: PathBuf,
         sources: SessionRuntimeSources,
     ) -> Result<Self> {
         Self::open_with_factory(
             run_id,
             project_root,
             run_root,
-            lock_root,
             sources,
             Box::new(ProductionRuntimeFactory::new()),
         )
@@ -214,20 +203,16 @@ impl TaskLaneSupervisor {
         run_id: String,
         project_root: PathBuf,
         run_root: PathBuf,
-        lock_root: PathBuf,
         sources: SessionRuntimeSources,
         factory: Box<dyn RuntimeFactory>,
     ) -> Result<Self> {
         crate::worker::validation::validate_opaque_id("run id", &run_id)?;
         let project_root = super::canonical_project_directory(&project_root)?;
         let run_root = super::canonical_private_directory(&run_root, "session runtime root")?;
-        // The lock root is still validated at open time so an unsafe control
-        // root fails closed here, but nothing reads it any more: the lane takes
-        // no repository lock because it never opens a repository.
-        super::canonical_private_directory(&lock_root, "repository lock root")?;
-        let session_profiles = sources.profiles.clone().ok_or_else(|| {
-            anyhow!("the Codex exec worker lane requires session-frozen profiles")
-        })?;
+        let session_profiles = sources
+            .profiles
+            .clone()
+            .ok_or_else(|| anyhow!("the Codex exec worker lane requires loaded profiles"))?;
         let profiles = TaskWorkerProfiles::from_session_profiles(&session_profiles)
             .map_err(|error| anyhow!(error.detail))?;
         profiles.validate().map_err(|error| anyhow!(error.detail))?;
@@ -665,10 +650,10 @@ impl TaskLaneSupervisor {
         )
         .map_err(|error| RuntimeOpenFailure::new(DriverFailureClass::Environment, error))?;
         let environment = self
-            .task_environment(&task.spec.task_key, &paths)
+            .task_environment(&task.spec.task_key)
             .map_err(|error| RuntimeOpenFailure::new(DriverFailureClass::Environment, error))?;
         let materialized = environment
-            .materialize_task_runtime(&self.epoch, &self.startup.run_id, &task.spec.task_key)
+            .materialize_task_runtime(&self.epoch)
             .map_err(|error| RuntimeOpenFailure::new(DriverFailureClass::Environment, error))?;
         let request = RuntimeOpenRequest {
             task_ordinal,
@@ -859,33 +844,17 @@ impl TaskLaneSupervisor {
         }
     }
 
-    fn task_environment(
-        &self,
-        task_key: &str,
-        paths: &TaskRuntimePaths,
-    ) -> Result<ExecutionEnvironmentLease> {
-        let policy = EnvironmentPolicy::new(
-            vec!["HCOM_DIR".into()],
-            vec!["HCOM_DIR".into(), "PATH".into()],
-        )?;
-        let overrides = vec![(
-            "HCOM_DIR".into(),
-            path_value("worker private hcom directory", &paths.hcom)?,
-        )];
+    fn task_environment(&self, task_key: &str) -> Result<ExecutionEnvironmentLease> {
+        let policy = EnvironmentPolicy::new(Vec::new(), Vec::new())?;
         let lease = ExecutionEnvironmentLease::capture_complete(
             format!("exec-lease-{}", Uuid::new_v4()),
             &self.epoch,
             &policy,
             &self.sources.parent_environment,
-            overrides,
+            Vec::new(),
         )
         .with_context(|| format!("failed to capture exec worker environment for {task_key}"))?;
-        match self.sources.codex_auth_source.as_deref() {
-            Some(auth_source) => {
-                lease.with_secret_redaction_values(codex_auth_redaction_values(auth_source)?)
-            }
-            None => Ok(lease),
-        }
+        Ok(lease)
     }
 
     fn build_turn_prompt(
@@ -1073,7 +1042,6 @@ fn runtime_error_failure(error: RuntimeError) -> Result<SanitizedRuntimeFailure>
 fn clone_runtime_paths(paths: &TaskRuntimePaths) -> TaskRuntimePaths {
     TaskRuntimePaths {
         runtime: paths.runtime.clone(),
-        hcom: paths.hcom.clone(),
     }
 }
 
@@ -1157,51 +1125,6 @@ fn bounded_single_line(input: &str) -> String {
     output
 }
 
-fn codex_auth_redaction_values(path: &Path) -> Result<Vec<String>> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
-    let mut bytes = Vec::new();
-    Read::by_ref(&mut file)
-        .take((MAX_AUTH_FILE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_AUTH_FILE_BYTES {
-        bail!("Codex auth source exceeds its bounded size");
-    }
-    let value: Value = serde_json::from_slice(&bytes).context("Codex auth source is not JSON")?;
-    let mut values = BTreeSet::new();
-    collect_auth_strings(&value, &mut values)?;
-    Ok(values.into_iter().collect())
-}
-
-fn collect_auth_strings(value: &Value, values: &mut BTreeSet<String>) -> Result<()> {
-    match value {
-        Value::String(value)
-            if value.len() >= 8
-                && value.len() <= 16 * 1024
-                && !value.chars().any(char::is_control) =>
-        {
-            if values.len() >= MAX_AUTH_REDACTION_VALUES && !values.contains(value) {
-                bail!("Codex auth redaction inventory exceeds 64 values");
-            }
-            values.insert(value.clone());
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_auth_strings(item, values)?;
-            }
-        }
-        Value::Object(object) => {
-            for item in object.values() {
-                collect_auth_strings(item, values)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 fn json_contains_sensitive_value(
     value: &Value,
     redactor: &crate::worker::environment::SecretRedactor,
@@ -1231,6 +1154,7 @@ mod tests {
         DeveloperOutcomeStatus, DeveloperOutcomeV1, ReviewFindingSeverity, ReviewFindingV1,
         ReviewerOutcomeV1, ReviewerVerdict, RuntimeTelemetry,
     };
+    use std::collections::BTreeSet;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::process::Command;
     use std::sync::{Arc, Mutex};
@@ -1419,7 +1343,6 @@ mod tests {
     struct Fixture {
         _temp: TempDir,
         run_root: PathBuf,
-        lock_root: PathBuf,
         project_root: PathBuf,
         repository: PathBuf,
         sources: SessionRuntimeSources,
@@ -1431,17 +1354,10 @@ mod tests {
             let root = fs::canonicalize(temp.path()).unwrap();
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
             let run_root = root.join("run");
-            let lock_root = root.join("locks");
             let project_root = root.join("project");
             let repository = root.join("repository");
             let toolchain = root.join("toolchain");
-            for directory in [
-                &run_root,
-                &lock_root,
-                &project_root,
-                &repository,
-                &toolchain,
-            ] {
+            for directory in [&run_root, &project_root, &repository, &toolchain] {
                 fs::create_dir(directory).unwrap();
                 fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
             }
@@ -1453,19 +1369,9 @@ mod tests {
             git_commit(&repository, "Initial fixture");
             let repository = fs::canonicalize(repository).unwrap();
 
-            let auth = root.join("codex-auth.json");
-            fs::write(
-                &auth,
-                br#"{"OPENAI_API_KEY":"fixture-auth-secret-value","account_id":"fixture-account-value"}"#,
-            )
-            .unwrap();
-            fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
-            let auth = fs::canonicalize(auth).unwrap();
-
             let mut sources = SessionRuntimeSources::fake(&toolchain);
             sources.profiles =
                 Some(SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Codex).unwrap());
-            sources.codex_auth_source = Some(auth);
             sources.parent_environment = ParentEnvironment::from_os(vec![
                 (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
                 (
@@ -1495,6 +1401,18 @@ mod tests {
                     OsString::from("HCOM_DIR"),
                     OsString::from("/must/not/reach/task"),
                 ),
+                (
+                    OsString::from("HCOM_WORKER_ROLE"),
+                    OsString::from("parent-worker-role"),
+                ),
+                (
+                    OsString::from("HCOM_RUN_ID"),
+                    OsString::from("parent-run-id"),
+                ),
+                (
+                    OsString::from("HCOM_TASK_ID"),
+                    OsString::from("parent-task-id"),
+                ),
                 (OsString::from("HOME"), OsString::from("/native/home")),
                 (
                     OsString::from("CODEX_HOME"),
@@ -1513,7 +1431,6 @@ mod tests {
             Self {
                 _temp: temp,
                 run_root,
-                lock_root,
                 project_root,
                 repository,
                 sources,
@@ -1543,7 +1460,6 @@ mod tests {
                 "run-driver-test".into(),
                 self.project_root.clone(),
                 self.run_root.clone(),
-                self.lock_root.clone(),
                 self.sources.clone(),
                 Box::new(ScriptedFactory {
                     scripts: scripts.into(),
@@ -1575,7 +1491,6 @@ mod tests {
             pub(crate) project_root: PathBuf,
             pub(crate) repository: PathBuf,
             run_root: PathBuf,
-            lock_root: PathBuf,
             sources: SessionRuntimeSources,
         }
 
@@ -1588,10 +1503,9 @@ mod tests {
                 let root = fs::canonicalize(temp.path()).unwrap();
                 fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
                 let run_root = root.join("run");
-                let lock_root = root.join("locks");
                 let project_root = root.join("project");
                 let repository = project_root.join("repository");
-                for directory in [&run_root, &lock_root, &project_root, &repository] {
+                for directory in [&run_root, &project_root, &repository] {
                     fs::create_dir_all(directory).unwrap();
                     fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
                 }
@@ -1617,8 +1531,6 @@ mod tests {
 
                 let mut sources = SessionRuntimeSources::fake(Path::new(&home));
                 sources.set_profiles_for_test(profiles);
-                sources.codex_auth_source =
-                    Some(fs::canonicalize(format!("{home}/.codex/auth.json")).unwrap());
                 // Complete parent inheritance, exactly like production.
                 sources.parent_environment = ParentEnvironment::capture_current();
 
@@ -1627,7 +1539,6 @@ mod tests {
                     project_root,
                     repository,
                     run_root,
-                    lock_root,
                     sources,
                 }
             }
@@ -1637,7 +1548,6 @@ mod tests {
                     "run-real-exec".into(),
                     self.project_root.clone(),
                     self.run_root.clone(),
-                    self.lock_root.clone(),
                     self.sources.clone(),
                 )
                 .unwrap()
@@ -1992,7 +1902,7 @@ mod tests {
     }
 
     #[test]
-    fn task_runtime_only_creates_hcom_owned_state_and_raw_transport_directories() {
+    fn task_runtime_only_creates_its_raw_transport_directory() {
         let fixture = Fixture::new();
         let (root, paths) =
             TaskRuntimePaths::create(&fixture.run_root, 0, "config", &fixture.repository).unwrap();
@@ -2001,8 +1911,7 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
         children.sort();
-        assert_eq!(children, [OsString::from("hcom"), OsString::from("run")]);
-        assert!(paths.hcom.is_dir());
+        assert_eq!(children, [OsString::from("run")]);
         assert!(paths.runtime.is_dir());
     }
 
@@ -2016,33 +1925,6 @@ mod tests {
         assert_eq!(bounded.len(), 1023);
         assert!(bounded.is_char_boundary(bounded.len()));
         assert!(!bounded.chars().any(char::is_control));
-    }
-
-    #[test]
-    fn auth_redaction_file_and_value_inventory_bounds_are_exact() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("auth.json");
-        for (bytes, accepted) in [
-            (MAX_AUTH_FILE_BYTES - 1, true),
-            (MAX_AUTH_FILE_BYTES, true),
-            (MAX_AUTH_FILE_BYTES + 1, false),
-        ] {
-            let encoded = format!("\"{}\"", "x".repeat(bytes - 2));
-            assert_eq!(encoded.len(), bytes);
-            fs::write(&path, encoded).unwrap();
-            assert_eq!(codex_auth_redaction_values(&path).is_ok(), accepted);
-        }
-        for (values, accepted) in [
-            (MAX_AUTH_REDACTION_VALUES - 1, true),
-            (MAX_AUTH_REDACTION_VALUES, true),
-            (MAX_AUTH_REDACTION_VALUES + 1, false),
-        ] {
-            let encoded: Vec<_> = (0..values)
-                .map(|index| format!("secret-{index:04}"))
-                .collect();
-            fs::write(&path, serde_json::to_vec(&encoded).unwrap()).unwrap();
-            assert_eq!(codex_auth_redaction_values(&path).is_ok(), accepted);
-        }
     }
 
     #[test]
@@ -2956,7 +2838,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_parent_environment_changes_only_hcom_owned_identity_and_state() {
+    fn complete_parent_environment_is_preserved_byte_for_byte() {
         let fixture = Fixture::new();
         let audit = Arc::new(Mutex::new(Audit::default()));
         let script = task_script(
@@ -3015,8 +2897,13 @@ mod tests {
             get(b"https_proxy"),
             Some(b"http://lower-proxy.example".as_slice())
         );
-        assert_ne!(get(b"HCOM_DIR"), Some(b"/must/not/reach/task".as_slice()));
-        assert_eq!(get(b"HCOM_WORKER_ROLE"), Some(b"task-runtime".as_slice()));
+        assert_eq!(get(b"HCOM_DIR"), Some(b"/must/not/reach/task".as_slice()));
+        assert_eq!(
+            get(b"HCOM_WORKER_ROLE"),
+            Some(b"parent-worker-role".as_slice())
+        );
+        assert_eq!(get(b"HCOM_RUN_ID"), Some(b"parent-run-id".as_slice()));
+        assert_eq!(get(b"HCOM_TASK_ID"), Some(b"parent-task-id".as_slice()));
         assert_eq!(get(b"HOME"), Some(b"/native/home".as_slice()));
         assert_eq!(get(b"CODEX_HOME"), Some(b"/native/codex-home".as_slice()));
         assert_eq!(get(b"TMPDIR"), Some(b"/native/tmp".as_slice()));
@@ -3028,10 +2915,11 @@ mod tests {
             get(b"XDG_CACHE_HOME"),
             Some(b"/native/xdg-cache".as_slice())
         );
+        assert_eq!(environment.len(), 18);
     }
 
     #[test]
-    fn independent_codex_role_overrides_are_frozen_into_runtime_turns() {
+    fn independent_codex_role_overrides_are_used_by_runtime_turns() {
         let mut fixture = Fixture::new();
         let profiles = fixture.sources.profiles.as_mut().unwrap();
         let DeveloperInvocationProfile::Codex { profile: developer } = &mut profiles.developer
@@ -3386,7 +3274,6 @@ mod tests {
             "run-factory-failure".into(),
             fixture.project_root.clone(),
             fixture.run_root.clone(),
-            fixture.lock_root.clone(),
             fixture.sources.clone(),
             Box::new(FailingFactory),
         )
@@ -3423,44 +3310,6 @@ mod tests {
                 .read_dir()
                 .unwrap()
                 .any(|entry| entry.is_ok())
-        );
-    }
-
-    #[test]
-    fn missing_codex_auth_file_does_not_block_native_environment_auth() {
-        let mut fixture = Fixture::new();
-        fixture.sources.codex_auth_source = None;
-        let script = task_script(
-            "environment-auth",
-            vec![
-                FakeTurnScript::new(
-                    WorkerRole::Developer,
-                    RuntimeTurnPurpose::InitialDevelopment,
-                    [ready("implemented")],
-                ),
-                FakeTurnScript::new(
-                    WorkerRole::Reviewer,
-                    RuntimeTurnPurpose::InitialReview,
-                    [lgtm("sound")],
-                ),
-            ],
-            vec![
-                Mutation::Commit {
-                    path: "src/task.txt",
-                    contents: "done\n",
-                },
-                Mutation::None,
-            ],
-        );
-        let mut supervisor =
-            fixture.supervisor(vec![script], Arc::new(Mutex::new(Audit::default())));
-        start(
-            &mut supervisor,
-            vec![fixture.task("environment-auth", &["src"], 2)],
-        );
-        assert_eq!(
-            drive_terminal(&mut supervisor).state,
-            SessionState::Completed
         );
     }
 

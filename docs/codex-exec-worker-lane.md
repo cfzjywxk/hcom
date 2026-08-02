@@ -65,12 +65,12 @@ AGENTS.md, AGENTS.override.md, and nested instructions in both the project and
 the task repository. hcom forwards the exact paths; it does not parse or
 resolve those instruction files itself.
 
-The only environment state redirected by hcom is `HCOM_DIR`, plus the
-hcom-owned run/task/role identity variables. HOME, CODEX_HOME, TMPDIR, XDG,
-Cargo/Rustup, authentication, proxies, and all other parent entries remain
-byte-for-byte native. Workers run directly on the host rather than in an outer
-bubblewrap filesystem sandbox. Reviewer non-mutation is a role instruction,
-not an OS read-only mount, matching a manually launched review session.
+No parent environment entry is redirected: `HCOM_DIR`, HOME, CODEX_HOME,
+TMPDIR, XDG, Cargo/Rustup, authentication, proxies, and every other entry remain
+byte-for-byte native. hcom neither adds nor replaces worker environment
+entries. Workers run directly on the host rather than in an outer bubblewrap
+filesystem sandbox. Reviewer non-mutation is a role instruction, not an OS
+read-only mount, matching a manually launched review session.
 
 ## What hcom parses
 
@@ -236,10 +236,6 @@ directory is not a repository at all is accepted, and the reviewer is given no
 diff range — it works out what changed from the source and the developer's
 report.
 
-*To change it:* re-introducing a repository lock is small; re-introducing diff
-ranges means the supervisor must observe HEAD again, with all the drift
-questions that follow.
-
 ### `hcom-tasks/` is evidence, not a security boundary
 
 A worker has the same native HOME/TMP and host filesystem authority as a
@@ -248,12 +244,6 @@ directly launched Codex process. It can therefore alter files under
 
 *Consequence:* artifacts are trustworthy as a record of a cooperating worker,
 not as tamper-proof audit. Do not build a security argument on them.
-
-*Known narrow gap:* the supervisor opens `decision.log` by path, so a worker
-that replaced it with a symlink could aim the supervisor's own (larger)
-authority at a file outside the sandbox. Closing it means `openat` from a
-pinned directory fd, `O_NOFOLLOW`, and an inode check before every write —
-worth doing, not yet done.
 
 ### Non-UTF-8 environment values expose an upstream native limitation
 

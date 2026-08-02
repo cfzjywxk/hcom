@@ -40,8 +40,8 @@ pub fn help_text() -> &'static str {
 Launch one blank, foreground Codex or Claude architect with capability-bound
 in-memory session-task tools. The invocation's exact current directory is the
 Architect's project context and does not need to be a Git repository. Every
-task separately binds an exact canonical Git root; exec worker role threads use
-the project directory as native cwd and receive that repository through
+task carries an exact canonical source directory; exec worker role threads use
+the project directory as native cwd and receive that directory through
 --add-dir when it is distinct.
 
 Profile configuration is read once from $HCOM_DIR/config.toml (default:
@@ -77,27 +77,30 @@ plugins, feature flags, providers, and MCP servers remain loaded. This does not
 override the explicit danger-full-access/never profile.
 The Architect may start in the same turn when the human explicitly directs it
 to follow or execute a named existing detailed plan/specification/current_todo;
-analysis or drafting alone still waits for approval. hcom validates the exact
-version/hash and confirmation bit, not OS-level keyboard provenance.
+analysis or drafting alone still waits for approval. hcom validates the typed
+plan revision/hash and confirmation bit, not OS-level keyboard provenance.
 
 Only typed profile fields are accepted; arbitrary native argv is not. The
 effective sanitized profiles and their SHA-256 hash are printed at startup and
-frozen into the approved plan.
+used for that foreground run.
 
 No prompt argument, stdin payload, terminal injection, or automatic first turn
 is used. The human owns every architect terminal input. The Architect has a
 path-preserving whole-host read-write view for project plans, current_todo, and
 coordination records. A Codex Architect and every Codex exec worker inherit the
 complete parent environment, real HOME/CODEX_HOME, native config, auth, caches,
-session history, and ordinary same-user host view. hcom overrides only private
-HCOM_DIR and its own run/task/role identity. Native shell_environment_policy
-decides what model-started commands inherit. The existing Claude foreground
-Architect keeps its separately documented private config/containment behavior;
-Claude task workers remain unsupported.
+session history, and ordinary same-user host view. hcom does not replace any
+parent environment variable, including HCOM_DIR, and does not add role/run/task
+environment variables to Codex worker processes.
+Native shell_environment_policy decides what model-started commands inherit.
+hcom does not inspect, register, or freeze a native Codex Architect session.
+The existing Claude foreground Architect keeps its separately documented
+private config/containment behavior; Claude task workers remain unsupported.
 
-Each authorized task names the exact canonical Git root discovered by the
-Architect from project documentation. Developer tasks work and commit directly
-there; hcom has no repository-root allowlist and does not inspect or repair Git.
+Each authorized task names the exact canonical source directory discovered by
+the Architect from project documentation. Developer tasks work and commit
+directly there; hcom has no repository-root allowlist and does not inspect or
+repair Git.
 The Reviewer receives the same native host view; source/Git/install
 non-mutation is a role instruction rather than an OS read-only mount. hcom
 sequences the reports and verdicts but never pushes, installs, resets, rebases,

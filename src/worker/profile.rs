@@ -1,4 +1,4 @@
-//! Typed, session-frozen native CLI invocation profiles.
+//! Typed native CLI invocation profiles loaded for one foreground run.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};

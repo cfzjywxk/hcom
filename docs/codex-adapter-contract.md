@@ -22,7 +22,8 @@ The deliberate exceptions are:
   user config;
 - typed sandbox/approval values are also explicit;
 - the Architect gets one hcom-owned task-control MCP table;
-- `HCOM_DIR` and hcom run/task/role identity are private to this invocation;
+- Architect and worker parent environments, including `HCOM_DIR`, remain
+  byte-for-byte unchanged; hcom adds or replaces no environment entry;
 - exec workers add the transport required for thread identity/final-message
   capture.
 
@@ -74,30 +75,20 @@ servers, custom providers, caches, and session history behave like a direct
 Codex invocation. hcom does not pass `--strict-config`, disable features, or
 write a private Codex config.
 
-`HCOM_DIR` alone points at per-run private hcom state, so hcom commands inside
-the Architect cannot address the user's live retained-agent store. The
-launch-control bubblewrap process still supplies the pre-registration gate,
-but binds the host root read-write and does not mask the user's Codex config,
-HOME, project, source repositories, XDG paths, or unrelated host files.
+The Architect is spawned directly as `codex` from the project directory. hcom
+does not insert bubblewrap or another launcher, rebuild the environment, change
+`HCOM_DIR`, create namespaces/mounts, or run Codex HOME/auth/session-store
+preflights. Parent-death handling and PID registration only tie orchestration
+lifetime and the task-control relay to this child.
 
-## Exact native-session binding with a shared CODEX_HOME
+## No Architect session binding
 
-A private CODEX_HOME previously made “exactly one rollout exists” sufficient
-for Architect identity. In the real native session store many old and
-concurrent sessions can exist, so hcom now:
-
-1. snapshots the bounded `(device, inode)` identities of rollout files before
-   starting the Architect;
-2. considers only post-snapshot rollout files whose first native
-   `session_meta` record matches the exact project root;
-3. requires one unique candidate for the first task-control call;
-4. after binding, keeps selecting that exact candidate even if another
-   same-project Codex session starts later;
-5. routes missing, ambiguous, or changed evidence through the existing closed
-   native-session refusal path.
-
-The snapshot is identity-only; hcom never reads old rollout contents. The
-bounded list fits the existing 256 KiB bridge bootstrap frame.
+The task-control relay authenticates its directly spawned Architect and bridge
+processes; it does not bind, freeze, or register a Codex session identity.
+hcom does not enumerate or parse `CODEX_HOME/sessions`, count rollout files,
+inspect `auth.json`, or require a unique native Codex rollout. Concurrent or
+unusual native session history therefore cannot block a direct Codex launch or
+its first task-control call.
 
 ## Background Codex workers
 
@@ -117,7 +108,8 @@ The exec lane:
 - proves create/resume identity from `thread.started.thread_id`;
 - captures final output with `--output-last-message`;
 - keeps Reviewer non-mutation as a role contract, not an OS read-only mount;
-- keeps private HCOM_DIR, bounded lifecycle/reaping, and redacted evidence.
+- preserves parent `HCOM_DIR` and keeps bounded lifecycle/reaping plus redacted
+  evidence.
 
 See the exec-lane document for exact argv ordering, verdict classification,
 artifact bounds, and contract smokes.
@@ -129,9 +121,8 @@ artifact bounds, and contract smokes.
 | defaults are explicit | `architect::profile::tests::missing_file_uses_reviewed_defaults`, `worker::profile::tests::codex_exec_worker_lane_defaults_both_workers_to_exact_codex_profiles` |
 | no prompt or input injection | `architect::launch::tests::native_profile_has_no_prompt_or_secret_transport`, `blank_codex_launch_keeps_input_empty_and_preserves_native_host_semantics` |
 | native config plus one MCP leaf | `architect::launch::tests::codex_control_server_is_an_additive_cli_overlay_not_a_private_config` |
-| shared-store session identity | `architect::bridge::tests::native_session_baseline_excludes_old_rollouts_and_keeps_the_bound_session` |
 | native worker argv/config | `worker::exec_runtime::tests::happy_developer_turn_completes_and_captures_thread_id`, `reviewer_registers_the_external_repository_as_a_native_workspace_root` |
-| native environment/HCOM exception | `orchestrator::task_lane::tests::complete_parent_environment_changes_only_hcom_owned_identity_and_state` |
+| byte-exact native environment with no additions | `orchestrator::task_lane::tests::complete_parent_environment_is_preserved_byte_for_byte` |
 | real CLI assumptions | `scripts/codex-exec-contract-smokes` |
 
 The standard source gate is:

@@ -64,18 +64,16 @@ The intentional exceptions are small:
 - typed sandbox and approval values are explicit;
 - the Architect receives one exact hcom task-control MCP table in addition to
   native MCP servers;
-- `HCOM_DIR` points at per-run/task private hcom state;
-- hcom-owned worker role/run/task identity variables override same-named
-  parent values;
+- every Architect and worker parent environment variable, including
+  `HCOM_DIR`, is preserved byte-for-byte; hcom adds or replaces none;
 - workers start from the complete parent environment; native Codex
   `shell_environment_policy` controls what model-started tool commands receive.
 
-For the Codex Architect, the launch-control bubblewrap process remains only as
-the pre-registration/lifetime gate. It binds `/` read-write and does not mask
-the native HOME, CODEX_HOME, project, source repositories, XDG runtime, `/tmp`,
-or unrelated same-user files. `HCOM_DIR` is still private so an hcom command
-inside the Architect cannot address retained interactive agents through the
-live hcom store.
+The Codex Architect is a direct child process launched as the bare program name
+`codex`. There is no bubblewrap, mount/user/PID namespace, launch gate, private
+environment reconstruction, or Codex HOME/auth/session-store preflight. hcom
+records the spawned PID for its task-control relay and uses parent-death
+lifecycle handling; neither changes the child's host capabilities.
 
 The Claude foreground Architect retains its existing adapter-specific
 containment. This Codex-native change does not add Claude worker support or
@@ -168,23 +166,18 @@ The production Codex defaults remain `gpt-5.6-sol`/`xhigh`. Model-backed
 contract and E2E tests deliberately default to the cheaper
 `gpt-5.3-codex-spark`/`medium` pair.
 
-## Exact Architect session binding
+## Session identity
 
-The Codex Architect writes to the real shared session store, where old sessions
-already exist and another same-project Codex can start concurrently. hcom
-therefore snapshots the bounded `(device, inode)` identities of existing
-rollout files before launch. On the first task-control call, it accepts exactly
-one new rollout whose native `session_meta` matches the project cwd and pinned
-CLI version.
+The task-control relay authenticates the hcom-spawned Architect/bridge
+processes without registering or freezing a Codex Architect session identity.
+hcom does not inspect or bind to Codex's shared session store: it does not scan
+rollout files, parse native session metadata, or reject concurrent or unusual
+Codex session history.
 
-Once bound, later task-control calls must observe that same session. A new
-same-project Codex does not displace it. Missing, ambiguous, or changed
-evidence fails closed through the native-session refusal path. Old rollout
-contents are never read; only their identities form the baseline.
-
-Exec workers prove identity directly from the first
-`thread.started.thread_id` JSON event. A resumed turn must emit the same ID.
-hcom never silently falls back to a fresh session.
+Exec workers use the `thread.started.thread_id` emitted by their own
+`codex exec --json` process solely to resume the same Developer or Reviewer
+conversation for the current task. A resumed turn returning a different ID
+fails that turn instead of silently becoming a fresh conversation.
 
 ## Task handoff and authorization
 
@@ -262,7 +255,9 @@ There is no outer worker filesystem sandbox. Developer and Reviewer see what a
 native process launched by the same user sees. Reviewer non-mutation is a
 model-facing role contract, not a read-only bind mount. hcom still owns process
 groups, cancellation, timeout, descendant cleanup, exact resume, and the
-private raw-final/evidence transport.
+private raw-final/evidence transport. Parent `HCOM_DIR` is unchanged; the only
+environment passed to the worker is the byte-for-byte parent environment, with
+no hcom additions or replacements.
 
 Native hooks/plugins/MCP can create descendants or alter behavior; that is
 intentional native equivalence. A turn routes only after exit 0, exact session

@@ -42,7 +42,6 @@ pub enum CallerAuth {
         binding_id: String,
         launch_nonce: String,
         capability: String,
-        native_session_id: Option<String>,
     },
 }
 
@@ -56,14 +55,10 @@ impl CallerAuth {
                 binding_id,
                 launch_nonce,
                 capability,
-                native_session_id,
             } => {
                 validate_id("binding_id", binding_id)?;
                 validate_secret("launch_nonce", launch_nonce)?;
                 validate_secret("capability", capability)?;
-                if let Some(native_session_id) = native_session_id {
-                    validate_single_line("native_session_id", native_session_id, 256)?;
-                }
                 Ok(())
             }
         }
