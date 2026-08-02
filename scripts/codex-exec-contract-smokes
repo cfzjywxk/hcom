@@ -1,20 +1,20 @@
 #!/bin/bash
 # Contract smokes for the Codex exec worker seam.
 #
-# These probe the *external* assumptions the lane depends on, against the real
-# pinned binary. Unit tests cannot cover them: a fake CLI would just reproduce
-# whatever hcom already believes. Run before every release, and again after any
-# change to the pinned Codex version.
+# These probe the *external* behavior the lane depends on, against the native
+# Codex selected from PATH. Unit tests cannot cover them: a fake CLI would just
+# reproduce whatever hcom already believes. Run before every release, and again
+# after material Codex CLI behavior changes.
 #
 #   scripts/codex-exec-contract-smokes
 #
-# Requires: the pinned codex build, usable native authentication, and network
+# Requires: codex on PATH, usable native authentication, and network
 # access. The disposable CODEX_HOME used here prevents a smoke from touching
 # the operator's real session history while exercising the same native config
 # loader and process shape as production.
 set -uo pipefail
 
-CODEX=/home/ywxk/.codex/packages/standalone/releases/0.146.0-x86_64-unknown-linux-musl/bin/codex
+CODEX=${CODEX:-codex}
 MODEL=${SMOKE_MODEL:-gpt-5.3-codex-spark}
 EFFORT=${SMOKE_EFFORT:-medium}
 
@@ -33,7 +33,7 @@ report() { # name, ok(0/1), detail
   fi
 }
 
-# Create turns carry --cd; resume turns must not (0.146 rejects it there) and
+# Create turns carry --cd; resume turns do not and
 # instead inherit the *process* working directory, so run from `cwd` either way.
 native_shape() { # cwd, out_file, extra args...
   local cwd="$1" out="$2"
@@ -56,18 +56,13 @@ native_shape() { # cwd, out_file, extra args...
     -
 }
 
-# --- C0: pinned binary and help contract ------------------------------------
-if [ -x "$CODEX" ]; then report "C0 pinned binary present" 0; else
-  report "C0 pinned binary present" 1 "$CODEX"; exit 1
+# --- C0: native command availability ----------------------------------------
+if command -v "$CODEX" >/dev/null 2>&1; then
+  report "C0 native codex available" 0 "$(command -v "$CODEX")"
+else
+  report "C0 native codex available" 1 "$CODEX"
+  exit 1
 fi
-help=$("$CODEX" exec --help 2>&1)
-missing=""
-for flag in resume --sandbox --skip-git-repo-check --json --model --config \
-            --cd --output-last-message --add-dir; do
-  grep -q -- "$flag" <<<"$help" || missing="$missing $flag"
-done
-[ -z "$missing" ]
-report "C0 exec help contract" $? "$missing"
 
 # --- C1: create turn writes the final message -------------------------------
 mkdir -p "$WORK/c1/project" "$WORK/c1/home"

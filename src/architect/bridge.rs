@@ -813,10 +813,7 @@ fn inspect_codex_session_file(path: &Path, project_root: &Path) -> Result<Option
     }
     let metadata: CodexSessionMetadata =
         serde_json::from_slice(trim_line(&first_line)).context("invalid Codex session metadata")?;
-    if metadata.kind != "session_meta"
-        || metadata.payload.cwd != project_root
-        || metadata.payload.cli_version != "0.145.0"
-    {
+    if metadata.kind != "session_meta" || metadata.payload.cwd != project_root {
         return Ok(None);
     }
     let id = Uuid::parse_str(&metadata.payload.id)
@@ -1099,7 +1096,6 @@ struct CodexSessionMetadata {
 struct CodexSessionPayload {
     id: String,
     cwd: PathBuf,
-    cli_version: String,
 }
 
 #[cfg(test)]
@@ -1167,7 +1163,7 @@ mod tests {
                     },
                     relay_executable: executable,
                     relay_runtime_scope_hash: relay_runtime_scope_hash(&root).unwrap(),
-                    developer_adapter: "codex-developer-0.145.0".into(),
+                    developer_adapter: "codex-developer".into(),
                     reviewer_adapter: "claude-reviewer-2.1.220".into(),
                 },
                 _session_path: session_path,
@@ -1202,7 +1198,7 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{},\"cli_version\":\"0.145.0\",\"originator\":\"codex_cli_rs\"}}}}\n",
+                "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{},\"cli_version\":\"test-cli\",\"originator\":\"codex_cli_rs\"}}}}\n",
                 serde_json::to_string(project_root).unwrap()
             ),
         )
@@ -1312,7 +1308,7 @@ mod tests {
             },
             relay_executable: executable,
             relay_runtime_scope_hash: "unused-by-authorization".into(),
-            developer_adapter: "codex-developer-0.145.0".into(),
+            developer_adapter: "codex-developer".into(),
             reviewer_adapter: "claude-reviewer-2.1.220".into(),
         };
         let activation = BridgeActivation {
@@ -1540,7 +1536,7 @@ mod tests {
                 "params":{
                     "protocolVersion":"2025-06-18",
                     "capabilities":{},
-                    "clientInfo":{"name":"codex-mcp-client","version":"0.145.0"}
+                    "clientInfo":{"name":"codex-mcp-client","version":"test-cli"}
                 }
             }),
             json!({
@@ -1561,7 +1557,7 @@ mod tests {
                     "name":"session_plan_replace",
                     "arguments":{
                         "expected_session_version":0,
-                        "developer_adapter":"codex-developer-0.145.0",
+                        "developer_adapter":"codex-developer",
                         "reviewer_adapter":"claude-reviewer-2.1.220",
                         "tasks":[{
                             "task_key":"p9-task-1",
@@ -1626,7 +1622,7 @@ mod tests {
                 ref developer_adapter,
                 ref reviewer_adapter,
                 ref tasks,
-            } if developer_adapter == "codex-developer-0.145.0"
+            } if developer_adapter == "codex-developer"
                 && reviewer_adapter == "claude-reviewer-2.1.220"
                 && tasks.len() == 1
                 && tasks[0].objective
@@ -1882,7 +1878,7 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{},\"cli_version\":\"0.145.0\",\"originator\":\"codex_cli_rs\"}}}}\n",
+                "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{},\"cli_version\":\"test-cli\",\"originator\":\"codex_cli_rs\"}}}}\n",
                 serde_json::to_string(&repo).unwrap()
             ),
         )
@@ -1896,7 +1892,7 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{},\"cli_version\":\"0.145.0\",\"originator\":\"codex_cli_rs\"}}}}\n",
+                "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{},\"cli_version\":\"test-cli\",\"originator\":\"codex_cli_rs\"}}}}\n",
                 serde_json::to_string("/wrong/project-directory").unwrap()
             ),
         )
@@ -1908,7 +1904,7 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{},\"cli_version\":\"0.145.0\",\"originator\":\"codex_cli_rs\"}}}}\n",
+                "{{\"timestamp\":\"2026-07-29T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{},\"cli_version\":\"test-cli\",\"originator\":\"codex_cli_rs\"}}}}\n",
                 serde_json::to_string(&repo).unwrap()
             ),
         )
@@ -2049,7 +2045,7 @@ mod tests {
             },
             relay_executable: executable,
             relay_runtime_scope_hash: relay_runtime_scope_hash(&relay_root).unwrap(),
-            developer_adapter: "codex-developer-0.145.0".into(),
+            developer_adapter: "codex-developer".into(),
             reviewer_adapter: "claude-reviewer-2.1.220".into(),
         };
         validate_bridge_configuration(&configuration).unwrap();

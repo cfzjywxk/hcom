@@ -1,4 +1,4 @@
-//! Exec-seam Codex task worker runtime: one pinned `codex exec` process per
+//! Exec-seam Codex task worker runtime: one native `codex exec` process per
 //! turn, no protocol conversation.
 //!
 //! The runtime gives a turn its capabilities up front (argv, environment,
@@ -11,9 +11,8 @@
 
 use super::environment::{ExecutionEnvironmentLease, SecretRedactor};
 use super::process::{ProcessGroupBinding, configure_worker_child};
-use super::profile::validate_cli_help_contract;
 use super::runtime::{
-    CODEX_EXECUTABLE_SHA256, DeveloperOutcomeStatus, DeveloperOutcomeV1, MAX_OUTCOME_SUMMARY_CHARS,
+    DeveloperOutcomeStatus, DeveloperOutcomeV1, MAX_OUTCOME_SUMMARY_CHARS,
     MAX_REVIEW_FINDING_MESSAGE_CHARS, ReviewFindingSeverity, ReviewFindingV1, ReviewerOutcomeV1,
     ReviewerVerdict, RoleSessionSpec, RuntimeContractIdentity, RuntimeError, RuntimeOutcome,
     RuntimeSessionKey, RuntimeTelemetry, RuntimeTurnKey, RuntimeTurnPoll, RuntimeTurnSpec,
@@ -24,10 +23,9 @@ use crate::artifact::{ArtifactAttempt, ArtifactKind, ArtifactRoot, ArtifactScope
 use crate::control_api::WorkerRole;
 use crate::worker::runtime::RuntimeFailureClass;
 use anyhow::{Context, Result, bail};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -36,29 +34,6 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-/// Pinned Codex 0.146 standalone build: the only executable this lane runs.
-pub const CODEX_EXECUTABLE: &str =
-    "/home/ywxk/.codex/packages/standalone/releases/0.146.0-x86_64-unknown-linux-musl/bin/codex";
-
-pub const CODEX_EXEC_ADAPTER: &str = "codex-exec-0.146.0";
-pub const CODEX_EXEC_VERSION: &str = "0.146.0";
-
-/// Flags the closed exec invocation actually uses; the startup preflight
-/// fails closed when any of them disappears from `codex exec --help`.
-const EXEC_HELP_REQUIREMENTS: &[&str] = &[
-    "resume",
-    "--sandbox",
-    "--skip-git-repo-check",
-    "--json",
-    "--model",
-    "--config",
-    "--cd",
-    "--add-dir",
-    "--output-last-message",
-];
-const RESUME_HELP_REQUIREMENTS: &[&str] =
-    &["--json", "--model", "--config", "--output-last-message"];
-
 const THREAD_STARTED_LINE_CAP: usize = 8 * 1024;
 const PIPE_CHUNK: usize = 32 * 1024;
 const NATIVE_STREAM_CAP: u64 = 1024 * 1024 * 1024;
@@ -66,7 +41,6 @@ const RAW_FINAL_CHUNK: usize = 64 * 1024;
 /// How much of a final message the supervisor may quote onward. The full text
 /// is always sealed into the artifacts regardless of this bound.
 const RELAY_WINDOW_BYTES: usize = 256 * 1024;
-const MAX_HELP_OUTPUT: usize = 128 * 1024;
 const STDERR_TAIL_BYTES: usize = 320;
 const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 const REAPER_ATTEMPTS: usize = 30;
@@ -87,6 +61,9 @@ pub struct ExecTaskPaths {
 /// factory. `artifact_root_path` points at the durable `hcom-tasks` tree;
 /// `raw output` targets live under the private `runtime` directory instead.
 pub struct ExecRuntimeConfig {
+    /// Production passes the bare program name `codex`, so every turn uses
+    /// the executable selected by the inherited native PATH. Tests may pass a
+    /// fixture path.
     pub codex: PathBuf,
     pub repository_root: PathBuf,
     pub paths: ExecTaskPaths,
@@ -97,61 +74,8 @@ pub struct ExecRuntimeConfig {
     pub task_id: String,
 }
 
-/// Startup preflight over the pinned executable: byte identity plus the help
-/// contract for exactly the flags the closed shape uses.
-#[derive(Debug, Clone)]
-pub struct ExecPreflight {
-    codex: PathBuf,
-}
-
-impl ExecPreflight {
-    pub fn verify_pinned() -> Result<Self, RuntimeError> {
-        let codex = PathBuf::from(CODEX_EXECUTABLE);
-        let digest = sha256_file(&codex)
-            .map_err(|error| RuntimeError::invalid_contract(single_line(&error.to_string())))?;
-        if digest != CODEX_EXECUTABLE_SHA256 {
-            return Err(RuntimeError::invalid_contract(
-                "pinned codex executable bytes changed",
-            ));
-        }
-        let help = bounded_help_output(&codex, &["exec", "--help"])
-            .map_err(|error| RuntimeError::invalid_contract(single_line(&error.to_string())))?;
-        validate_cli_help_contract("codex exec", &help, EXEC_HELP_REQUIREMENTS)
-            .map_err(|error| RuntimeError::invalid_contract(single_line(&error.to_string())))?;
-        let help = bounded_help_output(
-            &codex,
-            &["exec", "--sandbox", "read-only", "resume", "--help"],
-        )
-        .map_err(|error| RuntimeError::invalid_contract(single_line(&error.to_string())))?;
-        validate_cli_help_contract("codex exec resume", &help, RESUME_HELP_REQUIREMENTS)
-            .map_err(|error| RuntimeError::invalid_contract(single_line(&error.to_string())))?;
-        Ok(Self { codex })
-    }
-
-    pub fn codex(&self) -> &Path {
-        &self.codex
-    }
-}
-
 pub fn codex_exec_contract_identity() -> RuntimeContractIdentity {
-    let argv_contract: Vec<String> = EXEC_HELP_REQUIREMENTS
-        .iter()
-        .map(|flag| (*flag).to_owned())
-        .collect();
-    let mut hasher = Sha256::new();
-    hasher.update(b"hcom-codex-exec-argv-contract-v1\n");
-    for flag in &argv_contract {
-        hasher.update(flag.as_bytes());
-        hasher.update(b"\n");
-    }
-    RuntimeContractIdentity {
-        adapter: CODEX_EXEC_ADAPTER.into(),
-        cli_version: CODEX_EXEC_VERSION.into(),
-        executable_sha256: CODEX_EXECUTABLE_SHA256.into(),
-        schema_canonical_sha256: hex_digest(hasher),
-        selected_methods: argv_contract,
-        selected_fields: vec!["thread.started.thread_id".into()],
-    }
+    RuntimeContractIdentity::codex_exec()
 }
 
 struct ExecSession {
@@ -216,7 +140,7 @@ struct RunningTurn {
 }
 
 /// One task's exec runtime. Sessions are identities plus a captured
-/// `thread_id`; every turn is a fresh pinned process.
+/// `thread_id`; every turn is a fresh native process.
 pub struct ExecTaskWorkerRuntime {
     contract: RuntimeContractIdentity,
     config: ExecRuntimeConfig,
@@ -1226,51 +1150,6 @@ fn single_line(text: &str) -> String {
     out
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hex_digest(hasher))
-}
-
-fn hex_digest(hasher: Sha256) -> String {
-    let digest = hasher.finalize();
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    output
-}
-
-fn bounded_help_output(executable: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = Command::new(executable)
-        .args(args)
-        .env_clear()
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("failed to run {} {:?}", executable.display(), args))?;
-    if !output.status.success() {
-        bail!(
-            "{} {:?} exited with {}",
-            executable.display(),
-            args,
-            output.status
-        );
-    }
-    if output.stdout.len() > MAX_HELP_OUTPUT {
-        bail!("help output exceeds its bound");
-    }
-    Ok(output.stdout)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1303,7 +1182,7 @@ mod tests {
             fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
         }
 
-        let script = root.join("fake-codex");
+        let script = root.join("codex");
         let prelude = r#"
 OUT=""
 RESUME=""
@@ -1330,7 +1209,11 @@ echo ===STDIN-END=== >> "$CAPTURE/stdin.log"
         let values = vec![
             (
                 "PATH".to_string(),
-                std::env::var("PATH").unwrap_or_default(),
+                format!(
+                    "{}:{}",
+                    root.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
             ),
             (
                 "CAPTURE".to_string(),
@@ -1351,7 +1234,7 @@ echo ===STDIN-END=== >> "$CAPTURE/stdin.log"
             .collect();
 
         let config = ExecRuntimeConfig {
-            codex: script,
+            codex: PathBuf::from("codex"),
             repository_root: repo.clone(),
             paths: ExecTaskPaths {
                 runtime: runtime_dir.clone(),
@@ -1490,6 +1373,53 @@ printf 'implemented the change' > "$OUT"
         let stdin = fs::read_to_string(fixture.capture.join("stdin.log")).unwrap();
         assert!(stdin.contains("You are the worker."));
         assert!(stdin.contains("do the task"));
+    }
+
+    #[test]
+    fn native_path_executable_can_change_between_turns() {
+        let mut fixture = fixture(HAPPY_DEVELOPER);
+        let (_key, turn) = start(
+            &mut fixture,
+            WorkerRole::Developer,
+            RuntimeTurnPurpose::InitialDevelopment,
+        );
+        assert!(matches!(
+            poll_terminal(&mut fixture, turn),
+            RuntimeTurnPoll::Completed { .. }
+        ));
+
+        let replacement = fixture._temp.path().join("codex.next");
+        fs::write(
+            &replacement,
+            r#"#!/bin/sh
+set -eu
+OUT=""
+prev=""
+for argument in "$@"; do
+  if [ "$prev" = "--output-last-message" ]; then OUT="$argument"; fi
+  prev="$argument"
+done
+cat >/dev/null
+printf '{"type":"thread.started","thread_id":"thread-after-update"}\n'
+printf 'ran the updated native executable' > "$OUT"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::rename(&replacement, fixture._temp.path().join("codex")).unwrap();
+
+        let (_key, turn) = start(
+            &mut fixture,
+            WorkerRole::Developer,
+            RuntimeTurnPurpose::InitialDevelopment,
+        );
+        let RuntimeTurnPoll::Completed { outcome, .. } = poll_terminal(&mut fixture, turn) else {
+            panic!("updated native executable did not complete");
+        };
+        let RuntimeOutcome::Developer(outcome) = outcome else {
+            panic!("expected developer outcome");
+        };
+        assert!(outcome.summary.contains("updated native executable"));
     }
 
     #[test]

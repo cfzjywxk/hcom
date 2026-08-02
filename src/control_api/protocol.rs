@@ -645,8 +645,8 @@ mod tests {
     fn ordered_plan_is_strict_and_bounded() {
         let valid = ControlAction::SessionPlanReplace {
             expected_session_version: 0,
-            developer_adapter: "codex-developer-0.145.0".into(),
-            reviewer_adapter: "codex-reviewer-0.145.0".into(),
+            developer_adapter: "codex-developer".into(),
+            reviewer_adapter: "codex-reviewer".into(),
             tasks: vec![task("one"), task("two")],
         };
         assert!(valid.validate().is_ok());

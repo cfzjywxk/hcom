@@ -97,7 +97,7 @@ hcom
 `hcom arch` runs one blank interactive Codex or Claude architect and an
 in-memory, ordered task supervisor. Each approved task gets fresh no-TUI Codex
 Developer and Reviewer sessions. Both entrypoints currently use the same
-pinned `codex exec` worker lane; same-task review changes resume those exact
+native `codex exec` worker lane; same-task review changes resume those exact
 native threads, while a configured Claude Developer or Reviewer fails closed.
 If a developer exits with only allowed-path uncommitted changes, the
 supervisor exact-resumes that developer once to finish checks and commit before

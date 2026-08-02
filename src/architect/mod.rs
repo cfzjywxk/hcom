@@ -65,7 +65,7 @@ Architect CLI overrides (higher priority than TOML):
 Built-in Architect defaults are Codex gpt-5.6-sol/xhigh with
 danger-full-access/never, or Claude opus/xhigh with
 dangerously-skip-permissions. Both entrypoints share one worker lane: a fresh
-codex-exec-0.146.0 process per task. Developer and Reviewer both
+codex-exec process per turn. Developer and Reviewer both
 default to Codex gpt-5.6-sol/xhigh with danger-full-access/never. Explicit
 worker tables must also select Codex with danger-full-access/never; Claude
 workers are unsupported and fail closed.

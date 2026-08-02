@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn tool_inventory_is_exact_and_contains_no_project_or_generic_authority() {
-        let tools = tool_definitions("codex-developer-0.145.0", "claude-reviewer-2.1.220");
+        let tools = tool_definitions("codex-developer", "claude-reviewer-2.1.220");
         let names: BTreeSet<_> = tools
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
@@ -261,7 +261,7 @@ mod tests {
                 "plan_hash":"a".repeat(64),
                 "approval_confirmed":true
             }),
-            "codex-developer-0.145.0",
+            "codex-developer",
             "claude-reviewer-2.1.220",
         )
         .unwrap();
@@ -281,7 +281,7 @@ mod tests {
                     "plan_hash":"a".repeat(64),
                     "approval_confirmed":false
                 }),
-                "codex-developer-0.145.0",
+                "codex-developer",
                 "claude-reviewer-2.1.220",
             )
             .is_err()
@@ -290,7 +290,7 @@ mod tests {
             control_action(
                 "shell",
                 json!({}),
-                "codex-developer-0.145.0",
+                "codex-developer",
                 "claude-reviewer-2.1.220",
             )
             .is_err()
@@ -301,7 +301,7 @@ mod tests {
     fn plan_translation_accepts_real_multiline_objective_and_rejects_hidden_controls() {
         let arguments = json!({
             "expected_session_version":0,
-            "developer_adapter":"codex-developer-0.145.0",
+            "developer_adapter":"codex-developer",
             "reviewer_adapter":"claude-reviewer-2.1.220",
             "tasks":[{
                 "task_key":"p9-task-1",
@@ -318,7 +318,7 @@ mod tests {
         let action = control_action(
             "session_plan_replace",
             arguments.clone(),
-            "codex-developer-0.145.0",
+            "codex-developer",
             "claude-reviewer-2.1.220",
         )
         .unwrap();
@@ -334,7 +334,7 @@ mod tests {
             control_action(
                 "session_plan_replace",
                 invalid,
-                "codex-developer-0.145.0",
+                "codex-developer",
                 "claude-reviewer-2.1.220",
             )
             .is_err()
@@ -343,18 +343,18 @@ mod tests {
 
     #[test]
     fn configured_adapter_is_both_schema_visible_and_enforced() {
-        let tools = tool_definitions("codex-developer-0.145.0", "codex-reviewer-0.145.0");
+        let tools = tool_definitions("codex-developer", "codex-reviewer");
         let plan = tools
             .iter()
             .find(|tool| tool["name"] == "session_plan_replace")
             .unwrap();
         assert_eq!(
             plan["inputSchema"]["properties"]["reviewer_adapter"]["enum"],
-            json!(["codex-reviewer-0.145.0"])
+            json!(["codex-reviewer"])
         );
         let arguments = json!({
             "expected_session_version":0,
-            "developer_adapter":"codex-developer-0.145.0",
+            "developer_adapter":"codex-developer",
             "reviewer_adapter":"claude-reviewer-2.1.220",
             "tasks":[{
                 "task_key":"one",
@@ -372,8 +372,8 @@ mod tests {
             control_action(
                 "session_plan_replace",
                 arguments,
-                "codex-developer-0.145.0",
-                "codex-reviewer-0.145.0",
+                "codex-developer",
+                "codex-reviewer",
             )
             .is_err()
         );
@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn execution_authorization_contract_supports_exact_or_named_plan_start() {
-        let tools = tool_definitions("codex-developer-0.145.0", "claude-reviewer-2.1.220");
+        let tools = tool_definitions("codex-developer", "claude-reviewer-2.1.220");
         let plan = tools
             .iter()
             .find(|tool| tool["name"] == "session_plan_replace")
@@ -452,7 +452,7 @@ mod tests {
         // hcom takes only the task's source directory path. Any description
         // that still promised branch/revision evidence or a drift check would
         // make the Architect report guarantees the supervisor cannot give.
-        let tools = tool_definitions("codex-developer-0.145.0", "claude-reviewer-2.1.220");
+        let tools = tool_definitions("codex-developer", "claude-reviewer-2.1.220");
         for tool in &tools {
             let description = tool["description"].as_str().unwrap();
             for forbidden in [
@@ -490,7 +490,7 @@ mod tests {
 
     #[test]
     fn worker_status_contract_uses_low_frequency_model_polling() {
-        let tools = tool_definitions("codex-developer-0.145.0", "claude-reviewer-2.1.220");
+        let tools = tool_definitions("codex-developer", "claude-reviewer-2.1.220");
         let approve = tools
             .iter()
             .find(|tool| tool["name"] == "session_approve_and_start")

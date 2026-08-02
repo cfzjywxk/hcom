@@ -11,9 +11,7 @@ use crate::control_api::registration::{
 };
 use crate::control_api::supervisor::{ControlPaths, SessionSupervisorEndpoint};
 use crate::orchestrator::SessionRuntimeSources;
-use crate::worker::codex::{
-    BWRAP_EXECUTABLE, BWRAP_VERSION, CODEX_DEVELOPER_CLI_VERSION, CODEX_DEVELOPER_EXECUTABLE,
-};
+use crate::worker::codex::{BWRAP_EXECUTABLE, BWRAP_VERSION};
 use crate::worker::profile::{
     ArchitectAdapter, ArchitectInvocationProfile, CodexApprovalPolicy, CodexSandbox,
     DeveloperInvocationProfile, ReviewerInvocationProfile, SessionInvocationProfiles,
@@ -160,7 +158,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         if architect_adapter == ArchitectAdapter::Codex {
             writeln!(
                 stdout,
-                "worker runtime: codex-exec-0.146.0 (one fresh process per task)"
+                "worker runtime: codex-exec (one native process per turn)"
             )?;
         }
         writeln!(
@@ -692,22 +690,21 @@ struct ExactTools {
 }
 
 enum ExactArchitectTool {
-    Codex(ExecutableIdentity),
+    Codex,
     Claude(ExecutableIdentity),
 }
 
 impl ExactArchitectTool {
-    fn executable(&self) -> &ExecutableIdentity {
+    fn executable_path(&self) -> &Path {
         match self {
-            Self::Codex(executable) | Self::Claude(executable) => executable,
+            Self::Codex => Path::new("codex"),
+            Self::Claude(executable) => &executable.canonical_path,
         }
     }
 
     fn revalidate(&self) -> Result<()> {
         match self {
-            Self::Codex(executable) => {
-                revalidate_exact_tool(executable, CODEX_DEVELOPER_CLI_VERSION)
-            }
+            Self::Codex => Ok(()),
             Self::Claude(executable) => {
                 revalidate_exact_tool(executable, CLAUDE_REVIEWER_CLI_VERSION)
             }
@@ -718,14 +715,7 @@ impl ExactArchitectTool {
 impl ExactTools {
     fn discover(adapter: ArchitectAdapter) -> Result<Self> {
         let architect = match adapter {
-            ArchitectAdapter::Codex => {
-                let executable = capture_exact_tool(
-                    Path::new(CODEX_DEVELOPER_EXECUTABLE),
-                    CODEX_DEVELOPER_CLI_VERSION,
-                )?;
-                validate_architect_codex_cli(&executable.canonical_path)?;
-                ExactArchitectTool::Codex(executable)
-            }
+            ArchitectAdapter::Codex => ExactArchitectTool::Codex,
             ArchitectAdapter::Claude => {
                 let executable = capture_exact_tool(
                     Path::new(CLAUDE_REVIEWER_EXECUTABLE),
@@ -774,43 +764,6 @@ fn discover_hcom_executables() -> Result<Vec<ExecutableIdentity>> {
         .into_iter()
         .map(ExecutableIdentity::capture)
         .collect()
-}
-
-fn validate_architect_codex_cli(path: &Path) -> Result<()> {
-    let output = Command::new(path)
-        .arg("--help")
-        .env_clear()
-        .output()
-        .context("failed to query architect Codex CLI capabilities")?;
-    if !output.status.success() || !output.stderr.is_empty() {
-        bail!("architect Codex CLI capability probe failed");
-    }
-    validate_cli_help_contract(
-        "architect Codex CLI",
-        &output.stdout,
-        &[
-            "--config",
-            "--model",
-            "--sandbox",
-            "--ask-for-approval",
-            "--cd",
-            "--no-alt-screen",
-        ],
-    )?;
-    let help = std::str::from_utf8(&output.stdout)?;
-    for value in [
-        "read-only",
-        "workspace-write",
-        "danger-full-access",
-        "untrusted",
-        "on-request",
-        "never",
-    ] {
-        if !help.contains(value) {
-            bail!("architect Codex CLI help omitted configured value {value}");
-        }
-    }
-    Ok(())
 }
 
 fn validate_architect_claude_cli(path: &Path) -> Result<()> {
@@ -1448,14 +1401,16 @@ fn validate_path_isolation(
             bail!("architect {label} paths overlap");
         }
     }
-    for executable in [
-        &tools.architect.executable().canonical_path,
-        &tools.bwrap.canonical_path,
-        &tools.component.canonical_path,
-    ] {
+    for executable in [&tools.bwrap.canonical_path, &tools.component.canonical_path] {
         if executable.starts_with(&paths.state) || executable.starts_with(&paths.runtime) {
             bail!("architect writable roots contain a protected executable");
         }
+    }
+    if let ExactArchitectTool::Claude(executable) = &tools.architect
+        && (executable.canonical_path.starts_with(&paths.state)
+            || executable.canonical_path.starts_with(&paths.runtime))
+    {
+        bail!("architect writable roots contain a protected executable");
     }
     Ok(())
 }
@@ -1754,7 +1709,7 @@ impl ArchitectSandbox {
         tools.revalidate()?;
         if !matches!(
             (&tools.architect, self.adapter),
-            (ExactArchitectTool::Codex(_), ArchitectAdapter::Codex)
+            (ExactArchitectTool::Codex, ArchitectAdapter::Codex)
                 | (ExactArchitectTool::Claude(_), ArchitectAdapter::Claude)
         ) {
             bail!("architect executable differs from the selected adapter");
@@ -1837,11 +1792,11 @@ impl ArchitectSandbox {
             .iter()
             .map(ProtectedDirectoryIdentity::path)
             .collect();
-        let mut read_only_files = vec![
-            tools.architect.executable().canonical_path.as_path(),
-            tools.component.canonical_path.as_path(),
-            auth_source.path(),
-        ];
+        let mut read_only_files =
+            vec![tools.component.canonical_path.as_path(), auth_source.path()];
+        if let ExactArchitectTool::Claude(executable) = &tools.architect {
+            read_only_files.push(executable.canonical_path.as_path());
+        }
         read_only_files.extend(
             tools
                 .hcom_executables
@@ -1951,7 +1906,7 @@ fn architect_native_argv(
 ) -> Result<Vec<String>> {
     let executable = path_text(
         "architect native executable",
-        &tools.architect.executable().canonical_path,
+        tools.architect.executable_path(),
     )?
     .into();
     match profile {
@@ -2564,14 +2519,6 @@ mod tests {
     }
 
     #[test]
-    fn pinned_codex_root_help_matches_architect_command_contract_when_installed() {
-        let path = Path::new(CODEX_DEVELOPER_EXECUTABLE);
-        if path.exists() {
-            validate_architect_codex_cli(path).unwrap();
-        }
-    }
-
-    #[test]
     fn pinned_claude_root_help_matches_architect_command_contract_when_installed() {
         let path = Path::new(CLAUDE_REVIEWER_EXECUTABLE);
         if path.exists() {
@@ -2605,7 +2552,7 @@ mod tests {
         )
         .unwrap();
         let tools = ExactTools {
-            architect: ExactArchitectTool::Codex(executable.clone()),
+            architect: ExactArchitectTool::Codex,
             bwrap: executable.clone(),
             component: executable.clone(),
             hcom_executables: vec![executable],
@@ -2808,7 +2755,7 @@ mod tests {
     fn native_profile_has_no_prompt_or_secret_transport() {
         let profile = CodexInvocationProfile::architect_default();
         let native: Vec<String> = vec![
-            CODEX_DEVELOPER_EXECUTABLE.into(),
+            "codex".into(),
             "--model".into(),
             profile.model.clone(),
             "--config".into(),
@@ -2967,12 +2914,12 @@ mod tests {
             relay_socket: runtime.join("relay.sock"),
             auth_target: root.join("architect-state/home/.codex/auth.json"),
         };
-        let fake_codex = fs::canonicalize(root.join("fake-codex")).unwrap();
-        let codex = capture_exact_tool(&fake_codex, CODEX_DEVELOPER_CLI_VERSION).unwrap();
+        let fake_codex = fs::canonicalize(root.join("codex")).unwrap();
+        let codex = ExecutableIdentity::capture(fake_codex).unwrap();
         let bwrap = capture_exact_tool(Path::new(BWRAP_EXECUTABLE), BWRAP_VERSION).unwrap();
         let tools = ExactTools {
             component: codex.clone(),
-            architect: ExactArchitectTool::Codex(codex),
+            architect: ExactArchitectTool::Codex,
             bwrap,
             hcom_executables: vec![
                 ExecutableIdentity::capture(
@@ -3159,7 +3106,7 @@ mod tests {
 
         let report = home.join("blank-report");
         let external_write_probe = external_source.join("architect-write-probe");
-        let fake_codex = root.join("fake-codex");
+        let fake_codex = root.join("codex");
         let profile = CodexInvocationProfile::architect_default();
         let mut expected_args = vec![
             "--model".to_owned(),
@@ -3196,10 +3143,6 @@ import os
 import select
 import socket
 import sys
-
-if sys.argv[1:] == ["--version"]:
-    print("codex-cli 0.145.0")
-    raise SystemExit(0)
 
 if sys.argv[1:] != {expected_args}:
     raise SystemExit(31)
@@ -3315,6 +3258,14 @@ with open({report}, "w", encoding="utf-8") as output:
             ])
             .env(BLANK_HELPER_ROOT, &root)
             .env(BLANK_HELPER_CONTROL_HOME, &control_home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    root.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
             .env("HOME", &control_home)
             .env("XDG_CONFIG_HOME", root.join("xdg-config"))
             .env("XDG_RUNTIME_DIR", &host_runtime)

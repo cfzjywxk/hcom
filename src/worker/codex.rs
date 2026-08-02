@@ -1,4 +1,4 @@
-//! Exact-version Codex no-TUI developer adapter.
+//! Native Codex no-TUI developer adapter.
 
 use super::contract::{
     AdapterCapabilities, AdapterDescriptor, CommandSpec, ExecutableIdentity, NativeArtifacts,
@@ -7,7 +7,7 @@ use super::contract::{
     validate_native_session_id,
 };
 use super::environment::{EnvironmentPolicy, ExactEnvironmentRequirement};
-use super::profile::{CodexInvocationProfile, CodexSandbox, validate_cli_help_contract};
+use super::profile::{CodexInvocationProfile, CodexSandbox};
 use super::result::{
     CheckStatus, CommitSummary, DeveloperDecision, DeveloperResult, MAX_RESULT_BYTES,
 };
@@ -31,9 +31,6 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub const CODEX_DEVELOPER_EXECUTABLE: &str =
-    "/home/ywxk/.codex/packages/standalone/releases/0.145.0-x86_64-unknown-linux-musl/bin/codex";
-pub const CODEX_DEVELOPER_CLI_VERSION: &str = "codex-cli 0.145.0";
 pub const CODEX_DEVELOPER_MODEL: &str = "gpt-5.6-sol";
 pub const CODEX_DEVELOPER_REASONING: &str = "xhigh";
 pub const BWRAP_EXECUTABLE: &str = "/usr/bin/bwrap";
@@ -41,7 +38,7 @@ pub const BWRAP_VERSION: &str = "bubblewrap 0.9.0";
 pub const GIT_EXECUTABLE: &str = "/usr/bin/git";
 pub const GIT_VERSION: &str = "git version 2.43.0";
 
-const ADAPTER_NAME: &str = "codex-developer-0.145.0";
+const ADAPTER_NAME: &str = "codex-developer";
 const ADAPTER_CONTRACT_VERSION: u32 = 7;
 const OUTER_POLICY: &str = "bubblewrap-0.9.0-host-path-developer-repo-rw-v1";
 const MAX_CODEX_EVENTS: usize = 4096;
@@ -49,35 +46,6 @@ pub(super) const MAX_CODEX_EVENT_BYTES: usize = 128 * 1024;
 pub(super) const MAX_CODEX_JSONL_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_DURATION: Duration = Duration::from_secs(30);
-// Keep these inventories and their runtime-option coverage tests in sync with
-// docs/codex-adapter-contract.md.
-pub(super) const CODEX_EXEC_HELP_REQUIREMENTS: &[&str] = &[
-    "resume",
-    "--config",
-    "--disable",
-    "--strict-config",
-    "--model",
-    "--sandbox",
-    "--skip-git-repo-check",
-    "--cd",
-    "--add-dir",
-    "--ignore-user-config",
-    "--ignore-rules",
-    "--output-schema",
-    "--json",
-    "--output-last-message",
-];
-pub(super) const CODEX_RESUME_HELP_REQUIREMENTS: &[&str] = &[
-    "--config",
-    "--disable",
-    "--strict-config",
-    "--model",
-    "--ignore-user-config",
-    "--ignore-rules",
-    "--output-schema",
-    "--json",
-    "--output-last-message",
-];
 const CODEX_RESULT_SCHEMA_FILE: &str = "codex-developer-result-schema.json";
 const CODEX_FINAL_FILE: &str = "native-final.partial";
 const CODEX_AUTH_FILE: &str = "auth.json";
@@ -140,10 +108,10 @@ pub struct CodexDeveloperAdapter {
 impl CodexDeveloperAdapter {
     pub fn discover(config: CodexDeveloperConfig) -> Result<Self> {
         validate_production_runtime_contract(&config)?;
-        validate_codex_exec_cli(Path::new(CODEX_DEVELOPER_EXECUTABLE))?;
+        let codex = discover_native_codex()?;
         Self::discover_with_paths(
             config,
-            Path::new(CODEX_DEVELOPER_EXECUTABLE),
+            &codex,
             Path::new(BWRAP_EXECUTABLE),
             Path::new(GIT_EXECUTABLE),
         )
@@ -203,12 +171,12 @@ impl CodexDeveloperAdapter {
     ) -> Result<Self> {
         validate_codex_developer_invocation(&config.invocation)?;
         let invocation = config.invocation.clone();
-        let executable = capture_exact_tool(codex_path, CODEX_DEVELOPER_CLI_VERSION)?;
+        let (executable, cli_version) = capture_native_codex(codex_path)?;
         let outer_executable = capture_exact_tool(bwrap_path, BWRAP_VERSION)?;
         let git_executable = capture_exact_tool(git_path, GIT_VERSION)?;
         let sandbox =
             SandboxContract::capture(config, &executable, &outer_executable, &git_executable)?;
-        let descriptor = developer_descriptor(&invocation)?;
+        let descriptor = developer_descriptor(&invocation, &cli_version)?;
         Ok(Self {
             descriptor,
             executable,
@@ -228,7 +196,6 @@ impl CodexDeveloperAdapter {
         if control.role != WorkerRole::Developer {
             bail!("Codex developer adapter cannot build a reviewer turn");
         }
-        revalidate_exact_tool(&self.executable, CODEX_DEVELOPER_CLI_VERSION)?;
         revalidate_exact_tool(&self.outer_executable, BWRAP_VERSION)?;
         revalidate_exact_tool(&self.git_executable, GIT_VERSION)?;
         self.sandbox.revalidate(
@@ -340,36 +307,6 @@ fn validate_codex_developer_invocation(invocation: &CodexInvocationProfile) -> R
     Ok(())
 }
 
-fn validate_codex_exec_cli(path: &Path) -> Result<()> {
-    validate_codex_worker_cli(path, "Codex developer CLI")
-}
-
-pub(super) fn validate_codex_worker_cli(path: &Path, label: &str) -> Result<()> {
-    let mut command = Command::new(path);
-    command.args(["exec", "--help"]).env_clear();
-    let output = run_bounded_command(command, 128 * 1024)?;
-    if !output.status.success() || !output.stderr.is_empty() {
-        bail!("{label} capability probe failed");
-    }
-    validate_cli_help_contract(label, &output.stdout, CODEX_EXEC_HELP_REQUIREMENTS)?;
-
-    // `--sandbox` belongs to the `exec` parent in Codex 0.145. Keep it before
-    // `resume`; the resume subcommand does not declare that option itself.
-    let mut resume = Command::new(path);
-    resume
-        .args(["exec", "--sandbox", "read-only", "resume", "--help"])
-        .env_clear();
-    let output = run_bounded_command(resume, 128 * 1024)?;
-    if !output.status.success() || !output.stderr.is_empty() {
-        bail!("{label} resume capability probe failed");
-    }
-    validate_cli_help_contract(
-        &format!("{label} resume"),
-        &output.stdout,
-        CODEX_RESUME_HELP_REQUIREMENTS,
-    )
-}
-
 fn path_string(label: &str, path: &Path) -> Result<String> {
     path.to_str()
         .map(str::to_owned)
@@ -465,7 +402,7 @@ pub(crate) fn validate_codex_worker_stderr(stderr: &[u8]) -> Result<()> {
 Use a safer approach\\\")\" }",
             )
         {
-            bail!("Codex worker stderr is not the pinned safe-delete rejection");
+            bail!("Codex worker stderr is not the recognized safe-delete rejection");
         }
     }
     if lines == 0 {
@@ -494,12 +431,15 @@ fn is_codex_log_timestamp(value: &str) -> bool {
         && bytes[20..bytes.len() - 1].iter().all(u8::is_ascii_digit)
 }
 
-fn developer_descriptor(invocation: &CodexInvocationProfile) -> Result<AdapterDescriptor> {
+fn developer_descriptor(
+    invocation: &CodexInvocationProfile,
+    cli_version: &str,
+) -> Result<AdapterDescriptor> {
     let policy = invocation.effective_policy(OUTER_POLICY);
     AdapterDescriptor::new(
         ADAPTER_NAME,
         ADAPTER_CONTRACT_VERSION,
-        CODEX_DEVELOPER_CLI_VERSION,
+        cli_version,
         &invocation.model,
         &invocation.reasoning_effort,
         &policy,
@@ -693,7 +633,7 @@ impl SandboxContract {
 
     fn outer_argv(&self, artifact_dir: &Path, native: &ExecutableIdentity) -> Result<Vec<String>> {
         if !artifact_dir.starts_with(self.artifact_root.path()) {
-            bail!("Codex artifact attempt escaped its pinned artifact root");
+            bail!("Codex artifact attempt escaped its bound artifact root");
         }
         let auth_target = self.codex_home.path().join(CODEX_AUTH_FILE);
         let argv = self.host_root.host_root_argv(HostRootMounts {
@@ -1162,6 +1102,47 @@ fn capture_exact_tool(path: &Path, expected: &str) -> Result<ExecutableIdentity>
     Ok(after)
 }
 
+pub(super) fn discover_native_codex() -> Result<PathBuf> {
+    let path = std::env::var_os("PATH").ok_or_else(|| anyhow!("PATH is unavailable"))?;
+    let cwd = std::env::current_dir()?;
+    for directory in std::env::split_paths(&path) {
+        let directory = if directory.is_absolute() {
+            directory
+        } else {
+            cwd.join(directory)
+        };
+        let candidate = directory.join("codex");
+        if fs::metadata(&candidate)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        {
+            return fs::canonicalize(&candidate).with_context(|| {
+                format!(
+                    "failed to resolve native Codex executable {}",
+                    candidate.display()
+                )
+            });
+        }
+    }
+    bail!("codex is not available on PATH")
+}
+
+pub(super) fn capture_native_codex(path: &Path) -> Result<(ExecutableIdentity, String)> {
+    let before = ExecutableIdentity::capture(path)?;
+    let mut command = Command::new(path);
+    command.arg("--version").env_clear();
+    let output = run_bounded_command(command, 4096)?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        bail!("native Codex version query failed");
+    }
+    let cli_version = std::str::from_utf8(&output.stdout)?.trim_end();
+    validate_text("native Codex CLI version", cli_version, 128, false)?;
+    let after = ExecutableIdentity::capture(path)?;
+    if before != after {
+        bail!("native Codex executable changed during discovery");
+    }
+    Ok((after, cli_version.to_owned()))
+}
+
 fn revalidate_exact_tool(identity: &ExecutableIdentity, expected: &str) -> Result<()> {
     let current = capture_exact_tool(&identity.canonical_path, expected)?;
     if current != *identity {
@@ -1305,7 +1286,7 @@ pub(super) fn parse_codex_turn(control: &TurnControl, stdout: &[u8]) -> Result<C
             serde_json::from_str(line).context("Codex JSONL event header is malformed")?;
         validate_text("Codex event type", &header.kind, 128, false)?;
         let oversized_event = line.len() > MAX_CODEX_EVENT_BYTES;
-        // Codex 0.145 places a command's aggregate output in the same
+        // Codex places a command's aggregate output in the same
         // item.completed object as the bounded command/status evidence. Borrow
         // its raw range so only that known string may account for bytes above
         // the event bound; the aggregate stream cap still bounds parsing.
@@ -1371,7 +1352,7 @@ pub(super) fn parse_codex_turn(control: &TurnControl, stdout: &[u8]) -> Result<C
                         .item
                         .command
                         .ok_or_else(|| anyhow!("Codex command event omitted its command"))?;
-                    // Codex 0.145 preserves a shell script's embedded newlines
+                    // Codex preserves a shell script's embedded newlines
                     // in the JSONL display command for `/bin/bash -lc`. Keep the
                     // bounded, no-escape/no-CR terminal-safety checks while
                     // admitting that native multiline event shape.
@@ -1428,7 +1409,7 @@ fn exact_command_evidence(command: &str) -> BTreeSet<String> {
         && !payload.is_empty()
         && validate_text("Codex bash -lc payload", payload, 4096, true).is_ok()
     {
-        // Codex 0.145 reports shell tool executions as `/bin/bash -c
+        // Codex reports shell tool executions as `/bin/bash -c
         // '<payload>'` or `/bin/bash -lc '<payload>'`, depending on the tool
         // path. The approved check is the exact payload, so expose that one
         // payload, including its exact embedded newlines, as evidence too. No
@@ -2256,78 +2237,6 @@ mod tests {
     }
 
     #[test]
-    fn pinned_codex_exec_help_matches_configurable_command_contract_when_installed() {
-        let path = Path::new(CODEX_DEVELOPER_EXECUTABLE);
-        if path.exists() {
-            validate_codex_exec_cli(path).unwrap();
-        }
-    }
-
-    #[test]
-    fn worker_cli_help_requirements_cover_every_runtime_option() {
-        fn declared_output_options(command: &CommandSpec) -> BTreeSet<String> {
-            let mut options = BTreeSet::new();
-            match &command.schema_transport {
-                SchemaTransport::None => {}
-                SchemaTransport::InlineArgument { flag, .. } => {
-                    options.insert(flag.clone());
-                }
-                SchemaTransport::File { argument, .. } => {
-                    options.insert(argument.clone());
-                }
-            }
-            for output in &command.expected_outputs {
-                if let Some(argument) = &output.output_argument {
-                    options.insert(argument.clone());
-                }
-            }
-            options
-        }
-
-        let fixture = Fixture::new();
-        let adapter = fixture.adapter();
-        let create = adapter.build_create(&control(None)).unwrap();
-        let resume = adapter
-            .build_resume("native-codex-1", &control(Some("native-codex-1")))
-            .unwrap();
-        for command in [&create, &resume] {
-            let mut options = command
-                .fixed_argv
-                .iter()
-                .filter(|argument| argument.starts_with("--"))
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            options.extend(declared_output_options(command));
-            for option in options {
-                assert!(
-                    CODEX_EXEC_HELP_REQUIREMENTS.contains(&option.as_str()),
-                    "runtime option {option} is absent from the exec capability probe"
-                );
-            }
-        }
-
-        let resume_index = resume
-            .fixed_argv
-            .iter()
-            .position(|argument| argument == "resume")
-            .unwrap();
-        let mut resume_options = resume.fixed_argv[resume_index + 2..]
-            .iter()
-            .filter(|argument| argument.starts_with("--"))
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        resume_options.extend(declared_output_options(&resume));
-        for option in resume_options {
-            assert!(
-                CODEX_RESUME_HELP_REQUIREMENTS.contains(&option.as_str()),
-                "runtime resume option {option} is absent from the resume capability probe"
-            );
-        }
-        assert!(CODEX_EXEC_HELP_REQUIREMENTS.contains(&"resume"));
-        assert!(CODEX_EXEC_HELP_REQUIREMENTS.contains(&"--add-dir"));
-    }
-
-    #[test]
     fn configured_model_and_max_reasoning_reach_exact_codex_argv() {
         let fixture = Fixture::new();
         let mut config = fixture.config.clone();
@@ -2372,7 +2281,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_stderr_accepts_only_the_pinned_recovered_safe_delete_rejection() {
+    fn codex_stderr_accepts_only_the_recognized_recovered_safe_delete_rejection() {
         let accepted = concat!(
             "2026-07-30T12:44:08.667685Z ERROR codex_core::tools::router: ",
             "error=exec_command failed for `/bin/bash -c 'rm -rf /tmp/review.abc'`: ",
@@ -3105,20 +3014,21 @@ mod tests {
     }
 
     #[test]
-    fn exact_discovery_rejects_version_mismatch_and_external_git_admin_paths() {
+    fn native_discovery_accepts_reported_version_and_rejects_external_git_admin_paths() {
         let version_fixture = Fixture::new();
         write_executable(
             &version_fixture.codex,
-            "#!/bin/sh\nprintf '%s\\n' 'codex-cli 0.146.0'\n",
+            "#!/bin/sh\nprintf '%s\\n' 'codex-cli test-version'\n",
         );
-        assert!(
-            CodexDeveloperAdapter::discover_with_paths(
-                version_fixture.config.clone(),
-                &version_fixture.codex,
-                &version_fixture.bwrap,
-                &version_fixture.git,
-            )
-            .is_err()
+        let adapter = CodexDeveloperAdapter::discover_with_paths(
+            version_fixture.config.clone(),
+            &version_fixture.codex,
+            &version_fixture.bwrap,
+            &version_fixture.git,
+        );
+        assert_eq!(
+            adapter.unwrap().descriptor.cli_version,
+            "codex-cli test-version"
         );
 
         let linked_fixture = Fixture::new();
@@ -3484,7 +3394,7 @@ exec "$@"
         r#"#!/bin/sh
 set -eu
 if [ "${1-}" = "--version" ]; then
-    printf '%s\n' 'codex-cli 0.145.0'
+    printf '%s\n' 'codex-cli test-version'
     exit 0
 fi
 # SOCKET_REACHABILITY_PROBE

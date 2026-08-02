@@ -4999,7 +4999,7 @@ pub(super) mod tests {
                  ) VALUES (
                      'rv-invalid-worker', 'codex', 'preassigned',
                      'native-session', 'model', 'max', 'read-only',
-                     '/usr/bin/codex', 'codex-cli 0.145.0', 1,
+                     '/usr/bin/codex', 'codex-cli test-cli', 1,
                      '{\"observability\":\"structured\"}', 1.0, 1.0
                  );
                  PRAGMA user_version = 24;",

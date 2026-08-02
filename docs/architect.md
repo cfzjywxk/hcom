@@ -29,7 +29,7 @@ as a directory. It may be `/home/user/src/hcom` while the project is
 hcom passes this source path to both roles; it does not infer it from plan
 markdown or search the filesystem for a repository.
 
-Both public entrypoints currently use the same pinned Codex exec worker lane:
+Both public entrypoints currently use the same native Codex exec worker lane:
 
 - `hcom arch codex`: Codex foreground Architect, Codex Developer, Codex
   Reviewer.
@@ -236,7 +236,8 @@ role templates.
 
 ## Worker process and filesystem behavior
 
-Every worker turn is one direct pinned `codex exec` process:
+Every worker turn is one direct native `codex exec` process selected from the
+session's inherited `PATH`:
 
 ```text
 codex exec

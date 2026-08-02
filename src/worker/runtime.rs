@@ -16,18 +16,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 
-pub const CODEX_TASK_WORKER_ADAPTER: &str = "codex-exec-0.146.0";
-pub const CODEX_TASK_WORKER_VERSION: &str = "0.146.0";
-pub const CODEX_EXECUTABLE_SHA256: &str =
-    "2e863156ed35ecc5253b1e2f907a9143077b9f7cb51942070c61996471ff6e04";
-/// Raw hash captured from the design-time generated stable v2 schema bundle.
-///
-/// The 0.146 generator emits semantically identical `$defs` in nondeterministic
-/// map order, so runtime drift checks use [`CODEX_SCHEMA_CANONICAL_SHA256`].
-pub const CODEX_SCHEMA_EXEMPLAR_SHA256: &str =
-    "8a1e451c6244f9d954cc2b19aeef2cb33b03fbcd33d21002bd8875e4ead4bd40";
-pub const CODEX_SCHEMA_CANONICAL_SHA256: &str =
-    "2f402b7d1356adccc1a4785c0656db457578ca9ea5d5b08953487a410c630ce8";
+pub const CODEX_TASK_WORKER_ADAPTER: &str = "codex-exec";
 
 pub const MAX_RUNTIME_KEY_BYTES: usize = 128;
 pub const MAX_RUNTIME_PROMPT_BYTES: usize = 256 * 1024;
@@ -269,82 +258,46 @@ impl TaskWorkerProfiles {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeContractIdentity {
     pub adapter: String,
-    pub cli_version: String,
-    pub executable_sha256: String,
-    pub schema_canonical_sha256: String,
+    pub contract_sha256: String,
     pub selected_methods: Vec<String>,
     pub selected_fields: Vec<String>,
 }
 
 impl RuntimeContractIdentity {
-    pub fn codex_exec_0_146() -> Self {
+    pub fn codex_exec() -> Self {
+        Self::new(
+            CODEX_TASK_WORKER_ADAPTER,
+            vec!["exec".into(), "exec resume".into()],
+            vec![
+                "stdout.thread.started.thread_id".into(),
+                "output-last-message".into(),
+            ],
+        )
+    }
+
+    pub fn new(
+        adapter: impl Into<String>,
+        selected_methods: Vec<String>,
+        selected_fields: Vec<String>,
+    ) -> Self {
+        let adapter = adapter.into();
+        let contract_sha256 = canonical_hash(&(
+            "hcom-native-runtime-contract-v1",
+            &adapter,
+            &selected_methods,
+            &selected_fields,
+        ));
         Self {
-            adapter: CODEX_TASK_WORKER_ADAPTER.into(),
-            cli_version: CODEX_TASK_WORKER_VERSION.into(),
-            executable_sha256: CODEX_EXECUTABLE_SHA256.into(),
-            schema_canonical_sha256: CODEX_SCHEMA_CANONICAL_SHA256.into(),
-            selected_methods: [
-                "initialize",
-                "initialized",
-                "thread/start",
-                "turn/start",
-                "turn/interrupt",
-                "turn/completed",
-                "item/completed",
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-            selected_fields: [
-                "initialize.params.clientInfo.name",
-                "initialize.params.clientInfo.title",
-                "initialize.params.clientInfo.version",
-                "initialize.params.capabilities.optOutNotificationMethods",
-                "thread/start.params.cwd",
-                "thread/start.params.model",
-                "thread/start.params.approvalPolicy",
-                "thread/start.params.sandbox",
-                "thread/start.params.ephemeral",
-                "thread/start.params.developerInstructions",
-                "thread/start.params.config.mcp_servers",
-                "thread/start.result.thread.id",
-                "turn/start.params.threadId",
-                "turn/start.params.input",
-                "turn/start.params.cwd",
-                "turn/start.params.model",
-                "turn/start.params.effort",
-                "turn/start.params.approvalPolicy",
-                "turn/start.params.sandboxPolicy.type",
-                "turn/start.params.outputSchema",
-                "turn/start.result.turn.id",
-                "item/completed.params.threadId",
-                "item/completed.params.turnId",
-                "item/completed.params.item.id",
-                "item/completed.params.item.type",
-                "item/completed.params.item.text",
-                "item/completed.params.item.phase",
-                "turn/completed.params.threadId",
-                "turn/completed.params.turn.id",
-                "turn/completed.params.turn.status",
-                "turn/completed.params.turn.itemsView",
-                "turn/completed.params.turn.items",
-                "turn/interrupt.params.threadId",
-                "turn/interrupt.params.turnId",
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
+            adapter,
+            contract_sha256,
+            selected_methods,
+            selected_fields,
         }
     }
 
     pub fn validate(&self) -> Result<(), RuntimeError> {
         validate_single_line("runtime adapter", &self.adapter, 128, false)?;
-        validate_single_line("runtime CLI version", &self.cli_version, 64, false)?;
-        validate_sha256("runtime executable SHA-256", &self.executable_sha256)?;
-        validate_sha256(
-            "runtime schema canonical SHA-256",
-            &self.schema_canonical_sha256,
-        )?;
+        validate_sha256("runtime contract SHA-256", &self.contract_sha256)?;
         if self.selected_methods.is_empty() || self.selected_methods.len() > 32 {
             return Err(RuntimeError::invalid_contract(
                 "runtime selected method inventory must contain 1-32 entries",
@@ -1146,51 +1099,18 @@ mod tests {
 
     #[test]
     fn contract_identity_and_outcome_schema_hashes_are_stable() {
-        let identity = RuntimeContractIdentity::codex_exec_0_146();
+        let identity = RuntimeContractIdentity::codex_exec();
         identity.validate().unwrap();
         assert_eq!(
-            identity.schema_canonical_sha256,
-            CODEX_SCHEMA_CANONICAL_SHA256
+            identity.contract_sha256,
+            canonical_hash(&(
+                "hcom-native-runtime-contract-v1",
+                CODEX_TASK_WORKER_ADAPTER,
+                &identity.selected_methods,
+                &identity.selected_fields,
+            ))
         );
-        assert_eq!(
-            identity.selected_fields,
-            [
-                "initialize.params.clientInfo.name",
-                "initialize.params.clientInfo.title",
-                "initialize.params.clientInfo.version",
-                "initialize.params.capabilities.optOutNotificationMethods",
-                "thread/start.params.cwd",
-                "thread/start.params.model",
-                "thread/start.params.approvalPolicy",
-                "thread/start.params.sandbox",
-                "thread/start.params.ephemeral",
-                "thread/start.params.developerInstructions",
-                "thread/start.params.config.mcp_servers",
-                "thread/start.result.thread.id",
-                "turn/start.params.threadId",
-                "turn/start.params.input",
-                "turn/start.params.cwd",
-                "turn/start.params.model",
-                "turn/start.params.effort",
-                "turn/start.params.approvalPolicy",
-                "turn/start.params.sandboxPolicy.type",
-                "turn/start.params.outputSchema",
-                "turn/start.result.turn.id",
-                "item/completed.params.threadId",
-                "item/completed.params.turnId",
-                "item/completed.params.item.id",
-                "item/completed.params.item.type",
-                "item/completed.params.item.text",
-                "item/completed.params.item.phase",
-                "turn/completed.params.threadId",
-                "turn/completed.params.turn.id",
-                "turn/completed.params.turn.status",
-                "turn/completed.params.turn.itemsView",
-                "turn/completed.params.turn.items",
-                "turn/interrupt.params.threadId",
-                "turn/interrupt.params.turnId",
-            ]
-        );
+        assert_eq!(identity.selected_methods, ["exec", "exec resume"]);
         assert_eq!(identity.canonical_hash().len(), 64);
         assert!(serde_json::from_str::<OutcomeContract>(r#""developer_v2""#).is_err());
     }

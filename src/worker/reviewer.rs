@@ -1,9 +1,9 @@
-//! Exact-version no-TUI Codex reviewers and Claude developer/reviewer adapters.
+//! Native no-TUI Codex reviewers and Claude developer/reviewer adapters.
 
 use super::codex::{
     CODEX_JSONL_EVENT_BOUND_CAPABILITY, DISABLED_CODEX_FEATURES, MAX_CODEX_JSONL_BYTES,
-    developer_result_schema, observe_codex_record, parse_codex_turn, parse_git_commits,
-    parse_nul_paths, validate_codex_worker_cli, validate_codex_worker_stderr,
+    capture_native_codex, developer_result_schema, discover_native_codex, observe_codex_record,
+    parse_codex_turn, parse_git_commits, parse_nul_paths, validate_codex_worker_stderr,
 };
 use super::contract::{
     AdapterCapabilities, AdapterDescriptor, CommandSpec, ExecutableIdentity, NativeArtifacts,
@@ -37,9 +37,6 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-pub const CODEX_REVIEWER_EXECUTABLE: &str =
-    "/home/ywxk/.codex/packages/standalone/releases/0.145.0-x86_64-unknown-linux-musl/bin/codex";
-pub const CODEX_REVIEWER_CLI_VERSION: &str = "codex-cli 0.145.0";
 pub const CODEX_REVIEWER_MODEL: &str = "gpt-5.6-sol";
 pub const CODEX_REVIEWER_REASONING: &str = "xhigh";
 pub const CLAUDE_REVIEWER_EXECUTABLE: &str = "/home/ywxk/.local/share/claude/versions/2.1.220";
@@ -53,7 +50,7 @@ const BWRAP_EXECUTABLE: &str = "/usr/bin/bwrap";
 const BWRAP_VERSION: &str = "bubblewrap 0.9.0";
 const GIT_EXECUTABLE: &str = "/usr/bin/git";
 const GIT_VERSION: &str = "git version 2.43.0";
-const CODEX_ADAPTER_NAME: &str = "codex-reviewer-0.145.0";
+const CODEX_ADAPTER_NAME: &str = "codex-reviewer";
 const CLAUDE_ADAPTER_NAME: &str = "claude-reviewer-2.1.220";
 const CLAUDE_DEVELOPER_ADAPTER_NAME: &str = "claude-developer-2.1.220";
 const CODEX_ADAPTER_CONTRACT_VERSION: u32 = 7;
@@ -107,10 +104,10 @@ pub struct CodexReviewerAdapter {
 impl CodexReviewerAdapter {
     pub fn discover(config: CodexReviewerConfig) -> Result<Self> {
         validate_production_runtime_contract(&config.host_runtime_dir, &config.run_id)?;
-        validate_codex_reviewer_cli(Path::new(CODEX_REVIEWER_EXECUTABLE))?;
+        let codex = discover_native_codex()?;
         Self::discover_with_paths(
             config,
-            Path::new(CODEX_REVIEWER_EXECUTABLE),
+            &codex,
             Path::new(BWRAP_EXECUTABLE),
             Path::new(GIT_EXECUTABLE),
         )
@@ -141,7 +138,7 @@ impl CodexReviewerAdapter {
     ) -> Result<Self> {
         config.invocation.validate("Codex reviewer")?;
         let invocation = config.invocation.clone();
-        let executable = capture_exact_tool(codex_path, CODEX_REVIEWER_CLI_VERSION)?;
+        let (executable, cli_version) = capture_native_codex(codex_path)?;
         let outer_executable = capture_exact_tool(bwrap_path, BWRAP_VERSION)?;
         let git_executable = capture_exact_tool(git_path, GIT_VERSION)?;
         let sandbox = WorkerSandbox::capture(
@@ -167,7 +164,7 @@ impl CodexReviewerAdapter {
             &outer_executable,
             &git_executable,
         )?;
-        let descriptor = codex_reviewer_descriptor(&invocation)?;
+        let descriptor = codex_reviewer_descriptor(&invocation, &cli_version)?;
         Ok(Self {
             descriptor,
             executable,
@@ -184,7 +181,6 @@ impl CodexReviewerAdapter {
         resume_session_id: Option<&str>,
     ) -> Result<CommandSpec> {
         validate_reviewer_control(control)?;
-        revalidate_exact_tool(&self.executable, CODEX_REVIEWER_CLI_VERSION)?;
         revalidate_exact_tool(&self.outer_executable, BWRAP_VERSION)?;
         revalidate_exact_tool(&self.git_executable, GIT_VERSION)?;
         self.sandbox.revalidate(
@@ -855,10 +851,6 @@ impl ClaudeReviewerAdapter {
     }
 }
 
-fn validate_codex_reviewer_cli(path: &Path) -> Result<()> {
-    validate_codex_worker_cli(path, "Codex reviewer CLI")
-}
-
 fn validate_claude_cli(path: &Path) -> Result<()> {
     let mut command = Command::new(path);
     command.arg("--help").env_clear();
@@ -997,7 +989,10 @@ fn reviewer_capabilities(
     }
 }
 
-fn codex_reviewer_descriptor(invocation: &CodexInvocationProfile) -> Result<AdapterDescriptor> {
+fn codex_reviewer_descriptor(
+    invocation: &CodexInvocationProfile,
+    cli_version: &str,
+) -> Result<AdapterDescriptor> {
     let policy = invocation.effective_policy(REVIEWER_OUTER_POLICY);
     let mut capabilities = reviewer_capabilities(
         NativeSessionMode::Discovered,
@@ -1013,7 +1008,7 @@ fn codex_reviewer_descriptor(invocation: &CodexInvocationProfile) -> Result<Adap
     AdapterDescriptor::new(
         CODEX_ADAPTER_NAME,
         CODEX_ADAPTER_CONTRACT_VERSION,
-        CODEX_REVIEWER_CLI_VERSION,
+        cli_version,
         &invocation.model,
         &invocation.reasoning_effort,
         &policy,
@@ -2189,9 +2184,7 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::artifact::{ArtifactAttempt, ArtifactRoot, ArtifactScope};
-    use crate::worker::codex::{
-        CODEX_EXEC_HELP_REQUIREMENTS, CODEX_RESUME_HELP_REQUIREMENTS, MAX_CODEX_EVENT_BYTES,
-    };
+    use crate::worker::codex::MAX_CODEX_EVENT_BYTES;
     use crate::worker::environment::{ExecutionEnvironmentLease, WorkerEnvironmentIdentity};
     use crate::worker::{
         HeartbeatControl, NativeSessionBinding, ProcessRunner, WorkerAdapter, prepare_create_turn,
@@ -2769,11 +2762,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_reviewer_help_matches_configurable_command_contract_when_installed() {
-        let codex = Path::new(CODEX_REVIEWER_EXECUTABLE);
-        if codex.exists() {
-            validate_codex_reviewer_cli(codex).unwrap();
-        }
+    fn pinned_claude_help_matches_configurable_command_contract_when_installed() {
         let claude = Path::new(CLAUDE_REVIEWER_EXECUTABLE);
         if claude.exists() {
             validate_claude_cli(claude).unwrap();
@@ -3249,17 +3238,6 @@ mod tests {
         );
         let prepared =
             prepare_create_turn(&codex, &codex_profile, &codex_create, prompt.to_vec()).unwrap();
-        for option in prepared
-            .command()
-            .fixed_argv
-            .iter()
-            .filter(|argument| argument.starts_with("--"))
-        {
-            assert!(
-                CODEX_EXEC_HELP_REQUIREMENTS.contains(&option.as_str()),
-                "reviewer runtime option {option} is absent from the shared exec capability probe"
-            );
-        }
         assert_closed_codex_argv(
             &prepared.command().materialized_control_argv(),
             &fixture,
@@ -3307,21 +3285,6 @@ mod tests {
             prompt.to_vec(),
         )
         .unwrap();
-        let resume_index = prepared
-            .command()
-            .fixed_argv
-            .iter()
-            .position(|argument| argument == "resume")
-            .unwrap();
-        for option in prepared.command().fixed_argv[resume_index + 2..]
-            .iter()
-            .filter(|argument| argument.starts_with("--"))
-        {
-            assert!(
-                CODEX_RESUME_HELP_REQUIREMENTS.contains(&option.as_str()),
-                "reviewer resume option {option} is absent from the shared resume capability probe"
-            );
-        }
         let argv = prepared.command().materialized_control_argv();
         assert_closed_codex_argv(&argv, &fixture, prompt);
         assert!(
@@ -4133,7 +4096,7 @@ exec "$@"
         r#"#!/bin/sh
 set -eu
 if [ "${1-}" = "--version" ]; then
-    printf '%s\n' 'codex-cli 0.145.0'
+    printf '%s\n' 'codex-cli test-version'
     exit 0
 fi
 # SANDBOX_PROBE

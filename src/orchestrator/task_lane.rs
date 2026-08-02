@@ -15,8 +15,7 @@ use crate::worker::environment::{
     EnvironmentPolicy, ExecutionEnvironmentLease, MaterializedWorkerEnvironment,
 };
 use crate::worker::exec_runtime::{
-    ExecPreflight, ExecRuntimeConfig, ExecTaskPaths, ExecTaskWorkerRuntime,
-    codex_exec_contract_identity,
+    ExecRuntimeConfig, ExecTaskPaths, ExecTaskWorkerRuntime, codex_exec_contract_identity,
 };
 use crate::worker::runtime::{
     CODEX_TASK_WORKER_ADAPTER, OutcomeContract, RoleSessionSpec, RuntimeContractIdentity,
@@ -49,13 +48,11 @@ trait RuntimeFactory: Send {
     ) -> Result<Box<dyn TaskWorkerRuntime>, RuntimeError>;
 }
 
-struct ProductionRuntimeFactory {
-    preflight: Option<ExecPreflight>,
-}
+struct ProductionRuntimeFactory;
 
 impl ProductionRuntimeFactory {
     fn new() -> Self {
-        Self { preflight: None }
+        Self
     }
 }
 
@@ -75,16 +72,8 @@ impl RuntimeFactory for ProductionRuntimeFactory {
         }
         crate::worker::validation::validate_opaque_id("task runtime key", &request.task_key)
             .map_err(|_| RuntimeError::invalid_contract("task runtime key was invalid"))?;
-        let preflight = match &self.preflight {
-            Some(preflight) => preflight.clone(),
-            None => {
-                let preflight = ExecPreflight::verify_pinned()?;
-                self.preflight = Some(preflight.clone());
-                preflight
-            }
-        };
         let runtime = ExecTaskWorkerRuntime::open(ExecRuntimeConfig {
-            codex: preflight.codex().to_path_buf(),
+            codex: PathBuf::from("codex"),
             repository_root: request.repository_root,
             paths: ExecTaskPaths {
                 runtime: request.paths.runtime,
@@ -1302,7 +1291,7 @@ mod tests {
 
     impl RuntimeFactory for ScriptedFactory {
         fn contract(&self) -> RuntimeContractIdentity {
-            RuntimeContractIdentity::codex_exec_0_146()
+            RuntimeContractIdentity::codex_exec()
         }
 
         fn open(
@@ -1416,7 +1405,7 @@ mod tests {
 
     impl RuntimeFactory for FailingFactory {
         fn contract(&self) -> RuntimeContractIdentity {
-            RuntimeContractIdentity::codex_exec_0_146()
+            RuntimeContractIdentity::codex_exec()
         }
 
         fn open(
@@ -3562,7 +3551,7 @@ mod tests {
 
 /// Real-Codex acceptance for the exec lane.
 ///
-/// Opt-in; runs the pinned 0.146 binary against a disposable project with the
+/// Opt-in; runs the native Codex selected from PATH against a disposable project with the
 /// cheap test model. Never touches an existing user terminal or session.
 ///
 ///   cargo test --lib real_exec -- --ignored --nocapture --test-threads=1
@@ -3573,7 +3562,7 @@ mod real_exec_tests {
     use crate::control_api::TaskState;
 
     #[test]
-    #[ignore = "requires the pinned real codex binary, auth, and network"]
+    #[ignore = "requires native codex, auth, and network"]
     fn real_single_task_developer_then_reviewer_reaches_lgtm() {
         let fixture = RealFixture::new("fib");
         let mut supervisor = fixture.supervisor();
@@ -3613,7 +3602,7 @@ mod real_exec_tests {
     /// re-review, the second is approved on its first review, and all four
     /// role sessions are fresh.
     #[test]
-    #[ignore = "requires the pinned real codex binary, auth, and network"]
+    #[ignore = "requires native codex, auth, and network"]
     fn real_gate_one_review_loop_then_direct_approval_in_one_run() {
         let fixture = RealFixture::new("gate1");
         let mut supervisor = fixture.supervisor();
@@ -3722,7 +3711,7 @@ mod real_exec_tests {
     /// commits a hello-world crate, the reviewer independently judges it, and
     /// the run reaches LGTM with durable evidence on disk.
     #[test]
-    #[ignore = "requires the pinned real codex binary, auth, and network"]
+    #[ignore = "requires native codex, auth, and network"]
     fn real_rust_hello_world_task_reaches_lgtm_with_evidence() {
         let fixture = RealFixture::new("hello");
         let mut supervisor = fixture.supervisor();
@@ -3765,7 +3754,7 @@ mod real_exec_tests {
     }
 
     #[test]
-    #[ignore = "requires the pinned real codex binary, auth, and network"]
+    #[ignore = "requires native codex, auth, and network"]
     fn real_two_task_run_advances_automatically() {
         let fixture = RealFixture::new("two");
         let mut supervisor = fixture.supervisor();

@@ -4,11 +4,11 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const CODEX_DEVELOPER_ADAPTER: &str = "codex-developer-0.145.0";
+pub const CODEX_DEVELOPER_ADAPTER: &str = "codex-developer";
 pub const CLAUDE_DEVELOPER_ADAPTER: &str = "claude-developer-2.1.220";
-pub const CODEX_REVIEWER_ADAPTER: &str = "codex-reviewer-0.145.0";
+pub const CODEX_REVIEWER_ADAPTER: &str = "codex-reviewer";
 pub const CLAUDE_REVIEWER_ADAPTER: &str = "claude-reviewer-2.1.220";
-pub const CODEX_ARCHITECT_ADAPTER: &str = "codex-0.145.0";
+pub const CODEX_ARCHITECT_ADAPTER: &str = "codex";
 pub const CLAUDE_ARCHITECT_ADAPTER: &str = "claude-2.1.220";
 
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";

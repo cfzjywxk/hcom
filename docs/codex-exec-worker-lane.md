@@ -1,6 +1,6 @@
 # Codex exec worker lane
 
-The task worker lane hcom actually runs: one pinned `codex exec` process per
+The task worker lane hcom actually runs: one native `codex exec` process per
 turn, no protocol conversation, and a supervisor that never judges the work.
 
 ## The two rules
@@ -185,13 +185,13 @@ group would hang the supervisor itself.
   messages, giant events, resume identity, clarification, timeout and secret
   redaction.
 - **Contract smokes** (`scripts/codex-exec-contract-smokes`) — the external
-  assumptions, against the real pinned binary. Unit tests structurally cannot
+  behavior, against the native `codex` selected from `PATH`. Unit tests cannot
   cover these: a fake CLI reproduces whatever hcom already believes. Run before
-  every release and after every pin bump. The environment probe reads only
-  allowlisted synthetic variables; dumping the real environment would ship live
-  credentials into the model context and to the provider. Its disposable
-  native config selects the tool-command environment policy; hcom itself does
-  not override that policy. These smokes default
+  every release and after material CLI behavior changes. The environment probe
+  reads only allowlisted synthetic variables; dumping the real environment
+  would ship live credentials into the model context and to the provider. Its
+  disposable native config selects the tool-command environment policy; hcom
+  itself does not override that policy. These smokes default
   to `gpt-5.3-codex-spark` with `medium` reasoning and verify native global
   plus project AGENTS.md loading as well as explicit external-repository
   instruction discovery.
@@ -258,11 +258,11 @@ worth doing, not yet done.
 ### Non-UTF-8 environment values expose an upstream native limitation
 
 hcom inherits the parent environment byte-for-byte, including non-UTF-8 names
-and values. Codex 0.146's tool executor panics on `std::env::vars()` when it
-meets one, so **every tool call silently fails while the turn still exits 0**:
-the model narrates progress and returns a confident summary having done
-nothing. This is upstream native behavior, and hcom neither filters the parent
-environment nor overrides native environment policy to work around it.
+and values. An observed native Codex tool executor fails when it meets one, so
+**every tool call can silently fail while the turn still exits 0**: the model
+narrates progress and returns a confident summary having done nothing. This is
+upstream native behavior, and hcom neither filters the parent environment nor
+overrides native environment policy to work around it.
 
 The byte-exact hcom-to-Codex process boundary is covered by unit tests.
 `C4`/`C4b` separately verify that a native user

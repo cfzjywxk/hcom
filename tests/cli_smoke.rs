@@ -469,7 +469,7 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     assert!(stdout.contains("gpt-5.6-sol/xhigh"), "stdout={stdout}");
     assert!(stdout.contains("Claude opus/xhigh"), "stdout={stdout}");
     assert!(
-        stdout.contains("codex-exec-0.146.0 process per task"),
+        stdout.contains("codex-exec process per turn"),
         "stdout={stdout}"
     );
     assert!(

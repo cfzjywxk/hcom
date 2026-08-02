@@ -1,8 +1,8 @@
 # Codex Architect adapter maintenance contract
 
-This is the maintainer contract for the pinned Codex 0.145 blank Architect
-started by `hcom arch codex`. Background Developer and Reviewer turns use the
-pinned Codex 0.146 exec lane documented in
+This is the maintainer contract for the native Codex blank Architect started
+by `hcom arch codex`. Background Developer and Reviewer turns use the native
+Codex exec lane documented in
 [codex-exec-worker-lane.md](codex-exec-worker-lane.md). Existing tagged
 interactive hcom products are independent and must not be routed through this
 session lane.
@@ -26,10 +26,15 @@ The deliberate exceptions are:
 - exec workers add the transport required for thread identity/final-message
   capture.
 
-## Pinned identity and typed profile
+## Native executable and typed profile
 
-- The Architect pins the absolute Codex 0.145 executable and requires
-  `codex-cli 0.145.0`.
+- Architect and worker launches execute the program name `codex` with the
+  complete parent environment, so normal `PATH` resolution selects the native
+  installation at each process start.
+- hcom does not pin an absolute Codex path, CLI version, or executable hash. It
+  does not freeze executable identity across a session or reject a CLI because
+  a help probe differs. A missing or incompatible CLI fails that launch/turn
+  through the normal process error path.
 - Model names are 1–128 ASCII bytes, cannot begin with `-`, and may contain
   only letters, digits, `.`, `_`, `-`, `/`, `:`, or `@`.
 - Reasoning effort is one of `none`, `minimal`, `low`, `medium`, `high`,
@@ -84,7 +89,7 @@ concurrent sessions can exist, so hcom now:
 1. snapshots the bounded `(device, inode)` identities of rollout files before
    starting the Architect;
 2. considers only post-snapshot rollout files whose first native
-   `session_meta` record matches the exact project root and pinned CLI version;
+   `session_meta` record matches the exact project root;
 3. requires one unique candidate for the first task-control call;
 4. after binding, keeps selecting that exact candidate even if another
    same-project Codex session starts later;
@@ -143,13 +148,11 @@ The model-backed E2E/contract default is
 `gpt-5.3-codex-spark` with `medium` reasoning; production defaults remain
 `gpt-5.6-sol`/`xhigh`.
 
-Before changing the pin, argv, configuration overlay, or session observation:
+Before changing argv, the configuration overlay, or session observation:
 
-1. inspect the exact root/exec/resume help for the pinned binary;
-2. update both capability probes and fake-CLI argv assertions;
-3. cover blank Architect, Developer, Reviewer, create, and exact resume where
+1. cover blank Architect, Developer, Reviewer, create, and exact resume where
    applicable;
-4. keep hcom-owned config to the smallest exact leaf—never replace the whole
+2. keep hcom-owned config to the smallest exact leaf—never replace the whole
    native user config;
-5. run targeted tests, then the full source gate;
-6. do not automate a real Architect TUI by submitting its first prompt.
+3. run targeted tests, then the full source gate;
+4. do not automate a real Architect TUI by submitting its first prompt.

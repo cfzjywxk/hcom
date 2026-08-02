@@ -220,7 +220,7 @@ fn validate_checks(checks: &[CheckResult]) -> Result<()> {
     validate_list("checks", checks)?;
     let mut commands = BTreeSet::new();
     for check in checks {
-        // Codex 0.145 preserves embedded newlines for shell scripts in its
+        // Codex preserves embedded newlines for shell scripts in its
         // command events. Result commands must be able to carry that exact
         // evidence while still rejecting escape, CR, C1, and other controls.
         validate_text("check command", &check.command, 4096, true)?;
