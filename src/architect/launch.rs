@@ -42,6 +42,10 @@ use std::time::{Duration, Instant};
 
 const MAX_BWRAP_INFO_BYTES: usize = 4096;
 const MAX_INHERITED_CREDENTIAL_SOCKETS: usize = 8;
+// Codex currently requires a finite MCP tool timeout. Two years exceeds the
+// protocol's maximum 64-task, 20-review-round run at the six-hour turn bound,
+// so the terminal wait remains owned by the foreground process lifecycle.
+const CODEX_CONTROL_TOOL_TIMEOUT_SECS: u64 = 2 * 365 * 24 * 60 * 60;
 
 #[derive(Parser)]
 #[command(
@@ -2021,7 +2025,8 @@ fn codex_control_mcp_overrides(
     // transport fields merged into the control server.
     let value = format!(
         "{prefix}={{ command = {command}, args = {args}, startup_timeout_sec = 10, \
-         tool_timeout_sec = 300, enabled = true, default_tools_approval_mode = \"approve\" }}"
+         tool_timeout_sec = {CODEX_CONTROL_TOOL_TIMEOUT_SECS}, enabled = true, \
+         default_tools_approval_mode = \"approve\" }}"
     );
     Ok(vec!["--config".into(), value])
 }
@@ -3131,7 +3136,8 @@ mod tests {
             "--config".to_owned(),
             format!(
                 "mcp_servers.hcom_session_task_control={{ command = {command}, args = \
-                 {relay_args}, startup_timeout_sec = 10, tool_timeout_sec = 300, enabled = true, \
+                 {relay_args}, startup_timeout_sec = 10, tool_timeout_sec = \
+                 {CODEX_CONTROL_TOOL_TIMEOUT_SECS}, enabled = true, \
                  default_tools_approval_mode = \"approve\" }}"
             ),
         ]);

@@ -109,10 +109,15 @@ merges, or applies changes.
 The foreground parent owns every worker and task-local exec runtime; it keeps
 state only in memory and performs no daemon, project store, or cross-session
 recovery. Same-task corrections use the exact native Developer/Reviewer thread.
-After dispatch, the Architect should check worker status only every 3 to 5
-minutes unless the human asks or immediate intervention is required; the
-foreground supervisor monitors lifecycle internally without model calls, so
-short-cadence polling only wastes Architect requests and tokens.
+After dispatch, the Codex Architect opens one blocking session_wait MCP call.
+The foreground supervisor advances Developer and Reviewer without Architect
+model calls and completes that wait only for completed, needs_human, failed, or
+canceled. Normal role and correction transitions do not wake the Architect, and
+session_status is reserved for an explicit human status request. While the wait
+is pending Codex may display Working, but it is not issuing model turns or
+status polls. Interrupting the wait cancels only that subscription, never the
+run; after the human explicitly asks to wait again, a retained terminal result
+returns immediately even if it happened during the gap.
 
 See docs/architect.md for the complete TOML schema and examples."#
 }

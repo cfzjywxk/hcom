@@ -19,6 +19,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -100,14 +101,14 @@ impl SessionSupervisorEndpoint {
     }
 
     pub(crate) fn try_serve_one(&mut self) -> Result<bool> {
-        let (mut stream, _) = match self.listener.accept() {
+        let (stream, _) = match self.listener.accept() {
             Ok(connection) => connection,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
             Err(error) => return Err(error).context("failed to accept session control connection"),
         };
         stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT))?;
         stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT))?;
-        let _ = self.control.serve_stream(&mut stream);
+        let _ = self.control.serve_stream(stream);
         Ok(true)
     }
 
@@ -144,11 +145,14 @@ impl SessionSupervisorEndpoint {
                 }
             }
             let _ = self.control.supervisor.poll_once();
+            self.control.service_pending_wait();
             if !handled {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
-        self.control.supervisor.shutdown()
+        let result = self.control.supervisor.shutdown();
+        self.control.service_pending_wait();
+        result
     }
 }
 
@@ -159,6 +163,7 @@ struct SessionSupervisorControl {
     parent_birth: String,
     bindings: BTreeMap<String, ArchitectBinding>,
     requests: BTreeMap<(String, String), RequestRecord>,
+    pending_wait: Option<PendingSessionWait>,
 }
 
 trait SupervisorBackend: Send {
@@ -246,6 +251,11 @@ struct RequestRecord {
     response: Option<ControlResponse>,
 }
 
+struct PendingSessionWait {
+    stream: UnixStream,
+    request_id: String,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BindingState {
     Pending,
@@ -290,6 +300,7 @@ impl SessionSupervisorControl {
             parent_birth,
             bindings: BTreeMap::new(),
             requests: BTreeMap::new(),
+            pending_wait: None,
         })
     }
 
@@ -452,17 +463,17 @@ impl SessionSupervisorControl {
         }
     }
 
-    fn serve_stream(&mut self, stream: &mut UnixStream) -> Result<()> {
-        let peer = peer_credentials(stream)?;
+    fn serve_stream(&mut self, mut stream: UnixStream) -> Result<()> {
+        let peer = peer_credentials(&stream)?;
         if peer.uid != self.expected_uid {
             bail!("control peer uid mismatch");
         }
-        let frame = read_request_frame(stream)?;
+        let frame = read_request_frame(&mut stream)?;
         let request: ControlRequest = match serde_json::from_slice(&frame) {
             Ok(request) => request,
             Err(_) => {
                 return write_response(
-                    stream,
+                    &mut stream,
                     &ControlResponse::error(
                         "",
                         ControlErrorCode::InvalidRequest,
@@ -471,6 +482,11 @@ impl SessionSupervisorControl {
                 );
             }
         };
+        if request.validate().is_ok()
+            && matches!(&request.action, ControlAction::SessionWait { .. })
+        {
+            return self.handle_session_wait(peer, &request, stream);
+        }
         let response = match request.validate() {
             Ok(()) => self.handle_request(peer, &request),
             Err(_) => ControlResponse::error(
@@ -479,7 +495,114 @@ impl SessionSupervisorControl {
                 "invalid control request",
             ),
         };
-        write_response(stream, &response)
+        write_response(&mut stream, &response)
+    }
+
+    fn handle_session_wait(
+        &mut self,
+        peer: PeerCredentials,
+        request: &ControlRequest,
+        mut stream: UnixStream,
+    ) -> Result<()> {
+        if self.authorize_control(peer, request).is_err() {
+            return write_response(
+                &mut stream,
+                &ControlResponse::error(
+                    &request.request_id,
+                    ControlErrorCode::Unauthorized,
+                    "control caller is not authorized",
+                ),
+            );
+        }
+        self.service_pending_wait();
+        if self.pending_wait.is_some() {
+            return write_response(
+                &mut stream,
+                &ControlResponse::error(
+                    &request.request_id,
+                    ControlErrorCode::RequestInProgress,
+                    "another session wait is already in progress",
+                ),
+            );
+        }
+        let ControlAction::SessionWait {
+            after_session_version,
+        } = &request.action
+        else {
+            unreachable!("session wait handler requires a wait action")
+        };
+        let snapshot = self.supervisor.snapshot();
+        if *after_session_version > snapshot.version {
+            return write_response(
+                &mut stream,
+                &ControlResponse::error(
+                    &request.request_id,
+                    ControlErrorCode::Conflict,
+                    "session wait version is ahead of the current session",
+                ),
+            );
+        }
+        if snapshot.state.is_terminal() {
+            return write_response(
+                &mut stream,
+                &ControlResponse::success(
+                    &request.request_id,
+                    ControlResult::Session { session: snapshot },
+                ),
+            );
+        }
+        if snapshot.state != super::SessionState::Running {
+            return write_response(
+                &mut stream,
+                &ControlResponse::error(
+                    &request.request_id,
+                    ControlErrorCode::Conflict,
+                    "session wait requires a running or terminal session",
+                ),
+            );
+        }
+        stream.set_read_timeout(None)?;
+        stream.set_nonblocking(true)?;
+        self.pending_wait = Some(PendingSessionWait {
+            stream,
+            request_id: request.request_id.clone(),
+        });
+        Ok(())
+    }
+
+    fn service_pending_wait(&mut self) {
+        let disconnected = self.pending_wait.as_mut().is_some_and(|wait| {
+            let mut probe = [0u8; 1];
+            match wait.stream.read(&mut probe) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    false
+                }
+                Ok(_) | Err(_) => true,
+            }
+        });
+        if disconnected {
+            self.pending_wait = None;
+            return;
+        }
+        let snapshot = self.supervisor.snapshot();
+        if !snapshot.state.is_terminal() {
+            return;
+        }
+        let Some(mut wait) = self.pending_wait.take() else {
+            return;
+        };
+        let response = ControlResponse::success(
+            &wait.request_id,
+            ControlResult::Session { session: snapshot },
+        );
+        let _ = wait.stream.set_nonblocking(false);
+        let _ = wait.stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT));
+        let _ = write_response(&mut wait.stream, &response);
     }
 
     fn handle_request(
@@ -603,6 +726,9 @@ impl SessionSupervisorControl {
                 Ok(ControlResult::Session {
                     session: self.supervisor.snapshot(),
                 })
+            }
+            ControlAction::SessionWait { .. } => {
+                bail!("session wait must be served by the deferred control path")
             }
             ControlAction::SessionStatus => Ok(ControlResult::Session {
                 session: self.supervisor.snapshot(),
@@ -887,11 +1013,13 @@ fn constant_time_equal(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_api::codec::{read_response_frame, write_request_frame};
     use crate::control_api::protocol::PROTOCOL_VERSION;
     use crate::worker::profile::{ArchitectAdapter, SessionInvocationProfiles};
     use std::collections::BTreeSet;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
+    use std::time::Instant;
 
     struct Fixture {
         _temp: tempfile::TempDir,
@@ -961,6 +1089,251 @@ mod tests {
             args,
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    struct FakeSupervisor {
+        startup: SessionStartup,
+        snapshot: crate::control_api::SessionStatusSnapshot,
+    }
+
+    impl SupervisorBackend for FakeSupervisor {
+        fn startup(&self) -> &SessionStartup {
+            &self.startup
+        }
+
+        fn replace_plan(
+            &mut self,
+            _expected_session_version: u64,
+            _developer_adapter: &str,
+            _reviewer_adapter: &str,
+            _tasks: Vec<crate::control_api::TaskDraft>,
+        ) -> Result<(u64, String)> {
+            bail!("unused fake replace_plan")
+        }
+
+        fn approve_and_start(
+            &mut self,
+            _expected_session_version: u64,
+            _plan_version: u64,
+            _plan_hash: &str,
+            _approval_confirmed: bool,
+        ) -> Result<()> {
+            bail!("unused fake approve_and_start")
+        }
+
+        fn cancel(&mut self, expected_session_version: u64, reason: &str) -> Result<()> {
+            if self.snapshot.version != expected_session_version {
+                bail!("fake session version is stale");
+            }
+            self.snapshot.version += 1;
+            self.snapshot.state = crate::control_api::SessionState::Canceled;
+            self.snapshot.terminal_detail = Some(reason.into());
+            Ok(())
+        }
+
+        fn snapshot(&self) -> crate::control_api::SessionStatusSnapshot {
+            self.snapshot.clone()
+        }
+
+        fn poll_once(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            if !self.snapshot.state.is_terminal() {
+                let version = self.snapshot.version;
+                self.cancel(version, "fake parent stopped")?;
+            }
+            Ok(())
+        }
+    }
+
+    fn fake_wait_control(
+        state: crate::control_api::SessionState,
+        version: u64,
+    ) -> (SessionSupervisorControl, CallerAuth, PeerCredentials) {
+        let project_root = PathBuf::from("/project");
+        let snapshot = crate::control_api::SessionStatusSnapshot {
+            run_id: "run-wait-test".into(),
+            state,
+            version,
+            project_root: project_root.to_string_lossy().into_owned(),
+            plan_version: Some(1),
+            plan_hash: Some("a".repeat(64)),
+            current_task_ordinal: Some(0),
+            terminal_detail: state
+                .is_terminal()
+                .then(|| "terminal before subscription".into()),
+            tasks: Vec::new(),
+        };
+        let binding_id = "binding-wait-test";
+        let launch_nonce = "launch-nonce-wait-test";
+        let capability = "capability-wait-test";
+        let (action_set_json, _) = canonical_action_set(ActionName::ARCHITECT).unwrap();
+        let birth = process_birth_identity(std::process::id()).unwrap();
+        let binding = ArchitectBinding {
+            id: binding_id.into(),
+            project_root: project_root.clone(),
+            launch_nonce_hash: secret_hash(b"hcom-session/launch-nonce/v1", launch_nonce),
+            capability_hash: secret_hash(b"hcom-session/capability/v1", capability),
+            action_set_hash: sha256_hex(action_set_json.as_bytes()),
+            action_set_json,
+            state: BindingState::ProcessBound,
+            version: 1,
+            architect_pid: Some(std::process::id()),
+            architect_process_birth: Some(birth.clone()),
+            bridge_pid: Some(std::process::id()),
+            bridge_process_birth: Some(birth.clone()),
+            relay_executable_contract_hash: Some("b".repeat(64)),
+            relay_runtime_scope_hash: Some("c".repeat(64)),
+        };
+        let control = SessionSupervisorControl {
+            supervisor: Box::new(FakeSupervisor {
+                startup: SessionStartup {
+                    run_id: "run-wait-test".into(),
+                    project_root,
+                },
+                snapshot,
+            }),
+            // SAFETY: geteuid has no preconditions.
+            expected_uid: unsafe { libc::geteuid() },
+            parent_pid: std::process::id(),
+            parent_birth: birth,
+            bindings: BTreeMap::from([(binding_id.into(), binding)]),
+            requests: BTreeMap::new(),
+            pending_wait: None,
+        };
+        let caller = CallerAuth::Architect {
+            binding_id: binding_id.into(),
+            launch_nonce: launch_nonce.into(),
+            capability: capability.into(),
+        };
+        // SAFETY: geteuid/getegid have no preconditions.
+        let peer = PeerCredentials {
+            pid: std::process::id(),
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+        };
+        (control, caller, peer)
+    }
+
+    fn wait_request(caller: CallerAuth, request_id: &str, version: u64) -> ControlRequest {
+        ControlRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: request_id.into(),
+            caller,
+            action: ControlAction::SessionWait {
+                after_session_version: version,
+            },
+        }
+    }
+
+    fn serve_wait(control: &mut SessionSupervisorControl, request: &ControlRequest) -> UnixStream {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        write_request_frame(&mut client, &serde_json::to_vec(request).unwrap()).unwrap();
+        control.serve_stream(server).unwrap();
+        client
+    }
+
+    #[test]
+    fn deferred_session_wait_returns_terminal_snapshot_without_losing_the_gap() {
+        let (mut control, caller, _) =
+            fake_wait_control(crate::control_api::SessionState::Running, 7);
+        let request = wait_request(caller.clone(), "wait-running", 7);
+        let mut client = serve_wait(&mut control, &request);
+        assert!(control.pending_wait.is_some());
+
+        control.supervisor.cancel(7, "terminal after wait").unwrap();
+        control.service_pending_wait();
+        assert!(control.pending_wait.is_none());
+        let frame = read_response_frame(&mut client).unwrap();
+        let response: ControlResponse = serde_json::from_slice(&frame).unwrap();
+        assert!(response.ok);
+        let Some(ControlResult::Session { session }) = response.result else {
+            panic!("wait must return a session snapshot")
+        };
+        assert_eq!(session.state, crate::control_api::SessionState::Canceled);
+        assert_eq!(session.version, 8);
+        assert_eq!(
+            session.terminal_detail.as_deref(),
+            Some("terminal after wait")
+        );
+
+        let (mut terminal_control, terminal_caller, _) =
+            fake_wait_control(crate::control_api::SessionState::Completed, 11);
+        let mut replay = serve_wait(
+            &mut terminal_control,
+            &wait_request(terminal_caller, "wait-after-gap", 7),
+        );
+        assert!(terminal_control.pending_wait.is_none());
+        let frame = read_response_frame(&mut replay).unwrap();
+        let response: ControlResponse = serde_json::from_slice(&frame).unwrap();
+        let Some(ControlResult::Session { session }) = response.result else {
+            panic!("terminal replay must return a session snapshot")
+        };
+        assert_eq!(session.state, crate::control_api::SessionState::Completed);
+        assert_eq!(session.version, 11);
+    }
+
+    #[test]
+    fn disconnecting_session_wait_only_removes_the_subscription() {
+        let (mut control, caller, _) =
+            fake_wait_control(crate::control_api::SessionState::Running, 3);
+        let client = serve_wait(&mut control, &wait_request(caller, "wait-disconnect", 3));
+        assert!(control.pending_wait.is_some());
+        drop(client);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while control.pending_wait.is_some() && Instant::now() < deadline {
+            control.service_pending_wait();
+            std::thread::yield_now();
+        }
+        assert!(control.pending_wait.is_none());
+        assert_eq!(
+            control.supervisor.snapshot().state,
+            crate::control_api::SessionState::Running
+        );
+        assert_eq!(control.supervisor.snapshot().version, 3);
+    }
+
+    #[test]
+    fn session_status_remains_available_while_terminal_wait_is_pending() {
+        let (mut control, caller, _) =
+            fake_wait_control(crate::control_api::SessionState::Running, 5);
+        let wait_client = serve_wait(
+            &mut control,
+            &wait_request(caller.clone(), "wait-before-status", 5),
+        );
+        assert!(control.pending_wait.is_some());
+
+        let status_request = ControlRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: "explicit-human-status".into(),
+            caller,
+            action: ControlAction::SessionStatus,
+        };
+        let (mut status_client, status_server) = UnixStream::pair().unwrap();
+        write_request_frame(
+            &mut status_client,
+            &serde_json::to_vec(&status_request).unwrap(),
+        )
+        .unwrap();
+        control.serve_stream(status_server).unwrap();
+        let frame = read_response_frame(&mut status_client).unwrap();
+        let response: ControlResponse = serde_json::from_slice(&frame).unwrap();
+        let Some(ControlResult::Session { session }) = response.result else {
+            panic!("status must return a session snapshot")
+        };
+        assert_eq!(session.state, crate::control_api::SessionState::Running);
+        assert_eq!(session.version, 5);
+        assert!(control.pending_wait.is_some());
+
+        drop(wait_client);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while control.pending_wait.is_some() && Instant::now() < deadline {
+            control.service_pending_wait();
+            std::thread::yield_now();
+        }
+        assert!(control.pending_wait.is_none());
     }
 
     #[test]

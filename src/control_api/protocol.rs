@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
@@ -70,23 +70,26 @@ impl CallerAuth {
 pub enum ActionName {
     SessionPlanReplace,
     SessionApproveAndStart,
+    SessionWait,
     SessionStatus,
     SessionCancel,
 }
 
 impl ActionName {
-    pub const ARCHITECT: [Self; 4] = [
+    pub const ARCHITECT: [Self; 5] = [
         Self::SessionPlanReplace,
         Self::SessionApproveAndStart,
+        Self::SessionWait,
         Self::SessionStatus,
         Self::SessionCancel,
     ];
-    pub const ALL: [Self; 4] = Self::ARCHITECT;
+    pub const ALL: [Self; 5] = Self::ARCHITECT;
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SessionPlanReplace => "session_plan_replace",
             Self::SessionApproveAndStart => "session_approve_and_start",
+            Self::SessionWait => "session_wait",
             Self::SessionStatus => "session_status",
             Self::SessionCancel => "session_cancel",
         }
@@ -108,6 +111,9 @@ pub enum ControlAction {
         plan_hash: String,
         approval_confirmed: bool,
     },
+    SessionWait {
+        after_session_version: u64,
+    },
     SessionStatus,
     SessionCancel {
         expected_session_version: u64,
@@ -120,6 +126,7 @@ impl ControlAction {
         match self {
             Self::SessionPlanReplace { .. } => ActionName::SessionPlanReplace,
             Self::SessionApproveAndStart { .. } => ActionName::SessionApproveAndStart,
+            Self::SessionWait { .. } => ActionName::SessionWait,
             Self::SessionStatus => ActionName::SessionStatus,
             Self::SessionCancel { .. } => ActionName::SessionCancel,
         }
@@ -160,7 +167,7 @@ impl ControlAction {
                 }
                 Ok(())
             }
-            Self::SessionStatus => Ok(()),
+            Self::SessionWait { .. } | Self::SessionStatus => Ok(()),
             Self::SessionCancel { reason, .. } => {
                 validate_free_text("cancel reason", reason, 4096, false)
             }
@@ -711,6 +718,7 @@ mod tests {
             [
                 "session_plan_replace",
                 "session_approve_and_start",
+                "session_wait",
                 "session_status",
                 "session_cancel",
             ]

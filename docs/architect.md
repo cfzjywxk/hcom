@@ -283,9 +283,21 @@ unclassifiable Reviewer verdict moves the run to a human-visible terminal
 state. Parent exit/cancel stops the active process group. hcom never pushes,
 installs, resets, rebases, or automatically recovers after the parent exits.
 
-After dispatch, normal model-facing status checks are spaced 180–300 seconds
-apart unless the human asks for immediate status or intervention. The local
-supervisor continues lifecycle monitoring without model calls.
+After dispatch, the Codex Architect calls `session_wait` once with the returned
+session version. This is one blocking, terminal-only MCP subscription: the
+local supervisor continues lifecycle monitoring and advances normal
+Developer-to-Reviewer and correction transitions without Architect model
+calls. It completes the subscription only when the run becomes `completed`,
+`needs_human`, `failed`, or `canceled`. Codex may display `Working` for the
+duration, but it does not sleep, poll `session_status`, or repeatedly infer.
+
+Esc or MCP cancellation closes only the current wait subscription; it does not
+cancel the supervisor run. Codex cannot autonomously reissue a tool call after
+its turn was interrupted. If the human explicitly asks it to resume waiting,
+the new `session_wait` replaces any abandoned subscription. A terminal snapshot
+is retained in memory and returns immediately if the run finished during the
+gap. `session_status` remains available only for an explicit human progress
+query.
 
 ## Verification
 

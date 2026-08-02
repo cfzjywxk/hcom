@@ -178,11 +178,15 @@ host-path allowlist. The Codex Architect has the native same-user host view;
 hcom commands inside it use private per-run state so the live retained hcom
 store is not addressed through the normal CLI.
 
-After a developer or reviewer is dispatched, the foreground supervisor
-monitors it without Architect model calls. Unless the human requests status or
-immediate intervention is required, the Architect waits 3–5 minutes before
-the first status check and between later checks; it does not poll every
-30 seconds. A terminal or `needs_human` result ends polling.
+After dispatch, the Codex Architect makes one blocking `session_wait` call.
+The foreground supervisor advances Developer and Reviewer without Architect
+model calls and returns only when the run is `completed`, `needs_human`,
+`failed`, or `canceled`; normal role transitions do not wake it. The UI may
+remain `Working` while this MCP call is pending, but no timer, status polling,
+or repeated Architect inference is involved. Esc cancels only the wait
+subscription, not the run. If the human later asks to wait again, a terminal
+result reached during the gap is returned immediately. `session_status` is for
+an explicit human progress query only.
 
 ---
 

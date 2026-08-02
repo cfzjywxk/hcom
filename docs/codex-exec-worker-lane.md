@@ -285,5 +285,7 @@ bypassing the foreground launch path under test.
 
 A turn is killed after 6 hours of wall clock, monotonic and never reset by
 output. A genuinely slow turn is indistinguishable from a hung one; a wedged
-worker burns up to six hours before the watchdog fires. Faster detection is
-meant to come from the 180–300 s status pulse and a human cancelling.
+worker burns up to six hours before the watchdog fires. The foreground
+supervisor reports the resulting terminal state through the one pending
+`session_wait`; a human who needs an earlier progress check can interrupt that
+wait and explicitly request `session_status` or cancellation.

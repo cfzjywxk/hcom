@@ -13,7 +13,7 @@ use crate::control_api::registration::{
     RegistrationRequest, TOOL_REFUSAL_ACTION, TOOL_REFUSAL_ENVELOPE,
 };
 use crate::control_api::supervisor::ControlPaths;
-use crate::control_api::{CallerAuth, ControlRequest, ControlResponse};
+use crate::control_api::{CallerAuth, ControlAction, ControlRequest, ControlResponse};
 use crate::worker::ExecutableIdentity;
 use crate::worker::profile::{
     CLAUDE_DEVELOPER_ADAPTER, CLAUDE_REVIEWER_ADAPTER, CODEX_DEVELOPER_ADAPTER,
@@ -27,10 +27,14 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::Shutdown;
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -416,17 +420,23 @@ fn serve_mcp_connection(
     configuration: &BridgeConfiguration,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
+    let writer = Arc::new(Mutex::new(stream.try_clone()?));
+    let mut active_wait: Option<ActiveSessionWait> = None;
     while let Some(line) = read_bounded_line(&mut reader)? {
+        reap_finished_wait(&mut active_wait);
         let request: JsonRpcRequest = match serde_json::from_slice(trim_line(&line)) {
             Ok(request) => request,
             Err(_) => {
-                write_json_line(stream, &json_rpc_error(Value::Null, -32700, "parse error"))?;
+                write_shared_json_line(
+                    &writer,
+                    &json_rpc_error(Value::Null, -32700, "parse error"),
+                )?;
                 continue;
             }
         };
         if request.jsonrpc != "2.0" || request.method.is_empty() || request.method.len() > 128 {
             if let Some(id) = request.id {
-                write_json_line(stream, &json_rpc_error(id, -32600, "invalid request"))?;
+                write_shared_json_line(&writer, &json_rpc_error(id, -32600, "invalid request"))?;
             }
             continue;
         }
@@ -442,7 +452,11 @@ fn serve_mcp_connection(
                     }
                 })
             }),
-            "notifications/initialized" | "notifications/cancelled" => None,
+            "notifications/initialized" => None,
+            "notifications/cancelled" => {
+                cancel_matching_wait(&mut active_wait, request.params.as_ref());
+                None
+            }
             "ping" => request
                 .id
                 .map(|id| json!({"jsonrpc":"2.0","id":id,"result":{}})),
@@ -460,52 +474,187 @@ fn serve_mcp_connection(
                 let Some(id) = request.id else {
                     continue;
                 };
-                Some(handle_tool_call(id, request.params, configuration))
+                match prepare_control_request(request.params, configuration) {
+                    Ok(control_request)
+                        if matches!(&control_request.action, ControlAction::SessionWait { .. }) =>
+                    {
+                        // A client may abandon an interrupted request without
+                        // emitting notifications/cancelled. The next explicit
+                        // wait replaces that stale subscription; it never
+                        // changes the supervisor run itself.
+                        if let Some(wait) = active_wait.take() {
+                            wait.cancel_and_join();
+                        }
+                        match start_session_wait(
+                            id.clone(),
+                            control_request,
+                            configuration,
+                            Arc::clone(&writer),
+                        ) {
+                            Ok(wait) => {
+                                active_wait = Some(wait);
+                                None
+                            }
+                            Err(error) => {
+                                Some(tool_call_error(id, &tool_call_refusal_text(&error)))
+                            }
+                        }
+                    }
+                    Ok(control_request) => Some(complete_tool_call(
+                        id,
+                        request_control(control_request, configuration),
+                    )),
+                    Err(error) => Some(tool_call_error(id, &tool_call_refusal_text(&error))),
+                }
             }
             _ => request
                 .id
                 .map(|id| json_rpc_error(id, -32601, "method not found")),
         };
         if let Some(response) = response {
-            write_json_line(stream, &response)?;
+            write_shared_json_line(&writer, &response)?;
         }
+    }
+    if let Some(wait) = active_wait.take() {
+        wait.cancel_and_join();
     }
     Ok(())
 }
 
+struct ActiveSessionWait {
+    request_id: Value,
+    cancellation_stream: UnixStream,
+    cancelled: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl ActiveSessionWait {
+    fn cancel_and_join(mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        let _ = self.cancellation_stream.shutdown(Shutdown::Both);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+
+    fn join(mut self) {
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn start_session_wait(
+    id: Value,
+    request: ControlRequest,
+    configuration: &BridgeConfiguration,
+    writer: Arc<Mutex<UnixStream>>,
+) -> Result<ActiveSessionWait> {
+    let pending = ControlClient::new(&configuration.control_socket_path)
+        .begin_wait(&request)
+        .map_err(|_| ToolCallRefusal(CONTROL_REFUSAL_TRANSPORT))?;
+    let cancellation_stream = pending
+        .cancellation_stream()
+        .map_err(|_| ToolCallRefusal(CONTROL_REFUSAL_TRANSPORT))?;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+    let worker_finished = Arc::clone(&finished);
+    let worker_id = id.clone();
+    let worker = std::thread::spawn(move || {
+        let result = pending
+            .wait()
+            .map_err(|_| anyhow::Error::new(ToolCallRefusal(CONTROL_REFUSAL_TRANSPORT)));
+        if !worker_cancelled.load(Ordering::Acquire) {
+            let response = complete_tool_call(worker_id, result);
+            let _ = write_shared_json_line(&writer, &response);
+        }
+        worker_finished.store(true, Ordering::Release);
+    });
+    Ok(ActiveSessionWait {
+        request_id: id,
+        cancellation_stream,
+        cancelled,
+        finished,
+        worker: Some(worker),
+    })
+}
+
+fn reap_finished_wait(active_wait: &mut Option<ActiveSessionWait>) {
+    if active_wait
+        .as_ref()
+        .is_some_and(|wait| wait.finished.load(Ordering::Acquire))
+        && let Some(wait) = active_wait.take()
+    {
+        wait.join();
+    }
+}
+
+fn cancel_matching_wait(active_wait: &mut Option<ActiveSessionWait>, params: Option<&Value>) {
+    let Some(cancelled_id) = params
+        .and_then(Value::as_object)
+        .and_then(|params| params.get("requestId"))
+    else {
+        return;
+    };
+    if active_wait
+        .as_ref()
+        .is_some_and(|wait| wait.request_id == *cancelled_id)
+        && let Some(wait) = active_wait.take()
+    {
+        wait.cancel_and_join();
+    }
+}
+
+#[cfg(test)]
 fn handle_tool_call(
     id: Value,
     params: Option<Value>,
     configuration: &BridgeConfiguration,
 ) -> Value {
-    let result = (|| -> Result<ControlResponse> {
-        let params: ToolCallParams = serde_json::from_value(
-            params.ok_or_else(|| anyhow::anyhow!("tool call omitted params"))?,
-        )
-        .context("invalid typed tool call")
-        .map_err(|_| ToolCallRefusal(TOOL_REFUSAL_ENVELOPE))?;
-        let action = control_action(
-            &params.name,
-            params.arguments,
-            &configuration.developer_adapter,
-            &configuration.reviewer_adapter,
-        )
-        .map_err(|_| ToolCallRefusal(TOOL_REFUSAL_ACTION))?;
-        let request = ControlRequest {
-            protocol_version: PROTOCOL_VERSION,
-            request_id: format!("architect-{}", Uuid::new_v4()),
-            caller: CallerAuth::Architect {
-                binding_id: configuration.binding_id.clone(),
-                launch_nonce: configuration.launch_nonce.clone(),
-                capability: configuration.capability.clone(),
-            },
-            action,
-        };
-        Ok(ControlClient::new(&configuration.control_socket_path)
-            .request(&request)
-            .map_err(|_| ToolCallRefusal(CONTROL_REFUSAL_TRANSPORT))?)
-    })();
+    let result = prepare_control_request(params, configuration)
+        .and_then(|request| request_control(request, configuration));
+    complete_tool_call(id, result)
+}
 
+fn prepare_control_request(
+    params: Option<Value>,
+    configuration: &BridgeConfiguration,
+) -> Result<ControlRequest> {
+    let params: ToolCallParams =
+        serde_json::from_value(params.ok_or_else(|| anyhow::anyhow!("tool call omitted params"))?)
+            .context("invalid typed tool call")
+            .map_err(|_| ToolCallRefusal(TOOL_REFUSAL_ENVELOPE))?;
+    let action = control_action(
+        &params.name,
+        params.arguments,
+        &configuration.developer_adapter,
+        &configuration.reviewer_adapter,
+    )
+    .map_err(|_| ToolCallRefusal(TOOL_REFUSAL_ACTION))?;
+    Ok(ControlRequest {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: format!("architect-{}", Uuid::new_v4()),
+        caller: CallerAuth::Architect {
+            binding_id: configuration.binding_id.clone(),
+            launch_nonce: configuration.launch_nonce.clone(),
+            capability: configuration.capability.clone(),
+        },
+        action,
+    })
+}
+
+fn request_control(
+    request: ControlRequest,
+    configuration: &BridgeConfiguration,
+) -> Result<ControlResponse> {
+    Ok(ControlClient::new(&configuration.control_socket_path)
+        .request(&request)
+        .map_err(|_| ToolCallRefusal(CONTROL_REFUSAL_TRANSPORT))?)
+}
+
+fn complete_tool_call(id: Value, result: Result<ControlResponse>) -> Value {
     match result {
         Ok(response) => {
             let structured = serde_json::to_value(&response).unwrap_or_else(|_| json!({}));
@@ -521,15 +670,19 @@ fn handle_tool_call(
                 }
             })
         }
-        Err(error) => json!({
-            "jsonrpc":"2.0",
-            "id":id,
-            "result":{
-                "content":[{"type":"text","text":tool_call_refusal_text(&error)}],
-                "isError":true
-            }
-        }),
+        Err(error) => tool_call_error(id, &tool_call_refusal_text(&error)),
     }
+}
+
+fn tool_call_error(id: Value, message: &str) -> Value {
+    json!({
+        "jsonrpc":"2.0",
+        "id":id,
+        "result":{
+            "content":[{"type":"text","text":message}],
+            "isError":true
+        }
+    })
 }
 
 fn tool_call_refusal_text(error: &anyhow::Error) -> String {
@@ -606,6 +759,13 @@ fn write_json_line(writer: &mut impl Write, value: &Value) -> Result<()> {
     writer.write_all(b"\n")?;
     writer.flush()?;
     Ok(())
+}
+
+fn write_shared_json_line(writer: &Mutex<UnixStream>, value: &Value) -> Result<()> {
+    let mut writer = writer
+        .lock()
+        .map_err(|_| anyhow::anyhow!("architect MCP response writer is unavailable"))?;
+    write_json_line(&mut *writer, value)
 }
 
 fn json_rpc_error(id: Value, code: i32, message: &str) -> Value {
@@ -744,7 +904,6 @@ mod tests {
         ActionName, ControlAction, ControlErrorCode, ControlResult, SessionState,
         SessionStatusSnapshot,
     };
-    use std::net::Shutdown;
     use std::process::{Command, Stdio};
     use std::thread::JoinHandle;
     use std::time::Instant;
@@ -1008,6 +1167,254 @@ mod tests {
         let mut reader = BufReader::new(stream);
         assert!(read_bounded_line(&mut reader).unwrap().is_some());
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn session_wait_keeps_mcp_responsive_and_returns_terminal_result() {
+        let fixture = BridgeTestFixture::new();
+        let control = bind_private_listener(&fixture.configuration.control_socket_path);
+        let (request_ready_tx, request_ready_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let control_thread = spawn_control_server(control, move |request| {
+            request_ready_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+            let mut session = status_snapshot();
+            session.state = SessionState::Completed;
+            session.version = 9;
+            session.terminal_detail = Some("all tasks completed".into());
+            ControlResponse::success(&request.request_id, ControlResult::Session { session })
+        });
+
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let configuration = fixture.configuration.clone();
+        let bridge_thread = std::thread::spawn(move || {
+            serve_mcp_connection(&mut server, &configuration).unwrap();
+        });
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        write_json_line(
+            &mut client,
+            &json!({
+                "jsonrpc":"2.0",
+                "id":20,
+                "method":"tools/call",
+                "params":{
+                    "name":"session_wait",
+                    "arguments":{"after_session_version":4}
+                }
+            }),
+        )
+        .unwrap();
+        request_ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        write_json_line(
+            &mut client,
+            &json!({"jsonrpc":"2.0","id":21,"method":"ping"}),
+        )
+        .unwrap();
+        let ping: Value =
+            serde_json::from_slice(trim_line(&read_bounded_line(&mut reader).unwrap().unwrap()))
+                .unwrap();
+        assert_eq!(ping["id"], 21);
+
+        finish_tx.send(()).unwrap();
+        let terminal: Value =
+            serde_json::from_slice(trim_line(&read_bounded_line(&mut reader).unwrap().unwrap()))
+                .unwrap();
+        assert_eq!(terminal["id"], 20);
+        assert_eq!(terminal["result"]["isError"], false);
+        assert_eq!(
+            terminal["result"]["structuredContent"]["result"]["session"]["state"],
+            "completed"
+        );
+        assert_eq!(
+            terminal["result"]["structuredContent"]["result"]["session"]["version"],
+            9
+        );
+
+        client.shutdown(Shutdown::Write).unwrap();
+        bridge_thread.join().unwrap();
+        let request = control_thread.join().unwrap();
+        assert!(matches!(
+            request.action,
+            ControlAction::SessionWait {
+                after_session_version: 4
+            }
+        ));
+    }
+
+    #[test]
+    fn cancelling_session_wait_closes_only_its_control_subscription() {
+        let fixture = BridgeTestFixture::new();
+        let control = bind_private_listener(&fixture.configuration.control_socket_path);
+        let (request_ready_tx, request_ready_rx) = std::sync::mpsc::channel();
+        let control_thread = std::thread::spawn(move || {
+            let (mut stream, _) = control.accept().unwrap();
+            let frame = read_request_frame(&mut stream).unwrap();
+            let request: ControlRequest = serde_json::from_slice(&frame).unwrap();
+            request_ready_tx.send(()).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut probe = [0u8; 1];
+            assert_eq!(stream.read(&mut probe).unwrap(), 0);
+            request
+        });
+
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let configuration = fixture.configuration.clone();
+        let bridge_thread = std::thread::spawn(move || {
+            serve_mcp_connection(&mut server, &configuration).unwrap();
+        });
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        write_json_line(
+            &mut client,
+            &json!({
+                "jsonrpc":"2.0",
+                "id":30,
+                "method":"tools/call",
+                "params":{
+                    "name":"session_wait",
+                    "arguments":{"after_session_version":6}
+                }
+            }),
+        )
+        .unwrap();
+        request_ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        write_json_line(
+            &mut client,
+            &json!({"jsonrpc":"2.0","id":31,"method":"ping"}),
+        )
+        .unwrap();
+        let first_ping: Value =
+            serde_json::from_slice(trim_line(&read_bounded_line(&mut reader).unwrap().unwrap()))
+                .unwrap();
+        assert_eq!(first_ping["id"], 31);
+
+        write_json_line(
+            &mut client,
+            &json!({
+                "jsonrpc":"2.0",
+                "method":"notifications/cancelled",
+                "params":{"requestId":30,"reason":"architect turn interrupted"}
+            }),
+        )
+        .unwrap();
+        let request = control_thread.join().unwrap();
+        assert!(matches!(
+            request.action,
+            ControlAction::SessionWait {
+                after_session_version: 6
+            }
+        ));
+
+        write_json_line(
+            &mut client,
+            &json!({"jsonrpc":"2.0","id":32,"method":"ping"}),
+        )
+        .unwrap();
+        let second_ping: Value =
+            serde_json::from_slice(trim_line(&read_bounded_line(&mut reader).unwrap().unwrap()))
+                .unwrap();
+        assert_eq!(second_ping["id"], 32);
+        client.shutdown(Shutdown::Write).unwrap();
+        bridge_thread.join().unwrap();
+    }
+
+    #[test]
+    fn a_new_session_wait_replaces_an_abandoned_subscription() {
+        let fixture = BridgeTestFixture::new();
+        let control = bind_private_listener(&fixture.configuration.control_socket_path);
+        let (first_ready_tx, first_ready_rx) = std::sync::mpsc::channel();
+        let control_thread = std::thread::spawn(move || {
+            let (mut first_stream, _) = control.accept().unwrap();
+            let first_frame = read_request_frame(&mut first_stream).unwrap();
+            let first_request: ControlRequest = serde_json::from_slice(&first_frame).unwrap();
+            first_ready_tx.send(()).unwrap();
+            first_stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut probe = [0u8; 1];
+            assert_eq!(first_stream.read(&mut probe).unwrap(), 0);
+
+            let (mut second_stream, _) = control.accept().unwrap();
+            let second_frame = read_request_frame(&mut second_stream).unwrap();
+            let second_request: ControlRequest = serde_json::from_slice(&second_frame).unwrap();
+            let mut session = status_snapshot();
+            session.state = SessionState::Completed;
+            session.version = 13;
+            session.terminal_detail = Some("completed while the first wait was abandoned".into());
+            let response = ControlResponse::success(
+                &second_request.request_id,
+                ControlResult::Session { session },
+            );
+            write_response_frame(&mut second_stream, &serde_json::to_vec(&response).unwrap())
+                .unwrap();
+            (first_request, second_request)
+        });
+
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let configuration = fixture.configuration.clone();
+        let bridge_thread = std::thread::spawn(move || {
+            serve_mcp_connection(&mut server, &configuration).unwrap();
+        });
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        for id in [40, 41] {
+            write_json_line(
+                &mut client,
+                &json!({
+                    "jsonrpc":"2.0",
+                    "id":id,
+                    "method":"tools/call",
+                    "params":{
+                        "name":"session_wait",
+                        "arguments":{"after_session_version":8}
+                    }
+                }),
+            )
+            .unwrap();
+            if id == 40 {
+                first_ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+        }
+
+        let terminal: Value =
+            serde_json::from_slice(trim_line(&read_bounded_line(&mut reader).unwrap().unwrap()))
+                .unwrap();
+        assert_eq!(terminal["id"], 41);
+        assert_eq!(terminal["result"]["isError"], false);
+        assert_eq!(
+            terminal["result"]["structuredContent"]["result"]["session"]["state"],
+            "completed"
+        );
+        assert_eq!(
+            terminal["result"]["structuredContent"]["result"]["session"]["version"],
+            13
+        );
+
+        client.shutdown(Shutdown::Write).unwrap();
+        bridge_thread.join().unwrap();
+        let (first_request, second_request) = control_thread.join().unwrap();
+        for request in [first_request, second_request] {
+            assert!(matches!(
+                request.action,
+                ControlAction::SessionWait {
+                    after_session_version: 8
+                }
+            ));
+        }
     }
 
     #[test]

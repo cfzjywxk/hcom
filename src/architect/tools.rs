@@ -53,10 +53,13 @@ fn tool_description(action: ActionName) -> &'static str {
             "Draft or replace the bounded ordered task plan. Read the current project documentation first and set each task's repository_root to the real absolute path of that task's source directory; it need not equal or live under the project directory. You must faithfully select the directory identified by the named source plan: hcom takes that path only as the source directory handed to the task's workers. It never runs Git and never inspects the directory's identity, history, or working-tree state, and it has no configured host-path allowlist; the only binding requirement is that the path is an existing directory. You may create or update architecture plans, current_todo, and discussion records before this call. After this call, do not modify a bound task directory yourself: hcom performs no drift or identity check, so a concurrent write there can be silently swept into the developer's commit and nothing will report it. This call never starts a worker. Enumerate every returned task binding to the human with ordinal, task_key, and repository_root, then present the exact plan version and exact plan hash. Do not abbreviate or omit a writable directory binding. If the human's current message explicitly directs you to follow, implement, execute, proceed with, or complete a named existing detailed plan, specification, or current_todo (including an instruction meaning \"按照 current_todo\" or \"按照 <named plan> 推进完成开发\"), that message authorizes starting the faithfully derived plan in this same turn after you present these bindings; otherwise wait for a later explicit approval. An explicit instruction not to start always wins."
         }
         ActionName::SessionApproveAndStart => {
-            "Start the exact draft only with explicit human execution authorization in this architect conversation. Authorization is valid either when the human approves the complete displayed task binding list (ordinal, task_key, and repository_root) with its plan version and plan hash, or when the human's current message explicitly directs you to follow, implement, execute, proceed with, or complete a named existing detailed plan, specification, or current_todo (including an instruction meaning \"按照 current_todo\" or \"按照 <named plan> 推进完成开发\") and this draft faithfully derives from that source. In the latter case, present the complete returned bindings, plan version, and plan hash, then call this tool in the same turn without requiring a second human reply. A request only to read, analyze, discuss, summarize, draft, or update a plan is not execution authorization. An explicit instruction not to start always wins. Never infer authorization from vague continuation language or from the existence of a plan. When this call returns a running worker, do not immediately poll session_status and never poll on a roughly 30-second cadence. The foreground supervisor monitors the worker without model calls; unless the human asks for status or immediate intervention is required, wait 180 to 300 seconds before the first status check and between later checks."
+            "Start the exact draft only with explicit human execution authorization in this architect conversation. Authorization is valid either when the human approves the complete displayed task binding list (ordinal, task_key, and repository_root) with its plan version and plan hash, or when the human's current message explicitly directs you to follow, implement, execute, proceed with, or complete a named existing detailed plan, specification, or current_todo (including an instruction meaning \"按照 current_todo\" or \"按照 <named plan> 推进完成开发\") and this draft faithfully derives from that source. In the latter case, present the complete returned bindings, plan version, and plan hash, then call this tool in the same turn without requiring a second human reply. A request only to read, analyze, discuss, summarize, draft, or update a plan is not execution authorization. An explicit instruction not to start always wins. Never infer authorization from vague continuation language or from the existence of a plan. When this call returns a running session, immediately call session_wait exactly once with after_session_version set to the returned session.version. Do not sleep, run a timer, call session_status, or otherwise poll for progress. The foreground supervisor advances Developer and Reviewer without Architect model calls and completes the pending wait only when the session becomes completed, needs_human, failed, or canceled."
+        }
+        ActionName::SessionWait => {
+            "Passively wait for the already-authorized foreground run to become completed, needs_human, failed, or canceled. This is a terminal-only event subscription, not polling: normal Developer-to-Reviewer and automatic correction transitions do not complete it. After starting a run, call it exactly once with after_session_version equal to the returned session.version; do not combine it with sleep, timers, background-terminal waits, repeated calls, or session_status. Cancellation or interruption of this tool never cancels the run. If the human later explicitly asks to resume waiting, call this tool again with the most recently observed session.version; the new call replaces any abandoned subscription, and a terminal state reached during the gap is retained and returns immediately. Do not re-arm an interrupted wait unless the human explicitly requests it."
         }
         ActionName::SessionStatus => {
-            "Read the sanitized in-memory status of this foreground architect run. This tool is not a keepalive: the foreground supervisor monitors worker lifecycle internally without Architect model calls. While a developer or reviewer is running, do not poll on a roughly 30-second cadence. Unless the human explicitly asks for status or immediate intervention is required, wait at least 180 seconds and normally 180 to 300 seconds after dispatch and between status calls. Prefer one native wait or sleep over repeated tool calls so Architect requests and tokens are not wasted. Once a returned state is terminal or needs_human, stop polling."
+            "Read the sanitized in-memory status of this foreground architect run only when the human explicitly asks for current status. This tool is not a keepalive and must never be used to monitor a running Developer or Reviewer. After dispatch, use one session_wait call; do not sleep, run timers, or poll session_status."
         }
         ActionName::SessionCancel => {
             "Cancel this foreground run at an exact version only after the human requests cancellation."
@@ -120,6 +123,10 @@ fn action_schema(action: ActionName, developer_adapter: &str, reviewer_adapter: 
                     }),
                 ),
             ],
+        ),
+        ActionName::SessionWait => object_schema(
+            &["after_session_version"],
+            [("after_session_version", uint_schema())],
         ),
         ActionName::SessionStatus => object_schema(&[], []),
         ActionName::SessionCancel => object_schema(
@@ -489,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_status_contract_uses_low_frequency_model_polling() {
+    fn worker_status_contract_uses_one_terminal_wait_without_model_polling() {
         let tools = tool_definitions("codex-developer", "claude-reviewer-2.1.220");
         let approve = tools
             .iter()
@@ -497,18 +504,52 @@ mod tests {
             .unwrap()["description"]
             .as_str()
             .unwrap();
+        let wait_tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "session_wait")
+            .unwrap();
+        let wait = wait_tool["description"].as_str().unwrap();
         let status = tools
             .iter()
             .find(|tool| tool["name"] == "session_status")
             .unwrap()["description"]
             .as_str()
             .unwrap();
-        for description in [approve, status] {
-            assert!(description.contains("30-second cadence"));
-            assert!(description.contains("180 to 300 seconds"));
+        assert!(approve.contains("immediately call session_wait exactly once"));
+        assert!(approve.contains("Do not sleep"));
+        for terminal in ["completed", "needs_human", "failed", "canceled"] {
+            assert!(wait.contains(terminal));
         }
+        assert!(wait.contains("terminal-only event subscription"));
+        assert!(wait.contains("normal Developer-to-Reviewer"));
+        assert!(wait.contains("never cancels the run"));
+        assert!(wait.contains("replaces any abandoned subscription"));
+        assert!(wait.contains("retained and returns immediately"));
+        assert!(wait.contains("human explicitly requests it"));
+        assert_eq!(
+            wait_tool["inputSchema"]["required"],
+            json!(["after_session_version"])
+        );
+        assert!(status.contains("only when the human explicitly asks"));
         assert!(status.contains("not a keepalive"));
-        assert!(status.contains("requests and tokens"));
-        assert!(status.contains("stop polling"));
+        assert!(status.contains("must never be used to monitor"));
+        for description in [approve, wait, status] {
+            assert!(!description.contains("180 to 300 seconds"));
+            assert!(!description.contains("30-second cadence"));
+        }
+
+        let action = control_action(
+            "session_wait",
+            json!({"after_session_version":7}),
+            "codex-developer",
+            "claude-reviewer-2.1.220",
+        )
+        .unwrap();
+        assert!(matches!(
+            action,
+            ControlAction::SessionWait {
+                after_session_version: 7
+            }
+        ));
     }
 }
