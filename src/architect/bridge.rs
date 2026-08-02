@@ -1514,12 +1514,10 @@ mod tests {
                         "tasks":[{
                             "task_key":"p9-task-1",
                             "title":"Phase 9 Task 1",
-                            "objective":"Create task1.txt with exactly two lines:\nphase9-task-1\nreview-stage: pending",
                             "repository_root":fixture.configuration.project_root,
-                            "acceptance_criteria":["first review requests changes"],
-                            "required_checks":["/usr/bin/test -f task1.txt"],
-                            "allowed_paths":["README.md","task1.txt"],
-                            "forbidden_actions":["push"],
+                            "task_document_path":"/project/current_todo.md",
+                            "design_document_paths":["/project/architecture.md"],
+                            "task_selector":"FBTC-01",
                             "max_review_rounds":3
                         }]
                     },
@@ -1566,8 +1564,9 @@ mod tests {
             } if developer_adapter == "codex-developer"
                 && reviewer_adapter == "claude-reviewer-2.1.220"
                 && tasks.len() == 1
-                && tasks[0].objective
-                    == "Create task1.txt with exactly two lines:\nphase9-task-1\nreview-stage: pending"
+                && tasks[0].task_document_path == "/project/current_todo.md"
+                && tasks[0].design_document_paths == ["/project/architecture.md"]
+                && tasks[0].task_selector == "FBTC-01"
         ));
         assert!(matches!(
             control_request.caller,

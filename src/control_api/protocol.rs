@@ -2,12 +2,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
 const MAX_ID_BYTES: usize = 128;
-const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_TASKS: usize = 64;
 const MAX_LIST_ITEMS: usize = 256;
@@ -218,12 +217,10 @@ impl CapabilitySnapshot {
 pub struct TaskDraft {
     pub task_key: String,
     pub title: String,
-    pub objective: String,
     pub repository_root: String,
-    pub acceptance_criteria: Vec<String>,
-    pub required_checks: Vec<String>,
-    pub allowed_paths: Vec<String>,
-    pub forbidden_actions: Vec<String>,
+    pub task_document_path: String,
+    pub design_document_paths: Vec<String>,
+    pub task_selector: String,
     pub max_review_rounds: u8,
 }
 
@@ -243,40 +240,18 @@ impl TaskDraft {
         }
         validate_free_text("task title", &self.title, 512, false)?;
         validate_repository_root(&self.repository_root)?;
-        // Objectives are the one plan field that must preserve human-authored
-        // multi-line instructions (for example, exact file contents). The
-        // remaining task fields stay single-line list entries.
-        validate_free_text("task objective", &self.objective, MAX_TEXT_BYTES, true)?;
-        for (label, values, max_bytes) in [
-            (
-                "acceptance criterion",
-                &self.acceptance_criteria,
-                MAX_TEXT_BYTES,
-            ),
-            ("required check", &self.required_checks, 4096),
-            ("forbidden action", &self.forbidden_actions, 4096),
-        ] {
-            validate_list_len(label, values)?;
-            let mut unique = BTreeSet::new();
-            for value in values {
-                validate_free_text(label, value, max_bytes, false)?;
-                if !unique.insert(value) {
-                    return Err(ProtocolValidationError::new(format!(
-                        "{label} entries must be unique"
-                    )));
-                }
-            }
-        }
-        validate_list_len("allowed path", &self.allowed_paths)?;
-        let mut allowed_paths = BTreeSet::new();
-        for path in &self.allowed_paths {
-            validate_task_path(path)?;
-            if !allowed_paths.insert(path) {
+        validate_document_path("task document path", &self.task_document_path)?;
+        validate_list_len("design document path", &self.design_document_paths)?;
+        let mut design_document_paths = BTreeSet::new();
+        for path in &self.design_document_paths {
+            validate_document_path("design document path", path)?;
+            if !design_document_paths.insert(path) {
                 return Err(ProtocolValidationError::new(
-                    "allowed path entries must be unique",
+                    "design document path entries must be unique",
                 ));
             }
         }
+        validate_single_line("task selector", &self.task_selector, 4096)?;
         if !(1..=20).contains(&self.max_review_rounds) {
             return Err(ProtocolValidationError::new(
                 "max_review_rounds must be between 1 and 20",
@@ -318,6 +293,13 @@ pub enum TaskState {
     NeedsHuman,
     Failed,
     Canceled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewerVerdict {
+    Lgtm,
+    RequestChanges,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -409,6 +391,9 @@ pub struct TaskStatusSnapshot {
     pub ordinal: u32,
     pub state: TaskState,
     pub repository_root: String,
+    pub task_document_path: String,
+    pub design_document_paths: Vec<String>,
+    pub task_selector: String,
     pub branch: Option<String>,
     pub review_round: u32,
     pub max_review_rounds: u8,
@@ -417,6 +402,9 @@ pub struct TaskStatusSnapshot {
     pub developer_session_bound: bool,
     pub reviewer_session_bound: bool,
     pub outcome_detail: Option<String>,
+    pub latest_developer_final_path: Option<String>,
+    pub final_reviewer_message_paths: Vec<String>,
+    pub reviewer_verdict: Option<ReviewerVerdict>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -573,16 +561,11 @@ fn is_c1(character: char) -> bool {
     ('\u{80}'..='\u{9f}').contains(&character)
 }
 
-fn validate_task_path(value: &str) -> Result<(), ProtocolValidationError> {
-    validate_free_text("task path", value, MAX_PATH_BYTES, false)?;
-    let path = Path::new(value);
-    if path.is_absolute()
-        || !path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
-    {
+fn validate_document_path(label: &str, value: &str) -> Result<(), ProtocolValidationError> {
+    validate_free_text(label, value, MAX_PATH_BYTES, false)?;
+    if !Path::new(value).is_absolute() {
         return Err(ProtocolValidationError::new(
-            "task path must be workspace-relative and normalized",
+            "task and design document paths must be absolute",
         ));
     }
     Ok(())
@@ -633,12 +616,10 @@ mod tests {
         TaskDraft {
             task_key: key.into(),
             title: format!("Task {key}"),
-            objective: format!("Complete {key}"),
             repository_root: "/source/example".into(),
-            acceptance_criteria: vec!["the bounded behavior works".into()],
-            required_checks: vec!["cargo test".into()],
-            allowed_paths: vec!["src".into()],
-            forbidden_actions: vec!["do not push".into()],
+            task_document_path: format!("/project/tasks/{key}.md"),
+            design_document_paths: vec!["/project/design.md".into()],
+            task_selector: key.into(),
             max_review_rounds: 2,
         }
     }
@@ -675,21 +656,32 @@ mod tests {
     }
 
     #[test]
-    fn task_objective_preserves_bounded_multiline_instructions_only() {
-        let mut multiline = task("multiline");
-        multiline.objective =
-            "Create task.txt with exactly two lines:\nphase9-task\nstatus: complete".into();
-        assert!(multiline.validate().is_ok());
+    fn task_contract_accepts_only_bounded_absolute_document_paths_and_selector() {
+        let mut candidate = task("file-backed");
+        assert!(candidate.validate().is_ok());
 
-        multiline.objective.push('\r');
-        assert!(multiline.validate().is_err());
-        multiline.objective =
-            "Create task.txt with exactly two lines:\nphase9-task\nstatus: complete".into();
-        multiline.title = "Task\nmultiline".into();
-        assert!(multiline.validate().is_err());
-        multiline.title = "Task multiline".into();
-        multiline.acceptance_criteria = vec!["first line\nsecond line".into()];
-        assert!(multiline.validate().is_err());
+        candidate.task_document_path = "tasks/current.md".into();
+        assert!(candidate.validate().is_err());
+        candidate.task_document_path = "/project/tasks/current.md".into();
+        candidate.design_document_paths = vec!["design.md".into()];
+        assert!(candidate.validate().is_err());
+        candidate.design_document_paths =
+            vec!["/project/design.md".into(), "/project/design.md".into()];
+        assert!(candidate.validate().is_err());
+        candidate.design_document_paths = Vec::new();
+        candidate.task_selector = String::new();
+        assert!(candidate.validate().is_err());
+        candidate.task_selector = "FBTC-01\nhidden".into();
+        assert!(candidate.validate().is_err());
+    }
+
+    #[test]
+    fn document_paths_are_shape_checked_without_filesystem_preflight() {
+        let mut candidate = task("missing-files-are-worker-concerns");
+        candidate.task_document_path = "/definitely/not/present/../current_todo.md".into();
+        candidate.design_document_paths =
+            vec!["/also/not/present/file_backed_task_contract.md".into()];
+        assert!(candidate.validate().is_ok());
     }
 
     #[test]
@@ -705,6 +697,32 @@ mod tests {
         encoded["approval_confirmed"] = false.into();
         let action: ControlAction = serde_json::from_value(encoded).unwrap();
         assert!(action.validate().is_err());
+    }
+
+    #[test]
+    fn previous_protocol_version_fails_closed() {
+        assert_eq!(PROTOCOL_VERSION, 4);
+        let request = ControlRequest {
+            protocol_version: 3,
+            request_id: "v3-request".into(),
+            caller: CallerAuth::Human {
+                process_birth: "123:456".into(),
+            },
+            action: ControlAction::SessionStatus,
+        };
+        assert!(request.validate().is_err());
+
+        let response = ControlResponse {
+            protocol_version: 3,
+            request_id: "v3-response".into(),
+            ok: false,
+            result: None,
+            error: Some(ControlErrorBody {
+                code: ControlErrorCode::InvalidRequest,
+                message: "old binary".into(),
+            }),
+        };
+        assert!(response.validate().is_err());
     }
 
     #[test]

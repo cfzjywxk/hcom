@@ -373,9 +373,22 @@ impl TaskLaneSupervisor {
         for (ordinal, task) in self.core.tasks().iter().enumerate() {
             let spec = &task.spec;
             plan.push_str(&format!(
-                "## task {ordinal}: {}\n\n- title: {}\n- repository: {}\n- max review rounds: {}\n\n{}\n\n",
-                spec.task_key, spec.title, spec.repository_root, spec.max_review_rounds, spec.objective
+                "## task {ordinal}: {}\n\n- title: {}\n- repository root: {}\n- task document path: {}\n- task selector: {}\n- max review rounds: {}\n- design document paths:\n",
+                spec.task_key,
+                spec.title,
+                spec.repository_root,
+                spec.task_document_path,
+                spec.task_selector,
+                spec.max_review_rounds,
             ));
+            if spec.design_document_paths.is_empty() {
+                plan.push_str("  - (none)\n");
+            } else {
+                for path in &spec.design_document_paths {
+                    plan.push_str(&format!("  - {path}\n"));
+                }
+            }
+            plan.push('\n');
         }
         plan
     }
@@ -870,44 +883,29 @@ impl TaskLaneSupervisor {
             .ok_or_else(|| anyhow!("turn prompt task ordinal is out of range"))?;
         let spec = &task.spec;
         let mut prompt = String::new();
+        let role_name = match role {
+            WorkerRole::Developer => "Developer",
+            WorkerRole::Reviewer => "Reviewer",
+        };
         prompt.push_str(&format!(
-            "# Task {task_ordinal}: {}\n\n{}\n\n## Context\n\n- repository: {}\n- project directory: {}\n",
-            spec.title,
-            spec.objective,
-            spec.repository_root,
-            self.startup.project_root.display()
+            "You are the task {role_name}.\n\nRepository:\n{}\n\nTask file:\n{}\n\nDesign files:\n",
+            spec.repository_root, spec.task_document_path,
         ));
+        if spec.design_document_paths.is_empty() {
+            prompt.push_str("- (none)\n");
+        } else {
+            for path in &spec.design_document_paths {
+                prompt.push_str(&format!("- {path}\n"));
+            }
+        }
+        prompt.push_str(&format!("\nTask selector:\n{}\n", spec.task_selector));
         prompt.push_str(
-            "\nBefore doing any work, inspect and follow the instruction files applicable to \
-             both the project directory and the task repository (including AGENTS.md, \
+            "\nRead the task and design files and work only on the selected task. Before doing \
+             any work, inspect and follow every applicable instruction file (including AGENTS.md, \
              AGENTS.override.md, and nested instruction files for paths you touch). Codex has \
-             already loaded its native user/project configuration; the repository is also \
-             registered as a native workspace root when it differs from the project directory.\n",
+             already loaded its native user/project configuration; the repository is registered \
+             as a native workspace root when it differs from the project directory.\n",
         );
-        if !spec.acceptance_criteria.is_empty() {
-            prompt.push_str("\n## Acceptance criteria\n\n");
-            for item in &spec.acceptance_criteria {
-                prompt.push_str(&format!("- {item}\n"));
-            }
-        }
-        if !spec.required_checks.is_empty() {
-            prompt.push_str("\n## Required checks\n\n");
-            for item in &spec.required_checks {
-                prompt.push_str(&format!("- {item}\n"));
-            }
-        }
-        if !spec.allowed_paths.is_empty() {
-            prompt.push_str("\n## Paths in scope\n\n");
-            for item in &spec.allowed_paths {
-                prompt.push_str(&format!("- {item}\n"));
-            }
-        }
-        if !spec.forbidden_actions.is_empty() {
-            prompt.push_str("\n## Forbidden actions\n\n");
-            for item in &spec.forbidden_actions {
-                prompt.push_str(&format!("- {item}\n"));
-            }
-        }
 
         // Relay the peer's previous message verbatim (already redacted and
         // bounded upstream). hcom does not interpret it.
@@ -1437,16 +1435,26 @@ mod tests {
             }
         }
 
-        fn task(&self, key: &str, allowed_paths: &[&str], max_rounds: u8) -> TaskDraft {
+        fn task(&self, key: &str, _legacy_scope: &[&str], max_rounds: u8) -> TaskDraft {
+            let task_document_path = self.project_root.join(format!("task-{key}.md"));
+            let design_document_path = self.project_root.join("design.md");
+            fs::write(
+                &task_document_path,
+                format!("TASK-DOCUMENT-CONTENT-MUST-NOT-BE-IN-PROMPT: {key}\n"),
+            )
+            .unwrap();
+            fs::write(
+                &design_document_path,
+                "DESIGN-DOCUMENT-CONTENT-MUST-NOT-BE-IN-PROMPT\n",
+            )
+            .unwrap();
             TaskDraft {
                 task_key: key.into(),
                 title: format!("Task {key}"),
-                objective: format!("Implement {key}"),
                 repository_root: self.repository.to_string_lossy().into_owned(),
-                acceptance_criteria: vec![format!("{key} is complete")],
-                required_checks: vec!["cargo test --locked".into()],
-                allowed_paths: allowed_paths.iter().map(|path| (*path).into()).collect(),
-                forbidden_actions: vec!["do not push or install".into()],
+                task_document_path: task_document_path.to_string_lossy().into_owned(),
+                design_document_paths: vec![design_document_path.to_string_lossy().into_owned()],
+                task_selector: key.into(),
                 max_review_rounds: max_rounds,
             }
         }
@@ -1551,6 +1559,30 @@ mod tests {
                     self.sources.clone(),
                 )
                 .unwrap()
+            }
+
+            pub(crate) fn task(
+                &self,
+                task_key: &str,
+                title: &str,
+                task_body: &str,
+                max_review_rounds: u8,
+            ) -> TaskDraft {
+                let task_document_path = self.project_root.join(format!("task-{task_key}.md"));
+                fs::write(
+                    &task_document_path,
+                    format!("# {title}\n\nTask selector: {task_key}\n\n{task_body}\n"),
+                )
+                .unwrap();
+                TaskDraft {
+                    task_key: task_key.into(),
+                    title: title.into(),
+                    repository_root: self.repository.to_string_lossy().into_owned(),
+                    task_document_path: task_document_path.to_string_lossy().into_owned(),
+                    design_document_paths: Vec::new(),
+                    task_selector: task_key.into(),
+                    max_review_rounds,
+                }
             }
 
             /// Worker processes this fixture's own run leaves behind. A real
@@ -2407,7 +2439,13 @@ mod tests {
             assert!(prompt.contains("AGENTS.override.md"));
             assert!(prompt.contains(fixture.project_root.to_str().unwrap()));
             assert!(prompt.contains(fixture.repository.to_str().unwrap()));
+            assert!(prompt.contains("task-review-loop.md"));
+            assert!(prompt.contains("design.md"));
+            assert!(prompt.contains("Task selector:\nreview-loop"));
+            assert!(!prompt.contains("TASK-DOCUMENT-CONTENT-MUST-NOT-BE-IN-PROMPT"));
+            assert!(!prompt.contains("DESIGN-DOCUMENT-CONTENT-MUST-NOT-BE-IN-PROMPT"));
         }
+        assert!(!development_prompt.contains("first attempt: added the module"));
         assert!(review_prompt.contains("first attempt: added the module"));
         assert!(review_prompt.contains("VERDICT: LGTM"));
         assert!(review_prompt.contains("VERDICT: REQUEST_CHANGES"));
@@ -2430,6 +2468,129 @@ mod tests {
             .map(|(_, _, prompt)| prompt.clone())
             .expect("re-review prompt");
         assert!(rereview_prompt.contains("second attempt: handled overflow"));
+
+        let plan = fs::read_to_string(
+            fixture
+                .project_root
+                .join("hcom-tasks/run-driver-test/plan.md"),
+        )
+        .unwrap();
+        assert!(plan.contains("task document path:"));
+        assert!(plan.contains("task-review-loop.md"));
+        assert!(plan.contains("design document paths:"));
+        assert!(plan.contains("task selector: review-loop"));
+        assert!(!plan.contains("TASK-DOCUMENT-CONTENT-MUST-NOT-BE-IN-PROMPT"));
+        assert!(!plan.contains("DESIGN-DOCUMENT-CONTENT-MUST-NOT-BE-IN-PROMPT"));
+    }
+
+    #[test]
+    fn large_or_missing_task_documents_are_never_preflighted_or_copied_into_prompts() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+
+        let large = fixture.task("large-documents", &["src"], 2);
+        let large_task_marker = "LARGE-TASK-DOCUMENT-CONTENT-MUST-STAY-ON-DISK";
+        let large_design_marker = "LARGE-DESIGN-DOCUMENT-CONTENT-MUST-STAY-ON-DISK";
+        fs::write(
+            &large.task_document_path,
+            format!(
+                "{large_task_marker}\n{}",
+                "t".repeat(crate::worker::runtime::MAX_RUNTIME_PROMPT_BYTES * 2)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &large.design_document_paths[0],
+            format!(
+                "{large_design_marker}\n{}",
+                "d".repeat(crate::worker::runtime::MAX_RUNTIME_PROMPT_BYTES * 2)
+            ),
+        )
+        .unwrap();
+
+        let mut missing = fixture.task("missing-documents", &["src"], 2);
+        missing.task_document_path = fixture
+            .project_root
+            .join("does-not-exist-task.md")
+            .to_string_lossy()
+            .into_owned();
+        missing.design_document_paths = vec![
+            fixture
+                .project_root
+                .join("does-not-exist-design.md")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+
+        let scripts = ["large-documents", "missing-documents"]
+            .into_iter()
+            .map(|task_key| {
+                task_script(
+                    task_key,
+                    vec![
+                        FakeTurnScript::new(
+                            WorkerRole::Developer,
+                            RuntimeTurnPurpose::InitialDevelopment,
+                            [ready("developer completed the selected task")],
+                        ),
+                        FakeTurnScript::new(
+                            WorkerRole::Reviewer,
+                            RuntimeTurnPurpose::InitialReview,
+                            [lgtm("reviewer accepted the selected task")],
+                        ),
+                    ],
+                    vec![Mutation::None, Mutation::None],
+                )
+            })
+            .collect();
+        let mut supervisor = fixture.supervisor(scripts, Arc::clone(&audit));
+        start(&mut supervisor, vec![large.clone(), missing.clone()]);
+        let snapshot = drive_terminal(&mut supervisor);
+        assert_eq!(snapshot.state, SessionState::Completed);
+        assert!(
+            snapshot
+                .tasks
+                .iter()
+                .all(|task| task.state == TaskState::Lgtm)
+        );
+
+        let audit = audit.lock().unwrap();
+        assert_eq!(audit.prompts.len(), 4);
+        for (_, _, prompt) in &audit.prompts {
+            assert!(prompt.len() < crate::worker::runtime::MAX_RUNTIME_PROMPT_BYTES);
+            assert!(!prompt.contains(large_task_marker));
+            assert!(!prompt.contains(large_design_marker));
+        }
+        assert!(
+            audit
+                .prompts
+                .iter()
+                .any(|(_, _, prompt)| prompt.contains(&large.task_document_path))
+        );
+        assert!(
+            audit
+                .prompts
+                .iter()
+                .any(|(_, _, prompt)| prompt.contains(&missing.task_document_path))
+        );
+        assert!(
+            audit
+                .prompts
+                .iter()
+                .any(|(_, _, prompt)| prompt.contains(&missing.design_document_paths[0]))
+        );
+        drop(audit);
+
+        let plan = fs::read_to_string(
+            fixture
+                .project_root
+                .join("hcom-tasks/run-driver-test/plan.md"),
+        )
+        .unwrap();
+        assert!(plan.contains(&large.task_document_path));
+        assert!(plan.contains(&missing.task_document_path));
+        assert!(!plan.contains(large_task_marker));
+        assert!(!plan.contains(large_design_marker));
     }
 
     #[test]
@@ -3415,20 +3576,15 @@ mod real_exec_tests {
     fn real_single_task_developer_then_reviewer_reaches_lgtm() {
         let fixture = RealFixture::new("fib");
         let mut supervisor = fixture.supervisor();
-        let task = TaskDraft {
-            task_key: "fib".into(),
-            title: "Add a fibonacci function".into(),
-            objective: "Create fib.py in the repository root containing a function \
-                        fib(n) that returns the nth Fibonacci number (fib(0)=0, fib(1)=1). \
-                        Commit it with git."
-                .into(),
-            repository_root: fixture.repository.to_string_lossy().into_owned(),
-            acceptance_criteria: vec!["fib.py exists and is committed".into()],
-            required_checks: vec!["python3 -c \"import fib; print(fib.fib(10))\"".into()],
-            allowed_paths: vec!["fib.py".into()],
-            forbidden_actions: vec!["do not push".into()],
-            max_review_rounds: 2,
-        };
+        let task = fixture.task(
+            "fib",
+            "Add a fibonacci function",
+            "Create fib.py in the repository root containing a function fib(n) that returns the \
+             nth Fibonacci number (fib(0)=0, fib(1)=1). Commit it with git. Acceptance: fib.py \
+             exists and is committed. Check with `python3 -c \"import fib; print(fib.fib(10))\"`. \
+             Do not push.",
+            2,
+        );
         let snapshot = fixture.run(&mut supervisor, vec![task]);
         assert_eq!(
             snapshot.state,
@@ -3455,42 +3611,26 @@ mod real_exec_tests {
     fn real_gate_one_review_loop_then_direct_approval_in_one_run() {
         let fixture = RealFixture::new("gate1");
         let mut supervisor = fixture.supervisor();
-        let repository = fixture.repository.to_string_lossy().into_owned();
         let tasks = vec![
-            TaskDraft {
-                task_key: "staged".into(),
-                title: "Add add() with its test".into(),
-                objective: "Create calc.py in the repository root containing a function \
-                            add(a, b) that returns a + b, and commit it. On this first \
-                            turn create ONLY calc.py — do not write any test file yet; \
-                            a later turn covers the tests."
-                    .into(),
-                repository_root: repository.clone(),
-                acceptance_criteria: vec![
-                    "calc.py defines add(a, b) returning a + b".into(),
-                    "test_calc.py exists and asserts add(2, 3) == 5; the task is \
-                     incomplete without it and must be rejected"
-                        .into(),
-                ],
-                required_checks: vec!["python3 test_calc.py".into()],
-                allowed_paths: vec!["calc.py".into(), "test_calc.py".into()],
-                forbidden_actions: vec!["do not push".into()],
-                max_review_rounds: 3,
-            },
-            TaskDraft {
-                task_key: "direct".into(),
-                title: "Add a greeting helper".into(),
-                objective: "Create greet.py in the repository root with a function \
-                            greet(name) returning the string \"hello <name>\", and \
-                            commit it."
-                    .into(),
-                repository_root: repository,
-                acceptance_criteria: vec!["greet.py defines greet(name)".into()],
-                required_checks: vec!["python3 -c \"import greet\"".into()],
-                allowed_paths: vec!["greet.py".into()],
-                forbidden_actions: vec!["do not push".into()],
-                max_review_rounds: 3,
-            },
+            fixture.task(
+                "staged",
+                "Add add() with its test",
+                "Create calc.py in the repository root containing a function add(a, b) that \
+                 returns a + b, and commit it. On the first turn create ONLY calc.py — do not \
+                 write any test file yet; a later turn covers the tests. Acceptance: calc.py \
+                 defines add(a, b), and test_calc.py exists and asserts add(2, 3) == 5; the task \
+                 is incomplete without it and must be rejected. Check with `python3 \
+                 test_calc.py`. Do not push.",
+                3,
+            ),
+            fixture.task(
+                "direct",
+                "Add a greeting helper",
+                "Create greet.py in the repository root with a function greet(name) returning the \
+                 string \"hello <name>\", and commit it. Check with `python3 -c \"import \
+                 greet\"`. Do not push.",
+                3,
+            ),
         ];
         let snapshot = fixture.run(&mut supervisor, tasks);
         assert_eq!(
@@ -3564,24 +3704,15 @@ mod real_exec_tests {
     fn real_rust_hello_world_task_reaches_lgtm_with_evidence() {
         let fixture = RealFixture::new("hello");
         let mut supervisor = fixture.supervisor();
-        let task = TaskDraft {
-            task_key: "hello".into(),
-            title: "Create a hello world Rust binary".into(),
-            objective: "In the repository root create a Cargo binary crate: \
-                        Cargo.toml naming the package `hello` with edition 2021, and \
-                        src/main.rs whose main function prints exactly `Hello, world!`. \
-                        Verify it with `cargo run`, then commit both files with git."
-                .into(),
-            repository_root: fixture.repository.to_string_lossy().into_owned(),
-            acceptance_criteria: vec![
-                "cargo run prints Hello, world!".into(),
-                "Cargo.toml and src/main.rs are committed".into(),
-            ],
-            required_checks: vec!["cargo run".into()],
-            allowed_paths: vec!["Cargo.toml".into(), "src".into()],
-            forbidden_actions: vec!["do not push".into()],
-            max_review_rounds: 2,
-        };
+        let task = fixture.task(
+            "hello",
+            "Create a hello world Rust binary",
+            "In the repository root create a Cargo binary crate: Cargo.toml naming the package \
+             `hello` with edition 2021, and src/main.rs whose main function prints exactly \
+             `Hello, world!`. Verify it with `cargo run`, then commit both files with git. Do not \
+             push.",
+            2,
+        );
         let snapshot = fixture.run(&mut supervisor, vec![task]);
         assert_eq!(
             snapshot.state,
@@ -3608,32 +3739,21 @@ mod real_exec_tests {
         let fixture = RealFixture::new("two");
         let mut supervisor = fixture.supervisor();
         let tasks = vec![
-            TaskDraft {
-                task_key: "greet".into(),
-                title: "Add a greeting module".into(),
-                objective: "Create greet.py in the repository root with a function \
-                            greet(name) returning the string \"hello <name>\". Commit it."
-                    .into(),
-                repository_root: fixture.repository.to_string_lossy().into_owned(),
-                acceptance_criteria: vec!["greet.py exists and is committed".into()],
-                required_checks: vec!["python3 -c \"import greet\"".into()],
-                allowed_paths: vec!["greet.py".into()],
-                forbidden_actions: vec!["do not push".into()],
-                max_review_rounds: 2,
-            },
-            TaskDraft {
-                task_key: "square".into(),
-                title: "Add a square module".into(),
-                objective: "Create square.py in the repository root with a function \
-                            square(n) returning n*n. Commit it."
-                    .into(),
-                repository_root: fixture.repository.to_string_lossy().into_owned(),
-                acceptance_criteria: vec!["square.py exists and is committed".into()],
-                required_checks: vec!["python3 -c \"import square\"".into()],
-                allowed_paths: vec!["square.py".into()],
-                forbidden_actions: vec!["do not push".into()],
-                max_review_rounds: 2,
-            },
+            fixture.task(
+                "greet",
+                "Add a greeting module",
+                "Create greet.py in the repository root with a function greet(name) returning the \
+                 string \"hello <name>\". Commit it and check with `python3 -c \"import greet\"`. \
+                 Do not push.",
+                2,
+            ),
+            fixture.task(
+                "square",
+                "Add a square module",
+                "Create square.py in the repository root with a function square(n) returning n*n. \
+                 Commit it and check with `python3 -c \"import square\"`. Do not push.",
+                2,
+            ),
         ];
         let snapshot = fixture.run(&mut supervisor, tasks);
         assert_eq!(

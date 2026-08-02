@@ -4,6 +4,7 @@
 //! decisions. A runtime owns only the provider process/transport needed to
 //! implement those logical operations.
 
+pub use crate::control_api::ReviewerVerdict;
 use crate::control_api::WorkerRole;
 use crate::worker::profile::{
     CodexApprovalPolicy, CodexInvocationProfile, CodexSandbox, DeveloperInvocationProfile,
@@ -562,13 +563,6 @@ impl DeveloperOutcomeV1 {
             _ => Ok(()),
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ReviewerVerdict {
-    Lgtm,
-    RequestChanges,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]

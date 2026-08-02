@@ -16,6 +16,6 @@ pub(crate) mod peer;
 
 pub use protocol::{
     ActionName, CallerAuth, CapabilitySnapshot, ControlAction, ControlErrorBody, ControlErrorCode,
-    ControlRequest, ControlResponse, ControlResult, NativeSessionMode, SessionState,
-    SessionStatusSnapshot, TaskDraft, TaskState, TaskStatusSnapshot, WorkerRole,
+    ControlRequest, ControlResponse, ControlResult, NativeSessionMode, ReviewerVerdict,
+    SessionState, SessionStatusSnapshot, TaskDraft, TaskState, TaskStatusSnapshot, WorkerRole,
 };

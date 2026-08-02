@@ -50,10 +50,10 @@ pub(crate) fn control_action(
 fn tool_description(action: ActionName) -> &'static str {
     match action {
         ActionName::SessionPlanReplace => {
-            "Draft or replace the bounded ordered task plan. Read the current project documentation first and set each task's repository_root to the real absolute path of that task's source directory; it need not equal or live under the project directory. You must faithfully select the directory identified by the named source plan: hcom takes that path only as the source directory handed to the task's workers. It never runs Git and never inspects the directory's identity, history, or working-tree state, and it has no configured host-path allowlist; the only binding requirement is that the path is an existing directory. You may create or update architecture plans, current_todo, and discussion records before this call. After this call, do not modify a bound task directory yourself: hcom performs no drift or identity check, so a concurrent write there can be silently swept into the developer's commit and nothing will report it. This call never starts a worker. Enumerate every returned task binding to the human with ordinal, task_key, and repository_root, then present the exact plan version and exact plan hash. Do not abbreviate or omit a writable directory binding. If the human's current message explicitly directs you to follow, implement, execute, proceed with, or complete a named existing detailed plan, specification, or current_todo (including an instruction meaning \"按照 current_todo\" or \"按照 <named plan> 推进完成开发\"), that message authorizes starting the faithfully derived plan in this same turn after you present these bindings; otherwise wait for a later explicit approval. An explicit instruction not to start always wins."
+            "Draft or replace the bounded ordered task plan using file pointers. Read the current project documentation first. For every task, set repository_root to the real absolute path of that task's source directory, task_document_path to the absolute path of the file containing its objective/acceptance/checks/scope/actions, design_document_paths to the absolute paths of any design files, and task_selector to the exact section or task identifier the workers must follow. The repository need not equal or live under the project directory. hcom hands these exact strings to workers: it never reads, copies, snapshots, hashes, locks, canonicalizes, or drift-checks task/design files, and it does not check whether those document paths exist or are readable. It never runs Git or inspects the repository's identity, history, or working-tree state, and it has no configured host-path allowlist; repository_root is required to be an existing directory. You may create or update architecture plans, current_todo, and discussion records before this call. After this call, do not modify a bound task repository yourself: a concurrent write can be silently swept into the developer's commit and nothing will report it. This call never starts a worker. Enumerate every returned task binding to the human with ordinal, task_key, repository_root, task_document_path, every design_document_paths entry, and task_selector, then present the exact plan version and exact plan hash. Do not abbreviate or omit any path, selector, or writable repository binding. If the human's current message explicitly directs you to follow, implement, execute, proceed with, or complete a named existing detailed plan, specification, or current_todo (including an instruction meaning \"按照 current_todo\" or \"按照 <named plan> 推进完成开发\"), that message authorizes starting the faithfully derived plan in this same turn after you present these bindings; otherwise wait for a later explicit approval. An explicit instruction not to start always wins."
         }
         ActionName::SessionApproveAndStart => {
-            "Start the exact draft only with explicit human execution authorization in this architect conversation. Authorization is valid either when the human approves the complete displayed task binding list (ordinal, task_key, and repository_root) with its plan version and plan hash, or when the human's current message explicitly directs you to follow, implement, execute, proceed with, or complete a named existing detailed plan, specification, or current_todo (including an instruction meaning \"按照 current_todo\" or \"按照 <named plan> 推进完成开发\") and this draft faithfully derives from that source. In the latter case, present the complete returned bindings, plan version, and plan hash, then call this tool in the same turn without requiring a second human reply. A request only to read, analyze, discuss, summarize, draft, or update a plan is not execution authorization. An explicit instruction not to start always wins. Never infer authorization from vague continuation language or from the existence of a plan. When this call returns a running session, immediately call session_wait exactly once with after_session_version set to the returned session.version. Do not sleep, run a timer, call session_status, or otherwise poll for progress. The foreground supervisor advances Developer and Reviewer without Architect model calls and completes the pending wait only when the session becomes completed, needs_human, failed, or canceled."
+            "Start the exact draft only with explicit human execution authorization in this architect conversation. Authorization is valid either when the human approves the complete displayed task binding list (ordinal, task_key, repository_root, task_document_path, design_document_paths, and task_selector) with its plan version and plan hash, or when the human's current message explicitly directs you to follow, implement, execute, proceed with, or complete a named existing detailed plan, specification, or current_todo (including an instruction meaning \"按照 current_todo\" or \"按照 <named plan> 推进完成开发\") and this draft faithfully derives from that source. In the latter case, present the complete returned bindings, plan version, and plan hash, then call this tool in the same turn without requiring a second human reply. A request only to read, analyze, discuss, summarize, draft, or update a plan is not execution authorization. An explicit instruction not to start always wins. Never infer authorization from vague continuation language or from the existence of a plan. When this call returns a running session, immediately call session_wait exactly once with after_session_version set to the returned session.version. Do not sleep, run a timer, call session_status, or otherwise poll for progress. The foreground supervisor advances Developer and Reviewer without Architect model calls and completes the pending wait only when the session becomes completed, needs_human, failed, or canceled."
         }
         ActionName::SessionWait => {
             "Passively wait for the already-authorized foreground run to become completed, needs_human, failed, or canceled. This is a terminal-only event subscription, not polling: normal Developer-to-Reviewer and automatic correction transitions do not complete it. After starting a run, call it exactly once with after_session_version equal to the returned session.version; do not combine it with sleep, timers, background-terminal waits, repeated calls, or session_status. Cancellation or interruption of this tool never cancels the run. If the human later explicitly asks to resume waiting, call this tool again with the most recently observed session.version; the new call replaces any abandoned subscription, and a terminal state reached during the gap is retained and returns immediately. Do not re-arm an interrupted wait unless the human explicitly requests it."
@@ -144,26 +144,27 @@ fn task_schema() -> Value {
         &[
             "task_key",
             "title",
-            "objective",
             "repository_root",
-            "acceptance_criteria",
-            "required_checks",
-            "allowed_paths",
-            "forbidden_actions",
+            "task_document_path",
+            "design_document_paths",
+            "task_selector",
             "max_review_rounds",
         ],
         [
             ("task_key", id_schema()),
             ("title", string_schema(1, 512)),
-            ("objective", string_schema(1, 65_536)),
             ("repository_root", absolute_path_schema()),
             (
-                "acceptance_criteria",
-                unique_array(string_schema(1, 65_536)),
+                "task_document_path",
+                document_path_schema("Task file containing the selected work contract."),
             ),
-            ("required_checks", unique_array(string_schema(1, 4096))),
-            ("allowed_paths", unique_array(string_schema(1, 4096))),
-            ("forbidden_actions", unique_array(string_schema(1, 4096))),
+            (
+                "design_document_paths",
+                unique_array(document_path_schema(
+                    "Design file the selected task requires the workers to read.",
+                )),
+            ),
+            ("task_selector", string_schema(1, 4096)),
             (
                 "max_review_rounds",
                 json!({"type":"integer","minimum":1,"maximum":20}),
@@ -213,6 +214,16 @@ fn absolute_path_schema() -> Value {
         "maxLength":4096,
         "pattern":"^/[^\\r\\n]*$",
         "description":"Real absolute path of this task's source directory, discovered from the current project's documentation; it may be outside or nested under the project directory. hcom only requires that it exists and never inspects its Git state."
+    })
+}
+
+fn document_path_schema(description: &str) -> Value {
+    json!({
+        "type":"string",
+        "minLength":1,
+        "maxLength":4096,
+        "pattern":"^/[^\\r\\n]*$",
+        "description":format!("{description} hcom preserves this absolute path string without reading, canonicalizing, hashing, snapshotting, or checking the file.")
     })
 }
 
@@ -305,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_translation_accepts_real_multiline_objective_and_rejects_hidden_controls() {
+    fn plan_translation_accepts_file_pointers_and_rejects_inline_task_fields() {
         let arguments = json!({
             "expected_session_version":0,
             "developer_adapter":"codex-developer",
@@ -313,12 +324,10 @@ mod tests {
             "tasks":[{
                 "task_key":"p9-task-1",
                 "title":"Phase 9 Task 1",
-                "objective":"Create task1.txt with exactly two lines:\nphase9-task-1\nreview-stage: pending",
                 "repository_root":"/source/example",
-                "acceptance_criteria":["first review requests changes"],
-                "required_checks":["/usr/bin/test -f task1.txt"],
-                "allowed_paths":["README.md","task1.txt"],
-                "forbidden_actions":["push"],
+                "task_document_path":"/project/current_todo.md",
+                "design_document_paths":["/project/architecture.md","/project/design.md"],
+                "task_selector":"FBTC-01",
                 "max_review_rounds":3
             }]
         });
@@ -332,20 +341,55 @@ mod tests {
         assert!(matches!(
             action,
             ControlAction::SessionPlanReplace { ref tasks, .. }
-                if tasks[0].objective.contains('\n')
+                if tasks[0].task_document_path == "/project/current_todo.md"
+                    && tasks[0].design_document_paths.len() == 2
+                    && tasks[0].task_selector == "FBTC-01"
         ));
 
-        let mut invalid = arguments;
-        invalid["tasks"][0]["objective"] = Value::String("safe\n\u{1b}hidden".into());
-        assert!(
-            control_action(
-                "session_plan_replace",
-                invalid,
-                "codex-developer",
-                "claude-reviewer-2.1.220",
-            )
-            .is_err()
-        );
+        for inline_field in [
+            "objective",
+            "acceptance_criteria",
+            "required_checks",
+            "allowed_paths",
+            "forbidden_actions",
+        ] {
+            let mut invalid = arguments.clone();
+            invalid["tasks"][0][inline_field] = Value::String("inline task body".into());
+            assert!(
+                control_action(
+                    "session_plan_replace",
+                    invalid,
+                    "codex-developer",
+                    "claude-reviewer-2.1.220",
+                )
+                .is_err(),
+                "legacy inline field {inline_field} was accepted"
+            );
+        }
+
+        let tools = tool_definitions("codex-developer", "claude-reviewer-2.1.220");
+        let properties = tools
+            .iter()
+            .find(|tool| tool["name"] == "session_plan_replace")
+            .unwrap()["inputSchema"]["properties"]["tasks"]["items"]["properties"]
+            .as_object()
+            .unwrap();
+        for required in [
+            "task_document_path",
+            "design_document_paths",
+            "task_selector",
+        ] {
+            assert!(properties.contains_key(required));
+        }
+        for removed in [
+            "objective",
+            "acceptance_criteria",
+            "required_checks",
+            "allowed_paths",
+            "forbidden_actions",
+        ] {
+            assert!(!properties.contains_key(removed));
+        }
     }
 
     #[test]
@@ -366,12 +410,10 @@ mod tests {
             "tasks":[{
                 "task_key":"one",
                 "title":"one",
-                "objective":"one",
                 "repository_root":"/source/example",
-                "acceptance_criteria":["one"],
-                "required_checks":[],
-                "allowed_paths":["one.txt"],
-                "forbidden_actions":["push"],
+                "task_document_path":"/project/current_todo.md",
+                "design_document_paths":[],
+                "task_selector":"one",
                 "max_review_rounds":1
             }]
         });
@@ -399,6 +441,9 @@ mod tests {
             "ordinal",
             "task_key",
             "repository_root",
+            "task_document_path",
+            "design_document_paths",
+            "task_selector",
             "plan version",
             "plan hash",
         ] {
@@ -417,6 +462,9 @@ mod tests {
         for required in [
             "task binding list",
             "repository_root",
+            "task_document_path",
+            "design_document_paths",
+            "task_selector",
             "plan version",
             "plan hash",
             "named existing detailed plan",
@@ -431,7 +479,7 @@ mod tests {
         }
         for required in [
             "current_todo",
-            "do not modify a bound task directory",
+            "do not modify a bound task repository",
             "按照 current_todo",
             "An explicit instruction not to start always wins",
             "no configured host-path allowlist",
@@ -484,7 +532,8 @@ mod tests {
             .unwrap();
         let description = plan["description"].as_str().unwrap();
         assert!(description.contains("It never runs Git"));
-        assert!(description.contains("no drift or identity check"));
+        assert!(description.contains("drift-checks task/design files"));
+        assert!(description.contains("does not check whether those document paths exist"));
         assert!(description.contains("existing directory"));
         assert!(
             plan["inputSchema"]["properties"]["tasks"]["items"]["properties"]["repository_root"]

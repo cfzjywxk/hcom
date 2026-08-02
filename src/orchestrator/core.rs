@@ -351,6 +351,9 @@ pub struct CoreTask {
     pub developer_session: Option<RuntimeSessionKey>,
     pub reviewer_session: Option<RuntimeSessionKey>,
     pub outcome_detail: Option<String>,
+    latest_developer_final_path: Option<String>,
+    latest_reviewer_final_paths: Vec<String>,
+    latest_reviewer_verdict: Option<ReviewerVerdict>,
     last_developer_outcome: Option<DeveloperOutcomeV1>,
     last_reviewer_outcome: Option<ReviewerOutcomeV1>,
 }
@@ -364,6 +367,9 @@ impl CoreTask {
             developer_session: None,
             reviewer_session: None,
             outcome_detail: None,
+            latest_developer_final_path: None,
+            latest_reviewer_final_paths: Vec::new(),
+            latest_reviewer_verdict: None,
             last_developer_outcome: None,
             last_reviewer_outcome: None,
         }
@@ -535,6 +541,9 @@ impl SupervisorCore {
                     ordinal: u32::try_from(index).unwrap_or(u32::MAX),
                     state: task.state,
                     repository_root: task.spec.repository_root.clone(),
+                    task_document_path: task.spec.task_document_path.clone(),
+                    design_document_paths: task.spec.design_document_paths.clone(),
+                    task_selector: task.spec.task_selector.clone(),
                     branch: None,
                     review_round: task.review_round,
                     max_review_rounds: task.spec.max_review_rounds,
@@ -543,6 +552,9 @@ impl SupervisorCore {
                     developer_session_bound: task.developer_session.is_some(),
                     reviewer_session_bound: task.reviewer_session.is_some(),
                     outcome_detail: task.outcome_detail.clone(),
+                    latest_developer_final_path: task.latest_developer_final_path.clone(),
+                    final_reviewer_message_paths: task.latest_reviewer_final_paths.clone(),
+                    reviewer_verdict: task.latest_reviewer_verdict,
                 })
                 .collect(),
         }
@@ -1743,12 +1755,10 @@ mod tests {
         TaskDraft {
             task_key: key.into(),
             title: format!("Task {key}"),
-            objective: format!("Implement {key}"),
             repository_root: root.into(),
-            acceptance_criteria: vec!["the requested behavior is complete".into()],
-            required_checks: vec!["cargo test".into()],
-            allowed_paths: vec!["src".into(), "tests".into()],
-            forbidden_actions: vec!["do not push".into()],
+            task_document_path: format!("/project/tasks/{key}.md"),
+            design_document_paths: vec!["/project/design.md".into()],
+            task_selector: key.into(),
             max_review_rounds,
         }
     }
@@ -2964,6 +2974,9 @@ mod tests {
                     ordinal: 0,
                     state: TaskState::Lgtm,
                     repository_root: "/repo".into(),
+                    task_document_path: "/project/tasks/one.md".into(),
+                    design_document_paths: vec!["/project/design.md".into()],
+                    task_selector: "one".into(),
                     // hcom no longer observes Git, so the snapshot carries no
                     // branch or revision evidence at all.
                     branch: None,
@@ -2974,6 +2987,9 @@ mod tests {
                     developer_session_bound: true,
                     reviewer_session_bound: true,
                     outcome_detail: Some("Reviewer approved the exact clean revision".into()),
+                    latest_developer_final_path: None,
+                    final_reviewer_message_paths: Vec::new(),
+                    reviewer_verdict: None,
                 }],
             }
         );
@@ -3501,7 +3517,7 @@ mod tests {
     }
 
     #[test]
-    fn every_task_text_list_and_path_bound_has_below_equal_and_above_cases() {
+    fn every_file_backed_task_field_bound_has_below_equal_and_above_cases() {
         fn accepted(task: TaskDraft) -> bool {
             plan_result(vec![task]).is_ok()
         }
@@ -3528,40 +3544,6 @@ mod tests {
             candidate.title = "t".repeat(length);
             assert_eq!(accepted(candidate), expected, "title length {length}");
         }
-        for (length, expected) in [
-            (0, false),
-            (1, true),
-            (65_535, true),
-            (65_536, true),
-            (65_537, false),
-        ] {
-            let mut candidate = task("objective", "/repo", 1);
-            candidate.objective = "o".repeat(length);
-            assert_eq!(accepted(candidate), expected, "objective length {length}");
-        }
-        for (length, expected) in [(1, true), (65_535, true), (65_536, true), (65_537, false)] {
-            let mut candidate = task("criterion", "/repo", 1);
-            candidate.acceptance_criteria = vec!["a".repeat(length)];
-            assert_eq!(
-                accepted(candidate),
-                expected,
-                "acceptance criterion length {length}"
-            );
-        }
-        for (length, expected) in [(1, true), (4095, true), (4096, true), (4097, false)] {
-            let mut candidate = task("check", "/repo", 1);
-            candidate.required_checks = vec!["c".repeat(length)];
-            assert_eq!(
-                accepted(candidate),
-                expected,
-                "required check length {length}"
-            );
-        }
-        for (length, expected) in [(1, true), (4095, true), (4096, true), (4097, false)] {
-            let mut candidate = task("path", "/repo", 1);
-            candidate.allowed_paths = vec!["p".repeat(length)];
-            assert_eq!(accepted(candidate), expected, "path length {length}");
-        }
         for (length, expected) in [(2, true), (4095, true), (4096, true), (4097, false)] {
             let mut candidate = task("root", "/repo", 1);
             candidate.repository_root = format!("/{}", "r".repeat(length - 1));
@@ -3571,20 +3553,53 @@ mod tests {
                 "repository root length {length}"
             );
         }
-
+        for (length, expected) in [
+            (0, false),
+            (1, true),
+            (4095, true),
+            (4096, true),
+            (4097, false),
+        ] {
+            let mut candidate = task("task-document", "/repo", 1);
+            candidate.task_document_path = if length == 0 {
+                String::new()
+            } else {
+                format!("/{}", "t".repeat(length - 1))
+            };
+            assert_eq!(
+                accepted(candidate),
+                expected,
+                "task document path length {length}"
+            );
+        }
+        for (length, expected) in [
+            (0, false),
+            (1, true),
+            (4095, true),
+            (4096, true),
+            (4097, false),
+        ] {
+            let mut candidate = task("selector", "/repo", 1);
+            candidate.task_selector = "s".repeat(length);
+            assert_eq!(accepted(candidate), expected, "selector length {length}");
+        }
         for (count, expected) in [(255, true), (256, true), (257, false)] {
-            let mut candidate = task("list-count", "/repo", 1);
-            candidate.acceptance_criteria = (0..count)
-                .map(|index| format!("criterion-{index}"))
+            let mut candidate = task("design-list-count", "/repo", 1);
+            candidate.design_document_paths = (0..count)
+                .map(|index| format!("/project/design-{index}.md"))
                 .collect();
-            assert_eq!(accepted(candidate), expected, "list item count {count}");
+            assert_eq!(accepted(candidate), expected, "design path count {count}");
         }
 
-        let mut duplicate_list = task("duplicate-list", "/repo", 1);
-        duplicate_list.required_checks = vec!["cargo test".into(), "cargo test".into()];
-        assert!(!accepted(duplicate_list));
+        let mut relative_task_path = task("relative-task-path", "/repo", 1);
+        relative_task_path.task_document_path = "current_todo.md".into();
+        assert!(!accepted(relative_task_path));
+        let mut relative_design_path = task("relative-design-path", "/repo", 1);
+        relative_design_path.design_document_paths = vec!["design.md".into()];
+        assert!(!accepted(relative_design_path));
         let mut duplicate_path = task("duplicate-path", "/repo", 1);
-        duplicate_path.allowed_paths = vec!["src".into(), "src".into()];
+        duplicate_path.design_document_paths =
+            vec!["/project/design.md".into(), "/project/design.md".into()];
         assert!(!accepted(duplicate_path));
         let duplicate_tasks = vec![
             task("duplicate-task", "/repo", 1),
