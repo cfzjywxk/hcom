@@ -10,8 +10,8 @@ use crate::worker::environment::ParentEnvironment;
 use crate::worker::profile::SessionInvocationProfiles;
 use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
-use std::fs::{self, OpenOptions};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,8 +24,6 @@ pub(crate) struct SessionStartup {
 pub(crate) struct SessionRuntimeSources {
     parent_environment: ParentEnvironment,
     codex_auth_source: Option<PathBuf>,
-    cargo_bin_source: PathBuf,
-    rustup_home_source: PathBuf,
     profiles: Option<SessionInvocationProfiles>,
 }
 
@@ -51,40 +49,21 @@ impl SessionRuntimeSources {
             .unwrap_or_else(|| home.join(".codex"));
         let uses_codex =
             profiles.developer.codex().is_some() || profiles.reviewer.codex().is_some();
-        let codex_auth_source = if uses_codex {
-            Some(canonical_private_file(
-                &codex_home.join("auth.json"),
-                "Codex auth source",
-            )?)
+        let codex_auth = codex_home.join("auth.json");
+        let codex_auth_source = if uses_codex && codex_auth.exists() {
+            Some(canonical_private_file(&codex_auth, "Codex auth source")?)
         } else {
             None
         };
-        let cargo_bin_source = parent_environment
-            .unicode("CARGO_HOME")?
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".cargo"))
-            .join("bin");
-        let rustup_home_source = parent_environment
-            .unicode("RUSTUP_HOME")?
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".rustup"));
-        let cargo_bin_source =
-            canonical_readable_directory(&cargo_bin_source, "Rust cargo-bin source")?;
-        let rustup_home_source =
-            canonical_readable_directory(&rustup_home_source, "Rust rustup source")?;
         Ok(Self {
             parent_environment,
             codex_auth_source,
-            cargo_bin_source,
-            rustup_home_source,
             profiles: Some(profiles),
         })
     }
 
     #[cfg(test)]
-    pub(crate) fn fake(path: &Path) -> Self {
+    pub(crate) fn fake(_path: &Path) -> Self {
         Self {
             parent_environment: std::collections::BTreeMap::from([(
                 "PATH".into(),
@@ -92,8 +71,6 @@ impl SessionRuntimeSources {
             )])
             .into(),
             codex_auth_source: None,
-            cargo_bin_source: path.to_owned(),
-            rustup_home_source: path.to_owned(),
             profiles: None,
         }
     }
@@ -153,21 +130,6 @@ fn canonical_private_directory(path: &Path, label: &str) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn canonical_readable_directory(path: &Path, label: &str) -> Result<PathBuf> {
-    let canonical = fs::canonicalize(path)?;
-    let metadata = fs::symlink_metadata(path)?;
-    // SAFETY: geteuid has no preconditions.
-    if canonical != path
-        || metadata.file_type().is_symlink()
-        || !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.permissions().mode() & 0o002 != 0
-    {
-        bail!("{label} has an unsafe identity");
-    }
-    Ok(canonical)
-}
-
 fn canonical_private_file(path: &Path, label: &str) -> Result<PathBuf> {
     let canonical = fs::canonicalize(path)?;
     let metadata = fs::symlink_metadata(path)?;
@@ -183,30 +145,6 @@ fn canonical_private_file(path: &Path, label: &str) -> Result<PathBuf> {
         bail!("{label} has an unsafe identity");
     }
     Ok(canonical)
-}
-
-fn prepare_auth_mount_target(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata)
-            if !metadata.file_type().is_symlink()
-                && metadata.is_file()
-                && metadata.permissions().mode() & 0o777 == 0o600
-                && metadata.nlink() == 1 =>
-        {
-            return Ok(());
-        }
-        Ok(_) => bail!("worker auth mount target has an unsafe identity"),
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
-        Err(_) => {}
-    }
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
-    file.sync_all()?;
-    Ok(())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

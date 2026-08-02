@@ -1,52 +1,50 @@
-# Retained Codex CLI adapter maintenance contract
+# Codex Architect adapter maintenance contract
 
-This is the maintainer checklist for the pinned Codex 0.145 integration used by
-the blank Codex Architect, existing interactive hcom products, and retained
-CLI task workers behind `hcom arch claude`. It records which native arguments
-and configuration hcom owns, where size bounds are enforced, and which tests
-must change with the contract.
+This is the maintainer contract for the pinned Codex 0.145 blank Architect
+started by `hcom arch codex`. Background Developer and Reviewer turns use the
+pinned Codex 0.146 exec lane documented in
+[codex-exec-worker-lane.md](codex-exec-worker-lane.md). Existing tagged
+interactive hcom products are independent and must not be routed through this
+session lane.
 
-`hcom arch` does not use this adapter for its background Developer or Reviewer.
-Those roles run the exec worker lane described in
-[codex-exec-worker-lane.md](codex-exec-worker-lane.md). This document now covers
-only the retained interactive Codex integration; the two contracts are
-independent, and changing one must not silently alter the other.
+## Product rule
 
-The user-facing profile syntax remains in [architect.md](architect.md). This
-document is normative for implementation changes: do not infer compatibility
-from one successful `--help` command, role, or turn mode.
+hcom is a thin automation layer over a native Codex launch. It owns process
+lifetime, task-control transport, typed task handoff, exact resume, and
+redacted evidence. It does not replace the operator's Codex installation
+semantics with a generated HOME, CODEX_HOME, config, trust decision, MCP
+allowlist, feature allowlist, or reduced host filesystem.
 
-## Pinned identity and frozen profile
+The deliberate exceptions are:
 
-- Architect and worker adapters pin the absolute Codex 0.145 executable and
-  require `codex-cli 0.145.0`.
+- the built-in Codex Architect, Developer, and Reviewer model/effort defaults
+  are `gpt-5.6-sol` and `xhigh`, passed explicitly rather than inherited from
+  user config;
+- typed sandbox/approval values are also explicit;
+- the Architect gets one hcom-owned task-control MCP table;
+- `HCOM_DIR` and hcom run/task/role identity are private to this invocation;
+- exec workers add the transport required for thread identity/final-message
+  capture.
+
+## Pinned identity and typed profile
+
+- The Architect pins the absolute Codex 0.145 executable and requires
+  `codex-cli 0.145.0`.
 - Model names are 1–128 ASCII bytes, cannot begin with `-`, and may contain
   only letters, digits, `.`, `_`, `-`, `/`, `:`, or `@`.
 - Reasoning effort is one of `none`, `minimal`, `low`, `medium`, `high`,
   `xhigh`, or `max`.
-- Sandbox is `read-only`, `workspace-write`, or `danger-full-access`. A
-  retained CLI Developer cannot use `read-only`, because completion must write
-  and commit. A retained CLI Reviewer remains outer-filesystem read-only even
-  if native Codex is configured more broadly. App Server Reviewers are
-  deliberately writable and use an exact post-turn Git invariant instead.
-- Approval policy is `untrusted`, `on-request`, or `never`. Workers have no
-  interactive approval channel; hcom never answers a native prompt for the
-  human.
-- Profile TOML is a closed tagged schema with no arbitrary argv field. The
-  effective typed profile and SHA-256 hash are frozen before launch and bound
-  into the approved plan.
+- Sandbox is `read-only`, `workspace-write`, or `danger-full-access`.
+- Approval policy is `untrusted`, `on-request`, or `never`.
+- Profile TOML is a closed schema with no arbitrary argv field. Role tables
+  are partial overrides merged onto built-in defaults (`reasoning_effort` and
+  `effort` are Codex aliases); the effective typed profile and SHA-256 hash are
+  frozen before launch and bound into the approved plan.
 
-An acceptance change to a frozen worker adapter requires a contract-version
-bump and, when useful for negotiation, an updated capability feature. Codex
-developer and reviewer share the JSONL parser, so parser acceptance changes
-must update and test both descriptors together.
+## Blank Architect invocation
 
-## Interactive Architect invocation
-
-The Codex Architect is a blank interactive CLI. hcom supplies no positional
-prompt, stdin content, PTY injection, paste, key event, or Enter.
-
-Its owned native argv is:
+hcom supplies no positional prompt, stdin content, PTY injection, paste, key
+event, or Enter. The Codex argv is:
 
 ```text
 codex
@@ -54,182 +52,104 @@ codex
   --config model_reasoning_effort="<typed effort>"
   --sandbox <typed sandbox>
   --ask-for-approval <typed policy>
-  --cd <exact project_root>
+  --cd <exact project root>
   --no-alt-screen
-  --strict-config
-  --disable <each closed disabled feature>
+  --config 'mcp_servers.hcom_session_task_control={ ...exact relay... }'
 ```
 
-The Architect gets a fresh private `CODEX_HOME`. Its generated `config.toml`
-contains only:
+That last override replaces only the hcom-reserved MCP leaf. Every other
+native MCP server remains loaded. Replacing the whole leaf prevents a stale
+user table with the reserved name from merging incompatible transport fields
+into the relay.
 
-- an empty terminal-title configuration;
-- the exact project path with `trust_level = "untrusted"`, resolving folder
-  trust without enabling project-local `.codex` config, hooks, rules, or MCP;
-- one enabled `hcom_session_task_control` MCP server, bound to the private
-  per-run relay and preapproved only for that server.
+The Architect inherits the complete parent environment and uses the real
+HOME/CODEX_HOME. Consequently native config.toml, AGENTS.md, project
+instructions, trust, auth, rules, hooks, skills, plugins, feature flags, MCP
+servers, custom providers, caches, and session history behave like a direct
+Codex invocation. hcom does not pass `--strict-config`, disable features, or
+write a private Codex config.
 
-Parent Codex configuration and the exact auth source are read-only. Explicit
-CLI sandbox/approval options remain authoritative. Unrelated native notices
-are not hidden.
+`HCOM_DIR` alone points at per-run private hcom state, so hcom commands inside
+the Architect cannot address the user's live retained-agent store. The
+launch-control bubblewrap process still supplies the pre-registration gate,
+but binds the host root read-write and does not mask the user's Codex config,
+HOME, project, source repositories, XDG paths, or unrelated host files.
 
-## Retained CLI worker create/resume invocation
+## Exact native-session binding with a shared CODEX_HOME
 
-Developer and reviewer use one closed Codex `exec` shape. Shared probes live in
-`CODEX_EXEC_HELP_REQUIREMENTS` and `CODEX_RESUME_HELP_REQUIREMENTS`; adding a
-runtime option without adding it to the right probe is a test failure.
+A private CODEX_HOME previously made “exactly one rollout exists” sufficient
+for Architect identity. In the real native session store many old and
+concurrent sessions can exist, so hcom now:
 
-```text
-codex exec
-  --sandbox <typed sandbox>                 # exec-parent option
-  --skip-git-repo-check                     # project_root may be non-Git
-  [--add-dir <task repository>]             # workspace-write external/nested scope
-  [resume <exact native session id>]        # same task only
-  --json
-  --strict-config
-  --model <typed model>
-  --config model_reasoning_effort="<typed effort>"
-  --config approval_policy="<typed policy>"
-  --config mcp_servers={}
-  --ignore-user-config
-  --ignore-rules
-  --disable <each closed disabled feature>
-  [--cd <exact project_root>]                # create only
-  --output-schema <private schema file>
-  --output-last-message <private final file>
-  -                                         # bounded stdin + EOF
-```
+1. snapshots the bounded `(device, inode)` identities of rollout files before
+   starting the Architect;
+2. considers only post-snapshot rollout files whose first native
+   `session_meta` record matches the exact project root and pinned CLI version;
+3. requires one unique candidate for the first task-control call;
+4. after binding, keeps selecting that exact candidate even if another
+   same-project Codex session starts later;
+5. routes missing, ambiguous, or changed evidence through the existing closed
+   native-session refusal path.
 
-Ordering is load-bearing in Codex 0.145:
+The snapshot is identity-only; hcom never reads old rollout contents. The
+bounded list fits the existing 256 KiB bridge bootstrap frame.
 
-- `--sandbox`, `--skip-git-repo-check`, and optional `--add-dir` belong to the
-  `exec` parent and precede `resume`;
-- `--add-dir` is required when `workspace-write` must cover a task repository
-  distinct from the project directory;
-- `resume` is followed by the exact already-bound native session ID;
-- resume never carries `--cd`; create carries `--cd <project_root>`;
-- the prompt is private bounded stdin, never argv.
+## Background Codex workers
 
-Every worker session uses a role-private HOME/CODEX_HOME/TMP/runtime view,
-exact read-only auth overlay, complete parent environment snapshot followed by
-declared role-local overrides, no TTY, and the reviewed bubblewrap policy.
-`mcp_servers={}`, ignored user config/rules, and the closed disabled-feature
-inventory prevent parent/project capabilities from entering a worker.
+Both `hcom arch codex` and `hcom arch claude` currently bind the same
+Codex-only exec worker runtime. A configured Claude Developer or Reviewer is
+rejected before the Architect starts. The foreground Architect adapter does
+not change the worker adapter.
 
-Developer completion recovery is supervisor-owned and adapter-neutral. If a
-process leaves only allowed-path uncommitted changes, is interrupted after
-making such changes, or returns an invalid/missing completion result while
-branch/history/path scope remain safe, the supervisor performs one
-exact-session resume before `needs_human`. For a discovered Codex session, the
-`thread.started` observation must prove exactly one native session ID; missing
-or conflicting identity stops recovery. A nonzero final-file worker keeps its
-bounded stdout/stderr available for that observation and does not require a
-success-only result file; an existing result file is still securely ingested
-and an unsafe file shape remains an error. The recovery checkpoint fingerprints
-HEAD, branch, status, index evidence, file modes/sizes, and dirty-file content,
-and is revalidated before resume. Reviewer startup still requires a clean
-committed exact HEAD.
+The exec lane:
 
-## Artifact and JSONL bounds
+- launches directly from the project directory with the complete parent
+  environment and real native config;
+- passes `--add-dir <task repository>` to both roles when source is outside the
+  project;
+- tells both roles to inspect applicable project and repository AGENTS.md,
+  AGENTS.override.md, and nested instructions before work;
+- proves create/resume identity from `thread.started.thread_id`;
+- captures final output with `--output-last-message`;
+- keeps Reviewer non-mutation as a role contract, not an OS read-only mount;
+- keeps private HCOM_DIR, bounded lifecycle/reaping, and redacted evidence.
 
-Bounds are layered. A transport limit must not be reused as a semantic-field
-limit unless the formats have the same shape.
+See the exec-lane document for exact argv ordering, verdict classification,
+artifact bounds, and contract smokes.
 
-| Layer | Bound | Rule |
-|---|---:|---|
-| prompt | 256 KiB | Private stdin only |
-| argv item | 4 KiB | No terminal controls or newlines |
-| aggregate argv | 64 KiB | At most the shared bounded item count |
-| schema file | 64 KiB | UTF-8 JSON object |
-| native stdout | 1 MiB | Hard artifact cap |
-| native stderr | 1 MiB | Hard artifact cap; contents remain closed |
-| final structured result | 256 KiB | Strict developer/reviewer JSON |
-| JSONL event count | 4096 | The 4097th nonblank event fails closed |
-| ordinary JSONL event | 128 KiB | Per-event shape bound |
-| native observation record | 128 KiB | Best-effort activity/session record |
-| native session ID | 256 bytes | Bounded ASCII opaque identifier |
-| event `type` | 128 bytes | No control characters |
-| item ID | 256 bytes | No control characters |
-| item type/status | 128 bytes | No control characters |
-| command evidence | 4096 bytes | Exact newline-aware terminal-safe text |
+## Test map
 
-Codex 0.145 places `aggregated_output` inside an
-`item.completed`/`command_execution` event. That one known event may exceed
-128 KiB while complete stdout remains within 1 MiB. The field must be a JSON
-string, and the serialized event after excluding only that raw value must
-remain within 128 KiB. The parser borrows the raw value without copying it into
-evidence, diagnostics, results, or review summaries, while still validating:
-
-- event ordering and exactly one initial native session;
-- exact resume session equality;
-- item ID/type/status and command bounds;
-- exit-code/status consistency;
-- failed/error transitions and events after the terminal event;
-- forbidden MCP or collaboration/delegation activity;
-- the successful terminal event.
-
-No other oversized event is accepted. A large command event must contain the
-known `aggregated_output` string, and unrelated unknown fields cannot account
-for bytes above the ordinary event bound. Aggregate, event-count, and
-per-event-shape overflow have distinct sanitized diagnostics and never include
-raw provider payload.
-
-Structured check claims require exact successful command evidence from the
-same turn. A displayed `/bin/bash -c` or `/bin/bash -lc` wrapper may
-additionally yield its one exact parsed payload; there is no prefix, substring,
-or multi-command normalization.
-
-## Test coverage map
-
-| Contract area | Required regression |
+| Contract | Regression |
 |---|---|
-| typed defaults, closed values, profile hash | `worker::profile::tests::defaults_preserve_reviewed_outer_safety_and_native_profiles`, `typed_profiles_reject_argv_and_config_injection_material`, `worker_toml_is_adapter_tagged_and_hash_binds_every_option` |
-| config precedence and explicit reviewer independence | `architect::profile::tests::*`, `architect::launch::tests::explicit_architect_cli_overrides_toml_profile_only`, `explicit_reviewers_are_not_replaced_by_architect_cli_overrides` |
-| Architect help, blank argv, isolated config/trust | `pinned_codex_root_help_matches_architect_command_contract_when_installed`, `native_profile_has_no_prompt_or_secret_transport`, `isolated_codex_config_decides_project_trust_and_preapproves_only_control_server`, `blank_launch_keeps_input_empty_and_grants_path_preserving_architect_write` |
-| shared worker help/runtime options | `worker::codex::tests::pinned_codex_exec_help_matches_configurable_command_contract_when_installed`, `worker_cli_help_requirements_cover_every_runtime_option`, `worker::reviewer::tests::pinned_reviewer_help_matches_configurable_command_contract_when_installed` |
-| developer create/resume and no-TTY isolation | `worker::codex::tests::exact_profile_outer_envelope_and_fake_create_resume_are_closed` |
-| reviewer create/resume and exact session | `worker::reviewer::tests::exact_profiles_fake_create_and_same_task_workspace_refresh_resume_are_closed` |
-| non-Git project and external repository | `project_cwd_is_distinct_from_the_writable_task_repository`, `codex_workspace_write_reviewer_declares_an_external_task_repository` |
-| prompt/argv/schema/stream/result size layers | `worker::contract::tests::transport_size_bounds_are_independent_and_fail_closed`, `native_artifact_inputs_are_bounded_before_adapter_parsing` |
-| JSONL transitions and forbidden activity | `jsonl_requires_one_exact_session_and_successful_terminal_event`, `native_observations_never_forward_model_or_provider_text`, `command_completion_status_must_match_its_exit_code` |
-| JSONL aggregate/event/semantic bounds | `jsonl_accepts_large_ignored_command_output_for_create_and_exact_resume`, `jsonl_reports_sanitized_distinct_aggregate_count_and_event_shape_bounds`, `jsonl_large_event_exception_does_not_relax_semantic_field_bounds` |
-| reviewer parser path and exact HEAD | `codex_reviewer_accepts_large_ignored_command_output_and_keeps_head_validation` |
-| strict result/check and Git evidence | `completed_result_requires_exact_git_and_current_turn_check_evidence`, `resumed_completed_result_requires_the_full_task_range_not_only_the_turn_delta`, `strict_native_results_reject_wrong_model_session_semantics_and_check_claims` |
-| developer completion recovery | `orchestrator::tests::uncommitted_allowed_paths_resume_the_exact_developer_before_review`, `invalid_clean_completion_result_gets_one_exact_session_recovery`, `invalid_or_missing_result_with_dirty_paths_recovers_after_session_binding`, `interrupted_developer_with_allowed_dirty_paths_gets_exact_recovery`, `interrupted_recovery_refreshes_the_checkpoint_before_bounded_retry`, `uncommitted_result_without_proven_session_identity_needs_human`, `conflicting_discovered_session_identities_block_recovery`, `external_drift_after_recovery_checkpoint_stops_before_resume`, `worker::process::tests::nonzero_final_file_worker_preserves_streams_without_requiring_a_result_file` |
-| executable/auth/config/environment drift | `exact_discovery_rejects_version_mismatch_and_external_git_admin_paths`, `auth_quota_session_result_and_identity_drift_fail_closed`, `revision_git_identity_tool_auth_and_environment_drift_fail_closed` |
+| defaults are explicit | `architect::profile::tests::missing_file_uses_reviewed_defaults`, `worker::profile::tests::codex_exec_worker_lane_defaults_both_workers_to_exact_codex_profiles` |
+| no prompt or input injection | `architect::launch::tests::native_profile_has_no_prompt_or_secret_transport`, `blank_codex_launch_keeps_input_empty_and_preserves_native_host_semantics` |
+| native config plus one MCP leaf | `architect::launch::tests::codex_control_server_is_an_additive_cli_overlay_not_a_private_config` |
+| shared-store session identity | `architect::bridge::tests::native_session_baseline_excludes_old_rollouts_and_keeps_the_bound_session` |
+| native worker argv/config | `worker::exec_runtime::tests::happy_developer_turn_completes_and_captures_thread_id`, `reviewer_registers_the_external_repository_as_a_native_workspace_root` |
+| native environment/HCOM exception | `orchestrator::task_lane::tests::complete_parent_environment_changes_only_hcom_owned_identity_and_state` |
+| real CLI assumptions | `scripts/codex-exec-contract-smokes` |
 
-The standard gate is:
+The standard source gate is:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --quiet --locked --all-targets
-git diff --check <review-base>..HEAD
+git diff --check
 cargo build --quiet --release --locked
 ```
 
-Large-payload tests construct data only in memory/private files and assert
-sizes, counts, evidence, and sanitized errors. Do not print the payload or run
-these tests with `--nocapture`.
+The model-backed E2E/contract default is
+`gpt-5.3-codex-spark` with `medium` reasoning; production defaults remain
+`gpt-5.6-sol`/`xhigh`.
 
-## Change checklist
+Before changing the pin, argv, configuration overlay, or session observation:
 
-Before changing Codex arguments, config, parsing, or bounds:
-
-1. Confirm the exact pinned executable/version and inspect root help, `exec`
-   help, and the ordered `exec ... resume --help` path.
-2. Update the shared capability inventory before adding/removing a runtime
-   option.
-3. Cover Architect, developer, reviewer, create, and exact resume as
-   applicable; one successful path is not evidence for another.
-4. Keep profile/config input typed and closed. Never add arbitrary native
-   args, prompt transport, output paths, or arbitrary MCP config.
-5. Keep aggregate transport, event-count, per-event, and semantic bounds
-   separate. An exception must name one known event/field and retain the
-   aggregate cap.
-6. Keep diagnostics sanitized and specific enough to identify the failed
-   layer.
-7. If accepted frozen behavior changes, bump every affected adapter contract
-   version and update capability assertions.
-8. Run mapped targeted tests, then the standard gate. Never hide a new failure
-   with `ignore` or test serialization.
+1. inspect the exact root/exec/resume help for the pinned binary;
+2. update both capability probes and fake-CLI argv assertions;
+3. cover blank Architect, Developer, Reviewer, create, and exact resume where
+   applicable;
+4. keep hcom-owned config to the smallest exact leaf—never replace the whole
+   native user config;
+5. run targeted tests, then the full source gate;
+6. do not automate a real Architect TUI by submitting its first prompt.

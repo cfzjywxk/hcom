@@ -9,7 +9,6 @@
 //! from the final message's text, and every other byte is drained into
 //! redacted evidence artifacts without interpretation.
 
-use super::codex::{BWRAP_EXECUTABLE, DISABLED_CODEX_FEATURES};
 use super::environment::{ExecutionEnvironmentLease, SecretRedactor};
 use super::process::{ProcessGroupBinding, configure_worker_child};
 use super::profile::validate_cli_help_contract;
@@ -20,12 +19,11 @@ use super::runtime::{
     RuntimeSessionKey, RuntimeTelemetry, RuntimeTurnKey, RuntimeTurnPoll, RuntimeTurnSpec,
     SanitizedRuntimeFailure, TaskWorkerRuntime,
 };
-use super::sandbox::{HostRootAccess, HostRootContract, HostRootMounts};
 use super::verdict::{Verdict, VerdictClassification, classify_verdict};
 use crate::artifact::{ArtifactAttempt, ArtifactKind, ArtifactRoot, ArtifactScope};
 use crate::control_api::WorkerRole;
 use crate::worker::runtime::RuntimeFailureClass;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -52,22 +50,14 @@ const EXEC_HELP_REQUIREMENTS: &[&str] = &[
     "--sandbox",
     "--skip-git-repo-check",
     "--json",
-    "--strict-config",
     "--model",
     "--config",
-    "--ignore-user-config",
-    "--ignore-rules",
-    "--disable",
     "--cd",
+    "--add-dir",
     "--output-last-message",
 ];
-const RESUME_HELP_REQUIREMENTS: &[&str] = &[
-    "--json",
-    "--strict-config",
-    "--model",
-    "--config",
-    "--output-last-message",
-];
+const RESUME_HELP_REQUIREMENTS: &[&str] =
+    &["--json", "--model", "--config", "--output-last-message"];
 
 const THREAD_STARTED_LINE_CAP: usize = 8 * 1024;
 const PIPE_CHUNK: usize = 32 * 1024;
@@ -90,9 +80,6 @@ text on that line), followed by your findings in free-form markdown.";
 /// Task-private directories prepared by the driver for one task runtime.
 #[derive(Debug, Clone)]
 pub struct ExecTaskPaths {
-    pub home: PathBuf,
-    pub codex_home: PathBuf,
-    pub temp: PathBuf,
     pub runtime: PathBuf,
 }
 
@@ -101,12 +88,8 @@ pub struct ExecTaskPaths {
 /// `raw output` targets live under the private `runtime` directory instead.
 pub struct ExecRuntimeConfig {
     pub codex: PathBuf,
-    pub bwrap: Option<PathBuf>,
     pub repository_root: PathBuf,
     pub paths: ExecTaskPaths,
-    pub auth_source: PathBuf,
-    pub cargo_bin_source: PathBuf,
-    pub rustup_home_source: PathBuf,
     pub environment: Vec<(OsString, OsString)>,
     pub lease: ExecutionEnvironmentLease,
     pub artifact_root_path: PathBuf,
@@ -119,7 +102,6 @@ pub struct ExecRuntimeConfig {
 #[derive(Debug, Clone)]
 pub struct ExecPreflight {
     codex: PathBuf,
-    bwrap: PathBuf,
 }
 
 impl ExecPreflight {
@@ -143,21 +125,11 @@ impl ExecPreflight {
         .map_err(|error| RuntimeError::invalid_contract(single_line(&error.to_string())))?;
         validate_cli_help_contract("codex exec resume", &help, RESUME_HELP_REQUIREMENTS)
             .map_err(|error| RuntimeError::invalid_contract(single_line(&error.to_string())))?;
-        let bwrap = PathBuf::from(BWRAP_EXECUTABLE);
-        if !bwrap.is_file() {
-            return Err(RuntimeError::invalid_contract(
-                "pinned bubblewrap executable is missing",
-            ));
-        }
-        Ok(Self { codex, bwrap })
+        Ok(Self { codex })
     }
 
     pub fn codex(&self) -> &Path {
         &self.codex
-    }
-
-    pub fn bwrap(&self) -> &Path {
-        &self.bwrap
     }
 }
 
@@ -249,7 +221,6 @@ pub struct ExecTaskWorkerRuntime {
     contract: RuntimeContractIdentity,
     config: ExecRuntimeConfig,
     artifact_root: ArtifactRoot,
-    host_contract: Option<HostRootContract>,
     sessions: BTreeMap<RuntimeSessionKey, ExecSession>,
     turns: BTreeMap<RuntimeTurnKey, ExecTurn>,
     next_session: u64,
@@ -262,19 +233,10 @@ impl ExecTaskWorkerRuntime {
     pub fn open(config: ExecRuntimeConfig) -> Result<Self, RuntimeError> {
         let artifact_root = ArtifactRoot::open(&config.artifact_root_path)
             .map_err(|error| RuntimeError::internal(single_line(&error.to_string())))?;
-        let host_contract = if config.bwrap.is_some() {
-            Some(
-                HostRootContract::capture(&config.cargo_bin_source, &config.rustup_home_source)
-                    .map_err(|error| RuntimeError::internal(single_line(&error.to_string())))?,
-            )
-        } else {
-            None
-        };
         Ok(Self {
             contract: codex_exec_contract_identity(),
             config,
             artifact_root,
-            host_contract,
             sessions: BTreeMap::new(),
             turns: BTreeMap::new(),
             next_session: 0,
@@ -298,9 +260,12 @@ impl ExecTaskWorkerRuntime {
             profile.sandbox.as_str().into(),
             "--skip-git-repo-check".into(),
         ];
-        // The developer writes in the task repository; when that is not the
-        // project directory it needs an explicit extra writable scope.
-        if session.role == WorkerRole::Developer && session.task_repository != session.cwd {
+        // Register the task repository as a native workspace root for both
+        // roles when the Architect project is a separate documentation
+        // directory. Filesystem permissions remain the selected native Codex
+        // profile; reviewer immutability is a role instruction, matching a
+        // human-launched review session.
+        if session.task_repository != session.cwd {
             argv.push("--add-dir".into());
             argv.push(session.task_repository.as_os_str().to_owned());
         }
@@ -309,28 +274,15 @@ impl ExecTaskWorkerRuntime {
             argv.push(thread.into());
         }
         argv.push("--json".into());
-        argv.push("--strict-config".into());
         argv.push("--model".into());
         argv.push(profile.model.as_str().into());
         argv.push("--config".into());
         argv.push(format!("model_reasoning_effort=\"{}\"", profile.reasoning_effort).into());
         argv.push("--config".into());
         argv.push(format!("approval_policy=\"{}\"", profile.approval_policy.as_str()).into());
-        argv.push("--config".into());
-        argv.push("mcp_servers={}".into());
-        // W0-proven: these two --config entries keep complete environment
-        // inheritance effective at the tool-command layer even under
-        // --ignore-user-config (which skips the private CODEX_HOME config).
-        argv.push("--config".into());
-        argv.push("shell_environment_policy.inherit=\"all\"".into());
-        argv.push("--config".into());
-        argv.push("shell_environment_policy.ignore_default_excludes=true".into());
-        argv.push("--ignore-user-config".into());
-        argv.push("--ignore-rules".into());
-        for feature in DISABLED_CODEX_FEATURES {
-            argv.push("--disable".into());
-            argv.push((*feature).into());
-        }
+        // Model, effort and permission are the only profile overrides. Native
+        // user config decides every other setting, including the environment
+        // policy applied to model-started tool commands.
         if resume_thread.is_none() {
             argv.push("--cd".into());
             argv.push(session.cwd.as_os_str().to_owned());
@@ -341,67 +293,11 @@ impl ExecTaskWorkerRuntime {
         argv
     }
 
-    fn outer_command(
-        &self,
-        session: &ExecSession,
-        attempt_dir: &Path,
-        native_argv: Vec<OsString>,
-    ) -> Result<Command> {
-        let Some(bwrap) = &self.config.bwrap else {
-            let mut command = Command::new(&self.config.codex);
-            command.args(&native_argv);
-            command.current_dir(&session.cwd);
-            return Ok(command);
-        };
-        let contract = self
-            .host_contract
-            .as_ref()
-            .ok_or_else(|| anyhow!("bwrap configured without a host root contract"))?;
-        contract.revalidate()?;
-        let auth_target = self.config.paths.codex_home.join("auth.json");
-        let repo: &Path = &session.task_repository;
-        let project: &Path = &session.cwd;
-        let repo_is_project = repo == project;
-        let (writable_roots, readable_roots): (Vec<&Path>, Vec<&Path>) =
-            if session.role == WorkerRole::Developer {
-                // Developer writes the repository; the project is readable so
-                // task notes and plans stay reachable.
-                let readable = if repo_is_project {
-                    Vec::new()
-                } else {
-                    vec![project]
-                };
-                (vec![repo], readable)
-            } else {
-                // Reviewer reads both and writes neither.
-                let readable = if repo_is_project {
-                    vec![repo]
-                } else {
-                    vec![repo, project]
-                };
-                (Vec::new(), readable)
-            };
-        let extra: Vec<&Path> = vec![&self.config.paths.temp, &self.config.paths.runtime];
-        let outer_argv = contract.host_root_argv(HostRootMounts {
-            isolated_home: &self.config.paths.home,
-            native_config: &self.config.paths.codex_home,
-            launch_cwd: &session.cwd,
-            artifact_dir: attempt_dir,
-            auth_source: &self.config.auth_source,
-            auth_target: &auth_target,
-            readable_roots: &readable_roots,
-            writable_roots: &writable_roots,
-            read_only_files: &[&self.config.codex],
-            extra_writable_dirs: &extra,
-            host_root_access: HostRootAccess::Hidden,
-            masked_dirs: &[],
-        })?;
-        let mut command = Command::new(bwrap);
-        command.args(&outer_argv);
-        command.arg("--");
-        command.arg(&self.config.codex);
+    fn native_command(&self, session: &ExecSession, native_argv: Vec<OsString>) -> Command {
+        let mut command = Command::new(&self.config.codex);
         command.args(&native_argv);
-        Ok(command)
+        command.current_dir(&session.cwd);
+        command
     }
 
     fn spawn_invocation(
@@ -483,9 +379,7 @@ impl ExecTaskWorkerRuntime {
 
         let native_argv =
             self.build_native_argv(session, &spec, resume_thread.as_deref(), &raw_final);
-        let mut command = self
-            .outer_command(session, attempt.directory_path(), native_argv)
-            .map_err(|error| RuntimeError::internal(single_line(&error.to_string())))?;
+        let mut command = self.native_command(session, native_argv);
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
@@ -1401,26 +1295,13 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp");
         let root = fs::canonicalize(temp.path()).expect("canonical temp");
         let artifacts = root.join("artifacts");
-        let home = root.join("home");
-        let codex_home = home.join(".codex");
-        let tmp = root.join("tmp");
         let runtime_dir = root.join("run");
         let repo = root.join("repo");
         let capture = root.join("capture");
-        for dir in [
-            &artifacts,
-            &home,
-            &codex_home,
-            &tmp,
-            &runtime_dir,
-            &repo,
-            &capture,
-        ] {
+        for dir in [&artifacts, &runtime_dir, &repo, &capture] {
             fs::create_dir_all(dir).unwrap();
             fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let auth = root.join("auth.json");
-        fs::write(&auth, b"{}").unwrap();
 
         let script = root.join("fake-codex");
         let prelude = r#"
@@ -1471,17 +1352,10 @@ echo ===STDIN-END=== >> "$CAPTURE/stdin.log"
 
         let config = ExecRuntimeConfig {
             codex: script,
-            bwrap: None,
             repository_root: repo.clone(),
             paths: ExecTaskPaths {
-                home,
-                codex_home,
-                temp: tmp,
                 runtime: runtime_dir.clone(),
             },
-            auth_source: auth,
-            cargo_bin_source: root.join("cargo-bin"),
-            rustup_home_source: root.join("rustup"),
             environment,
             lease,
             artifact_root_path: artifacts.clone(),
@@ -1608,9 +1482,11 @@ printf 'implemented the change' > "$OUT"
         // Create turn used --cd; instructions prepended to stdin prompt.
         let args = fs::read_to_string(fixture.capture.join("args.log")).unwrap();
         assert!(args.contains("--cd"));
-        assert!(args.contains("shell_environment_policy.inherit=\"all\""));
-        assert!(args.contains("shell_environment_policy.ignore_default_excludes=true"));
-        assert!(args.contains("--ignore-user-config"));
+        assert!(!args.contains("shell_environment_policy"));
+        assert!(!args.contains("--ignore-user-config"));
+        assert!(!args.contains("--ignore-rules"));
+        assert!(!args.contains("mcp_servers={}"));
+        assert!(!args.contains("--strict-config"));
         let stdin = fs::read_to_string(fixture.capture.join("stdin.log")).unwrap();
         assert!(stdin.contains("You are the worker."));
         assert!(stdin.contains("do the task"));
@@ -2067,7 +1943,7 @@ printf 'work done; leaked value: %s' "$FAKE_SECRET_TOKEN" > "$OUT"
     }
 
     #[test]
-    fn reviewer_never_receives_a_writable_repository_scope() {
+    fn reviewer_registers_the_external_repository_as_a_native_workspace_root() {
         let mut fixture = fixture(
             r#"
 printf '{"type":"thread.started","thread_id":"thread-fake-1"}\n'
@@ -2077,7 +1953,7 @@ printf 'VERDICT: LGTM\nfine' > "$OUT"
         let external = fixture.repo.parent().unwrap().join("reviewer-external");
         fs::create_dir_all(&external).unwrap();
         let external = fs::canonicalize(&external).unwrap();
-        let key = session_with_repository(&mut fixture, WorkerRole::Reviewer, external);
+        let key = session_with_repository(&mut fixture, WorkerRole::Reviewer, external.clone());
         let repo = fixture.repo.clone();
         let turn = fixture
             .runtime
@@ -2097,9 +1973,10 @@ printf 'VERDICT: LGTM\nfine' > "$OUT"
         ));
         let args = fs::read_to_string(fixture.capture.join("args.log")).unwrap();
         assert!(
-            !args.contains("--add-dir"),
-            "reviewer must not get a writable scope: {args}"
+            args.contains("--add-dir"),
+            "reviewer must receive the same external workspace root: {args}"
         );
+        assert!(args.contains(external.to_str().unwrap()));
     }
 
     #[test]

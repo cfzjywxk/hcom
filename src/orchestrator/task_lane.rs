@@ -8,8 +8,7 @@ use super::core::{
 };
 use super::workspace::TasksWorkspace;
 use super::{
-    SessionRuntimeSources, SessionStartup, ensure_private_directory, path_value,
-    prepare_auth_mount_target, sha256_hex,
+    SessionRuntimeSources, SessionStartup, ensure_private_directory, path_value, sha256_hex,
 };
 use crate::control_api::{SessionState, SessionStatusSnapshot, TaskDraft, TaskState, WorkerRole};
 use crate::worker::environment::{
@@ -26,12 +25,11 @@ use crate::worker::runtime::{
     SanitizedRuntimeFailure, TaskWorkerProfiles, TaskWorkerRuntime,
 };
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -87,17 +85,10 @@ impl RuntimeFactory for ProductionRuntimeFactory {
         };
         let runtime = ExecTaskWorkerRuntime::open(ExecRuntimeConfig {
             codex: preflight.codex().to_path_buf(),
-            bwrap: Some(preflight.bwrap().to_path_buf()),
             repository_root: request.repository_root,
             paths: ExecTaskPaths {
-                home: request.paths.home,
-                codex_home: request.paths.codex_home,
-                temp: request.paths.temp,
                 runtime: request.paths.runtime,
             },
-            auth_source: request.auth_source,
-            cargo_bin_source: request.cargo_bin_source,
-            rustup_home_source: request.rustup_home_source,
             environment: request.environment,
             lease: request.lease,
             artifact_root_path: request.artifact_root,
@@ -113,9 +104,6 @@ struct RuntimeOpenRequest {
     task_key: String,
     repository_root: PathBuf,
     paths: TaskRuntimePaths,
-    auth_source: PathBuf,
-    cargo_bin_source: PathBuf,
-    rustup_home_source: PathBuf,
     environment: Vec<(OsString, OsString)>,
     lease: ExecutionEnvironmentLease,
     artifact_root: PathBuf,
@@ -137,16 +125,8 @@ impl RuntimeOpenFailure {
 }
 
 struct TaskRuntimePaths {
-    home: PathBuf,
-    codex_home: PathBuf,
-    temp: PathBuf,
     runtime: PathBuf,
-    artifacts: PathBuf,
     hcom: PathBuf,
-    xdg_config: PathBuf,
-    xdg_state: PathBuf,
-    xdg_cache: PathBuf,
-    xdg_data: PathBuf,
 }
 
 impl TaskRuntimePaths {
@@ -154,7 +134,7 @@ impl TaskRuntimePaths {
         run_root: &Path,
         task_ordinal: usize,
         task_key: &str,
-        repository_root: &Path,
+        _repository_root: &Path,
     ) -> Result<(TempDir, Self)> {
         let workers = run_root.join("exec-workers");
         ensure_private_directory(&workers)?;
@@ -164,31 +144,11 @@ impl TaskRuntimePaths {
             .tempdir_in(&workers)
             .context("failed to create task-private exec worker root")?;
         let root_path = fs::canonicalize(root.path())?;
-        let home = root_path.join("home");
         let paths = Self {
-            codex_home: home.join(".codex"),
-            temp: root_path.join("tmp"),
             runtime: root_path.join("run"),
-            artifacts: root_path.join("artifacts"),
             hcom: root_path.join("hcom"),
-            xdg_config: home.join(".config"),
-            xdg_state: home.join(".state"),
-            xdg_cache: home.join(".cache"),
-            xdg_data: home.join(".data"),
-            home,
         };
-        for directory in [
-            &paths.home,
-            &paths.codex_home,
-            &paths.temp,
-            &paths.runtime,
-            &paths.artifacts,
-            &paths.hcom,
-            &paths.xdg_config,
-            &paths.xdg_state,
-            &paths.xdg_cache,
-            &paths.xdg_data,
-        ] {
+        for directory in [&paths.runtime, &paths.hcom] {
             fs::create_dir(directory).with_context(|| {
                 format!(
                     "failed to create task-private exec worker directory {}",
@@ -197,8 +157,6 @@ impl TaskRuntimePaths {
             })?;
             fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
         }
-        prepare_auth_mount_target(&paths.codex_home.join("auth.json"))?;
-        write_private_codex_config(&paths.codex_home.join("config.toml"), repository_root)?;
         Ok((root, paths))
     }
 }
@@ -728,14 +686,6 @@ impl TaskLaneSupervisor {
             task_key: task.spec.task_key.clone(),
             repository_root,
             paths: clone_runtime_paths(&paths),
-            auth_source: self.sources.codex_auth_source.clone().ok_or_else(|| {
-                RuntimeOpenFailure::new(
-                    DriverFailureClass::Environment,
-                    anyhow!("Codex auth source is unavailable"),
-                )
-            })?,
-            cargo_bin_source: self.sources.cargo_bin_source.clone(),
-            rustup_home_source: self.sources.rustup_home_source.clone(),
             environment: materialized_environment(&materialized),
             lease: environment.clone(),
             artifact_root: self
@@ -925,86 +875,14 @@ impl TaskLaneSupervisor {
         task_key: &str,
         paths: &TaskRuntimePaths,
     ) -> Result<ExecutionEnvironmentLease> {
-        let cargo_home = self
-            .sources
-            .cargo_bin_source
-            .parent()
-            .ok_or_else(|| anyhow!("Rust cargo-bin source has no parent"))?;
-        let mut override_names = vec![
-            "CARGO_HOME",
-            "CODEX_HOME",
-            "HCOM_DIR",
-            "HOME",
-            "PYTHONPYCACHEPREFIX",
-            "RUSTUP_HOME",
-            "TMPDIR",
-            "XDG_CACHE_HOME",
-            "XDG_CONFIG_HOME",
-            "XDG_DATA_HOME",
-            "XDG_RUNTIME_DIR",
-            "XDG_STATE_HOME",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-        override_names.sort();
-        let mut required_names = override_names.clone();
-        required_names.push("PATH".into());
-        required_names.sort();
-        let policy = EnvironmentPolicy::new(override_names, required_names)?;
-        let overrides = vec![
-            (
-                "CARGO_HOME".into(),
-                path_value("worker Cargo home", cargo_home)?,
-            ),
-            (
-                "CODEX_HOME".into(),
-                path_value("worker private CODEX_HOME", &paths.codex_home)?,
-            ),
-            (
-                "HCOM_DIR".into(),
-                path_value("worker private hcom directory", &paths.hcom)?,
-            ),
-            (
-                "HOME".into(),
-                path_value("worker private HOME", &paths.home)?,
-            ),
-            (
-                "PYTHONPYCACHEPREFIX".into(),
-                path_value(
-                    "worker Python bytecode cache",
-                    &paths.temp.join("python-pycache"),
-                )?,
-            ),
-            (
-                "RUSTUP_HOME".into(),
-                path_value("worker Rustup home", &self.sources.rustup_home_source)?,
-            ),
-            (
-                "TMPDIR".into(),
-                path_value("worker temporary directory", &paths.temp)?,
-            ),
-            (
-                "XDG_CACHE_HOME".into(),
-                path_value("worker XDG cache", &paths.xdg_cache)?,
-            ),
-            (
-                "XDG_CONFIG_HOME".into(),
-                path_value("worker XDG config", &paths.xdg_config)?,
-            ),
-            (
-                "XDG_DATA_HOME".into(),
-                path_value("worker XDG data", &paths.xdg_data)?,
-            ),
-            (
-                "XDG_RUNTIME_DIR".into(),
-                path_value("worker XDG runtime", &paths.runtime)?,
-            ),
-            (
-                "XDG_STATE_HOME".into(),
-                path_value("worker XDG state", &paths.xdg_state)?,
-            ),
-        ];
+        let policy = EnvironmentPolicy::new(
+            vec!["HCOM_DIR".into()],
+            vec!["HCOM_DIR".into(), "PATH".into()],
+        )?;
+        let overrides = vec![(
+            "HCOM_DIR".into(),
+            path_value("worker private hcom directory", &paths.hcom)?,
+        )];
         let lease = ExecutionEnvironmentLease::capture_complete(
             format!("exec-lease-{}", Uuid::new_v4()),
             &self.epoch,
@@ -1013,12 +891,12 @@ impl TaskLaneSupervisor {
             overrides,
         )
         .with_context(|| format!("failed to capture exec worker environment for {task_key}"))?;
-        let auth_source = self
-            .sources
-            .codex_auth_source
-            .as_deref()
-            .ok_or_else(|| anyhow!("Codex auth source is unavailable"))?;
-        lease.with_secret_redaction_values(codex_auth_redaction_values(auth_source)?)
+        match self.sources.codex_auth_source.as_deref() {
+            Some(auth_source) => {
+                lease.with_secret_redaction_values(codex_auth_redaction_values(auth_source)?)
+            }
+            None => Ok(lease),
+        }
     }
 
     fn build_turn_prompt(
@@ -1041,6 +919,13 @@ impl TaskLaneSupervisor {
             spec.repository_root,
             self.startup.project_root.display()
         ));
+        prompt.push_str(
+            "\nBefore doing any work, inspect and follow the instruction files applicable to \
+             both the project directory and the task repository (including AGENTS.md, \
+             AGENTS.override.md, and nested instruction files for paths you touch). Codex has \
+             already loaded its native user/project configuration; the repository is also \
+             registered as a native workspace root when it differs from the project directory.\n",
+        );
         if !spec.acceptance_criteria.is_empty() {
             prompt.push_str("\n## Acceptance criteria\n\n");
             for item in &spec.acceptance_criteria {
@@ -1196,68 +1081,10 @@ fn runtime_error_failure(error: RuntimeError) -> Result<SanitizedRuntimeFailure>
         .map_err(|failure| anyhow!(failure.detail))
 }
 
-#[derive(Serialize)]
-struct TaskCodexConfig {
-    mcp_servers: BTreeMap<String, toml::Value>,
-    projects: BTreeMap<String, TaskCodexProject>,
-    shell_environment_policy: TaskShellEnvironmentPolicy,
-}
-
-#[derive(Serialize)]
-struct TaskCodexProject {
-    trust_level: &'static str,
-}
-
-#[derive(Serialize)]
-struct TaskShellEnvironmentPolicy {
-    inherit: &'static str,
-    ignore_default_excludes: bool,
-}
-
-fn write_private_codex_config(path: &Path, repository_root: &Path) -> Result<()> {
-    let repository_root = path_value("task repository root", repository_root)?;
-    let config = TaskCodexConfig {
-        mcp_servers: BTreeMap::new(),
-        projects: [(
-            repository_root,
-            TaskCodexProject {
-                trust_level: "untrusted",
-            },
-        )]
-        .into_iter()
-        .collect(),
-        shell_environment_policy: TaskShellEnvironmentPolicy {
-            inherit: "all",
-            ignore_default_excludes: true,
-        },
-    };
-    let contents = toml::to_string(&config)?.into_bytes();
-    if contents.len() > 16 * 1024 {
-        bail!("task-private Codex config exceeds its 16 KiB bound");
-    }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
-    file.write_all(&contents)?;
-    file.flush()?;
-    Ok(())
-}
-
 fn clone_runtime_paths(paths: &TaskRuntimePaths) -> TaskRuntimePaths {
     TaskRuntimePaths {
-        home: paths.home.clone(),
-        codex_home: paths.codex_home.clone(),
-        temp: paths.temp.clone(),
         runtime: paths.runtime.clone(),
-        artifacts: paths.artifacts.clone(),
         hcom: paths.hcom.clone(),
-        xdg_config: paths.xdg_config.clone(),
-        xdg_state: paths.xdg_state.clone(),
-        xdg_cache: paths.xdg_cache.clone(),
-        xdg_data: paths.xdg_data.clone(),
     }
 }
 
@@ -1282,9 +1109,11 @@ VERDICT: REQUEST_CHANGES
 
 on its own line, with no decoration and no other text on that line. After it,
 write your findings as free-form markdown (path:line references are helpful but
-not required). Judge how deeply to verify: the repository is read-only to you,
-but your sandbox is writable, so you may copy it elsewhere and build or test it
-if you want independent evidence.
+not required). Judge how deeply to verify. You have the same native host view as
+a human-launched Codex session, but the reviewer role forbids modifying the
+reviewed source, Git state, installed artifacts, or branches. You may copy the
+tree elsewhere and build or test that copy when it helps obtain independent
+evidence.
 ";
 
 fn role_instructions(role: WorkerRole) -> &'static str {
@@ -1677,6 +1506,20 @@ mod tests {
                     OsString::from("HCOM_DIR"),
                     OsString::from("/must/not/reach/task"),
                 ),
+                (OsString::from("HOME"), OsString::from("/native/home")),
+                (
+                    OsString::from("CODEX_HOME"),
+                    OsString::from("/native/codex-home"),
+                ),
+                (OsString::from("TMPDIR"), OsString::from("/native/tmp")),
+                (
+                    OsString::from("XDG_RUNTIME_DIR"),
+                    OsString::from("/native/xdg-runtime"),
+                ),
+                (
+                    OsString::from("XDG_CACHE_HOME"),
+                    OsString::from("/native/xdg-cache"),
+                ),
             ]);
             Self {
                 _temp: temp,
@@ -1787,8 +1630,6 @@ mod tests {
                 sources.set_profiles_for_test(profiles);
                 sources.codex_auth_source =
                     Some(fs::canonicalize(format!("{home}/.codex/auth.json")).unwrap());
-                sources.cargo_bin_source = PathBuf::from(format!("{home}/.cargo/bin"));
-                sources.rustup_home_source = PathBuf::from(format!("{home}/.rustup"));
                 // Complete parent inheritance, exactly like production.
                 sources.parent_environment = ParentEnvironment::capture_current();
 
@@ -2162,31 +2003,18 @@ mod tests {
     }
 
     #[test]
-    fn task_private_codex_config_is_closed_and_marks_the_exact_repository_untrusted() {
+    fn task_runtime_only_creates_hcom_owned_state_and_raw_transport_directories() {
         let fixture = Fixture::new();
-        let (_root, paths) =
+        let (root, paths) =
             TaskRuntimePaths::create(&fixture.run_root, 0, "config", &fixture.repository).unwrap();
-        let config_path = paths.codex_home.join("config.toml");
-        let encoded = fs::read_to_string(&config_path).unwrap();
-        let config: toml::Table = toml::from_str(&encoded).unwrap();
-        let repository = fixture.repository.to_str().unwrap();
-        assert_eq!(
-            config["projects"][repository]["trust_level"].as_str(),
-            Some("untrusted")
-        );
-        assert_eq!(
-            config["shell_environment_policy"]["inherit"].as_str(),
-            Some("all")
-        );
-        assert_eq!(
-            config["shell_environment_policy"]["ignore_default_excludes"].as_bool(),
-            Some(true)
-        );
-        assert!(config["mcp_servers"].as_table().unwrap().is_empty());
-        assert_eq!(
-            fs::metadata(config_path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        let mut children = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        children.sort();
+        assert_eq!(children, [OsString::from("hcom"), OsString::from("run")]);
+        assert!(paths.hcom.is_dir());
+        assert!(paths.runtime.is_dir());
     }
 
     #[test]
@@ -2695,6 +2523,20 @@ mod tests {
             })
             .map(|(_, _, prompt)| prompt.clone())
             .expect("initial review prompt");
+        let development_prompt = audit
+            .prompts
+            .iter()
+            .find(|(role, purpose, _)| {
+                *role == WorkerRole::Developer && *purpose == RuntimeTurnPurpose::InitialDevelopment
+            })
+            .map(|(_, _, prompt)| prompt.clone())
+            .expect("initial development prompt");
+        for prompt in [&development_prompt, &review_prompt] {
+            assert!(prompt.contains("AGENTS.md"));
+            assert!(prompt.contains("AGENTS.override.md"));
+            assert!(prompt.contains(fixture.project_root.to_str().unwrap()));
+            assert!(prompt.contains(fixture.repository.to_str().unwrap()));
+        }
         assert!(review_prompt.contains("first attempt: added the module"));
         assert!(review_prompt.contains("VERDICT: LGTM"));
         assert!(review_prompt.contains("VERDICT: REQUEST_CHANGES"));
@@ -3125,7 +2967,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_parent_environment_is_materialized_with_task_private_overrides() {
+    fn complete_parent_environment_changes_only_hcom_owned_identity_and_state() {
         let fixture = Fixture::new();
         let audit = Arc::new(Mutex::new(Audit::default()));
         let script = task_script(
@@ -3186,19 +3028,17 @@ mod tests {
         );
         assert_ne!(get(b"HCOM_DIR"), Some(b"/must/not/reach/task".as_slice()));
         assert_eq!(get(b"HCOM_WORKER_ROLE"), Some(b"task-runtime".as_slice()));
-        for name in [
-            b"HOME".as_slice(),
-            b"CODEX_HOME".as_slice(),
-            b"TMPDIR".as_slice(),
-            b"XDG_RUNTIME_DIR".as_slice(),
-            b"XDG_CACHE_HOME".as_slice(),
-        ] {
-            assert!(
-                get(name)
-                    .unwrap()
-                    .starts_with(fixture.run_root.as_os_str().as_bytes())
-            );
-        }
+        assert_eq!(get(b"HOME"), Some(b"/native/home".as_slice()));
+        assert_eq!(get(b"CODEX_HOME"), Some(b"/native/codex-home".as_slice()));
+        assert_eq!(get(b"TMPDIR"), Some(b"/native/tmp".as_slice()));
+        assert_eq!(
+            get(b"XDG_RUNTIME_DIR"),
+            Some(b"/native/xdg-runtime".as_slice())
+        );
+        assert_eq!(
+            get(b"XDG_CACHE_HOME"),
+            Some(b"/native/xdg-cache".as_slice())
+        );
     }
 
     #[test]
@@ -3598,29 +3438,40 @@ mod tests {
     }
 
     #[test]
-    fn missing_runtime_source_is_classified_as_environment_setup_failure() {
+    fn missing_codex_auth_file_does_not_block_native_environment_auth() {
         let mut fixture = Fixture::new();
         fixture.sources.codex_auth_source = None;
-        let mut supervisor = fixture.supervisor(Vec::new(), Arc::new(Mutex::new(Audit::default())));
-        let task = fixture.task("missing-auth", &["src"], 2);
-        let (plan_version, plan_hash) = supervisor
-            .replace_plan(
-                0,
-                CODEX_TASK_WORKER_ADAPTER,
-                CODEX_TASK_WORKER_ADAPTER,
-                vec![task],
-            )
-            .unwrap();
-        assert!(
-            supervisor
-                .approve_and_start(1, plan_version, &plan_hash, true)
-                .is_err()
+        let script = task_script(
+            "environment-auth",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("implemented")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [lgtm("sound")],
+                ),
+            ],
+            vec![
+                Mutation::Commit {
+                    path: "src/task.txt",
+                    contents: "done\n",
+                },
+                Mutation::None,
+            ],
         );
-        let snapshot = supervisor.snapshot();
-        assert_eq!(snapshot.state, SessionState::NeedsHuman);
+        let mut supervisor =
+            fixture.supervisor(vec![script], Arc::new(Mutex::new(Audit::default())));
+        start(
+            &mut supervisor,
+            vec![fixture.task("environment-auth", &["src"], 2)],
+        );
         assert_eq!(
-            snapshot.terminal_detail.as_deref(),
-            Some("task-private environment setup failed")
+            drive_terminal(&mut supervisor).state,
+            SessionState::Completed
         );
     }
 

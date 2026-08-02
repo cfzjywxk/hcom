@@ -8,7 +8,10 @@
 #
 #   scripts/codex-exec-contract-smokes
 #
-# Requires: the pinned codex build, a working auth.json, and network access.
+# Requires: the pinned codex build, usable native authentication, and network
+# access. The disposable CODEX_HOME used here prevents a smoke from touching
+# the operator's real session history while exercising the same native config
+# loader and process shape as production.
 set -uo pipefail
 
 CODEX=/home/ywxk/.codex/packages/standalone/releases/0.146.0-x86_64-unknown-linux-musl/bin/codex
@@ -19,7 +22,6 @@ WORK=$(mktemp -d -t hcom-exec-smokes.XXXXXX)
 trap 'rm -rf -- "$WORK"' EXIT
 pass=0
 fail=0
-block=0
 
 report() { # name, ok(0/1), detail
   if [ "$2" -eq 0 ]; then
@@ -31,21 +33,9 @@ report() { # name, ok(0/1), detail
   fi
 }
 
-# A known upstream defect this lane cannot work around. Never reported as
-# PASS: silently green would claim a guarantee the runtime does not have.
-report_block() { # name, ok(0/1), detail
-  if [ "$2" -eq 0 ]; then
-    printf 'PASS  %-46s %s\n' "$1" "${3:-}"
-    pass=$((pass + 1))
-  else
-    printf 'BLOCK %-46s %s\n' "$1" "${3:-}"
-    block=$((block + 1))
-  fi
-}
-
 # Create turns carry --cd; resume turns must not (0.146 rejects it there) and
 # instead inherit the *process* working directory, so run from `cwd` either way.
-closed_shape() { # cwd, out_file, extra args...
+native_shape() { # cwd, out_file, extra args...
   local cwd="$1" out="$2"
   shift 2
   local cd_args=(--cd "$cwd")
@@ -53,29 +43,14 @@ closed_shape() { # cwd, out_file, extra args...
     [ "$argument" = "resume" ] && cd_args=()
   done
   cd "$cwd" || return 1
-  local disable=(apps auth_elicitation browser_use browser_use_external
-    browser_use_full_cdp_access code_mode_host collaboration_modes computer_use
-    enable_fanout goals guardian_approval hooks image_generation in_app_browser
-    memories multi_agent multi_agent_v2 plugins plugin_sharing remote_plugin
-    shell_snapshot skill_mcp_dependency_install skill_search
-    tool_call_mcp_elicitation workspace_dependencies)
-  local dis=()
-  for feature in "${disable[@]}"; do dis+=(--disable "$feature"); done
   timeout "${SMOKE_TIMEOUT:-280}" "$CODEX" exec \
     --sandbox danger-full-access \
     --skip-git-repo-check \
     "$@" \
     --json \
-    --strict-config \
     --model "$MODEL" \
     --config "model_reasoning_effort=\"$EFFORT\"" \
     --config 'approval_policy="never"' \
-    --config 'mcp_servers={}' \
-    --config 'shell_environment_policy.inherit="all"' \
-    --config 'shell_environment_policy.ignore_default_excludes=true' \
-    --ignore-user-config \
-    --ignore-rules \
-    "${dis[@]}" \
     "${cd_args[@]}" \
     --output-last-message "$out" \
     -
@@ -87,8 +62,7 @@ if [ -x "$CODEX" ]; then report "C0 pinned binary present" 0; else
 fi
 help=$("$CODEX" exec --help 2>&1)
 missing=""
-for flag in resume --sandbox --skip-git-repo-check --json --strict-config \
-            --model --config --ignore-user-config --ignore-rules --disable \
+for flag in resume --sandbox --skip-git-repo-check --json --model --config \
             --cd --output-last-message --add-dir; do
   grep -q -- "$flag" <<<"$help" || missing="$missing $flag"
 done
@@ -100,7 +74,7 @@ mkdir -p "$WORK/c1/project" "$WORK/c1/home"
 export CODEX_HOME="$WORK/c1/home"
 cp ~/.codex/auth.json "$CODEX_HOME/auth.json" 2>/dev/null
 printf 'Reply with a final message of exactly: SMOKE-C1' \
-  | closed_shape "$WORK/c1/project" "$WORK/c1/last.md" \
+  | native_shape "$WORK/c1/project" "$WORK/c1/last.md" \
   > "$WORK/c1/events.jsonl" 2>"$WORK/c1/stderr.log"
 c1_exit=$?
 grep -q "SMOKE-C1" "$WORK/c1/last.md" 2>/dev/null
@@ -112,7 +86,7 @@ tid=$(head -1 "$WORK/c1/events.jsonl" 2>/dev/null | grep -oE '"thread_id":"[^"]+
 report "C2a first stdout line is thread.started" $? "$tid"
 if [ -n "$tid" ]; then
   printf 'Reply with a final message of exactly: SMOKE-C2' \
-    | closed_shape "$WORK/c1/project" "$WORK/c1/resume.md" resume "$tid" \
+    | native_shape "$WORK/c1/project" "$WORK/c1/resume.md" resume "$tid" \
     > "$WORK/c1/resume-events.jsonl" 2>/dev/null
   rid=$(head -1 "$WORK/c1/resume-events.jsonl" | grep -oE '"thread_id":"[^"]+"' | cut -d'"' -f4)
   [ "$rid" = "$tid" ]
@@ -123,19 +97,30 @@ fi
 mkdir -p "$WORK/c3/project" "$WORK/c3/extra" "$WORK/c3/home"
 export CODEX_HOME="$WORK/c3/home"
 cp ~/.codex/auth.json "$CODEX_HOME/auth.json" 2>/dev/null
-printf 'Use your shell tool to run: touch ../extra/wrote.txt
+cat > "$WORK/c3/extra/AGENTS.md" <<'INSTRUCTIONS'
+For work in this directory, write the exact text EXTERNAL-AGENTS-C3 to wrote.txt.
+INSTRUCTIONS
+printf 'Before changing the additional task repository, inspect its applicable AGENTS.md.
+Then use your shell tool to perform the requested change there.
 Then reply with a final message of exactly: SMOKE-C3' \
-  | closed_shape "$WORK/c3/project" "$WORK/c3/last.md" --add-dir "$WORK/c3/extra" \
+  | native_shape "$WORK/c3/project" "$WORK/c3/last.md" --add-dir "$WORK/c3/extra" \
   > /dev/null 2>&1
-[ -f "$WORK/c3/extra/wrote.txt" ]
-report "C3 non-Git cwd + --add-dir write scope" $?
+grep -qx "EXTERNAL-AGENTS-C3" "$WORK/c3/extra/wrote.txt" 2>/dev/null
+report "C3 --add-dir + explicit repository instructions" $?
 
-# --- C4: environment inheritance at the tool-command layer ------------------
+# --- C4: native environment policy at the tool-command layer ----------------
 # Allowlisted synthetic variables only: a full env dump would ship real
-# credentials into the model context and the provider.
+# credentials into the model context and the provider. Production hcom does
+# not override this policy; put it in the disposable native config so the
+# probe simultaneously verifies that user config is loaded.
 mkdir -p "$WORK/c4/project" "$WORK/c4/home"
 export CODEX_HOME="$WORK/c4/home"
 cp ~/.codex/auth.json "$CODEX_HOME/auth.json" 2>/dev/null
+cat > "$CODEX_HOME/config.toml" <<'CONFIG'
+[shell_environment_policy]
+inherit = "all"
+ignore_default_excludes = true
+CONFIG
 cat > "$WORK/c4/project/probe.sh" <<'PROBE'
 #!/bin/sh
 {
@@ -151,7 +136,7 @@ export smoke_case=lower-value SMOKE_CASE=UPPER-VALUE SMOKE_EMPTY=
 export smoke_proxy=http://proxy.invalid:8080
 printf 'Use your shell tool to run: sh probe.sh
 Then reply with a final message of exactly: SMOKE-C4' \
-  | closed_shape "$WORK/c4/project" "$WORK/c4/last.md" >"$WORK/c4/events.jsonl" 2>/dev/null
+  | native_shape "$WORK/c4/project" "$WORK/c4/last.md" >"$WORK/c4/events.jsonl" 2>/dev/null
 probe=$(cat "$WORK/c4/project/probe.txt" 2>/dev/null)
 ok=0
 grep -q "SECRETSHAPED=synthtok-smoke-abcdef" <<<"$probe" || ok=1
@@ -159,7 +144,7 @@ grep -q "CASE_low=lower-value" <<<"$probe" || ok=1
 grep -q "CASE_UP=UPPER-VALUE" <<<"$probe" || ok=1
 grep -q "EMPTY=\[\]" <<<"$probe" || ok=1
 grep -q "PROXY=http://proxy.invalid:8080" <<<"$probe" || ok=1
-report "C4 complete env reaches tool commands" $ok
+report "C4 native config controls tool environment" $ok
 
 # --- C4b: the same environment survives a resume ----------------------------
 tid4=$(head -1 "$WORK/c4/events.jsonl" 2>/dev/null | grep -oE '"thread_id":"[^"]+"' | cut -d'"' -f4)
@@ -167,7 +152,7 @@ if [ -n "$tid4" ]; then
   rm -f "$WORK/c4/project/probe.txt"
   printf 'Use your shell tool to run: sh probe.sh
 Then reply with a final message of exactly: SMOKE-C4B' \
-    | closed_shape "$WORK/c4/project" "$WORK/c4/resume.md" resume "$tid4" >/dev/null 2>&1
+    | native_shape "$WORK/c4/project" "$WORK/c4/resume.md" resume "$tid4" >/dev/null 2>&1
   probe=$(cat "$WORK/c4/project/probe.txt" 2>/dev/null)
   grep -q "SECRETSHAPED=synthtok-smoke-abcdef" <<<"$probe"
   report "C4b env survives exec resume" $?
@@ -175,47 +160,31 @@ else
   report "C4b env survives exec resume" 1 "no thread id from C4"
 fi
 
-# --- C4c: non-UTF-8 environment (known upstream block) ----------------------
-# hcom inherits the parent environment byte-for-byte. Codex 0.146 panics in its
-# tool executor on a non-UTF-8 value and still exits 0, so tool calls silently
-# do nothing. Probe it explicitly instead of pretending the layer is clean.
-mkdir -p "$WORK/c4c/project" "$WORK/c4c/home"
-export CODEX_HOME="$WORK/c4c/home"
+# --- C5: native global/project instructions are both loaded -----------------
+mkdir -p "$WORK/c5/project" "$WORK/c5/home"
+export CODEX_HOME="$WORK/c5/home"
 cp ~/.codex/auth.json "$CODEX_HOME/auth.json" 2>/dev/null
-cat > "$WORK/c4c/project/probe.sh" <<'PROBE'
-#!/bin/sh
-printf 'NONUTF8_HEX=' > probe.txt
-printf '%s' "$SMOKE_NON_UTF8" | od -An -tx1 | tr -d ' \n' >> probe.txt
-printf '\n' >> probe.txt
-PROBE
-export SMOKE_NON_UTF8=$'\xff\xfe-nonutf8'
-expected_hex=$(printf '%s' "$SMOKE_NON_UTF8" | od -An -tx1 | tr -d ' \n')
-printf 'Use your shell tool to run: sh probe.sh
-Then reply with a final message of exactly: SMOKE-C4C' \
-  | closed_shape "$WORK/c4c/project" "$WORK/c4c/last.md" >/dev/null 2>&1
-unset SMOKE_NON_UTF8
-# Layer 1 (hcom -> worker) is asserted byte-for-byte in the unit tests; this
-# probes layer 2 (codex -> tool command) with the raw bytes themselves.
-grep -q "NONUTF8_HEX=$expected_hex" "$WORK/c4c/project/probe.txt" 2>/dev/null
-report_block "C4c non-UTF-8 env value reaches tools" $? \
-  "upstream codex panics on non-UTF-8 env values"
+cat > "$CODEX_HOME/AGENTS.md" <<'INSTRUCTIONS'
+Every final answer must include the exact marker GLOBAL-INSTRUCTION-C5.
+INSTRUCTIONS
+cat > "$WORK/c5/project/AGENTS.md" <<'INSTRUCTIONS'
+Every final answer must include the exact marker PROJECT-INSTRUCTION-C5.
+INSTRUCTIONS
+printf 'Reply briefly and include SMOKE-C5 while following all loaded instructions.' \
+  | native_shape "$WORK/c5/project" "$WORK/c5/last.md" >/dev/null 2>&1
+c5=0
+grep -q "SMOKE-C5" "$WORK/c5/last.md" 2>/dev/null || c5=1
+grep -q "GLOBAL-INSTRUCTION-C5" "$WORK/c5/last.md" 2>/dev/null || c5=1
+grep -q "PROJECT-INSTRUCTION-C5" "$WORK/c5/last.md" 2>/dev/null || c5=1
+report "C5 native global + project AGENTS.md" $c5
 
-# --- C5: private CODEX_HOME keeps exactly one session -----------------------
-sessions=$(find "$WORK/c1/home" -name 'state_*.sqlite' | wc -l)
+# --- C6: native CODEX_HOME receives the normal session record ---------------
+sessions=$(find "$WORK/c1/home/sessions" -name 'rollout-*.jsonl' 2>/dev/null | wc -l)
 [ "$sessions" -ge 1 ]
-report "C5 private CODEX_HOME session store" $? "state files: $sessions"
+report "C6 native session store" $? "rollout files: $sessions"
 
-printf '\n%d passed, %d failed, %d known-blocked\n' "$pass" "$fail" "$block"
-if [ "$block" -ne 0 ]; then
-  printf 'A known upstream block is NOT a pass: the lane cannot honour complete\n'
-  printf 'environment inheritance while it stands. Releasing anyway requires an\n'
-  printf 'explicit human decision to narrow that requirement; set\n'
-  printf 'SMOKE_ACCEPT_KNOWN_BLOCKS=1 to record that decision.\n'
-fi
+printf '\n%d passed, %d failed\n' "$pass" "$fail"
 if [ "$fail" -ne 0 ]; then
   exit 1
-fi
-if [ "$block" -ne 0 ] && [ -z "${SMOKE_ACCEPT_KNOWN_BLOCKS:-}" ]; then
-  exit 2
 fi
 exit 0

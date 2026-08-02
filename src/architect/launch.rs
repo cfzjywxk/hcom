@@ -1,6 +1,6 @@
 use super::bridge::{
     BridgeActivation, BridgeConfiguration, activate_bridge, configure_bridge,
-    relay_runtime_scope_hash, sha256_hex,
+    relay_runtime_scope_hash, sha256_hex, snapshot_codex_session_files,
 };
 use super::profile::{LoadedInvocationProfiles, load_task_lane_profiles};
 use crate::control_api::ActionName;
@@ -13,7 +13,6 @@ use crate::control_api::supervisor::{ControlPaths, SessionSupervisorEndpoint};
 use crate::orchestrator::SessionRuntimeSources;
 use crate::worker::codex::{
     BWRAP_EXECUTABLE, BWRAP_VERSION, CODEX_DEVELOPER_CLI_VERSION, CODEX_DEVELOPER_EXECUTABLE,
-    DISABLED_CODEX_FEATURES,
 };
 use crate::worker::profile::{
     ArchitectAdapter, ArchitectInvocationProfile, CodexApprovalPolicy, CodexSandbox,
@@ -26,7 +25,7 @@ use crate::worker::sandbox::{HostRootAccess, HostRootContract, HostRootMounts};
 use crate::worker::{ExecutableIdentity, ParentEnvironment};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -102,7 +101,11 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
 
     let project_root = canonical_project_directory(&std::env::current_dir()?)?;
     let native_environment = ArchitectEnvironment::capture()?;
-    let protected_roots = capture_architect_protected_roots(&project_root, &native_environment)?;
+    let protected_roots = if architect_adapter == ArchitectAdapter::Claude {
+        capture_architect_protected_roots(&project_root, &native_environment)?
+    } else {
+        Vec::new()
+    };
     let session_root = create_private_session_runtime()?;
     let run_root = fs::canonicalize(session_root.path())?;
     let lock_root = native_environment
@@ -176,17 +179,26 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
     let capability = random_hex(32)?;
     let paths = ArchitectLaunchPaths::create(&control_paths, &launch_id, architect_adapter)?;
     validate_path_isolation(&project_root, &paths, &tools)?;
-    let auth_source =
-        PrivateFileIdentity::capture(&discover_architect_auth_source(architect_adapter)?)?;
-    if paths_overlap(auth_source.path(), &paths.state)
-        || paths_overlap(auth_source.path(), &paths.runtime)
-    {
-        bail!("native architect auth source overlaps architect writable state");
-    }
-    create_empty_private_file(&paths.auth_target)?;
-    if architect_adapter == ArchitectAdapter::Codex {
-        write_isolated_codex_config(&paths, &tools.component.canonical_path, &project_root)?;
-    }
+    let auth_source = if architect_adapter == ArchitectAdapter::Claude {
+        let source =
+            PrivateFileIdentity::capture(&discover_architect_auth_source(architect_adapter)?)?;
+        if paths_overlap(source.path(), &paths.state)
+            || paths_overlap(source.path(), &paths.runtime)
+        {
+            bail!("native architect auth source overlaps architect writable state");
+        }
+        create_empty_private_file(&paths.auth_target)?;
+        Some(source)
+    } else {
+        None
+    };
+    let codex_native_session_source = if architect_adapter == ArchitectAdapter::Codex {
+        let codex_home = discover_native_codex_home(&native_environment, &project_root)?;
+        let baseline = snapshot_codex_session_files(&codex_home)?;
+        Some((codex_home, baseline))
+    } else {
+        None
+    };
     let preassigned_native_session_id =
         (architect_adapter == ArchitectAdapter::Claude).then(|| uuid::Uuid::new_v4().to_string());
 
@@ -265,9 +277,15 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
             Some(native_session_id) => super::bridge::ArchitectNativeSessionSource::Claude {
                 native_session_id: native_session_id.clone(),
             },
-            None => super::bridge::ArchitectNativeSessionSource::Codex {
-                codex_home: paths.native_config.clone(),
-            },
+            None => {
+                let (codex_home, baseline) = codex_native_session_source
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("native Codex session source is unavailable"))?;
+                super::bridge::ArchitectNativeSessionSource::Codex {
+                    codex_home,
+                    baseline,
+                }
+            }
         },
         relay_executable: tools.component.clone(),
         relay_runtime_scope_hash: relay_scope_hash.clone(),
@@ -292,10 +310,14 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         adapter: architect_adapter,
         control_root: control_paths.run_root().to_owned(),
         host_runtime: native_environment.runtime_home.clone(),
-        host_root: HostRootContract::capture(
-            &native_environment.cargo_bin_source,
-            &native_environment.rustup_home_source,
-        )?,
+        host_root: (architect_adapter == ArchitectAdapter::Claude)
+            .then(|| {
+                HostRootContract::capture(
+                    &native_environment.cargo_bin_source,
+                    &native_environment.rustup_home_source,
+                )
+            })
+            .transpose()?,
         protected_roots,
     };
     let (mut architect, gate_write, info_read) = match spawn_blocked_architect(
@@ -317,7 +339,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
             return Err(error);
         }
     };
-    let info = match read_bwrap_info(&info_read) {
+    let info = match read_bwrap_info(&info_read, architect_adapter == ArchitectAdapter::Claude) {
         Ok(info) => info,
         Err(error) => {
             terminate_child(&mut architect);
@@ -768,8 +790,6 @@ fn validate_architect_codex_cli(path: &Path) -> Result<()> {
         &output.stdout,
         &[
             "--config",
-            "--disable",
-            "--strict-config",
             "--model",
             "--sandbox",
             "--ask-for-approval",
@@ -790,10 +810,6 @@ fn validate_architect_codex_cli(path: &Path) -> Result<()> {
             bail!("architect Codex CLI help omitted configured value {value}");
         }
     }
-    // Codex 0.145 does not load or validate config while rendering --help, so
-    // an approval-key probe here would be vacuous. The real Architect always
-    // carries --strict-config; an unsupported serialized key therefore aborts
-    // the production launch instead of being ignored.
     Ok(())
 }
 
@@ -900,7 +916,6 @@ struct ArchitectLaunchPaths {
     runtime: PathBuf,
     relay_socket: PathBuf,
     auth_target: PathBuf,
-    codex_config_file: Option<PathBuf>,
 }
 
 impl ArchitectLaunchPaths {
@@ -945,8 +960,6 @@ impl ArchitectLaunchPaths {
             runtime: runtime.clone(),
             relay_socket: runtime.join("relay.sock"),
             auth_target,
-            codex_config_file: (adapter == ArchitectAdapter::Codex)
-                .then(|| native_config.join("config.toml")),
         })
     }
 }
@@ -997,6 +1010,44 @@ fn discover_architect_auth_source(adapter: ArchitectAdapter) -> Result<PathBuf> 
         .with_context(|| format!("{label} architect credential is unavailable"))?;
     if canonical != source {
         bail!("{label} architect credential must already be canonical");
+    }
+    Ok(canonical)
+}
+
+fn discover_native_codex_home(
+    environment: &ArchitectEnvironment,
+    project_root: &Path,
+) -> Result<PathBuf> {
+    let home = environment
+        .parent_environment
+        .unicode("HOME")?
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("native Codex requires non-empty parent HOME"))?;
+    let configured = environment
+        .parent_environment
+        .unicode("CODEX_HOME")?
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"));
+    let configured = if configured.is_absolute() {
+        configured
+    } else {
+        project_root.join(configured)
+    };
+    let canonical = fs::canonicalize(&configured).context("native Codex home is unavailable")?;
+    let metadata = fs::symlink_metadata(&configured)?;
+    // The bridge relies on this tree as native-session evidence. Group-writable
+    // user homes are valid native Codex layouts; only another-user ownership,
+    // symlinks and world-writable roots make that observation untrustworthy.
+    // SAFETY: geteuid has no preconditions.
+    if canonical != configured
+        || metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o002 != 0
+    {
+        bail!("native Codex home has an invalid identity");
     }
     Ok(canonical)
 }
@@ -1379,128 +1430,6 @@ fn create_empty_private_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct IsolatedCodexConfig {
-    tui: IsolatedTuiConfig,
-    projects: BTreeMap<String, IsolatedCodexProject>,
-    mcp_servers: BTreeMap<String, IsolatedMcpServer>,
-}
-
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct IsolatedTuiConfig {
-    terminal_title: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct IsolatedCodexProject {
-    trust_level: IsolatedCodexProjectTrustLevel,
-}
-
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum IsolatedCodexProjectTrustLevel {
-    Untrusted,
-}
-
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct IsolatedMcpServer {
-    command: String,
-    args: Vec<String>,
-    startup_timeout_sec: u32,
-    tool_timeout_sec: u32,
-    enabled: bool,
-    default_tools_approval_mode: IsolatedMcpToolApprovalMode,
-}
-
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-enum IsolatedMcpToolApprovalMode {
-    Approve,
-}
-
-fn write_isolated_codex_config(
-    paths: &ArchitectLaunchPaths,
-    component: &Path,
-    project_root: &Path,
-) -> Result<()> {
-    let server = IsolatedMcpServer {
-        command: path_text("architect MCP component", component)?.into(),
-        args: vec![
-            "relay".into(),
-            "--socket".into(),
-            path_text("architect relay socket", &paths.relay_socket)?.into(),
-        ],
-        startup_timeout_sec: 10,
-        tool_timeout_sec: 300,
-        enabled: true,
-        // The server is a per-invocation, capability-bound relay exposing only
-        // the four session-plan tools. The tool contract requires the model to
-        // relay explicit human execution authorization, which may be a direct
-        // request to follow a named plan in the current turn. hcom itself
-        // verifies the exact plan/hash and confirmation bit, not keyboard
-        // provenance. A second native MCP dialog is intentionally absent.
-        default_tools_approval_mode: IsolatedMcpToolApprovalMode::Approve,
-    };
-    let config = IsolatedCodexConfig {
-        tui: IsolatedTuiConfig {
-            terminal_title: vec![],
-        },
-        // A fresh CODEX_HOME would otherwise ask the human to decide folder
-        // trust on every Architect invocation. Record an explicit native
-        // decision for this exact cwd, but keep it untrusted: the Architect
-        // already has its separately reviewed OS-level host view, while
-        // project-local .codex config/hooks/rules must not expand the isolated
-        // native control surface.
-        projects: [(
-            path_text("architect project directory", project_root)?.into(),
-            IsolatedCodexProject {
-                trust_level: IsolatedCodexProjectTrustLevel::Untrusted,
-            },
-        )]
-        .into_iter()
-        .collect(),
-        mcp_servers: [("hcom_session_task_control".into(), server)]
-            .into_iter()
-            .collect(),
-    };
-    let bytes = toml::to_string(&config)?.into_bytes();
-    if bytes.len() > 16 * 1024 {
-        bail!("isolated Codex config exceeds its bound");
-    }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(
-            paths
-                .codex_config_file
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Codex config target is unavailable"))?,
-        )?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    drop(file);
-    let parsed: IsolatedCodexConfig = toml::from_str(std::str::from_utf8(&bytes)?)?;
-    if parsed != config {
-        bail!("isolated Codex config failed its exact round trip");
-    }
-    let metadata = fs::symlink_metadata(
-        paths
-            .codex_config_file
-            .as_ref()
-            .expect("validated Codex config target"),
-    )?;
-    if metadata.permissions().mode() & 0o777 != 0o600 {
-        bail!("isolated Codex config mode drifted");
-    }
-    Ok(())
-}
-
 fn validate_path_isolation(
     project_root: &Path,
     paths: &ArchitectLaunchPaths,
@@ -1650,24 +1579,19 @@ impl ArchitectEnvironment {
         adapter: ArchitectAdapter,
     ) -> Result<BTreeMap<String, String>> {
         let mut values = BTreeMap::new();
-        let home = self
-            .control_environment
-            .get("HOME")
-            .ok_or_else(|| anyhow::anyhow!("architect parent HOME disappeared"))?
-            .clone();
-        values.insert("HOME".into(), home);
         values.insert(
             "HCOM_DIR".into(),
             path_text("architect isolated hcom state", &paths.hcom_state)?.into(),
         );
         match adapter {
-            ArchitectAdapter::Codex => {
-                values.insert(
-                    "CODEX_HOME".into(),
-                    path_text("architect isolated Codex home", &paths.native_config)?.into(),
-                );
-            }
+            ArchitectAdapter::Codex => {}
             ArchitectAdapter::Claude => {
+                let home = self
+                    .control_environment
+                    .get("HOME")
+                    .ok_or_else(|| anyhow::anyhow!("architect parent HOME disappeared"))?
+                    .clone();
+                values.insert("HOME".into(), home);
                 values.insert(
                     "CLAUDE_CONFIG_DIR".into(),
                     path_text("architect isolated Claude config", &paths.native_config)?.into(),
@@ -1704,19 +1628,19 @@ impl ArchitectEnvironment {
                 ] {
                     values.insert(name.into(), value.into());
                 }
-            }
-        }
-        values.insert(
-            "TMPDIR".into(),
-            path_text("architect private temporary directory", &paths.runtime)?.into(),
-        );
-        values.insert(
-            "XDG_RUNTIME_DIR".into(),
-            path_text("architect private runtime directory", &paths.runtime)?.into(),
-        );
-        for name in ["CARGO_HOME", "RUSTUP_HOME"] {
-            if let Some(value) = self.control_environment.get(name) {
-                values.insert(name.into(), value.clone());
+                values.insert(
+                    "TMPDIR".into(),
+                    path_text("architect private temporary directory", &paths.runtime)?.into(),
+                );
+                values.insert(
+                    "XDG_RUNTIME_DIR".into(),
+                    path_text("architect private runtime directory", &paths.runtime)?.into(),
+                );
+                for name in ["CARGO_HOME", "RUSTUP_HOME"] {
+                    if let Some(value) = self.control_environment.get(name) {
+                        values.insert(name.into(), value.clone());
+                    }
+                }
             }
         }
         Ok(values)
@@ -1807,11 +1731,11 @@ fn spawn_bridge(component: &Path, environment: &BTreeMap<String, String>) -> Res
 struct ArchitectSandbox {
     project_root: PathBuf,
     paths: ArchitectLaunchPaths,
-    auth_source: PrivateFileIdentity,
+    auth_source: Option<PrivateFileIdentity>,
     adapter: ArchitectAdapter,
     control_root: PathBuf,
     host_runtime: PathBuf,
-    host_root: HostRootContract,
+    host_root: Option<HostRootContract>,
     protected_roots: Vec<ProtectedDirectoryIdentity>,
 }
 
@@ -1827,11 +1751,53 @@ impl ArchitectSandbox {
         {
             bail!("architect launch-control descriptors are invalid");
         }
-        self.auth_source.revalidate()?;
+        tools.revalidate()?;
+        if !matches!(
+            (&tools.architect, self.adapter),
+            (ExactArchitectTool::Codex(_), ArchitectAdapter::Codex)
+                | (ExactArchitectTool::Claude(_), ArchitectAdapter::Claude)
+        ) {
+            bail!("architect executable differs from the selected adapter");
+        }
+        if self.adapter == ArchitectAdapter::Codex {
+            if self.auth_source.is_some()
+                || self.host_root.is_some()
+                || !self.protected_roots.is_empty()
+            {
+                bail!("native Codex architect unexpectedly carries an isolated host contract");
+            }
+            let mut argv = vec![
+                "--die-with-parent".into(),
+                "--bind".into(),
+                "/".into(),
+                "/".into(),
+                "--chdir".into(),
+                path_text("architect project directory", &self.project_root)?.into(),
+            ];
+            for (name, value) in environment.sandbox_values(&self.paths, self.adapter)? {
+                argv.extend(["--setenv".into(), name, value]);
+            }
+            argv.extend([
+                "--block-fd".into(),
+                block_fd.to_string(),
+                "--info-fd".into(),
+                info_fd.to_string(),
+            ]);
+            return Ok(argv);
+        }
+
+        let auth_source = self
+            .auth_source
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Claude architect auth source is unavailable"))?;
+        let host_root = self
+            .host_root
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Claude architect host contract is unavailable"))?;
+        auth_source.revalidate()?;
         if paths_overlap(&self.paths.runtime, &self.host_runtime) {
             bail!("architect relay runtime overlaps the host runtime directory");
         }
-        tools.revalidate()?;
         for root in &self.protected_roots {
             root.revalidate("architect control root")?;
         }
@@ -1850,13 +1816,6 @@ impl ArchitectSandbox {
             {
                 bail!("inherited credential socket overlaps hcom architect control state");
             }
-        }
-        if !matches!(
-            (&tools.architect, self.adapter),
-            (ExactArchitectTool::Codex(_), ArchitectAdapter::Codex)
-                | (ExactArchitectTool::Claude(_), ArchitectAdapter::Claude)
-        ) {
-            bail!("architect executable differs from the selected adapter");
         }
         let tmp = Path::new("/tmp");
         let masked_dirs: Vec<&Path> = if self.host_runtime.starts_with(tmp) {
@@ -1881,7 +1840,7 @@ impl ArchitectSandbox {
         let mut read_only_files = vec![
             tools.architect.executable().canonical_path.as_path(),
             tools.component.canonical_path.as_path(),
-            self.auth_source.path(),
+            auth_source.path(),
         ];
         read_only_files.extend(
             tools
@@ -1897,12 +1856,12 @@ impl ArchitectSandbox {
         );
         read_only_files.sort_unstable();
         read_only_files.dedup();
-        let mut argv = self.host_root.host_root_argv(HostRootMounts {
+        let mut argv = host_root.host_root_argv(HostRootMounts {
             isolated_home: &self.paths.home,
             native_config: &self.paths.native_config,
             launch_cwd: &self.project_root,
             artifact_dir: &self.paths.runtime,
-            auth_source: self.auth_source.path(),
+            auth_source: auth_source.path(),
             auth_target: &self.paths.auth_target,
             readable_roots: &protected_roots,
             writable_roots: &[&self.project_root],
@@ -2013,11 +1972,8 @@ fn architect_native_argv(
                 "--cd".into(),
                 path_text("architect project directory", &sandbox.project_root)?.into(),
                 "--no-alt-screen".into(),
-                "--strict-config".into(),
             ];
-            for feature in DISABLED_CODEX_FEATURES {
-                argv.extend(["--disable".into(), (*feature).into()]);
-            }
+            argv.extend(codex_control_mcp_overrides(tools, sandbox)?);
             Ok(argv)
         }
         ArchitectInvocationProfile::Claude { profile } => {
@@ -2071,6 +2027,34 @@ fn architect_native_argv(
             Ok(argv)
         }
     }
+}
+
+fn codex_control_mcp_overrides(
+    tools: &ExactTools,
+    sandbox: &ArchitectSandbox,
+) -> Result<Vec<String>> {
+    let prefix = "mcp_servers.hcom_session_task_control";
+    let command = toml::Value::String(
+        path_text("architect MCP component", &tools.component.canonical_path)?.into(),
+    )
+    .to_string();
+    let args = toml::Value::Array(vec![
+        toml::Value::String("relay".into()),
+        toml::Value::String("--socket".into()),
+        toml::Value::String(
+            path_text("architect relay socket", &sandbox.paths.relay_socket)?.into(),
+        ),
+    ])
+    .to_string();
+    // Replace this one hcom-owned leaf as a whole. Native user configuration
+    // remains loaded, including every other MCP server, while a stale or
+    // user-defined table under the reserved name cannot leave incompatible
+    // transport fields merged into the control server.
+    let value = format!(
+        "{prefix}={{ command = {command}, args = {args}, startup_timeout_sec = 10, \
+         tool_timeout_sec = 300, enabled = true, default_tools_approval_mode = \"approve\" }}"
+    );
+    Ok(vec!["--config".into(), value])
 }
 
 fn validate_native_argv(
@@ -2157,13 +2141,13 @@ fn release_gate(gate: OwnedFd) -> Result<()> {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct BwrapInfo {
     child_pid: u32,
-    ipc_namespace: u64,
+    ipc_namespace: Option<u64>,
     mnt_namespace: u64,
-    pid_namespace: u64,
-    uts_namespace: u64,
+    pid_namespace: Option<u64>,
+    uts_namespace: Option<u64>,
 }
 
-fn read_bwrap_info(fd: &OwnedFd) -> Result<BwrapInfo> {
+fn read_bwrap_info(fd: &OwnedFd, require_isolated_namespaces: bool) -> Result<BwrapInfo> {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut bytes = Vec::new();
     loop {
@@ -2208,23 +2192,25 @@ fn read_bwrap_info(fd: &OwnedFd) -> Result<BwrapInfo> {
             if bytes.is_empty() {
                 bail!("bwrap closed its info fd before reporting a child");
             }
-            return parse_bwrap_info(&bytes)
+            return parse_bwrap_info(&bytes, require_isolated_namespaces)
                 .context("bwrap closed its info fd with an invalid report");
         }
         bytes.extend_from_slice(&buffer[..count as usize]);
     }
 }
 
-fn parse_bwrap_info(bytes: &[u8]) -> Result<BwrapInfo> {
+fn parse_bwrap_info(bytes: &[u8], require_isolated_namespaces: bool) -> Result<BwrapInfo> {
     let info: BwrapInfo =
         serde_json::from_slice(bytes).context("bwrap launch info is not strict JSON")?;
-    if info.child_pid <= 1
-        || info.ipc_namespace == 0
-        || info.mnt_namespace == 0
-        || info.pid_namespace == 0
-        || info.uts_namespace == 0
-    {
+    if info.child_pid <= 1 || info.mnt_namespace == 0 {
         bail!("bwrap returned an invalid launch identity");
+    }
+    if require_isolated_namespaces
+        && [info.ipc_namespace, info.pid_namespace, info.uts_namespace]
+            .into_iter()
+            .any(|namespace| namespace.is_none_or(|namespace| namespace == 0))
+    {
+        bail!("bwrap omitted a required isolated namespace identity");
     }
     Ok(info)
 }
@@ -2594,14 +2580,13 @@ mod tests {
     }
 
     #[test]
-    fn isolated_codex_config_decides_project_trust_and_preapproves_only_control_server() {
+    fn codex_control_server_is_an_additive_cli_overlay_not_a_private_config() {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
         let project = root.join("project");
         fs::create_dir(&project).unwrap();
         let native_config = root.join("codex-home");
         fs::create_dir(&native_config).unwrap();
-        let config_file = native_config.join("config.toml");
         let paths = ArchitectLaunchPaths {
             state: root.join("state"),
             home: root.join("home"),
@@ -2614,34 +2599,42 @@ mod tests {
             runtime: root.join("runtime"),
             relay_socket: root.join("runtime/relay.sock"),
             auth_target: root.join("codex-home/auth.json"),
-            codex_config_file: Some(config_file.clone()),
         };
-        let component = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
-
-        write_isolated_codex_config(&paths, &component, &project).unwrap();
-
-        let encoded = fs::read_to_string(config_file).unwrap();
-        let config: IsolatedCodexConfig = toml::from_str(&encoded).unwrap();
-        assert!(!encoded.contains("[notice]"));
-        assert!(!encoded.contains("hide_full_access_warning"));
-        assert!(!encoded.contains("hide_world_writable_warning"));
-        assert_eq!(config.projects.len(), 1);
-        assert!(matches!(
-            config
-                .projects
-                .get(project.to_str().unwrap())
-                .unwrap()
-                .trust_level,
-            IsolatedCodexProjectTrustLevel::Untrusted
-        ));
-        assert!(encoded.contains("trust_level = \"untrusted\""));
-        assert_eq!(config.mcp_servers.len(), 1);
-        let server = config.mcp_servers.get("hcom_session_task_control").unwrap();
-        assert!(matches!(
-            server.default_tools_approval_mode,
-            IsolatedMcpToolApprovalMode::Approve
-        ));
+        let executable = ExecutableIdentity::capture(
+            fs::canonicalize(std::env::current_exe().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let tools = ExactTools {
+            architect: ExactArchitectTool::Codex(executable.clone()),
+            bwrap: executable.clone(),
+            component: executable.clone(),
+            hcom_executables: vec![executable],
+        };
+        let sandbox = ArchitectSandbox {
+            project_root: project,
+            paths,
+            auth_source: None,
+            adapter: ArchitectAdapter::Codex,
+            control_root: root.join("control"),
+            host_runtime: root.join("host-runtime"),
+            host_root: None,
+            protected_roots: Vec::new(),
+        };
+        let overrides = codex_control_mcp_overrides(&tools, &sandbox).unwrap();
+        let encoded = overrides.join("\n");
+        assert_eq!(
+            overrides
+                .iter()
+                .filter(|value| *value == "--config")
+                .count(),
+            1
+        );
+        assert!(encoded.contains("mcp_servers.hcom_session_task_control={"));
+        assert!(encoded.contains("command = "));
         assert!(encoded.contains("default_tools_approval_mode = \"approve\""));
+        assert!(!encoded.contains("projects."));
+        assert!(!encoded.contains("trust_level"));
+        assert!(!sandbox.paths.native_config.join("config.toml").exists());
     }
 
     #[test]
@@ -2827,7 +2820,6 @@ mod tests {
             "--cd".into(),
             "/repo".into(),
             "--no-alt-screen".into(),
-            "--strict-config".into(),
         ];
         assert!(!native.iter().any(|argument| argument == "-"));
         assert!(!native.iter().any(|argument| argument.contains("nonce")));
@@ -2836,6 +2828,12 @@ mod tests {
                 .iter()
                 .any(|argument| argument.contains("capability"))
         );
+        assert!(!native.iter().any(|argument| {
+            matches!(
+                argument.as_str(),
+                "--strict-config" | "--disable" | "--ignore-user-config" | "--ignore-rules"
+            )
+        }));
     }
 
     #[test]
@@ -2886,16 +2884,15 @@ mod tests {
             runtime: runtime.clone(),
             relay_socket: runtime.join("relay.sock"),
             auth_target: native_config.join(".credentials.json"),
-            codex_config_file: None,
         };
         let sandbox = ArchitectSandbox {
             project_root: project,
             paths,
-            auth_source: PrivateFileIdentity::capture(&auth).unwrap(),
+            auth_source: Some(PrivateFileIdentity::capture(&auth).unwrap()),
             adapter: ArchitectAdapter::Claude,
             control_root: root.join("control"),
             host_runtime: root.clone(),
-            host_root: HostRootContract::capture(&cargo_bin, &rustup_home).unwrap(),
+            host_root: Some(HostRootContract::capture(&cargo_bin, &rustup_home).unwrap()),
             protected_roots: Vec::new(),
         };
         let profile = ArchitectInvocationProfile::Claude {
@@ -2969,7 +2966,6 @@ mod tests {
             runtime: runtime.clone(),
             relay_socket: runtime.join("relay.sock"),
             auth_target: root.join("architect-state/home/.codex/auth.json"),
-            codex_config_file: Some(root.join("architect-state/home/.codex/config.toml")),
         };
         let fake_codex = fs::canonicalize(root.join("fake-codex")).unwrap();
         let codex = capture_exact_tool(&fake_codex, CODEX_DEVELOPER_CLI_VERSION).unwrap();
@@ -3002,23 +2998,12 @@ mod tests {
         let sandbox = ArchitectSandbox {
             project_root: repository,
             paths,
-            auth_source: PrivateFileIdentity::capture(&root.join("auth.json")).unwrap(),
+            auth_source: None,
             adapter: ArchitectAdapter::Codex,
             control_root: root.join("session-control"),
             host_runtime,
-            host_root: HostRootContract::capture(&cargo_bin_source, &rustup_home_source).unwrap(),
-            protected_roots: [
-                control_home.join(".hcom"),
-                control_home.join(".codex"),
-                control_home.join(".claude"),
-            ]
-            .iter()
-            .map(|path| {
-                ProtectedDirectoryIdentity::capture_if_present(path, "test control root")
-                    .unwrap()
-                    .unwrap()
-            })
-            .collect(),
+            host_root: None,
+            protected_roots: Vec::new(),
         };
         let report = root.join("architect-state/home/blank-report");
         let write_probe = root.join("repo/architect-write-probe");
@@ -3032,7 +3017,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let info = match read_bwrap_info(&info) {
+        let info = match read_bwrap_info(&info, false) {
             Ok(info) => info,
             Err(error) => {
                 drop(gate);
@@ -3057,7 +3042,7 @@ mod tests {
     }
 
     #[test]
-    fn blank_launch_keeps_input_empty_and_grants_path_preserving_architect_write() {
+    fn blank_codex_launch_keeps_input_empty_and_preserves_native_host_semantics() {
         let temp = tempfile::Builder::new()
             .prefix("hcom-phase7-blank.")
             .tempdir()
@@ -3174,6 +3159,7 @@ mod tests {
 
         let report = home.join("blank-report");
         let external_write_probe = external_source.join("architect-write-probe");
+        let fake_codex = root.join("fake-codex");
         let profile = CodexInvocationProfile::architect_default();
         let mut expected_args = vec![
             "--model".to_owned(),
@@ -3187,12 +3173,22 @@ mod tests {
             "--cd".to_owned(),
             repository.to_string_lossy().into_owned(),
             "--no-alt-screen".to_owned(),
-            "--strict-config".to_owned(),
         ];
-        for feature in DISABLED_CODEX_FEATURES {
-            expected_args.extend(["--disable".to_owned(), (*feature).to_owned()]);
-        }
-        let fake_codex = root.join("fake-codex");
+        let command = toml::Value::String(fake_codex.to_string_lossy().into_owned()).to_string();
+        let relay_args = toml::Value::Array(vec![
+            toml::Value::String("relay".into()),
+            toml::Value::String("--socket".into()),
+            toml::Value::String(relay_socket.to_string_lossy().into_owned()),
+        ])
+        .to_string();
+        expected_args.extend([
+            "--config".to_owned(),
+            format!(
+                "mcp_servers.hcom_session_task_control={{ command = {command}, args = \
+                 {relay_args}, startup_timeout_sec = 10, tool_timeout_sec = 300, enabled = true, \
+                 default_tools_approval_mode = \"approve\" }}"
+            ),
+        ]);
         let script = format!(
             r#"#!/usr/bin/python3
 import errno
@@ -3221,7 +3217,7 @@ if os.environb.get(b"RAW_\xff_NAME") != b"value-\xfe":
     raise SystemExit(70)
 if os.environ.get("HCOM_DIR") != {isolated_hcom_state}:
     raise SystemExit(34)
-if os.environ.get("CODEX_HOME") != {isolated_codex_home}:
+if os.environ.get("CODEX_HOME") != {parent_codex_home}:
     raise SystemExit(71)
 if os.environ.get("HOME") != {isolated_parent_home}:
     raise SystemExit(72)
@@ -3240,44 +3236,17 @@ with open({external_source}, encoding="utf-8") as source:
 with open({external_write_probe}, "x", encoding="utf-8") as output:
     output.write("architect external write\n")
 
-for index, protected in enumerate({protected_files}):
+for index, native_writable in enumerate({native_writable_files}):
     try:
-        with open(protected, "a", encoding="utf-8") as output:
-            output.write("forbidden")
-    except OSError as error:
-        if error.errno != errno.EROFS:
-            raise SystemExit(40 + index)
-    else:
-        raise SystemExit(50 + index)
-try:
-    os.unlink({installed_hcom})
-except OSError as error:
-    if error.errno not in (errno.EROFS, errno.EBUSY, errno.EPERM):
-        raise SystemExit(60)
-else:
-    raise SystemExit(61)
-
-try:
-    with open({auth_source}, "a", encoding="utf-8") as output:
-        output.write("forbidden")
-except OSError as error:
-    if error.errno != errno.EROFS:
-        raise SystemExit(62)
-else:
-    raise SystemExit(63)
-for hidden in {hidden_sockets}:
-    if os.path.exists(hidden):
+        with open(native_writable, "a", encoding="utf-8") as output:
+            output.write("native-write")
+    except OSError:
+        raise SystemExit(40 + index)
+with open({auth_source}, "a", encoding="utf-8") as output:
+    output.write("native-write")
+for visible in {visible_sockets}:
+    if not os.path.exists(visible):
         raise SystemExit(64)
-    probe = socket.socket(socket.AF_UNIX)
-    try:
-        probe.connect(hidden)
-    except OSError as error:
-        if error.errno != errno.ENOENT:
-            raise SystemExit(65)
-    else:
-        raise SystemExit(66)
-    finally:
-        probe.close()
 
 for inherited in {inherited_sockets}:
     probe = socket.socket(socket.AF_UNIX)
@@ -3297,7 +3266,7 @@ with open({report}, "w", encoding="utf-8") as output:
             expected_args = serde_json::to_string(&expected_args).unwrap(),
             isolated_hcom_state =
                 serde_json::to_string(&state.join("hcom").to_string_lossy()).unwrap(),
-            isolated_codex_home = serde_json::to_string(&codex_home).unwrap(),
+            parent_codex_home = serde_json::to_string("parent-codex-home").unwrap(),
             isolated_parent_home = serde_json::to_string(&control_home).unwrap(),
             dbus_address =
                 serde_json::to_string(&format!("unix:path={}", session_bus_socket.display()))
@@ -3308,16 +3277,14 @@ with open({report}, "w", encoding="utf-8") as output:
             write_probe = serde_json::to_string(&repository.join("architect-write-probe")).unwrap(),
             external_source = serde_json::to_string(&external_source.join("source.txt")).unwrap(),
             external_write_probe = serde_json::to_string(&external_write_probe).unwrap(),
-            protected_files = serde_json::to_string(&[
+            native_writable_files = serde_json::to_string(&[
                 live_hcom_db.to_string_lossy().into_owned(),
                 parent_codex_config.to_string_lossy().into_owned(),
                 parent_claude_config.to_string_lossy().into_owned(),
-                installed_hcom.to_string_lossy().into_owned(),
             ])
             .unwrap(),
-            installed_hcom = serde_json::to_string(&installed_hcom).unwrap(),
             auth_source = serde_json::to_string(&auth_source).unwrap(),
-            hidden_sockets = serde_json::to_string(&[
+            visible_sockets = serde_json::to_string(&[
                 control_socket.to_string_lossy().into_owned(),
                 registration_socket.to_string_lossy().into_owned(),
                 other_relay_socket.to_string_lossy().into_owned(),
@@ -3348,6 +3315,7 @@ with open({report}, "w", encoding="utf-8") as output:
             ])
             .env(BLANK_HELPER_ROOT, &root)
             .env(BLANK_HELPER_CONTROL_HOME, &control_home)
+            .env("HOME", &control_home)
             .env("XDG_CONFIG_HOME", root.join("xdg-config"))
             .env("XDG_RUNTIME_DIR", &host_runtime)
             .env("XDG_STATE_HOME", root.join("xdg-state"))
@@ -3423,18 +3391,18 @@ with open({report}, "w", encoding="utf-8") as output:
             fs::read_to_string(&external_write_probe).unwrap(),
             "architect external write\n"
         );
-        assert_eq!(fs::read_to_string(&auth_source).unwrap(), "");
+        assert_eq!(fs::read_to_string(&auth_source).unwrap(), "native-write");
         assert_eq!(
             fs::read_to_string(&live_hcom_db).unwrap(),
-            "live hcom state\n"
+            "live hcom state\nnative-write"
         );
         assert_eq!(
             fs::read_to_string(&parent_codex_config).unwrap(),
-            "live codex config\n"
+            "live codex config\nnative-write"
         );
         assert_eq!(
             fs::read_to_string(&parent_claude_config).unwrap(),
-            "live claude config\n"
+            "live claude config\nnative-write"
         );
         assert_eq!(
             fs::read_to_string(&installed_hcom).unwrap(),

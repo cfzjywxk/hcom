@@ -2,8 +2,9 @@
 //!
 //! The workspace is evidence and human handoff material, never a recovery
 //! store: the supervisor's state lives only in memory, and a restarted hcom
-//! never reads this tree to resume a run. Only hcom writes here; workers get
-//! no writable mount anywhere inside it.
+//! never reads this tree to resume a run. The hcom APIs are its intended
+//! writer, but native-equivalent workers have ordinary same-user host access;
+//! this directory is not a tamper-proof boundary.
 
 use anyhow::{Context, Result, bail};
 use std::fs::{self, File, OpenOptions};

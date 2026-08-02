@@ -1,6 +1,7 @@
 use crate::worker::profile::{
-    ArchitectAdapter, ArchitectInvocationProfile, ClaudeInvocationProfile, CodexInvocationProfile,
-    DeveloperInvocationProfile, ReviewerInvocationProfile, SessionInvocationProfiles,
+    ArchitectAdapter, ArchitectInvocationProfile, ClaudeInvocationProfile, CodexApprovalPolicy,
+    CodexInvocationProfile, CodexSandbox, DeveloperInvocationProfile, ReviewerInvocationProfile,
+    SessionInvocationProfiles,
 };
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -21,8 +22,187 @@ pub(super) struct LoadedInvocationProfiles {
 #[serde(deny_unknown_fields)]
 struct ArchitectToml {
     profile: Option<toml::Value>,
-    developer: Option<DeveloperInvocationProfile>,
-    reviewer: Option<ReviewerInvocationProfile>,
+    developer: Option<toml::Value>,
+    reviewer: Option<toml::Value>,
+}
+
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum ConfiguredAdapter {
+    Codex,
+    Claude,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileOverride {
+    adapter: Option<ConfiguredAdapter>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    effort: Option<String>,
+    sandbox: Option<CodexSandbox>,
+    #[serde(rename = "ask_for_approval")]
+    approval_policy: Option<CodexApprovalPolicy>,
+    dangerously_skip_permissions: Option<bool>,
+}
+
+fn apply_codex_override(
+    profile: &mut CodexInvocationProfile,
+    configured: ProfileOverride,
+    label: &str,
+) -> Result<()> {
+    let ProfileOverride {
+        adapter,
+        model,
+        reasoning_effort,
+        effort,
+        sandbox,
+        approval_policy,
+        dangerously_skip_permissions,
+    } = configured;
+    if adapter.is_some() {
+        bail!("{label} cannot select its adapter in this table");
+    }
+    if dangerously_skip_permissions.is_some() {
+        bail!("{label} contains a Claude-only field");
+    }
+    if reasoning_effort.is_some() && effort.is_some() {
+        bail!("{label} cannot set both reasoning_effort and its effort alias");
+    }
+    if let Some(model) = model {
+        profile.model = model;
+    }
+    if let Some(effort) = reasoning_effort.or(effort) {
+        profile.reasoning_effort = effort;
+    }
+    if let Some(sandbox) = sandbox {
+        profile.sandbox = sandbox;
+    }
+    if let Some(approval_policy) = approval_policy {
+        profile.approval_policy = approval_policy;
+    }
+    Ok(())
+}
+
+fn apply_claude_override(
+    profile: &mut ClaudeInvocationProfile,
+    configured: ProfileOverride,
+    label: &str,
+) -> Result<()> {
+    let ProfileOverride {
+        adapter,
+        model,
+        reasoning_effort,
+        effort,
+        sandbox,
+        approval_policy,
+        dangerously_skip_permissions,
+    } = configured;
+    if adapter.is_some() {
+        bail!("{label} cannot select its adapter in this table");
+    }
+    if reasoning_effort.is_some() || sandbox.is_some() || approval_policy.is_some() {
+        bail!("{label} contains a Codex-only field");
+    }
+    if let Some(model) = model {
+        profile.model = model;
+    }
+    if let Some(effort) = effort {
+        profile.effort = effort;
+    }
+    if let Some(dangerously_skip_permissions) = dangerously_skip_permissions {
+        profile.dangerously_skip_permissions = dangerously_skip_permissions;
+    }
+    Ok(())
+}
+
+fn apply_architect_override(
+    profile: &mut ArchitectInvocationProfile,
+    value: toml::Value,
+) -> Result<()> {
+    let configured: ProfileOverride = value
+        .try_into()
+        .context("invalid foreground Architect profile fields")?;
+    match profile {
+        ArchitectInvocationProfile::Codex { profile } => {
+            apply_codex_override(profile, configured, "Codex [architect.profile]")
+        }
+        ArchitectInvocationProfile::Claude { profile } => {
+            apply_claude_override(profile, configured, "Claude [architect.profile]")
+        }
+    }
+}
+
+fn apply_developer_override(
+    profile: &mut DeveloperInvocationProfile,
+    value: toml::Value,
+) -> Result<()> {
+    let mut configured: ProfileOverride = value
+        .try_into()
+        .context("invalid [architect.developer] profile fields")?;
+    let adapter = configured.adapter.take().unwrap_or(match profile {
+        DeveloperInvocationProfile::Codex { .. } => ConfiguredAdapter::Codex,
+        DeveloperInvocationProfile::Claude { .. } => ConfiguredAdapter::Claude,
+    });
+    *profile = match adapter {
+        ConfiguredAdapter::Codex => {
+            let mut merged = match profile {
+                DeveloperInvocationProfile::Codex { profile } => profile.clone(),
+                DeveloperInvocationProfile::Claude { .. } => {
+                    CodexInvocationProfile::developer_default()
+                }
+            };
+            apply_codex_override(&mut merged, configured, "Codex [architect.developer]")?;
+            DeveloperInvocationProfile::Codex { profile: merged }
+        }
+        ConfiguredAdapter::Claude => {
+            let mut merged = match profile {
+                DeveloperInvocationProfile::Claude { profile } => profile.clone(),
+                DeveloperInvocationProfile::Codex { .. } => {
+                    ClaudeInvocationProfile::developer_default()
+                }
+            };
+            apply_claude_override(&mut merged, configured, "Claude [architect.developer]")?;
+            DeveloperInvocationProfile::Claude { profile: merged }
+        }
+    };
+    Ok(())
+}
+
+fn apply_reviewer_override(
+    profile: &mut ReviewerInvocationProfile,
+    value: toml::Value,
+) -> Result<()> {
+    let mut configured: ProfileOverride = value
+        .try_into()
+        .context("invalid [architect.reviewer] profile fields")?;
+    let adapter = configured.adapter.take().unwrap_or(match profile {
+        ReviewerInvocationProfile::Codex { .. } => ConfiguredAdapter::Codex,
+        ReviewerInvocationProfile::Claude { .. } => ConfiguredAdapter::Claude,
+    });
+    *profile = match adapter {
+        ConfiguredAdapter::Codex => {
+            let mut merged = match profile {
+                ReviewerInvocationProfile::Codex { profile } => profile.clone(),
+                ReviewerInvocationProfile::Claude { .. } => {
+                    CodexInvocationProfile::reviewer_default()
+                }
+            };
+            apply_codex_override(&mut merged, configured, "Codex [architect.reviewer]")?;
+            ReviewerInvocationProfile::Codex { profile: merged }
+        }
+        ConfiguredAdapter::Claude => {
+            let mut merged = match profile {
+                ReviewerInvocationProfile::Claude { profile } => profile.clone(),
+                ReviewerInvocationProfile::Codex { .. } => {
+                    ClaudeInvocationProfile::reviewer_default()
+                }
+            };
+            apply_claude_override(&mut merged, configured, "Claude [architect.reviewer]")?;
+            ReviewerInvocationProfile::Claude { profile: merged }
+        }
+    };
+    Ok(())
 }
 
 /// Resolver for the production Codex exec worker task-runtime lane.
@@ -118,24 +298,16 @@ fn load_invocation_profiles_with_defaults(
             .try_into()
             .context("invalid [architect] profile configuration")?;
         if let Some(value) = configured.profile {
-            profiles.architect = match architect_adapter {
-                ArchitectAdapter::Codex => ArchitectInvocationProfile::Codex {
-                    profile: value
-                        .try_into::<CodexInvocationProfile>()
-                        .context("invalid Codex [architect.profile] configuration")?,
-                },
-                ArchitectAdapter::Claude => ArchitectInvocationProfile::Claude {
-                    profile: value
-                        .try_into::<ClaudeInvocationProfile>()
-                        .context("invalid Claude [architect.profile] configuration")?,
-                },
-            };
+            apply_architect_override(&mut profiles.architect, value)
+                .context("invalid [architect.profile] configuration")?;
         }
-        if let Some(developer) = configured.developer {
-            profiles.developer = developer;
+        if let Some(value) = configured.developer {
+            apply_developer_override(&mut profiles.developer, value)
+                .context("invalid [architect.developer] configuration")?;
         }
-        if let Some(reviewer) = configured.reviewer {
-            profiles.reviewer = reviewer;
+        if let Some(value) = configured.reviewer {
+            apply_reviewer_override(&mut profiles.reviewer, value)
+                .context("invalid [architect.reviewer] configuration")?;
         }
     }
     profiles.validate()?;
@@ -153,7 +325,7 @@ fn load_invocation_profiles_with_defaults(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::profile::{CODEX_DEVELOPER_ADAPTER, CODEX_REVIEWER_ADAPTER, CodexSandbox};
+    use crate::worker::profile::{CODEX_DEVELOPER_ADAPTER, CODEX_REVIEWER_ADAPTER};
     use std::os::unix::fs::PermissionsExt;
 
     fn write_config(contents: &str) -> (tempfile::TempDir, PathBuf) {
@@ -175,6 +347,14 @@ mod tests {
             loaded.profiles.architect.codex().unwrap().sandbox,
             CodexSandbox::DangerFullAccess
         );
+        for profile in [
+            loaded.profiles.architect.codex().unwrap(),
+            loaded.profiles.developer.codex().unwrap(),
+            loaded.profiles.reviewer.codex().unwrap(),
+        ] {
+            assert_eq!(profile.model, "gpt-5.6-sol");
+            assert_eq!(profile.reasoning_effort, "xhigh");
+        }
         // Workers are Codex-only in this lane, for both roles.
         assert_eq!(
             loaded.profiles.developer_adapter_name(),
@@ -275,43 +455,58 @@ ask_for_approval = "never"
     }
 
     #[test]
-    fn exec_worker_role_sections_default_independently_and_partial_profiles_fail_closed() {
+    fn profile_sections_merge_partial_overrides_onto_role_defaults() {
         let (_temp, path) = write_config(
             r#"
+[architect.profile]
+model = "architect-override"
+
 [architect.developer]
-adapter = "codex"
 model = "developer-override"
-reasoning_effort = "high"
-sandbox = "danger-full-access"
-ask_for_approval = "never"
+
+[architect.reviewer]
+effort = "medium"
 "#,
         );
         let loaded = load_task_lane_profiles(&path, ArchitectAdapter::Codex).unwrap();
+        let architect = loaded.profiles.architect.codex().unwrap();
+        assert_eq!(architect.model, "architect-override");
+        assert_eq!(architect.reasoning_effort, "xhigh");
+        assert_eq!(architect.sandbox, CodexSandbox::DangerFullAccess);
         assert_eq!(
             loaded.profiles.developer.codex().unwrap().model,
             "developer-override"
         );
         assert_eq!(
-            loaded.profiles.reviewer.codex().unwrap(),
-            &CodexInvocationProfile::reviewer_default()
+            loaded.profiles.developer.codex().unwrap().reasoning_effort,
+            "xhigh"
         );
-
-        let (_temp, path) = write_config(
-            r#"
-[architect.reviewer]
-adapter = "codex"
-model = "partial"
-"#,
-        );
-        let error = match load_task_lane_profiles(&path, ArchitectAdapter::Codex) {
-            Ok(_) => panic!("partial role profile was accepted"),
-            Err(error) => error,
-        };
+        let reviewer = loaded.profiles.reviewer.codex().unwrap();
+        assert_eq!(reviewer.model, "gpt-5.6-sol");
+        assert_eq!(reviewer.reasoning_effort, "medium");
         assert_eq!(
-            error.to_string(),
-            "invalid [architect] profile configuration"
+            reviewer.sandbox,
+            CodexInvocationProfile::reviewer_default().sandbox
         );
     }
+
+    #[test]
+    fn codex_effort_alias_is_unambiguous() {
+        let (_temp, path) = write_config(
+            r#"
+[architect.developer]
+reasoning_effort = "high"
+effort = "medium"
+"#,
+        );
+        let error = load_task_lane_profiles(&path, ArchitectAdapter::Codex)
+            .err()
+            .expect("duplicate effort spelling must be rejected");
+        assert!(
+            format!("{error:#}").contains("cannot set both reasoning_effort and its effort alias")
+        );
+    }
+
     #[test]
     fn config_can_select_codex_for_both_roles() {
         let (_temp, path) = write_config(

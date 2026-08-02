@@ -24,6 +24,8 @@ use crate::worker::profile::{
 };
 use crate::worker::runtime::CODEX_TASK_WORKER_ADAPTER;
 use anyhow::{Context, Result, bail};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -40,6 +42,11 @@ const MAX_MCP_LINE_BYTES: usize = 256 * 1024;
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const RELAY_SOCKET_NAME: &str = "relay.sock";
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const MAX_CODEX_SESSION_TREE_ENTRIES: usize = 32 * 1024;
+// 8192 fixed-width identities encode to under 175 KiB, leaving ample room in
+// the existing 256 KiB bootstrap frame. A JSON array of decimal u64 tuples
+// would not have that property.
+const MAX_CODEX_SESSION_FILES: usize = 8 * 1024;
 
 #[derive(Debug)]
 struct NativeSessionBindingRefusal(&'static str);
@@ -74,8 +81,65 @@ pub(super) struct BridgeConfiguration {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "adapter", rename_all = "lowercase", deny_unknown_fields)]
 pub(super) enum ArchitectNativeSessionSource {
-    Codex { codex_home: PathBuf },
-    Claude { native_session_id: String },
+    Codex {
+        codex_home: PathBuf,
+        baseline: CodexSessionBaseline,
+    },
+    Claude {
+        native_session_id: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct CodexSessionFileIdentity(pub(super) u64, pub(super) u64);
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CodexSessionBaseline {
+    identities_base64: String,
+}
+
+impl CodexSessionBaseline {
+    fn empty() -> Self {
+        Self {
+            identities_base64: String::new(),
+        }
+    }
+
+    fn from_identities(identities: &[CodexSessionFileIdentity]) -> Result<Self> {
+        if identities.len() > MAX_CODEX_SESSION_FILES
+            || !identities.windows(2).all(|pair| pair[0] < pair[1])
+        {
+            bail!("native Codex session baseline is invalid");
+        }
+        let mut bytes = Vec::with_capacity(identities.len() * 16);
+        for CodexSessionFileIdentity(device, inode) in identities {
+            bytes.extend_from_slice(&device.to_be_bytes());
+            bytes.extend_from_slice(&inode.to_be_bytes());
+        }
+        Ok(Self {
+            identities_base64: URL_SAFE_NO_PAD.encode(bytes),
+        })
+    }
+
+    fn identities(&self) -> Result<Vec<CodexSessionFileIdentity>> {
+        let bytes = URL_SAFE_NO_PAD
+            .decode(&self.identities_base64)
+            .context("native Codex session baseline encoding is invalid")?;
+        if bytes.len() % 16 != 0 || bytes.len() / 16 > MAX_CODEX_SESSION_FILES {
+            bail!("native Codex session baseline is invalid");
+        }
+        let mut identities = Vec::with_capacity(bytes.len() / 16);
+        for pair in bytes.chunks_exact(16) {
+            let device = u64::from_be_bytes(pair[..8].try_into().expect("eight-byte device"));
+            let inode = u64::from_be_bytes(pair[8..].try_into().expect("eight-byte inode"));
+            identities.push(CodexSessionFileIdentity(device, inode));
+        }
+        if !identities.windows(2).all(|pair| pair[0] < pair[1]) {
+            bail!("native Codex session baseline is invalid");
+        }
+        Ok(identities)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -250,8 +314,12 @@ fn validate_bridge_configuration(configuration: &BridgeConfiguration) -> Result<
         bail!("architect relay runtime scope drifted before bridge start");
     }
     match &configuration.native_session_source {
-        ArchitectNativeSessionSource::Codex { codex_home } => {
-            validate_canonical_directory("isolated Codex home", codex_home, Some(0o700))?;
+        ArchitectNativeSessionSource::Codex {
+            codex_home,
+            baseline,
+        } => {
+            validate_canonical_directory("native Codex home", codex_home, None)?;
+            baseline.identities()?;
         }
         ArchitectNativeSessionSource::Claude { native_session_id } => {
             validate_native_session_id(native_session_id)?;
@@ -532,8 +600,9 @@ fn handle_tool_call(
             &configuration.reviewer_adapter,
         )
         .map_err(|_| NativeSessionBindingRefusal(TOOL_REFUSAL_ACTION))?;
-        let observed = discover_architect_native_session(configuration)
-            .map_err(|_| NativeSessionBindingRefusal(NATIVE_SESSION_REFUSAL_DISCOVERY))?;
+        let observed =
+            discover_architect_native_session(configuration, native_session_id.as_deref())
+                .map_err(|_| NativeSessionBindingRefusal(NATIVE_SESSION_REFUSAL_DISCOVERY))?;
         match native_session_id {
             Some(expected) if expected != &observed => {
                 bail!(NativeSessionBindingRefusal(NATIVE_SESSION_REFUSAL_CHANGED))
@@ -620,11 +689,20 @@ fn handle_tool_call(
     }
 }
 
-fn discover_architect_native_session(configuration: &BridgeConfiguration) -> Result<String> {
+fn discover_architect_native_session(
+    configuration: &BridgeConfiguration,
+    expected: Option<&str>,
+) -> Result<String> {
     match &configuration.native_session_source {
-        ArchitectNativeSessionSource::Codex { codex_home } => {
-            discover_codex_native_session(codex_home, &configuration.project_root)
-        }
+        ArchitectNativeSessionSource::Codex {
+            codex_home,
+            baseline,
+        } => discover_codex_native_session(
+            codex_home,
+            &configuration.project_root,
+            baseline,
+            expected,
+        ),
         ArchitectNativeSessionSource::Claude { native_session_id } => {
             validate_native_session_id(native_session_id)?;
             Ok(native_session_id.clone())
@@ -639,15 +717,74 @@ fn tool_call_refusal_text(error: &anyhow::Error) -> String {
     }
 }
 
-fn discover_codex_native_session(codex_home: &Path, project_root: &Path) -> Result<String> {
+pub(super) fn snapshot_codex_session_files(codex_home: &Path) -> Result<CodexSessionBaseline> {
+    let sessions = codex_home.join("sessions");
+    if !sessions.exists() {
+        return Ok(CodexSessionBaseline::empty());
+    }
+    let mut files = Vec::new();
+    let mut entries = 0;
+    collect_session_files(&sessions, &mut files, 0, &mut entries)?;
+    let mut identities = Vec::with_capacity(files.len());
+    for path in files {
+        let metadata = fs::symlink_metadata(&path)?;
+        // SAFETY: geteuid has no preconditions.
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            bail!("native Codex session baseline contains an invalid file");
+        }
+        identities.push(CodexSessionFileIdentity(metadata.dev(), metadata.ino()));
+    }
+    identities.sort_unstable();
+    identities.dedup();
+    if identities.len() > MAX_CODEX_SESSION_FILES {
+        bail!("native Codex session baseline exceeds its bounded file count");
+    }
+    CodexSessionBaseline::from_identities(&identities)
+}
+
+fn discover_codex_native_session(
+    codex_home: &Path,
+    project_root: &Path,
+    baseline: &CodexSessionBaseline,
+    expected: Option<&str>,
+) -> Result<String> {
+    let baseline = baseline.identities()?;
     let sessions = codex_home.join("sessions");
     let mut files = Vec::new();
     let mut entries = 0;
     collect_session_files(&sessions, &mut files, 0, &mut entries)?;
-    if files.len() != 1 {
+    let mut candidates = Vec::new();
+    for path in files {
+        let metadata = fs::symlink_metadata(&path)?;
+        let identity = CodexSessionFileIdentity(metadata.dev(), metadata.ino());
+        if baseline.binary_search(&identity).is_ok() {
+            continue;
+        }
+        let Some(id) = inspect_codex_session_file(&path, project_root)? else {
+            continue;
+        };
+        candidates.push(id);
+    }
+    candidates.sort();
+    candidates.dedup();
+    if let Some(expected) = expected
+        && candidates
+            .binary_search_by(|candidate| candidate.as_str().cmp(expected))
+            .is_ok()
+    {
+        return Ok(expected.to_owned());
+    }
+    if candidates.len() != 1 {
         bail!("architect native session is not uniquely observable");
     }
-    let path = &files[0];
+    Ok(candidates.pop().expect("one candidate"))
+}
+
+fn inspect_codex_session_file(path: &Path, project_root: &Path) -> Result<Option<String>> {
     let metadata = fs::symlink_metadata(path)?;
     // SAFETY: geteuid has no preconditions.
     if metadata.file_type().is_symlink()
@@ -680,7 +817,7 @@ fn discover_codex_native_session(codex_home: &Path, project_root: &Path) -> Resu
         || metadata.payload.cwd != project_root
         || metadata.payload.cli_version != "0.145.0"
     {
-        bail!("architect native session metadata does not match the exact project directory");
+        return Ok(None);
     }
     let id = Uuid::parse_str(&metadata.payload.id)
         .context("architect native session id is not a canonical UUID")?
@@ -706,7 +843,7 @@ fn discover_codex_native_session(codex_home: &Path, project_root: &Path) -> Resu
     {
         bail!("architect native session record changed during observation");
     }
-    Ok(id)
+    Ok(Some(id))
 }
 
 fn collect_session_files(
@@ -731,7 +868,7 @@ fn collect_session_files(
     children.sort_by_key(|entry| entry.file_name());
     for child in children {
         *entries += 1;
-        if *entries > 512 {
+        if *entries > MAX_CODEX_SESSION_TREE_ENTRIES {
             bail!("architect session tree exceeds its bounded entry count");
         }
         let path = child.path();
@@ -748,8 +885,8 @@ fn collect_session_files(
                 .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
         {
             files.push(path);
-            if files.len() > 1 {
-                bail!("architect native session is ambiguous");
+            if files.len() > MAX_CODEX_SESSION_FILES {
+                bail!("architect session tree exceeds its bounded file count");
             }
         }
     }
@@ -1024,7 +1161,10 @@ mod tests {
                     relay_socket_path: root.join(RELAY_SOCKET_NAME),
                     registration_socket_path: root.join("registration.sock"),
                     control_socket_path: root.join("control.sock"),
-                    native_session_source: ArchitectNativeSessionSource::Codex { codex_home },
+                    native_session_source: ArchitectNativeSessionSource::Codex {
+                        codex_home,
+                        baseline: CodexSessionBaseline::empty(),
+                    },
                     relay_executable: executable,
                     relay_runtime_scope_hash: relay_runtime_scope_hash(&root).unwrap(),
                     developer_adapter: "codex-developer-0.145.0".into(),
@@ -1168,6 +1308,7 @@ mod tests {
             control_socket_path: root.join("control.sock"),
             native_session_source: ArchitectNativeSessionSource::Codex {
                 codex_home: root.clone(),
+                baseline: CodexSessionBaseline::empty(),
             },
             relay_executable: executable,
             relay_runtime_scope_hash: "unused-by-authorization".into(),
@@ -1746,7 +1887,11 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(discover_codex_native_session(&codex, &repo).unwrap(), id);
+        assert_eq!(
+            discover_codex_native_session(&codex, &repo, &CodexSessionBaseline::empty(), None,)
+                .unwrap(),
+            id
+        );
 
         fs::write(
             &path,
@@ -1756,7 +1901,10 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(discover_codex_native_session(&codex, &repo).is_err());
+        assert!(
+            discover_codex_native_session(&codex, &repo, &CodexSessionBaseline::empty(), None,)
+                .is_err()
+        );
         fs::write(
             &path,
             format!(
@@ -1771,7 +1919,69 @@ mod tests {
             "{}\n",
         )
         .unwrap();
-        assert!(discover_codex_native_session(&codex, &repo).is_err());
+        assert!(
+            discover_codex_native_session(&codex, &repo, &CodexSessionBaseline::empty(), None,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn native_session_baseline_excludes_old_rollouts_and_keeps_the_bound_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let codex = temp.path().join("codex");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&codex).unwrap();
+        let old_id = "019fa976-e270-7a92-b5f0-6d3d8a0ad3f3";
+        let expected_id = "019fa976-e270-7a92-b5f0-6d3d8a0ad3f4";
+        let concurrent_id = "019fa976-e270-7a92-b5f0-6d3d8a0ad3f5";
+
+        write_codex_session(&codex, &repo, old_id);
+        let baseline = snapshot_codex_session_files(&codex).unwrap();
+        write_codex_session(&codex, &repo, expected_id);
+        assert_eq!(
+            discover_codex_native_session(&codex, &repo, &baseline, None).unwrap(),
+            expected_id
+        );
+
+        write_codex_session(&codex, &repo, concurrent_id);
+        assert!(
+            discover_codex_native_session(&codex, &repo, &baseline, None).is_err(),
+            "two post-launch sessions are ambiguous before the first binding"
+        );
+        assert_eq!(
+            discover_codex_native_session(&codex, &repo, &baseline, Some(expected_id)).unwrap(),
+            expected_id,
+            "later same-project sessions must not displace the established binding"
+        );
+    }
+
+    #[test]
+    fn maximum_native_session_baseline_fits_the_bootstrap_frame() {
+        let identities = (1..=MAX_CODEX_SESSION_FILES as u64)
+            .map(|inode| CodexSessionFileIdentity(u64::MAX, inode))
+            .collect::<Vec<_>>();
+        let baseline = CodexSessionBaseline::from_identities(&identities).unwrap();
+        assert_eq!(baseline.identities().unwrap(), identities);
+
+        let mut fixture = BridgeTestFixture::new(false);
+        let codex_home = match &fixture.configuration.native_session_source {
+            ArchitectNativeSessionSource::Codex { codex_home, .. } => codex_home.clone(),
+            ArchitectNativeSessionSource::Claude { .. } => unreachable!(),
+        };
+        fixture.configuration.native_session_source = ArchitectNativeSessionSource::Codex {
+            codex_home,
+            baseline,
+        };
+        let frame = serde_json::to_vec(&BootstrapRequest::Configure {
+            configuration: Box::new(fixture.configuration),
+        })
+        .unwrap();
+        assert!(
+            frame.len() <= crate::control_api::protocol::MAX_REQUEST_BYTES,
+            "encoded bootstrap frame is {} bytes",
+            frame.len()
+        );
     }
 
     #[test]
@@ -1782,7 +1992,7 @@ mod tests {
         };
         validate_bridge_configuration(&fixture.configuration).unwrap();
         assert_eq!(
-            discover_architect_native_session(&fixture.configuration).unwrap(),
+            discover_architect_native_session(&fixture.configuration, None).unwrap(),
             TEST_NATIVE_SESSION_ID
         );
 
@@ -1833,7 +2043,10 @@ mod tests {
             relay_socket_path: relay_root.join(RELAY_SOCKET_NAME),
             registration_socket_path: run_root.join("registration.sock"),
             control_socket_path: run_root.join("control.sock"),
-            native_session_source: ArchitectNativeSessionSource::Codex { codex_home },
+            native_session_source: ArchitectNativeSessionSource::Codex {
+                codex_home,
+                baseline: CodexSessionBaseline::empty(),
+            },
             relay_executable: executable,
             relay_runtime_scope_hash: relay_runtime_scope_hash(&relay_root).unwrap(),
             developer_adapter: "codex-developer-0.145.0".into(),

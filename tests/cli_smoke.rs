@@ -490,25 +490,40 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     );
     let normalized_stdout = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        normalized_stdout
-            .contains("Reviewer receives the same writable task envelope as its Developer")
-            && normalized_stdout.contains("Git evidence is exactly unchanged"),
+        normalized_stdout.contains(
+            "Each table is a partial override: omitted fields keep the built-in role default"
+        ) && normalized_stdout.contains("Codex accepts reasoning_effort or its effort alias"),
         "stdout={stdout}"
     );
     assert!(
         normalized_stdout.contains(
-            "DBUS_SESSION_BUS_ADDRESS, SSH_AUTH_SOCK, and GPG_AGENT_INFO are identity-checked and rebound read-only"
-        ) && normalized_stdout.contains("without exposing sibling hcom sockets"),
+            "Reviewer receives the same native host view; source/Git/install non-mutation is a role instruction rather than an OS read-only mount"
+        ) && normalized_stdout.contains("hcom has no repository-root allowlist and does not inspect or repair Git"),
         "stdout={stdout}"
     );
     assert!(
-        stdout.contains("native")
-            && stdout.contains("untrusted, avoiding")
-            && stdout.contains("repeated folder-trust prompt")
-            && stdout.contains("does not override the")
-            && stdout.contains("danger-full-access/never profile"),
+        normalized_stdout.contains(
+            "Codex Architect and every Codex exec worker inherit the complete parent environment, real HOME/CODEX_HOME, native config"
+        ) && normalized_stdout.contains(
+            "hcom overrides only private HCOM_DIR and its own run/task/role identity"
+        ),
         "stdout={stdout}"
     );
+    assert!(
+        normalized_stdout.contains(
+            "hcom adds one exact task-control MCP config leaf; all other native user/project config"
+        ) && normalized_stdout.contains(
+            "trust, AGENTS.md, rules, hooks, skills, plugins, feature flags, providers, and MCP servers remain loaded"
+        ) && normalized_stdout.contains(
+            "project directory as native cwd and receive that repository through --add-dir"
+        ),
+        "stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("per-run private config"),
+        "stdout={stdout}"
+    );
+    assert!(!stdout.contains("native untrusted"), "stdout={stdout}");
     assert!(!stdout.contains("--repo"), "stdout={stdout}");
     assert!(!stdout.contains("--project"), "stdout={stdout}");
     assert!(stdout.contains("session-task tools"), "stdout={stdout}");

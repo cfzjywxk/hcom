@@ -5,10 +5,13 @@ turn, no protocol conversation, and a supervisor that never judges the work.
 
 ## The two rules
 
-**Strict about capability, lenient about output.** A turn's powers are fixed
-before it starts — argv, environment, mount namespace. Afterwards hcom observes
-the world (process exit, one documented stdout event, one native output file)
-and relays bytes. Model text is payload, never protocol.
+**Native Codex semantics, thin hcom transport.** A worker starts from the
+launching terminal's complete environment, real HOME/CODEX_HOME, native Codex
+configuration and ordinary host filesystem view. hcom fixes the typed
+model/effort/permission profile and adds only the transport needed to automate
+the human copy/paste loop. Afterwards hcom observes the world (process exit,
+one documented stdout event, one native output file) and relays bytes. Model
+text is payload, never protocol.
 
 **The supervisor is task-agnostic.** It sequences processes and carries
 messages between them. It does not run checks, inspect commits, or judge
@@ -19,7 +22,8 @@ a review round or a local commit, both cheap and revertible.
 
 ## Invocation
 
-`ExecTaskWorkerRuntime` (`src/worker/exec_runtime.rs`) builds one closed shape.
+`ExecTaskWorkerRuntime` (`src/worker/exec_runtime.rs`) builds one bounded
+transport shape on top of native Codex configuration.
 Ordering is load-bearing: `--sandbox`, `--skip-git-repo-check` and `--add-dir`
 belong to the `exec` parent and precede `resume`.
 
@@ -30,33 +34,43 @@ codex exec
   [--add-dir <task repository>]             # external/nested repository scope
   [resume <exact thread id>]                # same task only; never with --cd
   --json                                    # only thread.started is parsed
-  --strict-config
   --model <typed model>
   --config model_reasoning_effort="<typed effort>"
   --config approval_policy="never"
-  --config mcp_servers={}
-  --config shell_environment_policy.inherit="all"
-  --config shell_environment_policy.ignore_default_excludes=true
-  --ignore-user-config
-  --ignore-rules
-  --disable <each closed disabled feature>
   [--cd <project root>]                     # create only
   --output-last-message <private raw target>
   -                                         # bounded stdin prompt, then EOF
 ```
 
 `--cd` applies to create turns only. A **resume takes no `--cd` and inherits
-the process working directory**, so every invocation is launched from the
-project directory (bwrap `--chdir`, or `Command::current_dir` when unsandboxed)
-— otherwise a resumed turn would silently work somewhere else. `--add-dir`
-belongs to the exec parent, ahead of `resume`, and is passed only for a
-developer whose task repository is not the project directory itself.
+the process working directory**, so every invocation is launched directly
+from the project directory with `Command::current_dir` — otherwise a resumed
+turn would silently work somewhere else. `--add-dir` belongs to the exec
+parent, ahead of `resume`, and is passed for both Developer and Reviewer when
+the task repository differs from the project directory.
 
-`--ignore-user-config` makes argv the single source of configuration truth
-(Codex writes its own `config.toml` into the private `CODEX_HOME`). That is why
-the two `shell_environment_policy` entries must travel as `--config`: without
-them Codex filters KEY/SECRET/TOKEN-shaped names out of the environment its
-tool commands see, which would silently break complete parent inheritance.
+hcom does not pass `--strict-config`, `--ignore-user-config`,
+`--ignore-rules`, `mcp_servers={}`, feature-disable flags, or a private
+HOME/CODEX_HOME. Native user/project configuration, global and project
+AGENTS.md, trust, auth, rules, hooks, skills, plugins, MCP servers, feature
+flags, and session history therefore behave as they do in a directly launched
+Codex CLI. This includes `shell_environment_policy`: hcom gives the Codex
+process the complete parent environment, while native user configuration
+decides what Codex passes onward to model-started tool commands.
+
+Codex discovers instructions automatically only in its primary project chain.
+An external task repository is a secondary `--add-dir` root, so every hcom
+Developer/Reviewer prompt explicitly requires inspecting applicable
+AGENTS.md, AGENTS.override.md, and nested instructions in both the project and
+the task repository. hcom forwards the exact paths; it does not parse or
+resolve those instruction files itself.
+
+The only environment state redirected by hcom is `HCOM_DIR`, plus the
+hcom-owned run/task/role identity variables. HOME, CODEX_HOME, TMPDIR, XDG,
+Cargo/Rustup, authentication, proxies, and all other parent entries remain
+byte-for-byte native. Workers run directly on the host rather than in an outer
+bubblewrap filesystem sandbox. Reviewer non-mutation is a role instruction,
+not an OS read-only mount, matching a manually launched review session.
 
 ## What hcom parses
 
@@ -128,12 +142,12 @@ into a failed run.
 ## Evidence
 
 Durable evidence lives in `<project>/hcom-tasks/<run-id>/…`
-(`src/orchestrator/workspace.rs`), which only hcom writes: workers have no
-writable mount anywhere in that tree. The raw `--output-last-message` target
-sits in the per-run private runtime instead, so if hcom is killed between the
-CLI writing it and hcom ingesting it, no unredacted bytes ever land in the
-project directory. Ingestion reads the file bounded, redacts it, writes the
-sealed copy atomically, and deletes the raw one.
+(`src/orchestrator/workspace.rs`). It is hcom-owned handoff material, not a
+tamper-proof boundary: a native-equivalent worker has the operator's ordinary
+host access and can reach it. The raw `--output-last-message` target sits in
+the per-run private runtime instead, so hcom itself never writes unredacted
+final text into the project directory. Ingestion reads the file bounded,
+redacts it, writes the sealed copy atomically, and deletes the raw one.
 
 The final message is redacted by **streaming the whole file**: memory is
 bounded, the file is not, so a legal long message keeps its tail. Chunks overlap
@@ -173,11 +187,14 @@ group would hang the supervisor itself.
 - **Contract smokes** (`scripts/codex-exec-contract-smokes`) — the external
   assumptions, against the real pinned binary. Unit tests structurally cannot
   cover these: a fake CLI reproduces whatever hcom already believes. Run before
-  every release and after every pin bump. A known upstream block exits 2 and
-  fails the gate: releasing over it needs an explicit human decision
-  (`SMOKE_ACCEPT_KNOWN_BLOCKS=1`) to narrow the inheritance requirement. The environment probe reads only
+  every release and after every pin bump. The environment probe reads only
   allowlisted synthetic variables; dumping the real environment would ship live
-  credentials into the model context and to the provider.
+  credentials into the model context and to the provider. Its disposable
+  native config selects the tool-command environment policy; hcom itself does
+  not override that policy. These smokes default
+  to `gpt-5.3-codex-spark` with `medium` reasoning and verify native global
+  plus project AGENTS.md loading as well as explicit external-repository
+  instruction discovery.
 - **Real acceptance** (`cargo test --lib real_exec -- --ignored`) — four runs
   against the real binary on disposable projects: a single task, a Rust
   hello-world, a two-task run, and **Gate 1**: one run whose first task goes
@@ -225,10 +242,9 @@ questions that follow.
 
 ### `hcom-tasks/` is evidence, not a security boundary
 
-A worker's own writable scopes (its task repository, its private HOME/TMP)
-overlap the evidence tree when the project *is* the repository. A worker can
-therefore alter files under `hcom-tasks/`, including its own `prompt.md` and
-stream logs.
+A worker has the same native HOME/TMP and host filesystem authority as a
+directly launched Codex process. It can therefore alter files under
+`hcom-tasks/`, including its own `prompt.md` and stream logs.
 
 *Consequence:* artifacts are trustworthy as a record of a cooperating worker,
 not as tamper-proof audit. Do not build a security argument on them.
@@ -239,23 +255,23 @@ authority at a file outside the sandbox. Closing it means `openat` from a
 pinned directory fd, `O_NOFOLLOW`, and an inode check before every write —
 worth doing, not yet done.
 
-### Non-UTF-8 environment values break the pinned Codex
+### Non-UTF-8 environment values expose an upstream native limitation
 
 hcom inherits the parent environment byte-for-byte, including non-UTF-8 names
 and values. Codex 0.146's tool executor panics on `std::env::vars()` when it
 meets one, so **every tool call silently fails while the turn still exits 0**:
 the model narrates progress and returns a confident summary having done
-nothing. This is upstream, and hcom does not work around it.
+nothing. This is upstream native behavior, and hcom neither filters the parent
+environment nor overrides native environment policy to work around it.
 
-*Stands in for it:* contract smoke `C4c` probes it and reports `BLOCK` — never
-a pass — so a release cannot claim complete inheritance while it stands.
-Ordinary UTF-8 variables (`GH_TOKEN`, proxies, secret-shaped names, empty
-values, case pairs) are covered by `C4`/`C4b` and do inherit correctly, on both
-create and resume.
+The byte-exact hcom-to-Codex process boundary is covered by unit tests.
+`C4`/`C4b` separately verify that a native user
+`shell_environment_policy.inherit = "all"` setting controls create and resume
+tool commands. They do not claim that Codex itself supports non-UTF-8 tool
+environments.
 
-*To change it:* either a fixed upstream Codex, or a human decision to narrow
-the inheritance requirement (recorded by running the smokes with
-`SMOKE_ACCEPT_KNOWN_BLOCKS=1`).
+*To change it:* use a fixed upstream Codex. Filtering or rewriting the parent
+environment inside hcom would violate native-equivalent semantics.
 
 ### `review_exhausted` still advances
 
@@ -263,17 +279,17 @@ A task whose reviewer keeps requesting changes until `max_review_rounds` is
 marked `review_exhausted` and the run moves to the next task. It is never
 disguised as an approval, but nothing stops the run.
 
-### The outer Architect namespace is not covered by automated tests
+### The interactive Architect launch is not covered by automated model tests
 
-Gate 1 drives the supervisor and the worker's inner bwrap directly. It does not
-start the Architect's outer bwrap, so mount ownership, protected surfaces, and
-long `TMPDIR` shapes are unverified by CI — and those have broken real runs
-before.
+Gate 1 drives the supervisor and native exec workers directly. It does not
+start the blank interactive Architect TUI, so foreground-terminal plumbing,
+the launch gate, and native configuration interaction still need a human
+smoke.
 
 *Stands in for it:* a human starting `hcom arch codex` once in a disposable
 terminal before release. It cannot be automated without either violating the
 input-ownership rule (a script must never submit the first TUI prompt) or
-bypassing the very namespace under test.
+bypassing the foreground launch path under test.
 
 ### Timeouts are coarse
 
