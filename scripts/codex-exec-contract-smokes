@@ -178,6 +178,36 @@ sessions=$(find "$WORK/c1/home/sessions" -name 'rollout-*.jsonl' 2>/dev/null | w
 [ "$sessions" -ge 1 ]
 report "C6 native session store" $? "rollout files: $sessions"
 
+# --- C7: file-backed task and peer-final pointers ---------------------------
+# Keep the document bodies out of the prompt. A successful response proves
+# that a native worker can consume the exact path-only handoff used by hcom.
+mkdir -p "$WORK/c7/project/hcom-tasks/reviewer/attempt-1" "$WORK/c7/home"
+export CODEX_HOME="$WORK/c7/home"
+cp ~/.codex/auth.json "$CODEX_HOME/auth.json" 2>/dev/null
+printf '%s\n' 'Selector FBTC-SMOKE-C7 carries marker TASK-C7.' \
+  >"$WORK/c7/project/current_todo.md"
+printf '%s\n' 'The bound design marker is DESIGN-C7.' \
+  >"$WORK/c7/project/design.md"
+printf '%s\n' \
+  'VERDICT: LGTM' \
+  'Peer marker: PEER-C7 fake-bearer-c7 Markdown-**exact**-汉字' \
+  >"$WORK/c7/project/hcom-tasks/reviewer/attempt-1/native-final.partial"
+printf 'Read the original task, design, and peer-final files at these exact paths:
+Task: %s
+Selector: FBTC-SMOKE-C7
+Design: %s
+Peer final: %s
+Reply with one final line containing exactly:
+TASK-C7|DESIGN-C7|PEER-C7 fake-bearer-c7 Markdown-**exact**-汉字' \
+  "$WORK/c7/project/current_todo.md" \
+  "$WORK/c7/project/design.md" \
+  "$WORK/c7/project/hcom-tasks/reviewer/attempt-1/native-final.partial" \
+  | native_shape "$WORK/c7/project" "$WORK/c7/last.md" >/dev/null 2>&1
+grep -Fqx \
+  'TASK-C7|DESIGN-C7|PEER-C7 fake-bearer-c7 Markdown-**exact**-汉字' \
+  "$WORK/c7/last.md" 2>/dev/null
+report "C7 file-backed task + peer-final pointers" $?
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 if [ "$fail" -ne 0 ]; then
   exit 1

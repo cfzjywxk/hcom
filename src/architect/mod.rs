@@ -97,14 +97,18 @@ hcom does not inspect, register, or freeze a native Codex Architect session.
 The existing Claude foreground Architect keeps its separately documented
 private config/containment behavior; Claude task workers remain unsupported.
 
-Each authorized task names the exact canonical source directory discovered by
-the Architect from project documentation. Developer tasks work and commit
-directly there; hcom has no repository-root allowlist and does not inspect or
-repair Git.
+Each authorized task binds the exact canonical source directory, absolute task
+document path, ordered absolute design document paths, and task selector
+discovered by the Architect from project documentation. hcom transports those
+strings without reading, copying, hashing, locking, or drift-checking the
+documents. Developer tasks read the original files, then work and commit
+directly in the source directory; hcom has no repository-root allowlist and
+does not inspect or repair Git.
 The Reviewer receives the same native host view; source/Git/install
-non-mutation is a role instruction rather than an OS read-only mount. hcom
-sequences the reports and verdicts but never pushes, installs, resets, rebases,
-merges, or applies changes.
+non-mutation is a role instruction rather than an OS read-only mount. It reads
+the Developer's exact durable final through its path. Corrections and
+re-reviews also carry only durable final-message paths. hcom never pushes,
+installs, resets, rebases, merges, or applies changes.
 
 The foreground parent owns every worker and task-local exec runtime; it keeps
 state only in memory and performs no daemon, project store, or cross-session
@@ -118,6 +122,12 @@ is pending Codex may display Working, but it is not issuing model turns or
 status polls. Interrupting the wait cancels only that subscription, never the
 run; after the human explicitly asks to wait again, a retained terminal result
 returns immediately even if it happened during the gap.
+The terminal snapshot contains each task's latest Developer final path, ordered
+final Reviewer message paths, and Reviewer verdict, never the Reviewer body.
+The Architect reads every final Reviewer file in order and delivers its
+original verdict and findings, distinguishing LGTM, review exhaustion, and
+lifecycle failure. It does not rerun tests, review, or validation unless the
+human explicitly requests that work.
 
 See docs/architect.md for the complete TOML schema and examples."#
 }

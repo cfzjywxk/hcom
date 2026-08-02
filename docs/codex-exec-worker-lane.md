@@ -10,8 +10,9 @@ launching terminal's complete environment, real HOME/CODEX_HOME, native Codex
 configuration and ordinary host filesystem view. hcom fixes the typed
 model/effort/permission profile and adds only the transport needed to automate
 the human copy/paste loop. Afterwards hcom observes the world (process exit,
-one documented stdout event, one native output file) and relays bytes. Model
-text is payload, never protocol.
+one documented stdout event, one native output file), publishes exact durable
+final-message paths, and retains diagnostic evidence. Model text is payload,
+never protocol.
 
 **The supervisor is task-agnostic.** It sequences processes and carries
 messages between them. It does not run checks, inspect commits, or judge
@@ -84,8 +85,9 @@ Exactly two things, and nothing else:
    fails closed; identity is never assumed.
 2. **The reviewer's verdict line** — see below.
 
-Everything else the model writes is relayed verbatim (after redaction) or
-stored as evidence.
+Everything else on stdout/stderr is diagnostic evidence. The native final is
+stored exactly and routed only by its durable file path; its body is never
+copied into the next role's prompt or the Architect control response.
 
 ## Routing preconditions
 
@@ -93,7 +95,8 @@ A turn routes onward only when all three hold:
 
 - the process exited 0;
 - a `thread.started` proof was captured;
-- the native final-message file is non-empty.
+- the native final-message file is non-empty, valid UTF-8, and within the hard
+  cap.
 
 Plus three integrity conditions: the prompt must have been delivered in full (a
 partial prompt means the worker answered a different question), the drain threads must report no read/write/seal
@@ -113,57 +116,76 @@ still narrate progress and emit a confident-looking summary.
 ## Verdict grammar
 
 The reviewer prompt asks for a first line of exactly `VERDICT: LGTM` or
-`VERDICT: REQUEST_CHANGES`. The classifier (`src/worker/verdict.rs`) tolerates
-drift from that, but only in the safe direction:
+`VERDICT: REQUEST_CHANGES`. The classifier (`src/worker/verdict.rs`) reads only
+the bytes before the first newline, strips at most one trailing carriage return
+so CRLF works, and byte-matches exactly those two strings. An empty first line
+is `NoVerdictFound`; every other first line is `UnrecognizedForm`.
 
-- tokens must be anchored at the normalized line start or directly after
-  `VERDICT:`, with word boundaries — `NOT LGTM`, `I cannot APPROVE` and
-  `The developer claims LGTM, but…` therefore never match;
-- the LGTM direction accepts only a closed tail allowlist (empty, non-question
-  punctuation, `with minor comments`, `with non-blocking comments`);
-- the REQUEST_CHANGES direction accepts any tail, because a false
-  REQUEST_CHANGES costs one round while a false LGTM advances a task wrongly;
-- conflicts and anything unrecognized are undetermined.
+There is no whitespace or case normalization, Markdown decoration, synonym,
+trailing explanation, or later-line tolerance. Later lines are opaque payload,
+so hcom neither searches them for a verdict nor performs conflict detection.
+This strictness is intentional: a false LGTM can advance a task incorrectly,
+while a malformed or ambiguous first line safely enters the one clarification
+path.
 
 Undetermined gets **one** clarification: a fresh native invocation resuming the
 same thread, recorded as a new attempt. It does not consume a review round, both
-attempts keep their artifacts, and the relayed outcome carries the original
-findings *and* the clarified verdict. A second failure stops for a human with
-the full text.
+attempts keep their exact final artifacts, and the outcome carries the ordered
+original and clarification paths plus the clarified verdict. A second failure
+stops for a human; its successfully published paths remain in the snapshot.
 
 ## Repository observation
 
-Exactly two, both routing data: the head at task start (the reviewer's diff
-base) and the head at developer completion. Review takes **no** observation at
-all — whether the tree drifted, went detached, or is dirty is the reviewer's
-and the human's judgment, and observing it here would turn an untidy checkout
-into a failed run.
+hcom checks only that `repository_root` is an existing directory. It never
+opens Git, records a branch or revision, checks cleanliness, or drift-checks
+the bound task/design documents. Source state and the appropriate review range
+are for the Developer, Reviewer, and human to establish from the original
+files and repository.
+
+## File-backed task and peer routing
+
+The Architect binds each task with an absolute `repository_root`, absolute
+`task_document_path`, ordered absolute `design_document_paths`, and exact
+`task_selector`. hcom validates the typed shape and that the repository is an
+existing directory. It does not open, copy, snapshot, hash, lock, or
+drift-check the task/design files.
+
+Every role reads those original files. Peer handoff is path-only:
+
+- initial review names the latest Developer `native-final.partial`;
+- correction names the current Reviewer final path or ordered
+  original-plus-clarification paths;
+- re-review names the latest corrected Developer final;
+- clarification names the original Reviewer final.
+
+There is no inline summary route, request/response manifest, or copied peer
+body. A successful new role final replaces that role's current task pointer;
+historical attempt artifacts stay on disk.
 
 ## Evidence
 
-Durable evidence lives in `<project>/hcom-tasks/<run-id>/…`
+Durable artifacts live in `<project>/hcom-tasks/<run-id>/…`
 (`src/orchestrator/workspace.rs`). It is hcom-owned handoff material, not a
 tamper-proof boundary: a native-equivalent worker has the operator's ordinary
 host access and can reach it. The raw `--output-last-message` target sits in
-the per-run private runtime instead, so hcom itself never writes unredacted
-final text into the project directory. Ingestion reads the file bounded,
-redacts it, writes the sealed copy atomically, and deletes the raw one.
-
-The final message is redacted by **streaming the whole file**: memory is
-bounded, the file is not, so a legal long message keeps its tail. Chunks overlap
-by `max-secret-length` bytes so a credential straddling a read boundary is still
-matched. Only a leading window is quoted onward; the sealed artifact holds
-everything.
+the per-run private runtime instead. Ingestion pins that file's identity,
+enforces the hard size cap, validates non-empty UTF-8, copies all bytes exactly
+to the attempt's durable `native-final.partial`, and removes the raw source.
+The exact final does not pass through redaction, sensitive-value scanning,
+lossy conversion, or a leading-window truncation. A transport or process
+failure never publishes its path for routing.
 
 Prompts are streamed as bounded artifacts rather than written as adapter control
 files, so a legal full-size prompt cannot fail the turn — and the prompt is
 **not** used to seed the redactor. It is an hcom-generated task description, not
 a credential; seeding with it would replace prompt.md with `[REDACTED]` and
-destroy reproducibility. Real secrets come from the environment inventory and
-are redacted everywhere regardless.
+destroy reproducibility. Existing stdout/stderr diagnostic evidence still uses
+the environment-backed redactor; that diagnostic policy does not alter agent
+finals.
 
 The workspace is handoff material, not a recovery store. A restarted hcom never
-reads it to resume; a human reads `latest/`, then authorizes a new run.
+reads it to resume. The live in-memory snapshot carries only the latest
+Developer path and the current ordered Reviewer path or paths for each task.
 
 ## Failures
 
@@ -183,7 +205,8 @@ group would hang the supervisor itself.
 - **Unit** (`cargo test --lib`) — the flow state machine, the verdict grammar,
   and the runtime against fake CLI scripts covering exit codes, missing final
   messages, giant events, resume identity, clarification, timeout and secret
-  redaction.
+  redaction in diagnostic evidence, plus byte-exact Unicode/Markdown and fake
+  secret-shaped agent finals.
 - **Contract smokes** (`scripts/codex-exec-contract-smokes`) — the external
   behavior, against the native `codex` selected from `PATH`. Unit tests cannot
   cover these: a fake CLI reproduces whatever hcom already believes. Run before
@@ -233,8 +256,8 @@ this design removed.
 Beyond "this path is an existing directory", hcom does not open, lock, or read
 a repository. Two runs against one checkout are not prevented, a task whose
 directory is not a repository at all is accepted, and the reviewer is given no
-diff range — it works out what changed from the source and the developer's
-report.
+diff range — it works out what changed from the source, task/design files, and
+the Developer's durable final file.
 
 ### `hcom-tasks/` is evidence, not a security boundary
 
@@ -289,3 +312,11 @@ worker burns up to six hours before the watchdog fires. The foreground
 supervisor reports the resulting terminal state through the one pending
 `session_wait`; a human who needs an earlier progress check can interrupt that
 wait and explicitly request `session_status` or cancellation.
+
+At terminal return, every task snapshot exposes
+`latest_developer_final_path`, ordered `final_reviewer_message_paths`, and
+`reviewer_verdict`. The Architect reads every non-empty Reviewer file in order
+and reports its original verdict/findings, distinguishing LGTM,
+`review_exhausted`, and lifecycle failure. Neither MCP response shape embeds
+the Reviewer body, and the Architect does not rerun tests, review, or
+validation unless the human asks.

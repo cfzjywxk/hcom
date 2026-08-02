@@ -901,8 +901,8 @@ mod tests {
         CONTROL_REFUSAL_TRANSPORT, TOOL_REFUSAL_ACTION, TOOL_REFUSAL_ENVELOPE,
     };
     use crate::control_api::{
-        ActionName, ControlAction, ControlErrorCode, ControlResult, SessionState,
-        SessionStatusSnapshot,
+        ActionName, ControlAction, ControlErrorCode, ControlResult, ReviewerVerdict, SessionState,
+        SessionStatusSnapshot, TaskState, TaskStatusSnapshot,
     };
     use std::process::{Command, Stdio};
     use std::thread::JoinHandle;
@@ -991,6 +991,29 @@ mod tests {
             current_task_ordinal: None,
             terminal_detail: None,
             tasks: Vec::new(),
+        }
+    }
+
+    fn reviewed_task_snapshot(reviewer_path: &Path) -> TaskStatusSnapshot {
+        TaskStatusSnapshot {
+            task_key: "reviewed-task".into(),
+            ordinal: 0,
+            state: TaskState::Lgtm,
+            repository_root: "/source".into(),
+            task_document_path: "/project/current_todo.md".into(),
+            design_document_paths: vec!["/project/design.md".into()],
+            task_selector: "FBTC-03".into(),
+            branch: None,
+            review_round: 1,
+            max_review_rounds: 3,
+            base_revision: None,
+            head_revision: None,
+            developer_session_bound: true,
+            reviewer_session_bound: true,
+            outcome_detail: Some("Reviewer returned LGTM".into()),
+            latest_developer_final_path: Some("/artifacts/developer/native-final.partial".into()),
+            final_reviewer_message_paths: vec![reviewer_path.to_string_lossy().into_owned()],
+            reviewer_verdict: Some(ReviewerVerdict::Lgtm),
         }
     }
 
@@ -1172,6 +1195,16 @@ mod tests {
     #[test]
     fn session_wait_keeps_mcp_responsive_and_returns_terminal_result() {
         let fixture = BridgeTestFixture::new();
+        let reviewer_path = fixture
+            .configuration
+            .run_root
+            .join("reviewer/native-final.partial");
+        fs::create_dir_all(reviewer_path.parent().unwrap()).unwrap();
+        const REVIEWER_BODY: &str =
+            "VERDICT: LGTM\n\nREVIEWER-BODY-MUST-REMAIN-IN-THE-DURABLE-FILE";
+        fs::write(&reviewer_path, REVIEWER_BODY).unwrap();
+        let reviewer_path_text = reviewer_path.to_string_lossy().into_owned();
+        let response_reviewer_path = reviewer_path.clone();
         let control = bind_private_listener(&fixture.configuration.control_socket_path);
         let (request_ready_tx, request_ready_rx) = std::sync::mpsc::channel();
         let (finish_tx, finish_rx) = std::sync::mpsc::channel();
@@ -1182,6 +1215,7 @@ mod tests {
             session.state = SessionState::Completed;
             session.version = 9;
             session.terminal_detail = Some("all tasks completed".into());
+            session.tasks = vec![reviewed_task_snapshot(&response_reviewer_path)];
             ControlResponse::success(&request.request_id, ControlResult::Session { session })
         });
 
@@ -1235,6 +1269,24 @@ mod tests {
             terminal["result"]["structuredContent"]["result"]["session"]["version"],
             9
         );
+        let structured = &terminal["result"]["structuredContent"];
+        assert_eq!(
+            structured["result"]["session"]["tasks"][0]["final_reviewer_message_paths"],
+            json!([reviewer_path_text])
+        );
+        assert_eq!(
+            structured["result"]["session"]["tasks"][0]["reviewer_verdict"],
+            "lgtm"
+        );
+        let content_text = terminal["result"]["content"][0]["text"]
+            .as_str()
+            .expect("MCP compatibility content must be JSON text");
+        let content: Value = serde_json::from_str(content_text).unwrap();
+        assert_eq!(content, *structured);
+        assert!(content_text.contains(reviewer_path.to_str().unwrap()));
+        assert!(!content_text.contains(REVIEWER_BODY));
+        assert!(!structured.to_string().contains(REVIEWER_BODY));
+        assert_eq!(fs::read_to_string(&reviewer_path).unwrap(), REVIEWER_BODY);
 
         client.shutdown(Shutdown::Write).unwrap();
         bridge_thread.join().unwrap();

@@ -539,6 +539,24 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
         stdout.contains("canonical source directory"),
         "stdout={stdout}"
     );
+    assert!(
+        normalized_stdout.contains(
+            "absolute task document path, ordered absolute design document paths, and task selector"
+        ) && normalized_stdout.contains(
+            "hcom transports those strings without reading, copying, hashing, locking, or drift-checking the documents"
+        ),
+        "stdout={stdout}"
+    );
+    assert!(
+        normalized_stdout.contains(
+            "terminal snapshot contains each task's latest Developer final path, ordered final Reviewer message paths, and Reviewer verdict, never the Reviewer body"
+        ) && normalized_stdout.contains(
+            "Architect reads every final Reviewer file in order and delivers its original verdict and findings"
+        ) && normalized_stdout.contains(
+            "does not rerun tests, review, or validation unless the human explicitly requests that work"
+        ),
+        "stdout={stdout}"
+    );
     assert!(stdout.contains("$HCOM_DIR/config.toml"), "stdout={stdout}");
     assert!(stdout.contains("[architect.profile]"), "stdout={stdout}");
     assert!(stdout.contains("[architect.developer]"), "stdout={stdout}");

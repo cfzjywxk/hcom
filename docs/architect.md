@@ -181,7 +181,8 @@ fails that turn instead of silently becoming a fresh conversation.
 
 ## Task handoff and authorization
 
-The Architect submits structured data, not plan markdown:
+The Architect submits an ordered list of file bindings, not copied plan
+content:
 
 ```text
 session_plan_replace({
@@ -191,12 +192,10 @@ session_plan_replace({
   tasks: [{
     task_key,
     title,
-    objective,
     repository_root,
-    acceptance_criteria,
-    required_checks,
-    allowed_paths,
-    forbidden_actions,
+    task_document_path,
+    design_document_paths,
+    task_selector,
     max_review_rounds
   }]
 })
@@ -210,22 +209,30 @@ session_approve_and_start({
 ```
 
 The supervisor validates the exact session version, plan version/hash, frozen
-adapter pair, and confirmation bit. A human message explicitly directing the
-Architect to follow/execute/implement a named existing detailed plan,
-specification, or `current_todo` authorizes same-turn plan derivation and
-start. Read/analyze/discuss/summarize/draft/update alone does not authorize
-execution, and an explicit “do not start” always wins.
+adapter pair, confirmation bit, field shape, and lexical absolute-path
+syntax. It checks only that `repository_root` is an existing directory. hcom
+does not open, copy, snapshot, hash, lock, or drift-check the task/design
+documents, and it does not parse Markdown to infer a task.
 
-The Developer prompt contains the structured task objective, criteria, checks,
-paths, forbidden actions, project/source paths, instruction-discovery rule,
-and role contract. The Reviewer prompt adds the Developer's full redacted
-report and the verdict contract. A request-changes response is relayed
-verbatim to the same Developer session; the next review resumes the same
-Reviewer session.
+A human message explicitly directing the Architect to
+follow/execute/implement a named existing detailed plan, specification, or
+`current_todo` authorizes same-turn plan derivation and start.
+Read/analyze/discuss/summarize/draft/update alone does not authorize execution,
+and an explicit “do not start” always wins.
 
-hcom does not ask an LLM to parse plan.md or infer missing task fields. The
-Architect creates the typed object; hcom validates and forwards it with fixed
-role templates.
+Both role prompts carry the exact project/source paths, task document path,
+ordered design document paths, selector, instruction-discovery rule, and fixed
+role contract. The workers read the original files. Peer messages use one
+file-only route:
+
+- the initial Reviewer prompt names the Developer's durable final path;
+- a correction prompt names the current ordered Reviewer final path or paths;
+- a re-review prompt names only the latest Developer final path;
+- verdict clarification names the original Reviewer final path.
+
+No peer body, redacted summary, or inline/file alternative enters these
+prompts. Same-task correction and re-review resume the exact respective role
+session.
 
 ## Worker process and filesystem behavior
 
@@ -266,16 +273,22 @@ surviving process-group descendants.
 
 ## Evidence, lifetime, and terminal states
 
-Redacted evidence is stored under:
+Per-turn artifacts are stored under:
 
 ```text
 <project>/hcom-tasks/<run-id>/
 ```
 
-The raw final file stays in a mode-0700 per-run runtime and is ingested,
-stream-redacted, sealed, and removed by hcom. The evidence directory is human
-handoff material, not a recovery store or tamper-proof security boundary; a
-native-equivalent worker has ordinary same-user host access.
+Diagnostic prompt/stdout/stderr evidence retains its existing bounded
+redaction behavior. The agent final is different: the native raw target stays
+in a mode-0700 per-run runtime, then hcom validates its identity, size,
+non-emptiness, and UTF-8 and writes it byte-for-byte to the attempt's durable
+`native-final.partial`. hcom does not redact, scan, truncate, or lossily
+convert a legal Developer/Reviewer final. Empty, invalid UTF-8, oversized, or
+otherwise unsuccessful turns do not publish a routable final path. The
+evidence directory is human handoff material, not a recovery store or
+tamper-proof security boundary; a native-equivalent worker has ordinary
+same-user host access.
 
 An LGTM or `review_exhausted` closes the current task runtime before advancing.
 Runtime failure, identity mismatch, cleanup failure, or a second
@@ -298,6 +311,17 @@ the new `session_wait` replaces any abandoned subscription. A terminal snapshot
 is retained in memory and returns immediately if the run finished during the
 gap. `session_status` remains available only for an explicit human progress
 query.
+
+Every terminal snapshot carries, for every task, its
+`latest_developer_final_path`, ordered `final_reviewer_message_paths`, and
+`reviewer_verdict`. The Reviewer body is not copied into either the MCP
+compatibility text or `structuredContent`. After `session_wait` returns, the
+Architect reads every non-empty Reviewer path in order and uses the original
+verdict and findings for the human-facing delivery. It distinguishes `lgtm`,
+`review_exhausted`, and lifecycle failure from the typed task/session state;
+an empty list means that no Reviewer final was successfully published. The
+Architect does not rerun tests, perform another review, or repeat validation
+unless the human explicitly requests that extra work.
 
 ## Verification
 

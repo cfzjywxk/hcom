@@ -2620,6 +2620,18 @@ mod tests {
         let snapshot = drive_terminal(&mut supervisor);
         assert_eq!(snapshot.state, SessionState::Completed);
         assert_eq!(snapshot.tasks[0].state, TaskState::ReviewExhausted);
+        assert_eq!(
+            snapshot.tasks[0].final_reviewer_message_paths,
+            vec![
+                message_path(WorkerRole::Reviewer, "still wrong")
+                    .to_string_lossy()
+                    .into_owned()
+            ]
+        );
+        assert_eq!(
+            snapshot.tasks[0].reviewer_verdict,
+            Some(ReviewerVerdict::RequestChanges)
+        );
         assert!(
             snapshot.tasks[0]
                 .outcome_detail

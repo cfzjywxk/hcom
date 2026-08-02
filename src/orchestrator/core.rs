@@ -3038,6 +3038,131 @@ mod tests {
     }
 
     #[test]
+    fn failed_and_canceled_terminals_keep_successfully_published_peer_paths() {
+        let (mut before_review, developer) = active_core();
+        before_review
+            .reduce(SupervisorEvent::TurnFailed {
+                expected_version: before_review.version(),
+                task_ordinal: developer.task,
+                role: developer.role,
+                session: developer.session,
+                turn: developer.turn,
+                completion_token: developer.token.into(),
+                failure: runtime_failure(
+                    RuntimeFailureClass::Process,
+                    false,
+                    "initial development failed",
+                ),
+            })
+            .unwrap();
+        let before_review_task = &before_review.snapshot().tasks[0];
+        assert!(before_review_task.latest_developer_final_path.is_none());
+        assert!(before_review_task.final_reviewer_message_paths.is_empty());
+        assert_eq!(before_review_task.reviewer_verdict, None);
+
+        let (mut during_review, reviewer) = active_reviewer_core(2);
+        during_review
+            .reduce(SupervisorEvent::TurnFailed {
+                expected_version: during_review.version(),
+                task_ordinal: reviewer.task,
+                role: reviewer.role,
+                session: reviewer.session,
+                turn: reviewer.turn,
+                completion_token: reviewer.token.into(),
+                failure: runtime_failure(
+                    RuntimeFailureClass::Process,
+                    false,
+                    "review process failed before publishing a final",
+                ),
+            })
+            .unwrap();
+        let during_review_task = &during_review.snapshot().tasks[0];
+        assert_eq!(
+            during_review_task.latest_developer_final_path.as_deref(),
+            Some("/artifacts/developer/turn-1/native-final.partial")
+        );
+        assert!(during_review_task.final_reviewer_message_paths.is_empty());
+        assert_eq!(during_review_task.reviewer_verdict, None);
+
+        let (mut after_review, reviewer) = active_reviewer_core(2);
+        complete_review(&mut after_review, reviewer, request_changes());
+        let before_terminal = after_review.snapshot().tasks[0].clone();
+        assert_eq!(
+            before_terminal.latest_developer_final_path.as_deref(),
+            Some("/artifacts/developer/turn-1/native-final.partial")
+        );
+        assert_eq!(
+            before_terminal.final_reviewer_message_paths,
+            ["/artifacts/reviewer/turn-2/native-final.partial"]
+        );
+        assert_eq!(
+            before_terminal.reviewer_verdict,
+            Some(ReviewerVerdict::RequestChanges)
+        );
+
+        let mut canceled = after_review.clone();
+        canceled
+            .reduce(SupervisorEvent::CancelRequested {
+                expected_version: canceled.version(),
+                reason: "stop after a published review".into(),
+            })
+            .unwrap();
+        let canceled_task = &canceled.snapshot().tasks[0];
+        assert_eq!(
+            canceled_task.latest_developer_final_path,
+            before_terminal.latest_developer_final_path
+        );
+        assert_eq!(
+            canceled_task.final_reviewer_message_paths,
+            before_terminal.final_reviewer_message_paths
+        );
+        assert_eq!(
+            canceled_task.reviewer_verdict,
+            before_terminal.reviewer_verdict
+        );
+
+        let developer_session = after_review.tasks[0].developer_session.unwrap();
+        let developer_turn = RuntimeTurnKey::from_counter(3).unwrap();
+        start_turn(
+            &mut after_review,
+            0,
+            WorkerRole::Developer,
+            RuntimeTurnPurpose::DeveloperCorrection,
+            developer_session,
+            developer_turn,
+            "failed-correction",
+        );
+        after_review
+            .reduce(SupervisorEvent::TurnFailed {
+                expected_version: after_review.version(),
+                task_ordinal: 0,
+                role: WorkerRole::Developer,
+                session: developer_session,
+                turn: developer_turn,
+                completion_token: "failed-correction".into(),
+                failure: runtime_failure(
+                    RuntimeFailureClass::Process,
+                    false,
+                    "correction process failed",
+                ),
+            })
+            .unwrap();
+        let failed_task = &after_review.snapshot().tasks[0];
+        assert_eq!(
+            failed_task.latest_developer_final_path,
+            before_terminal.latest_developer_final_path
+        );
+        assert_eq!(
+            failed_task.final_reviewer_message_paths,
+            before_terminal.final_reviewer_message_paths
+        );
+        assert_eq!(
+            failed_task.reviewer_verdict,
+            before_terminal.reviewer_verdict
+        );
+    }
+
+    #[test]
     fn two_task_journey_closes_each_runtime_before_the_next_task_opens() {
         let mut core = new_core();
         bind(
@@ -3074,6 +3199,21 @@ mod tests {
             "first task keeps its logical session evidence"
         );
         assert_eq!(core.tasks[1].developer_session.unwrap().counter(), 3);
+        let snapshot = core.snapshot();
+        assert_eq!(
+            snapshot.tasks[0].final_reviewer_message_paths,
+            ["/artifacts/reviewer/turn-2/native-final.partial"]
+        );
+        assert_eq!(
+            snapshot.tasks[1].final_reviewer_message_paths,
+            ["/artifacts/reviewer/turn-4/native-final.partial"]
+        );
+        assert!(
+            snapshot
+                .tasks
+                .iter()
+                .all(|task| task.reviewer_verdict == Some(ReviewerVerdict::Lgtm))
+        );
     }
 
     #[test]
@@ -3130,6 +3270,17 @@ mod tests {
             2,
             "Reviewer re-review must use the first logical session"
         );
+        let task = &core.snapshot().tasks[0];
+        assert_eq!(
+            task.latest_developer_final_path.as_deref(),
+            Some("/artifacts/developer/turn-3/native-final.partial")
+        );
+        assert_eq!(
+            task.final_reviewer_message_paths,
+            ["/artifacts/reviewer/turn-4/native-final.partial"],
+            "the Architect handoff carries only the final review round"
+        );
+        assert_eq!(task.reviewer_verdict, Some(ReviewerVerdict::Lgtm));
     }
 
     #[test]
@@ -3175,6 +3326,20 @@ mod tests {
         );
         assert_eq!(core.tasks[0].state, TaskState::ReviewExhausted);
         assert_eq!(core.tasks[0].review_round, 2);
+        let exhausted = &core.snapshot().tasks[0];
+        assert_eq!(
+            exhausted.latest_developer_final_path.as_deref(),
+            Some("/artifacts/developer/turn-3/native-final.partial")
+        );
+        assert_eq!(
+            exhausted.final_reviewer_message_paths,
+            ["/artifacts/reviewer/turn-4/native-final.partial"],
+            "review exhaustion carries only the last REQUEST_CHANGES round"
+        );
+        assert_eq!(
+            exhausted.reviewer_verdict,
+            Some(ReviewerVerdict::RequestChanges)
+        );
         assert_eq!(core.current_task(), Some(1));
         start_first_developer(&mut core, 1, 3, 5, "next-developer");
         assert_eq!(core.tasks[1].state, TaskState::Developing);

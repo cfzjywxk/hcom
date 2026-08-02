@@ -10,10 +10,11 @@ session lane.
 ## Product rule
 
 hcom is a thin automation layer over a native Codex launch. It owns process
-lifetime, task-control transport, typed task handoff, exact resume, and
-redacted evidence. It does not replace the operator's Codex installation
-semantics with a generated HOME, CODEX_HOME, config, trust decision, MCP
-allowlist, feature allowlist, or reduced host filesystem.
+lifetime, task-control transport, typed file bindings, durable peer-final
+paths, exact resume, and diagnostic evidence. It does not replace the
+operator's Codex installation semantics with a generated HOME, CODEX_HOME,
+config, trust decision, MCP allowlist, feature allowlist, or reduced host
+filesystem.
 
 The deliberate exceptions are:
 
@@ -106,13 +107,34 @@ The exec lane:
 - tells both roles to inspect applicable project and repository AGENTS.md,
   AGENTS.override.md, and nested instructions before work;
 - proves create/resume identity from `thread.started.thread_id`;
-- captures final output with `--output-last-message`;
+- captures final output with `--output-last-message`, validates it, and
+  publishes the exact durable `native-final.partial` path without redacting or
+  copying its body into another prompt;
 - keeps Reviewer non-mutation as a role contract, not an OS read-only mount;
 - preserves parent `HCOM_DIR` and keeps bounded lifecycle/reaping plus redacted
-  evidence.
+  stdout/stderr diagnostic evidence.
 
 See the exec-lane document for exact argv ordering, verdict classification,
 artifact bounds, and contract smokes.
+
+## File-backed task and terminal contract
+
+An approved task binds `repository_root`, `task_document_path`, ordered
+`design_document_paths`, and `task_selector`. The adapter transports those
+exact strings; it does not read, snapshot, hash, lock, or drift-check the
+documents. Developer and Reviewer read the originals.
+
+Developer-to-Reviewer, Reviewer-to-correction, correction-to-re-review, and
+verdict-clarification handoffs contain only durable final-message paths. There
+is no peer-body summary or inline/file dual route. The in-memory terminal
+snapshot exposes each task's latest Developer path, ordered final Reviewer
+paths, and Reviewer verdict. Both MCP response representations contain that
+metadata but never the Reviewer body.
+
+After the one terminal `session_wait` returns, the Architect reads every
+non-empty final Reviewer file in order and delivers the original verdict and
+findings. It distinguishes LGTM, `review_exhausted`, and lifecycle failure and
+does not rerun tests, review, or validation unless the human explicitly asks.
 
 ## Test map
 
@@ -123,6 +145,7 @@ artifact bounds, and contract smokes.
 | native config plus one MCP leaf | `architect::launch::tests::codex_control_server_is_an_additive_cli_overlay_not_a_private_config` |
 | native worker argv/config | `worker::exec_runtime::tests::happy_developer_turn_completes_and_captures_thread_id`, `reviewer_registers_the_external_repository_as_a_native_workspace_root` |
 | byte-exact native environment with no additions | `orchestrator::task_lane::tests::complete_parent_environment_is_preserved_byte_for_byte` |
+| path-only peer and terminal handoff | `orchestrator::task_lane::tests::request_changes_round_routes_only_ordered_durable_paths`, `architect::bridge::tests::session_wait_keeps_mcp_responsive_and_returns_terminal_result` |
 | real CLI assumptions | `scripts/codex-exec-contract-smokes` |
 
 The standard source gate is:

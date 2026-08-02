@@ -1128,6 +1128,9 @@ mod tests {
             self.snapshot.version += 1;
             self.snapshot.state = crate::control_api::SessionState::Canceled;
             self.snapshot.terminal_detail = Some(reason.into());
+            for task in &mut self.snapshot.tasks {
+                task.state = crate::control_api::TaskState::Canceled;
+            }
             Ok(())
         }
 
@@ -1153,6 +1156,28 @@ mod tests {
         version: u64,
     ) -> (SessionSupervisorControl, CallerAuth, PeerCredentials) {
         let project_root = PathBuf::from("/project");
+        let (task_state, reviewer_verdict) = match state {
+            crate::control_api::SessionState::Completed => (
+                crate::control_api::TaskState::Lgtm,
+                crate::control_api::ReviewerVerdict::Lgtm,
+            ),
+            crate::control_api::SessionState::Canceled => (
+                crate::control_api::TaskState::Canceled,
+                crate::control_api::ReviewerVerdict::RequestChanges,
+            ),
+            crate::control_api::SessionState::Failed => (
+                crate::control_api::TaskState::Failed,
+                crate::control_api::ReviewerVerdict::RequestChanges,
+            ),
+            crate::control_api::SessionState::NeedsHuman => (
+                crate::control_api::TaskState::NeedsHuman,
+                crate::control_api::ReviewerVerdict::RequestChanges,
+            ),
+            _ => (
+                crate::control_api::TaskState::Developing,
+                crate::control_api::ReviewerVerdict::RequestChanges,
+            ),
+        };
         let snapshot = crate::control_api::SessionStatusSnapshot {
             run_id: "run-wait-test".into(),
             state,
@@ -1164,7 +1189,30 @@ mod tests {
             terminal_detail: state
                 .is_terminal()
                 .then(|| "terminal before subscription".into()),
-            tasks: Vec::new(),
+            tasks: vec![crate::control_api::TaskStatusSnapshot {
+                task_key: "wait-task".into(),
+                ordinal: 0,
+                state: task_state,
+                repository_root: "/source".into(),
+                task_document_path: "/project/current_todo.md".into(),
+                design_document_paths: vec!["/project/design.md".into()],
+                task_selector: "FBTC-03".into(),
+                branch: None,
+                review_round: 1,
+                max_review_rounds: 3,
+                base_revision: None,
+                head_revision: None,
+                developer_session_bound: true,
+                reviewer_session_bound: true,
+                outcome_detail: Some("Reviewer returned LGTM".into()),
+                latest_developer_final_path: Some(
+                    "/artifacts/developer/native-final.partial".into(),
+                ),
+                final_reviewer_message_paths: vec![
+                    "/artifacts/reviewer/native-final.partial".into(),
+                ],
+                reviewer_verdict: Some(reviewer_verdict),
+            }],
         };
         let binding_id = "binding-wait-test";
         let launch_nonce = "launch-nonce-wait-test";
@@ -1258,6 +1306,14 @@ mod tests {
             session.terminal_detail.as_deref(),
             Some("terminal after wait")
         );
+        assert_eq!(
+            session.tasks[0].final_reviewer_message_paths,
+            ["/artifacts/reviewer/native-final.partial"]
+        );
+        assert_eq!(
+            session.tasks[0].reviewer_verdict,
+            Some(crate::control_api::ReviewerVerdict::RequestChanges)
+        );
 
         let (mut terminal_control, terminal_caller, _) =
             fake_wait_control(crate::control_api::SessionState::Completed, 11);
@@ -1325,6 +1381,14 @@ mod tests {
         };
         assert_eq!(session.state, crate::control_api::SessionState::Running);
         assert_eq!(session.version, 5);
+        assert_eq!(
+            session.tasks[0].latest_developer_final_path.as_deref(),
+            Some("/artifacts/developer/native-final.partial")
+        );
+        assert_eq!(
+            session.tasks[0].final_reviewer_message_paths,
+            ["/artifacts/reviewer/native-final.partial"]
+        );
         assert!(control.pending_wait.is_some());
 
         drop(wait_client);
