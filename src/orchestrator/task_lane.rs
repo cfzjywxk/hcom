@@ -393,18 +393,44 @@ impl TaskLaneSupervisor {
             })
             .map_err(|error| anyhow!(error.to_string()))?;
         if self.tasks_workspace.is_none() {
-            let workspace = TasksWorkspace::open(&self.startup.project_root, &self.startup.run_id)
-                .context("failed to open the hcom-tasks workspace")?;
-            workspace.write_run_file(
-                "plan.md",
-                self.render_plan(plan_version, plan_hash).as_bytes(),
-            )?;
-            let _ = workspace.append_decision(&format!(
-                "execution authorized: plan version {plan_version} hash {plan_hash}"
-            ));
-            self.tasks_workspace = Some(workspace);
+            // Authorization is already committed above; a mechanical staging
+            // failure here must terminalize the run as needs_human instead of
+            // returning early, which would leave a Running session with no
+            // worker, no effects, and no way to re-authorize.
+            match self.stage_tasks_workspace(plan_version, plan_hash) {
+                Ok(workspace) => self.tasks_workspace = Some(workspace),
+                Err(error) => {
+                    let task_ordinal = effects
+                        .iter()
+                        .find_map(|effect| match effect {
+                            SupervisorEffect::OpenTaskRuntime { task_ordinal } => {
+                                Some(*task_ordinal)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    return self.fail_driver_effect(
+                        task_ordinal,
+                        DriverFailureClass::Environment,
+                        error,
+                    );
+                }
+            }
         }
         self.execute_effects(effects)
+    }
+
+    fn stage_tasks_workspace(&self, plan_version: u64, plan_hash: &str) -> Result<TasksWorkspace> {
+        let workspace = TasksWorkspace::open(&self.startup.project_root, &self.startup.run_id)
+            .context("failed to open the hcom-tasks workspace")?;
+        workspace.write_run_file(
+            "plan.md",
+            self.render_plan(plan_version, plan_hash).as_bytes(),
+        )?;
+        let _ = workspace.append_decision(&format!(
+            "execution authorized: plan version {plan_version} hash {plan_hash}"
+        ));
+        Ok(workspace)
     }
 
     fn render_plan(&self, plan_version: u64, plan_hash: &str) -> String {
@@ -3596,6 +3622,39 @@ mod tests {
             snapshot.terminal_detail.as_deref(),
             Some("task-private environment setup failed")
         );
+    }
+
+    #[test]
+    fn workspace_staging_failure_terminalizes_instead_of_wedging_the_run() {
+        let fixture = Fixture::new();
+        // A foreign `hcom-tasks` directory without the ownership marker makes
+        // workspace staging fail after authorization is already committed.
+        fs::create_dir(fixture.project_root.join("hcom-tasks")).unwrap();
+        let mut supervisor = fixture.supervisor(Vec::new(), Arc::new(Mutex::new(Audit::default())));
+        let task = fixture.task("foreign-workspace", &["src"], 2);
+        let (plan_version, plan_hash) = supervisor
+            .replace_plan(
+                0,
+                CODEX_TASK_WORKER_ADAPTER,
+                CODEX_TASK_WORKER_ADAPTER,
+                vec![task],
+            )
+            .unwrap();
+        let error = supervisor
+            .approve_and_start(1, plan_version, &plan_hash, true)
+            .unwrap_err();
+        assert!(error.to_string().contains("hcom-tasks"));
+        // The run must not stay Running with no worker and no way to
+        // re-authorize; it terminalizes as an explainable needs_human.
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, SessionState::NeedsHuman);
+        assert_eq!(snapshot.tasks[0].state, TaskState::NeedsHuman);
+        assert_eq!(
+            snapshot.terminal_detail.as_deref(),
+            Some("task-private environment setup failed")
+        );
+        supervisor.poll_once().unwrap();
+        assert_eq!(supervisor.snapshot().state, SessionState::NeedsHuman);
     }
 
     #[test]

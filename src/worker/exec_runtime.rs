@@ -601,7 +601,6 @@ impl ExecTaskWorkerRuntime {
         let raw = ingest_raw_final(
             &running.raw_final,
             running.raw_final_identity,
-            running.redactor.trailing_guard_bytes(),
             &running.redactor,
             &mut final_writer,
         );
@@ -1023,7 +1022,14 @@ impl TaskWorkerRuntime for ExecTaskWorkerRuntime {
             .turns
             .get_mut(&turn)
             .ok_or_else(|| RuntimeError::invalid_identity("unknown runtime turn"))?;
-        if let TurnState::Running(running) = &mut entry.state {
+        if matches!(entry.state, TurnState::Running(_)) {
+            let placeholder = TurnState::Done(RuntimeTurnPoll::Pending {
+                telemetry: RuntimeTelemetry::default(),
+            });
+            let TurnState::Running(mut running) = std::mem::replace(&mut entry.state, placeholder)
+            else {
+                unreachable!("running state checked above");
+            };
             let killed = running
                 .group
                 .terminate_and_reap(&mut running.child, CANCEL_GRACE);
@@ -1046,25 +1052,37 @@ impl TaskWorkerRuntime for ExecTaskWorkerRuntime {
                     "exec turn canceled but its process group could not be terminated: {error}"
                 )),
             };
+            if killed.is_err() {
+                // The group survived SIGKILL. The supervisor must neither
+                // report a clean cancel nor abandon the process: hand the
+                // still-owned handle to the bounded detached reaper and
+                // surface the failure to the caller.
+                spawn_detached_reaper(running);
+            }
             entry.state = TurnState::Done(RuntimeTurnPoll::Failed {
                 failure: SanitizedRuntimeFailure::new(
                     RuntimeFailureClass::Canceled,
-                    detail,
+                    detail.clone(),
                     false,
                 )?,
                 telemetry: RuntimeTelemetry::default(),
             });
+            if killed.is_err() {
+                self.active_turn = None;
+                return Err(RuntimeError::internal(detail));
+            }
         }
         self.active_turn = None;
         Ok(())
     }
 
     fn shutdown(&mut self) -> Result<(), RuntimeError> {
-        if let Some(turn) = self.active_turn {
-            let _ = self.cancel_turn(turn);
-        }
+        let result = match self.active_turn {
+            Some(turn) => self.cancel_turn(turn),
+            None => Ok(()),
+        };
         self.shut_down = true;
-        Ok(())
+        result
     }
 }
 
@@ -1183,7 +1201,6 @@ fn parse_thread_started(line: &[u8]) -> Option<String> {
 fn ingest_raw_final(
     path: &Path,
     expected: (u64, u64),
-    guard: usize,
     redactor: &SecretRedactor,
     sink: &mut crate::artifact::BoundedArtifactWriter,
 ) -> Result<Option<String>> {
@@ -1203,9 +1220,11 @@ fn ingest_raw_final(
     if (metadata.dev(), metadata.ino()) != expected {
         bail!("raw final message file identity changed since it was created");
     }
-    // Read in bounded chunks, carrying `guard` bytes forward so a secret split
-    // across a boundary is still matched. `relayed` keeps only the leading
-    // window the supervisor may quote; the sealed artifact gets everything.
+    // Read in bounded chunks, splitting the carry only where the redactor
+    // proves the cut cannot bisect a secret: the guard window is held back
+    // and no visible occurrence is ever cut in half. `relayed` keeps only the
+    // leading window the supervisor may quote; the sealed artifact gets
+    // everything.
     let mut reader = std::io::BufReader::new(file);
     let mut carry: Vec<u8> = Vec::new();
     let mut chunk = vec![0_u8; RAW_FINAL_CHUNK];
@@ -1218,17 +1237,11 @@ fn ingest_raw_final(
         }
         total += read as u64;
         carry.extend_from_slice(&chunk[..read]);
-        // Hold back the guard window; it may be the head of a secret whose
-        // tail arrives in the next chunk.
-        let emit_len = carry.len().saturating_sub(guard);
-        if emit_len == 0 {
-            continue;
-        }
-        let mut boundary = emit_len;
-        while boundary > 0 && !is_utf8_boundary(&carry, boundary) {
-            boundary -= 1;
-        }
+        let boundary = redactor.safe_stream_split(&carry);
         if boundary == 0 {
+            if carry.len() > redactor.max_stream_carry_bytes() {
+                bail!("raw final message redaction carry exceeded its bound");
+            }
             continue;
         }
         let piece: Vec<u8> = carry.drain(..boundary).collect();
@@ -1236,6 +1249,9 @@ fn ingest_raw_final(
         sink.write_chunk(redacted.as_bytes())?;
         if relayed.len() < RELAY_WINDOW_BYTES {
             relayed.push_str(&redacted);
+        }
+        if carry.len() > redactor.max_stream_carry_bytes() {
+            bail!("raw final message redaction carry exceeded its bound");
         }
     }
     if !carry.is_empty() {
@@ -1251,10 +1267,6 @@ fn ingest_raw_final(
     } else {
         Ok(Some(relayed))
     }
-}
-
-fn is_utf8_boundary(bytes: &[u8], index: usize) -> bool {
-    index == bytes.len() || (bytes[index] & 0xC0) != 0x80
 }
 
 fn exit_failure_detail(

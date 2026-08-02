@@ -68,6 +68,12 @@ pub fn classify_verdict(text: &str) -> VerdictClassification {
     if labeled.windows(2).any(|w| w[0] != w[1]) {
         return VerdictClassification::Undetermined(UndeterminedReason::Conflict);
     }
+    // An explicit labeled attempt that could not be parsed ("VERDICT: NOT
+    // LGTM", "VERDICT: maybe") may be negating or correcting every other line
+    // in the message, so no determination elsewhere may advance past it.
+    if saw_unrecognized_labeled {
+        return VerdictClassification::Undetermined(UndeterminedReason::UnrecognizedForm);
+    }
     let labeled_verdict = labeled.first().copied();
 
     match first {
@@ -75,18 +81,14 @@ pub fn classify_verdict(text: &str) -> VerdictClassification {
             Some(l) if l != v => VerdictClassification::Undetermined(UndeterminedReason::Conflict),
             _ => VerdictClassification::Determined(v),
         },
-        LineOutcome::Unrecognized => match labeled_verdict {
-            // The first line carried an affirmative-looking token with an
-            // unrecognized tail; a later labeled line cannot override that
-            // ambiguity silently.
-            Some(_) => VerdictClassification::Undetermined(UndeterminedReason::UnrecognizedForm),
-            None => VerdictClassification::Undetermined(UndeterminedReason::UnrecognizedForm),
-        },
+        // The first line carried an affirmative-looking token with an
+        // unrecognized tail; a later labeled line cannot override that
+        // ambiguity silently.
+        LineOutcome::Unrecognized => {
+            VerdictClassification::Undetermined(UndeterminedReason::UnrecognizedForm)
+        }
         LineOutcome::NoToken => match labeled_verdict {
             Some(v) => VerdictClassification::Determined(v),
-            None if saw_unrecognized_labeled => {
-                VerdictClassification::Undetermined(UndeterminedReason::UnrecognizedForm)
-            }
             None => VerdictClassification::Undetermined(UndeterminedReason::NoVerdictFound),
         },
     }
@@ -413,6 +415,26 @@ mod tests {
     fn empty_and_whitespace_only() {
         undetermined("", UndeterminedReason::NoVerdictFound);
         undetermined("\n\n   \n", UndeterminedReason::NoVerdictFound);
+    }
+
+    #[test]
+    fn unrecognized_labeled_line_poisons_any_determination() {
+        // A labeled attempt that cannot be parsed may be a negation or a
+        // correction of the determined line; it must force clarification
+        // instead of letting the earlier determination advance the task.
+        undetermined(
+            "VERDICT: LGTM\nVERDICT: NOT LGTM",
+            UndeterminedReason::UnrecognizedForm,
+        );
+        undetermined("LGTM\nVERDICT: maybe", UndeterminedReason::UnrecognizedForm);
+        undetermined(
+            "Preamble.\nVERDICT: LGTM\nVERDICT: maybe",
+            UndeterminedReason::UnrecognizedForm,
+        );
+        undetermined(
+            "VERDICT: REQUEST_CHANGES\nVERDICT: never mind, all good",
+            UndeterminedReason::UnrecognizedForm,
+        );
     }
 
     #[test]

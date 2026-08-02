@@ -500,21 +500,21 @@ impl BoundedArtifactWriter {
             return Ok(ArtifactWriteStatus::Truncated);
         }
         self.carry.extend_from_slice(bytes);
-        // Hold back the guard window: it may be the head of a secret whose
-        // tail arrives in the next chunk.
-        let guard = self.redactor.trailing_guard_bytes();
-        if self.carry.len() <= guard {
-            return Ok(ArtifactWriteStatus::Accepted);
+        // The split is chosen against the full carry: it holds back the guard
+        // window (a possible secret head whose tail has not arrived) and never
+        // cuts through a visible secret, so every occurrence is either
+        // redacted whole in this piece or kept intact for a later one.
+        let split = self.redactor.safe_stream_split(&self.carry);
+        let status = if split == 0 {
+            ArtifactWriteStatus::Accepted
+        } else {
+            let piece: Vec<u8> = self.carry.drain(..split).collect();
+            self.emit(&piece)?
+        };
+        if self.carry.len() > self.redactor.max_stream_carry_bytes() {
+            bail!("streaming redaction carry exceeded its bound");
         }
-        let mut split = self.carry.len() - guard;
-        while split > 0 && !is_utf8_start(self.carry[split]) {
-            split -= 1;
-        }
-        if split == 0 {
-            return Ok(ArtifactWriteStatus::Accepted);
-        }
-        let piece: Vec<u8> = self.carry.drain(..split).collect();
-        self.emit(&piece)
+        Ok(status)
     }
 
     /// Sanitize and append one already-safe-to-cut piece, honouring the cap.
@@ -571,10 +571,6 @@ impl BoundedArtifactWriter {
 /// Appended whenever a stream hits its cap, so a reader can always tell a
 /// complete artifact from a prefix.
 const TRUNCATION_MARKER: &[u8] = b"\n[hcom: truncated at the artifact cap]\n";
-
-fn is_utf8_start(byte: u8) -> bool {
-    (byte & 0xC0) != 0x80
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactWriteStatus {
@@ -1434,7 +1430,9 @@ mod tests {
         )
         .unwrap();
         let attempt = ArtifactAttempt::create(&root, scope(), &environment, TEST_PROMPT).unwrap();
-        let hard_cap = (b"prefix ".len() + secret.len() - 3) as u64;
+        // The cap lands inside the region the secret occupies, so the
+        // truncation cut happens right where the secret would have been.
+        let hard_cap = (b"prefix ".len() + 4) as u64;
         let mut writer = attempt
             .start_native_stream(ArtifactKind::NativeStderr, hard_cap)
             .unwrap();
@@ -1445,7 +1443,44 @@ mod tests {
         assert!(receipt.truncated);
         let stored = fs::read_to_string(attempt.artifact_path(ArtifactKind::NativeStderr)).unwrap();
         assert!(!stored.contains("boundary-secret"));
-        assert!(!stored.contains("boundary-secret-value-12"));
+        assert!(!stored.contains("value-12345"));
+    }
+
+    #[test]
+    fn secret_spanning_the_hold_back_cut_is_still_redacted() {
+        let (_temp, root) = fixture_root();
+        let secret = "credential-token-123456789";
+        let environment = ExecutionEnvironmentLease::capture(
+            "lease-span",
+            "epoch-1",
+            &EnvironmentPolicy::baseline(),
+            vec![
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("SERVICE_TOKEN".into(), secret.into()),
+            ],
+        )
+        .unwrap();
+        let attempt = ArtifactAttempt::create(&root, scope(), &environment, TEST_PROMPT).unwrap();
+        let mut writer = attempt
+            .start_native_stream(ArtifactKind::NativeStderr, 4096)
+            .unwrap();
+        // The chunk ends a few bytes past the hold-back window, so a naive
+        // cut at `len - guard` lands in the middle of the secret and each
+        // half fails to match on its own.
+        writer
+            .write_chunk(format!("prefix {secret}xxxxxxxxxx").as_bytes())
+            .unwrap();
+        writer.write_chunk(b" trailing data").unwrap();
+        let receipt = writer.finish().unwrap();
+        assert!(!receipt.truncated);
+        let stored = fs::read_to_string(attempt.artifact_path(ArtifactKind::NativeStderr)).unwrap();
+        assert!(
+            !stored.contains(secret),
+            "secret bisected by the streaming cut leaked into evidence: {stored:?}"
+        );
+        assert!(stored.contains("[REDACTED]"));
+        assert!(stored.contains("prefix "));
+        assert!(stored.contains("trailing data"));
     }
 
     #[test]

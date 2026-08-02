@@ -452,6 +452,61 @@ impl SecretRedactor {
             .max()
             .unwrap_or(0)
     }
+
+    /// Largest prefix of `carry` that is safe to cut off and redact on its
+    /// own. Holds back the trailing guard window (a possible head of a secret
+    /// whose tail has not arrived yet), then walks the cut onto a UTF-8
+    /// character start and out of any visible occurrence of a sensitive
+    /// value: a cut through an occurrence would leave two halves that each
+    /// fail to match, leaking the secret verbatim across the seam. Returns 0
+    /// when nothing can be cut yet.
+    pub(crate) fn safe_stream_split(&self, carry: &[u8]) -> usize {
+        let mut split = carry.len().saturating_sub(self.trailing_guard_bytes());
+        loop {
+            while split > 0 && split < carry.len() && (carry[split] & 0xC0) == 0x80 {
+                split -= 1;
+            }
+            match self.occurrence_spanning(carry, split) {
+                Some(start) => split = start,
+                None => return split,
+            }
+        }
+    }
+
+    /// Fail-closed bound on how much a streaming writer may hold back while
+    /// waiting for a safe cut. Non-overlapping secret values never push the
+    /// cut back more than two guard windows; a carry beyond this bound means
+    /// pathologically overlapping occurrences, and refusing keeps memory
+    /// bounded without risking a bisected secret.
+    pub(crate) fn max_stream_carry_bytes(&self) -> usize {
+        self.trailing_guard_bytes()
+            .saturating_mul(4)
+            .saturating_add(4096)
+    }
+
+    /// The start of the earliest visible occurrence of a sensitive value that
+    /// a cut at `split` would bisect: it begins strictly before the cut and
+    /// ends strictly after it, entirely within `haystack`. Occurrences that
+    /// run past the end of `haystack` are the guard window's job.
+    fn occurrence_spanning(&self, haystack: &[u8], split: usize) -> Option<usize> {
+        let mut earliest: Option<usize> = None;
+        for value in &self.sensitive_values {
+            let value = value.as_bytes();
+            if value.len() < 2 {
+                continue;
+            }
+            let lowest = split.saturating_sub(value.len() - 1);
+            for start in lowest..split {
+                if start + value.len() <= haystack.len()
+                    && &haystack[start..start + value.len()] == value
+                {
+                    earliest = Some(earliest.map_or(start, |seen| seen.min(start)));
+                    break;
+                }
+            }
+        }
+        earliest
+    }
 }
 
 fn validate_environment_names(label: &str, names: &[String]) -> Result<()> {
@@ -929,6 +984,56 @@ mod tests {
         assert!(!output.contains("worker-user"));
         assert!(!output.contains("worker-pass"));
         assert!(output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn safe_stream_split_never_cuts_through_a_visible_secret() {
+        let secret = "credential-token-123456789";
+        let redactor =
+            SecretRedactor::from_sensitive_values([secret.to_string()].into_iter().collect());
+        let guard = redactor.trailing_guard_bytes();
+        assert_eq!(guard, secret.len());
+
+        // No secret in sight: hold back exactly the guard window.
+        let plain = b"plain text with nothing sensitive at all";
+        assert_eq!(redactor.safe_stream_split(plain), plain.len() - guard);
+
+        // Carry not longer than the guard: nothing can be cut yet.
+        assert_eq!(redactor.safe_stream_split(b"short"), 0);
+
+        // The naive cut at len-guard would land inside the occurrence; the
+        // split must retreat to the occurrence start so the secret is later
+        // redacted whole instead of leaking as two unmatchable halves.
+        let spanning = format!("prefix {secret}xxxxxxxxxx");
+        let spanning = spanning.as_bytes();
+        let naive = spanning.len() - guard;
+        assert!(naive > 7 && naive < 7 + secret.len());
+        assert_eq!(redactor.safe_stream_split(spanning), 7);
+
+        // An occurrence that ends exactly at the cut is not bisected.
+        let mut ending = Vec::from(secret.as_bytes());
+        ending.extend_from_slice(&vec![b'y'; guard]);
+        assert_eq!(redactor.safe_stream_split(&ending), secret.len());
+    }
+
+    #[test]
+    fn safe_stream_split_retreats_over_chained_occurrences_and_utf8() {
+        let redactor =
+            SecretRedactor::from_sensitive_values(["ababab".to_string()].into_iter().collect());
+        // Self-overlapping occurrences chain the retreat back to the start of
+        // the covered run; everything before the run is still safe to cut.
+        let chained = b"zzababababababababababab";
+        assert_eq!(redactor.safe_stream_split(chained), 2);
+
+        let redactor = SecretRedactor::from_sensitive_values(
+            ["secret-value".to_string()].into_iter().collect(),
+        );
+        // The naive cut lands inside a multi-byte character; the split walks
+        // back to the character start.
+        let mut carry = Vec::new();
+        carry.extend_from_slice("aaaaaaaaaa€".as_bytes());
+        carry.extend_from_slice(&[b'b'; 10]);
+        assert_eq!(redactor.safe_stream_split(&carry), 10);
     }
 
     #[test]
