@@ -17,12 +17,11 @@ use crate::worker::exec_runtime::{
 };
 use crate::worker::runtime::{
     CODEX_TASK_WORKER_ADAPTER, OutcomeContract, RoleSessionSpec, RuntimeContractIdentity,
-    RuntimeError, RuntimeErrorCode, RuntimeFailureClass, RuntimeOutcome, RuntimeProfile,
-    RuntimeSessionKey, RuntimeTurnKey, RuntimeTurnPoll, RuntimeTurnPurpose, RuntimeTurnSpec,
-    SanitizedRuntimeFailure, TaskWorkerProfiles, TaskWorkerRuntime,
+    RuntimeError, RuntimeErrorCode, RuntimeFailureClass, RuntimeProfile, RuntimeSessionKey,
+    RuntimeTurnKey, RuntimeTurnPoll, RuntimeTurnPurpose, RuntimeTurnSpec, SanitizedRuntimeFailure,
+    TaskWorkerProfiles, TaskWorkerRuntime,
 };
 use anyhow::{Context, Result, anyhow, bail};
-use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::fs;
@@ -144,7 +143,6 @@ impl TaskRuntimePaths {
 struct OpenTaskRuntime {
     task_ordinal: usize,
     _root: TempDir,
-    environment: ExecutionEnvironmentLease,
     runtime: Box<dyn TaskWorkerRuntime>,
     sessions: BTreeMap<RuntimeSessionKey, LocalSession>,
 }
@@ -163,7 +161,6 @@ struct ActiveTurn {
     logical_turn: RuntimeTurnKey,
     local_turn: RuntimeTurnKey,
     completion_token: String,
-    prompt: String,
 }
 
 pub(crate) struct TaskLaneSupervisor {
@@ -429,38 +426,20 @@ impl TaskLaneSupervisor {
         };
         let event = match poll {
             Ok(RuntimeTurnPoll::Pending { .. }) => return Ok(()),
-            Ok(RuntimeTurnPoll::Completed { outcome, .. }) => {
-                if self.outcome_contains_sensitive_value(
-                    active.task_ordinal,
-                    &active.prompt,
-                    &outcome,
-                ) {
-                    SupervisorEvent::TurnFailed {
-                        expected_version: self.core.version(),
-                        task_ordinal: active.task_ordinal,
-                        role: active.role,
-                        session: active.logical_session,
-                        turn: active.logical_turn,
-                        completion_token: active.completion_token.clone(),
-                        failure: SanitizedRuntimeFailure::new(
-                            RuntimeFailureClass::Contract,
-                            "typed worker outcome contained protected session data",
-                            false,
-                        )
-                        .map_err(|error| anyhow!(error.detail))?,
-                    }
-                } else {
-                    SupervisorEvent::TurnCompleted {
-                        expected_version: self.core.version(),
-                        task_ordinal: active.task_ordinal,
-                        role: active.role,
-                        session: active.logical_session,
-                        turn: active.logical_turn,
-                        completion_token: active.completion_token.clone(),
-                        outcome,
-                    }
-                }
-            }
+            Ok(RuntimeTurnPoll::Completed {
+                outcome,
+                final_message_path,
+                ..
+            }) => SupervisorEvent::TurnCompleted {
+                expected_version: self.core.version(),
+                task_ordinal: active.task_ordinal,
+                role: active.role,
+                session: active.logical_session,
+                turn: active.logical_turn,
+                completion_token: active.completion_token.clone(),
+                outcome,
+                final_message_path,
+            },
             Ok(RuntimeTurnPoll::Failed { failure, .. }) => SupervisorEvent::TurnFailed {
                 expected_version: self.core.version(),
                 task_ordinal: active.task_ordinal,
@@ -699,7 +678,6 @@ impl TaskLaneSupervisor {
         self.task_runtime = Some(OpenTaskRuntime {
             task_ordinal,
             _root: root,
-            environment,
             runtime,
             sessions: BTreeMap::new(),
         });
@@ -804,7 +782,6 @@ impl TaskLaneSupervisor {
             logical_turn,
             local_turn,
             completion_token: completion_token.clone(),
-            prompt,
         });
         Ok((logical_turn, completion_token))
     }
@@ -907,20 +884,20 @@ impl TaskLaneSupervisor {
              as a native workspace root when it differs from the project directory.\n",
         );
 
-        // Relay the peer's previous message verbatim (already redacted and
-        // bounded upstream). hcom does not interpret it.
         match role {
             WorkerRole::Developer => {
-                if purpose == RuntimeTurnPurpose::DeveloperCorrection
-                    && let Some(review) = task.last_reviewer_outcome()
-                {
+                if purpose == RuntimeTurnPurpose::DeveloperCorrection {
+                    let paths = task.latest_reviewer_final_paths();
+                    if paths.is_empty() {
+                        bail!("developer correction has no reviewer final message path");
+                    }
+                    prompt.push_str("\nReviewer final messages, in order:\n");
+                    for path in paths {
+                        prompt.push_str(&format!("- {path}\n"));
+                    }
                     prompt.push_str(
-                        "\n## Reviewer response to your previous work\n\nThe reviewer requested \
-                         changes. Their full message follows verbatim.\n\n---\n\n",
-                    );
-                    prompt.push_str(&bounded_relay(&review.summary));
-                    prompt.push_str(
-                        "\n\n---\n\nAddress it, then fold the fix into the SAME commit you \
+                        "\nRead every Reviewer final file and address the requested changes. Then \
+                         fold the fix into the SAME commit you \
                          created earlier in this task with `git commit --amend`, updating its \
                          message so it still describes the whole task. This task must end as \
                          exactly one commit. Do not amend anything older than your own commit. \
@@ -929,14 +906,18 @@ impl TaskLaneSupervisor {
                 }
             }
             WorkerRole::Reviewer => {
-                if let Some(developer) = task.last_developer_outcome() {
-                    prompt.push_str(
-                        "\n## Developer report\n\nThe developer's full final message follows \
-                         verbatim.\n\n---\n\n",
-                    );
-                    prompt.push_str(&bounded_relay(&developer.summary));
-                    prompt.push_str("\n\n---\n");
-                }
+                let developer_path = task
+                    .latest_developer_final_path()
+                    .ok_or_else(|| anyhow!("reviewer turn has no Developer final message path"))?;
+                let label = if purpose == RuntimeTurnPurpose::ReviewerRereview {
+                    "Latest Developer final message"
+                } else {
+                    "Developer final message"
+                };
+                prompt.push_str(&format!(
+                    "\n{label}:\n{developer_path}\n\nRead the Developer final file and \
+                     independently review the selected task.\n"
+                ));
                 prompt.push_str(REVIEWER_OUTPUT_CONTRACT);
             }
         }
@@ -945,27 +926,6 @@ impl TaskLaneSupervisor {
             bail!("rendered task turn prompt exceeds its 256 KiB bound");
         }
         Ok(prompt)
-    }
-
-    fn outcome_contains_sensitive_value(
-        &self,
-        task_ordinal: usize,
-        prompt: &str,
-        outcome: &RuntimeOutcome,
-    ) -> bool {
-        let Some(runtime) = self
-            .task_runtime
-            .as_ref()
-            .filter(|runtime| runtime.task_ordinal == task_ordinal)
-        else {
-            return true;
-        };
-        let redactor = runtime.environment.redactor().with_value(prompt);
-        let value = match serde_json::to_value(outcome) {
-            Ok(value) => value,
-            Err(_) => return true,
-        };
-        json_contains_sensitive_value(&value, &redactor)
     }
 
     fn profile(&self, role: WorkerRole) -> &RuntimeProfile {
@@ -1082,23 +1042,6 @@ fn role_instructions(role: WorkerRole) -> &'static str {
     }
 }
 
-/// Relay a peer message into the next prompt: bounded view of an already
-/// redacted string, truncated with an explicit marker rather than rejected.
-fn bounded_relay(text: &str) -> String {
-    const RELAY_CAP: usize = 64 * 1024;
-    if text.len() <= RELAY_CAP {
-        return text.to_string();
-    }
-    let mut end = RELAY_CAP;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!(
-        "{}\n\n[hcom: truncated at {end} bytes; the full message is on disk in this run's artifacts]",
-        &text[..end]
-    )
-}
-
 fn bounded_single_line(input: &str) -> String {
     let mut output: String = input
         .chars()
@@ -1123,22 +1066,6 @@ fn bounded_single_line(input: &str) -> String {
     output
 }
 
-fn json_contains_sensitive_value(
-    value: &Value,
-    redactor: &crate::worker::environment::SecretRedactor,
-) -> bool {
-    match value {
-        Value::String(value) => redactor.would_redact(value),
-        Value::Array(values) => values
-            .iter()
-            .any(|value| json_contains_sensitive_value(value, redactor)),
-        Value::Object(values) => values
-            .values()
-            .any(|value| json_contains_sensitive_value(value, redactor)),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1149,8 +1076,8 @@ mod tests {
         SessionInvocationProfiles,
     };
     use crate::worker::runtime::{
-        DeveloperOutcomeStatus, DeveloperOutcomeV1, ReviewFindingSeverity, ReviewFindingV1,
-        ReviewerOutcomeV1, ReviewerVerdict, RuntimeTelemetry,
+        DeveloperOutcomeStatus, DeveloperOutcomeV1, ReviewerOutcomeV1, ReviewerVerdict,
+        RuntimeOutcome, RuntimeTelemetry,
     };
     use std::collections::BTreeSet;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -1749,40 +1676,66 @@ mod tests {
         script
     }
 
-    fn completed(outcome: RuntimeOutcome) -> RuntimeTurnPoll {
+    fn message_path(role: WorkerRole, seed: &str) -> PathBuf {
+        let role = match role {
+            WorkerRole::Developer => "developer",
+            WorkerRole::Reviewer => "reviewer",
+        };
+        PathBuf::from(format!(
+            "/artifacts/{role}/{}/native-final.partial",
+            sha256_hex(seed.as_bytes())
+        ))
+    }
+
+    fn completed(outcome: RuntimeOutcome, seed: &str) -> RuntimeTurnPoll {
+        let final_message_path = message_path(outcome.role(), seed);
         RuntimeTurnPoll::Completed {
             outcome,
+            final_message_path,
             telemetry: RuntimeTelemetry::default(),
         }
     }
 
-    fn ready(summary: &str) -> RuntimeTurnPoll {
-        completed(RuntimeOutcome::Developer(DeveloperOutcomeV1 {
-            status: DeveloperOutcomeStatus::Ready,
-            summary: summary.into(),
-            questions: Vec::new(),
-        }))
+    fn ready(message_seed: &str) -> RuntimeTurnPoll {
+        completed(
+            RuntimeOutcome::Developer(DeveloperOutcomeV1 {
+                status: DeveloperOutcomeStatus::Ready,
+            }),
+            message_seed,
+        )
     }
 
-    fn lgtm(summary: &str) -> RuntimeTurnPoll {
-        completed(RuntimeOutcome::Reviewer(ReviewerOutcomeV1 {
-            verdict: ReviewerVerdict::Lgtm,
-            summary: summary.into(),
-            findings: Vec::new(),
-        }))
+    fn lgtm(message_seed: &str) -> RuntimeTurnPoll {
+        completed(
+            RuntimeOutcome::Reviewer(ReviewerOutcomeV1 {
+                verdict: ReviewerVerdict::Lgtm,
+                preceding_final_message_paths: Vec::new(),
+            }),
+            message_seed,
+        )
     }
 
     fn request_changes(message: &str) -> RuntimeTurnPoll {
-        completed(RuntimeOutcome::Reviewer(ReviewerOutcomeV1 {
-            verdict: ReviewerVerdict::RequestChanges,
-            summary: "changes required".into(),
-            findings: vec![ReviewFindingV1 {
-                severity: ReviewFindingSeverity::Major,
-                path: Some("src/task.txt".into()),
-                line: Some(1),
-                message: message.into(),
-            }],
-        }))
+        completed(
+            RuntimeOutcome::Reviewer(ReviewerOutcomeV1 {
+                verdict: ReviewerVerdict::RequestChanges,
+                preceding_final_message_paths: Vec::new(),
+            }),
+            message,
+        )
+    }
+
+    fn request_changes_after_clarification(message: &str) -> RuntimeTurnPoll {
+        completed(
+            RuntimeOutcome::Reviewer(ReviewerOutcomeV1 {
+                verdict: ReviewerVerdict::RequestChanges,
+                preceding_final_message_paths: vec![message_path(
+                    WorkerRole::Reviewer,
+                    &format!("{message}-original"),
+                )],
+            }),
+            message,
+        )
     }
 
     fn failed_retryable() -> RuntimeTurnPoll {
@@ -2348,7 +2301,7 @@ mod tests {
     }
 
     #[test]
-    fn request_changes_round_relays_the_full_reviewer_message_to_the_developer() {
+    fn request_changes_round_routes_only_ordered_durable_paths() {
         let fixture = Fixture::new();
         let audit = Arc::new(Mutex::new(Audit::default()));
         let script = task_script(
@@ -2362,7 +2315,9 @@ mod tests {
                 FakeTurnScript::new(
                     WorkerRole::Reviewer,
                     RuntimeTurnPurpose::InitialReview,
-                    [request_changes("the overflow case is unhandled")],
+                    [request_changes_after_clarification(
+                        "the overflow case is unhandled",
+                    )],
                 ),
                 FakeTurnScript::new(
                     WorkerRole::Developer,
@@ -2416,8 +2371,7 @@ mod tests {
                 .count(),
             1
         );
-        // The reviewer sees the developer's report; the correction turn sees
-        // the reviewer's message verbatim.
+        // Each role receives the peer's durable path, never the peer body.
         let review_prompt = audit
             .prompts
             .iter()
@@ -2446,7 +2400,14 @@ mod tests {
             assert!(!prompt.contains("DESIGN-DOCUMENT-CONTENT-MUST-NOT-BE-IN-PROMPT"));
         }
         assert!(!development_prompt.contains("first attempt: added the module"));
-        assert!(review_prompt.contains("first attempt: added the module"));
+        assert!(!review_prompt.contains("first attempt: added the module"));
+        assert!(
+            review_prompt.contains(
+                message_path(WorkerRole::Developer, "first attempt: added the module")
+                    .to_str()
+                    .unwrap()
+            )
+        );
         assert!(review_prompt.contains("VERDICT: LGTM"));
         assert!(review_prompt.contains("VERDICT: REQUEST_CHANGES"));
         let correction_prompt = audit
@@ -2458,7 +2419,20 @@ mod tests {
             })
             .map(|(_, _, prompt)| prompt.clone())
             .expect("correction prompt");
-        assert!(correction_prompt.contains("changes required"));
+        assert!(!correction_prompt.contains("the overflow case is unhandled"));
+        let original_review_path = message_path(
+            WorkerRole::Reviewer,
+            "the overflow case is unhandled-original",
+        );
+        let clarification_path =
+            message_path(WorkerRole::Reviewer, "the overflow case is unhandled");
+        let original_index = correction_prompt
+            .find(original_review_path.to_str().unwrap())
+            .expect("original Reviewer path");
+        let clarification_index = correction_prompt
+            .find(clarification_path.to_str().unwrap())
+            .expect("clarification Reviewer path");
+        assert!(original_index < clarification_index);
         let rereview_prompt = audit
             .prompts
             .iter()
@@ -2467,7 +2441,26 @@ mod tests {
             })
             .map(|(_, _, prompt)| prompt.clone())
             .expect("re-review prompt");
-        assert!(rereview_prompt.contains("second attempt: handled overflow"));
+        assert!(!rereview_prompt.contains("second attempt: handled overflow"));
+        assert!(
+            rereview_prompt.contains(
+                message_path(WorkerRole::Developer, "second attempt: handled overflow")
+                    .to_str()
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            snapshot.tasks[0].latest_developer_final_path.as_deref(),
+            message_path(WorkerRole::Developer, "second attempt: handled overflow").to_str()
+        );
+        assert_eq!(
+            snapshot.tasks[0].final_reviewer_message_paths,
+            vec![
+                message_path(WorkerRole::Reviewer, "overflow handling is correct now")
+                    .to_string_lossy()
+                    .into_owned()
+            ]
+        );
 
         let plan = fs::read_to_string(
             fixture
@@ -3134,7 +3127,7 @@ mod tests {
     }
 
     #[test]
-    fn out_of_scope_commit_routes_to_review_and_sensitive_outcome_fails_closed() {
+    fn out_of_scope_commit_and_secret_shaped_final_both_route_to_review() {
         // Task-agnostic lane: an out-of-allowlist commit is the reviewer's
         // and the human's call, not a supervisor gate.
         let fixture = Fixture::new();
@@ -3168,32 +3161,36 @@ mod tests {
             SessionState::Completed
         );
 
-        // The secret-leak screen on outcomes remains a hard stop.
+        // Agent final contents are opaque and never trigger a sensitive-value
+        // rejection in the task lane.
         let fixture = Fixture::new();
         let audit = Arc::new(Mutex::new(Audit::default()));
         let script = task_script(
             "secret",
-            vec![FakeTurnScript::new(
-                WorkerRole::Developer,
-                RuntimeTurnPurpose::InitialDevelopment,
-                [ready("environment-secret-sentinel")],
-            )],
-            vec![Mutation::Commit {
-                path: "src/task.txt",
-                contents: "done\n",
-            }],
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("environment-secret-sentinel")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [lgtm("secret-shaped text is opaque")],
+                ),
+            ],
+            vec![
+                Mutation::Commit {
+                    path: "src/task.txt",
+                    contents: "done\n",
+                },
+                Mutation::None,
+            ],
         );
         let mut supervisor = fixture.supervisor(vec![script], audit);
         start(&mut supervisor, vec![fixture.task("secret", &["src"], 2)]);
         let snapshot = drive_terminal(&mut supervisor);
-        assert_eq!(snapshot.state, SessionState::NeedsHuman);
-        let detail = snapshot.terminal_detail.clone().unwrap();
-        assert!(
-            detail.starts_with("worker runtime contract failed"),
-            "{detail}"
-        );
-        // The leak screen fires before any outcome text is relayed, so the
-        // sentinel must not appear anywhere in the report.
+        assert_eq!(snapshot.state, SessionState::Completed);
         let encoded = serde_json::to_string(&snapshot).unwrap();
         assert!(!encoded.contains("environment-secret-sentinel"));
     }

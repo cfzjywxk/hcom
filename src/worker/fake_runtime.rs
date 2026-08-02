@@ -180,13 +180,13 @@ impl TaskWorkerRuntime for FakeTaskWorkerRuntime {
             ));
         }
         for poll in &script.polls {
-            if let RuntimeTurnPoll::Completed { outcome, .. } = poll {
-                outcome.validate()?;
-                if outcome.role() != spec.role {
-                    return Err(RuntimeError::invalid_contract(
-                        "fake completed outcome has the wrong role",
-                    ));
-                }
+            poll.validate()?;
+            if let RuntimeTurnPoll::Completed { outcome, .. } = poll
+                && outcome.role() != spec.role
+            {
+                return Err(RuntimeError::invalid_contract(
+                    "fake completed outcome has the wrong role",
+                ));
             }
         }
         let key = self.allocate_turn_key()?;
@@ -288,9 +288,8 @@ mod tests {
         RuntimeTurnPoll::Completed {
             outcome: RuntimeOutcome::Developer(DeveloperOutcomeV1 {
                 status: DeveloperOutcomeStatus::Ready,
-                summary: "done".into(),
-                questions: Vec::new(),
             }),
+            final_message_path: PathBuf::from("/artifacts/developer/native-final.partial"),
             telemetry: RuntimeTelemetry::default(),
         }
     }

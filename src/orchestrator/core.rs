@@ -9,9 +9,8 @@ use crate::control_api::{
     SessionState, SessionStatusSnapshot, TaskDraft, TaskState, TaskStatusSnapshot, WorkerRole,
 };
 use crate::worker::runtime::{
-    DeveloperOutcomeStatus, DeveloperOutcomeV1, ReviewerOutcomeV1, ReviewerVerdict,
-    RuntimeFailureClass, RuntimeOutcome, RuntimeSessionKey, RuntimeTurnKey, RuntimeTurnPurpose,
-    SanitizedRuntimeFailure,
+    DeveloperOutcomeStatus, ReviewerOutcomeV1, ReviewerVerdict, RuntimeFailureClass,
+    RuntimeOutcome, RuntimeSessionKey, RuntimeTurnKey, RuntimeTurnPurpose, SanitizedRuntimeFailure,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -97,6 +96,7 @@ pub enum SupervisorEvent {
         turn: RuntimeTurnKey,
         completion_token: String,
         outcome: RuntimeOutcome,
+        final_message_path: PathBuf,
     },
     TurnFailed {
         expected_version: u64,
@@ -354,8 +354,6 @@ pub struct CoreTask {
     latest_developer_final_path: Option<String>,
     latest_reviewer_final_paths: Vec<String>,
     latest_reviewer_verdict: Option<ReviewerVerdict>,
-    last_developer_outcome: Option<DeveloperOutcomeV1>,
-    last_reviewer_outcome: Option<ReviewerOutcomeV1>,
 }
 
 impl CoreTask {
@@ -370,17 +368,15 @@ impl CoreTask {
             latest_developer_final_path: None,
             latest_reviewer_final_paths: Vec::new(),
             latest_reviewer_verdict: None,
-            last_developer_outcome: None,
-            last_reviewer_outcome: None,
         }
     }
 
-    pub fn last_developer_outcome(&self) -> Option<&DeveloperOutcomeV1> {
-        self.last_developer_outcome.as_ref()
+    pub fn latest_developer_final_path(&self) -> Option<&str> {
+        self.latest_developer_final_path.as_deref()
     }
 
-    pub fn last_reviewer_outcome(&self) -> Option<&ReviewerOutcomeV1> {
-        self.last_reviewer_outcome.as_ref()
+    pub fn latest_reviewer_final_paths(&self) -> &[String] {
+        &self.latest_reviewer_final_paths
     }
 }
 
@@ -638,6 +634,7 @@ impl SupervisorCore {
                 turn,
                 completion_token,
                 outcome,
+                final_message_path,
                 ..
             } => self.turn_completed(
                 task_ordinal,
@@ -646,6 +643,7 @@ impl SupervisorCore {
                 turn,
                 &completion_token,
                 outcome,
+                final_message_path,
             ),
             SupervisorEvent::TurnFailed {
                 task_ordinal,
@@ -930,6 +928,7 @@ impl SupervisorCore {
         turn: RuntimeTurnKey,
         completion_token: &str,
         outcome: RuntimeOutcome,
+        final_message_path: PathBuf,
     ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
         self.require_running_task(task_ordinal)?;
         let active =
@@ -942,6 +941,13 @@ impl SupervisorCore {
                 "typed runtime outcome role does not match the active turn",
             ));
         }
+        let final_message_path = final_message_path
+            .to_str()
+            .ok_or_else(|| {
+                SupervisorError::invalid_event("runtime final message path must be UTF-8")
+            })?
+            .to_owned();
+        validate_absolute_path("runtime final message path", &final_message_path)?;
         self.accepted_completion_tokens
             .insert(active.completion_token);
 
@@ -956,33 +962,15 @@ impl SupervisorCore {
                         ));
                     }
                     let task = &mut self.tasks[task_ordinal];
-                    task.last_developer_outcome = Some(developer);
+                    task.latest_developer_final_path = Some(final_message_path);
                     task.state = TaskState::Reviewing;
                     task.outcome_detail =
                         Some("developer turn completed; routing to review".into());
                     self.start_reviewer(task_ordinal)
                 }
-                DeveloperOutcomeStatus::NeedsHuman => {
-                    self.tasks[task_ordinal].last_developer_outcome = Some(developer);
-                    self.terminalize_current(
-                        SessionState::NeedsHuman,
-                        TaskState::NeedsHuman,
-                        "developer requested human input",
-                        Vec::new(),
-                    )
-                }
-                DeveloperOutcomeStatus::Blocked => {
-                    self.tasks[task_ordinal].last_developer_outcome = Some(developer);
-                    self.terminalize_current(
-                        SessionState::NeedsHuman,
-                        TaskState::NeedsHuman,
-                        "developer reported an unrecoverable block",
-                        Vec::new(),
-                    )
-                }
             },
             RuntimeOutcome::Reviewer(reviewer) => {
-                self.handle_reviewer_verdict(task_ordinal, reviewer)
+                self.handle_reviewer_verdict(task_ordinal, reviewer, final_message_path)
             }
         }
     }
@@ -1150,6 +1138,7 @@ impl SupervisorCore {
         &mut self,
         task_ordinal: usize,
         outcome: ReviewerOutcomeV1,
+        final_message_path: String,
     ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
         if self.tasks[task_ordinal].state != TaskState::Reviewing {
             return Err(SupervisorError::invalid_transition(
@@ -1168,14 +1157,31 @@ impl SupervisorCore {
         {
             let task = &mut self.tasks[task_ordinal];
             task.review_round = next_round;
-            task.last_reviewer_outcome = Some(outcome.clone());
+            let mut paths = Vec::with_capacity(
+                outcome
+                    .preceding_final_message_paths
+                    .len()
+                    .saturating_add(1),
+            );
+            for path in &outcome.preceding_final_message_paths {
+                let path = path.to_str().ok_or_else(|| {
+                    SupervisorError::invalid_event(
+                        "preceding reviewer final message path must be UTF-8",
+                    )
+                })?;
+                validate_absolute_path("preceding reviewer final message path", path)?;
+                paths.push(path.to_owned());
+            }
+            paths.push(final_message_path);
+            task.latest_reviewer_final_paths = paths;
+            task.latest_reviewer_verdict = Some(outcome.verdict);
         }
 
         match outcome.verdict {
             ReviewerVerdict::Lgtm => {
                 let task = &mut self.tasks[task_ordinal];
                 task.state = TaskState::Lgtm;
-                task.outcome_detail = Some("Reviewer approved the exact clean revision".into());
+                task.outcome_detail = Some("Reviewer returned LGTM".into());
                 self.complete_current_task(task_ordinal)
             }
             ReviewerVerdict::RequestChanges
@@ -1748,6 +1754,7 @@ fn canonical_hash(value: &impl Serialize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::runtime::DeveloperOutcomeV1;
 
     const PROFILE_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -1766,24 +1773,6 @@ mod tests {
     fn ready() -> RuntimeOutcome {
         RuntimeOutcome::Developer(DeveloperOutcomeV1 {
             status: DeveloperOutcomeStatus::Ready,
-            summary: "implementation complete".into(),
-            questions: Vec::new(),
-        })
-    }
-
-    fn needs_human() -> RuntimeOutcome {
-        RuntimeOutcome::Developer(DeveloperOutcomeV1 {
-            status: DeveloperOutcomeStatus::NeedsHuman,
-            summary: "a decision is required".into(),
-            questions: vec!["Which behavior should be selected?".into()],
-        })
-    }
-
-    fn blocked() -> RuntimeOutcome {
-        RuntimeOutcome::Developer(DeveloperOutcomeV1 {
-            status: DeveloperOutcomeStatus::Blocked,
-            summary: "the required tool is unavailable".into(),
-            questions: Vec::new(),
         })
     }
 
@@ -1802,22 +1791,26 @@ mod tests {
     fn lgtm() -> RuntimeOutcome {
         RuntimeOutcome::Reviewer(ReviewerOutcomeV1 {
             verdict: ReviewerVerdict::Lgtm,
-            summary: "sound".into(),
-            findings: Vec::new(),
+            preceding_final_message_paths: Vec::new(),
         })
     }
 
     fn request_changes() -> RuntimeOutcome {
         RuntimeOutcome::Reviewer(ReviewerOutcomeV1 {
             verdict: ReviewerVerdict::RequestChanges,
-            summary: "changes required".into(),
-            findings: vec![crate::worker::runtime::ReviewFindingV1 {
-                severity: crate::worker::runtime::ReviewFindingSeverity::Major,
-                path: Some("src/lib.rs".into()),
-                line: Some(1),
-                message: "fix the boundary".into(),
-            }],
+            preceding_final_message_paths: Vec::new(),
         })
+    }
+
+    fn final_message_path(role: WorkerRole, turn: RuntimeTurnKey) -> PathBuf {
+        let role = match role {
+            WorkerRole::Developer => "developer",
+            WorkerRole::Reviewer => "reviewer",
+        };
+        PathBuf::from(format!(
+            "/artifacts/{role}/turn-{}/native-final.partial",
+            turn.counter()
+        ))
     }
 
     fn new_core() -> SupervisorCore {
@@ -1911,6 +1904,7 @@ mod tests {
             turn,
             completion_token: completion_token.into(),
             outcome,
+            final_message_path: final_message_path(role, turn),
         })
         .unwrap()
     }
@@ -2182,15 +2176,20 @@ mod tests {
 
     fn needs_human_core() -> SupervisorCore {
         let (mut core, developer) = active_core();
-        complete_turn(
-            &mut core,
-            developer.task,
-            developer.role,
-            developer.session,
-            developer.turn,
-            developer.token,
-            needs_human(),
-        );
+        core.reduce(SupervisorEvent::TurnFailed {
+            expected_version: core.version(),
+            task_ordinal: developer.task,
+            role: developer.role,
+            session: developer.session,
+            turn: developer.turn,
+            completion_token: developer.token.into(),
+            failure: runtime_failure(
+                RuntimeFailureClass::Contract,
+                false,
+                "developer needs a human decision",
+            ),
+        })
+        .unwrap();
         core
     }
 
@@ -2325,6 +2324,7 @@ mod tests {
                 turn: RuntimeTurnKey::from_counter(1).unwrap(),
                 completion_token: "active".into(),
                 outcome: ready(),
+                final_message_path: PathBuf::from("/artifacts/developer/final.md"),
             },
             SupervisorEventKind::TurnFailed => SupervisorEvent::TurnFailed {
                 expected_version: core.version(),
@@ -2485,6 +2485,7 @@ mod tests {
                                 turn: RuntimeTurnKey::from_counter(2).unwrap(),
                                 completion_token: "reviewer".into(),
                                 outcome: lgtm(),
+                                final_message_path: PathBuf::from("/artifacts/reviewer/final.md"),
                             },
                             SupervisorEventKind::TurnFailed => SupervisorEvent::TurnFailed {
                                 expected_version: core.version(),
@@ -2774,18 +2775,20 @@ mod tests {
 
         let (mut blocked_core, active) = active_core();
         let before = blocked_core.tasks[0].state;
-        complete_turn(
-            &mut blocked_core,
-            0,
-            WorkerRole::Developer,
-            active.session,
-            active.turn,
-            active.token,
-            blocked(),
-        );
+        blocked_core
+            .reduce(SupervisorEvent::TurnFailed {
+                expected_version: blocked_core.version(),
+                task_ordinal: 0,
+                role: WorkerRole::Developer,
+                session: active.session,
+                turn: active.turn,
+                completion_token: active.token.into(),
+                failure: runtime_failure(RuntimeFailureClass::Contract, false, "blocked"),
+            })
+            .unwrap();
         edges.insert((
             name(before),
-            "developer_blocked",
+            "runtime_contract_failure",
             name(blocked_core.tasks[0].state),
         ));
         observed_states.insert(name(blocked_core.tasks[0].state));
@@ -2840,7 +2843,7 @@ mod tests {
                 // Task-agnostic lane: the developer's exit routes straight to
                 // review; the supervisor inspects nothing about the work.
                 ("developing", "developer_ready", "reviewing"),
-                ("developing", "developer_blocked", "needs_human"),
+                ("developing", "runtime_contract_failure", "needs_human"),
                 ("reviewing", "request_changes", "developing"),
                 ("reviewing", "lgtm", "lgtm"),
                 ("reviewing", "max_round_request_changes", "review_exhausted",),
@@ -2986,10 +2989,14 @@ mod tests {
                     head_revision: None,
                     developer_session_bound: true,
                     reviewer_session_bound: true,
-                    outcome_detail: Some("Reviewer approved the exact clean revision".into()),
-                    latest_developer_final_path: None,
-                    final_reviewer_message_paths: Vec::new(),
-                    reviewer_verdict: None,
+                    outcome_detail: Some("Reviewer returned LGTM".into()),
+                    latest_developer_final_path: Some(
+                        "/artifacts/developer/turn-1/native-final.partial".into(),
+                    ),
+                    final_reviewer_message_paths: vec![
+                        "/artifacts/reviewer/turn-2/native-final.partial".into(),
+                    ],
+                    reviewer_verdict: Some(ReviewerVerdict::Lgtm),
                 }],
             }
         );
@@ -2999,6 +3006,35 @@ mod tests {
             Vec::<SupervisorEffect>::new()
         );
         assert_eq!(core, before);
+    }
+
+    #[test]
+    fn clarified_reviewer_round_keeps_original_then_clarification_paths() {
+        let (mut core, reviewer) = active_reviewer_core(2);
+        complete_turn(
+            &mut core,
+            reviewer.task,
+            reviewer.role,
+            reviewer.session,
+            reviewer.turn,
+            reviewer.token,
+            RuntimeOutcome::Reviewer(ReviewerOutcomeV1 {
+                verdict: ReviewerVerdict::RequestChanges,
+                preceding_final_message_paths: vec![PathBuf::from(
+                    "/artifacts/reviewer/original/native-final.partial",
+                )],
+            }),
+        );
+        let task = &core.snapshot().tasks[0];
+        assert_eq!(task.state, TaskState::Developing);
+        assert_eq!(
+            task.final_reviewer_message_paths,
+            vec![
+                "/artifacts/reviewer/original/native-final.partial",
+                "/artifacts/reviewer/turn-2/native-final.partial",
+            ]
+        );
+        assert_eq!(task.reviewer_verdict, Some(ReviewerVerdict::RequestChanges));
     }
 
     #[test]
@@ -3225,6 +3261,7 @@ mod tests {
                 turn: active.turn,
                 completion_token: active.token.into(),
                 outcome: ready(),
+                final_message_path: PathBuf::from("/artifacts/developer/wrong-task.md"),
             },
             SupervisorEvent::TurnCompleted {
                 expected_version: core.version(),
@@ -3234,6 +3271,7 @@ mod tests {
                 turn: active.turn,
                 completion_token: active.token.into(),
                 outcome: lgtm(),
+                final_message_path: PathBuf::from("/artifacts/reviewer/wrong-role.md"),
             },
             SupervisorEvent::TurnCompleted {
                 expected_version: core.version(),
@@ -3243,6 +3281,7 @@ mod tests {
                 turn: active.turn,
                 completion_token: active.token.into(),
                 outcome: ready(),
+                final_message_path: PathBuf::from("/artifacts/developer/wrong-session.md"),
             },
             SupervisorEvent::TurnCompleted {
                 expected_version: core.version(),
@@ -3252,6 +3291,7 @@ mod tests {
                 turn: RuntimeTurnKey::from_counter(99).unwrap(),
                 completion_token: active.token.into(),
                 outcome: ready(),
+                final_message_path: PathBuf::from("/artifacts/developer/wrong-turn.md"),
             },
             SupervisorEvent::TurnCompleted {
                 expected_version: core.version(),
@@ -3261,6 +3301,7 @@ mod tests {
                 turn: active.turn,
                 completion_token: "wrong-token".into(),
                 outcome: ready(),
+                final_message_path: PathBuf::from("/artifacts/developer/wrong-token.md"),
             },
         ];
         for event in wrong_events {
@@ -3284,6 +3325,7 @@ mod tests {
                 turn: RuntimeTurnKey::from_counter(1).unwrap(),
                 completion_token: "not-started".into(),
                 outcome: ready(),
+                final_message_path: PathBuf::from("/artifacts/developer/not-started.md"),
             })
             .unwrap_err();
         assert_eq!(error.code, SupervisorErrorCode::InvalidTransition);
@@ -3298,6 +3340,7 @@ mod tests {
             turn: active.turn,
             completion_token: active.token.into(),
             outcome: ready(),
+            final_message_path: PathBuf::from("/artifacts/developer/accepted.md"),
         };
         accepted.reduce(event.clone()).unwrap();
         let before = accepted.clone();
@@ -3324,6 +3367,7 @@ mod tests {
                 turn: active.turn,
                 completion_token: active.token.into(),
                 outcome: lgtm(),
+                final_message_path: PathBuf::from("/artifacts/reviewer/wrong-outcome.md"),
             })
             .unwrap_err();
         assert_eq!(error.code, SupervisorErrorCode::InvalidEvent);
@@ -3406,6 +3450,7 @@ mod tests {
                 turn: active.turn,
                 completion_token: active.token.into(),
                 outcome: ready(),
+                final_message_path: PathBuf::from("/artifacts/developer/after-cancel.md"),
             })
             .unwrap_err();
         assert_eq!(error.code, SupervisorErrorCode::Terminal);
@@ -3689,72 +3734,16 @@ mod tests {
     }
 
     #[test]
-    fn typed_outcome_cross_field_failures_are_rejected_without_consuming_the_turn() {
-        let (developer_core, active) = active_core();
-        let invalid_developer = [
-            DeveloperOutcomeV1 {
-                status: DeveloperOutcomeStatus::Ready,
-                summary: "done".into(),
-                questions: vec!["unexpected".into()],
-            },
-            DeveloperOutcomeV1 {
-                status: DeveloperOutcomeStatus::NeedsHuman,
-                summary: "needs input".into(),
-                questions: Vec::new(),
-            },
-            DeveloperOutcomeV1 {
-                status: DeveloperOutcomeStatus::Blocked,
-                summary: String::new(),
-                questions: Vec::new(),
-            },
-            DeveloperOutcomeV1 {
-                status: DeveloperOutcomeStatus::Ready,
-                summary: "s".repeat(crate::worker::runtime::MAX_OUTCOME_SUMMARY_CHARS + 1),
-                questions: Vec::new(),
-            },
-        ];
-        for outcome in invalid_developer {
-            let mut core = developer_core.clone();
-            let before = core.clone();
-            let error = core
-                .reduce(SupervisorEvent::TurnCompleted {
-                    expected_version: core.version(),
-                    task_ordinal: 0,
-                    role: WorkerRole::Developer,
-                    session: active.session,
-                    turn: active.turn,
-                    completion_token: active.token.into(),
-                    outcome: RuntimeOutcome::Developer(outcome),
-                })
-                .unwrap_err();
-            assert_eq!(error.code, SupervisorErrorCode::InvalidEvent);
-            assert_eq!(core, before);
-        }
-
+    fn invalid_final_paths_are_rejected_without_consuming_the_turn() {
         let (reviewer_core, active) = active_reviewer_core(2);
-        let RuntimeOutcome::Reviewer(request_changes_outcome) = request_changes() else {
-            unreachable!()
-        };
         let invalid_reviewer = [
             ReviewerOutcomeV1 {
                 verdict: ReviewerVerdict::Lgtm,
-                summary: "not sound".into(),
-                findings: request_changes_outcome.findings,
+                preceding_final_message_paths: vec![PathBuf::from("relative.md")],
             },
             ReviewerOutcomeV1 {
                 verdict: ReviewerVerdict::RequestChanges,
-                summary: "missing finding".into(),
-                findings: Vec::new(),
-            },
-            ReviewerOutcomeV1 {
-                verdict: ReviewerVerdict::RequestChanges,
-                summary: "bad path".into(),
-                findings: vec![crate::worker::runtime::ReviewFindingV1 {
-                    severity: crate::worker::runtime::ReviewFindingSeverity::Major,
-                    path: Some("../escape".into()),
-                    line: Some(0),
-                    message: "bad".into(),
-                }],
+                preceding_final_message_paths: vec![PathBuf::from("/one"), PathBuf::from("/two")],
             },
         ];
         for outcome in invalid_reviewer {
@@ -3769,6 +3758,7 @@ mod tests {
                     turn: active.turn,
                     completion_token: active.token.into(),
                     outcome: RuntimeOutcome::Reviewer(outcome),
+                    final_message_path: PathBuf::from("/review/current.md"),
                 })
                 .unwrap_err();
             assert_eq!(error.code, SupervisorErrorCode::InvalidEvent);
@@ -3777,27 +3767,8 @@ mod tests {
     }
 
     #[test]
-    fn needs_human_blocked_timeout_and_runtime_failures_have_exact_safe_outputs() {
+    fn timeout_and_runtime_failures_have_exact_safe_outputs() {
         let mut terminal_details = BTreeSet::new();
-
-        for (outcome, expected) in [
-            (needs_human(), "developer requested human input"),
-            (blocked(), "developer reported an unrecoverable block"),
-        ] {
-            let (mut core, active) = active_core();
-            complete_turn(
-                &mut core,
-                0,
-                WorkerRole::Developer,
-                active.session,
-                active.turn,
-                active.token,
-                outcome,
-            );
-            assert_eq!(core.session_state(), SessionState::NeedsHuman);
-            assert_eq!(core.snapshot().terminal_detail.as_deref(), Some(expected));
-            terminal_details.insert(expected.to_owned());
-        }
 
         let (mut timed_out, active) = active_core();
         let effects = timed_out
@@ -3879,7 +3850,7 @@ mod tests {
             );
             terminal_details.insert(detail);
         }
-        assert_eq!(terminal_details.len(), 8);
+        assert_eq!(terminal_details.len(), 6);
     }
 
     #[test]
@@ -3953,24 +3924,25 @@ mod tests {
     }
 
     #[test]
-    fn snapshots_exclude_raw_developer_outcomes() {
-        let (mut raw_outcome, active) = active_core();
+    fn snapshots_carry_developer_path_without_peer_body() {
+        let (mut core, active) = active_core();
         complete_turn(
-            &mut raw_outcome,
+            &mut core,
             0,
             WorkerRole::Developer,
             active.session,
             active.turn,
             active.token,
-            RuntimeOutcome::Developer(DeveloperOutcomeV1 {
-                status: DeveloperOutcomeStatus::NeedsHuman,
-                summary: "RAW_SECRET_SUMMARY".into(),
-                questions: vec!["RAW_SECRET_QUESTION".into()],
-            }),
+            ready(),
         );
-        let encoded = serde_json::to_string(&raw_outcome.snapshot()).unwrap();
-        assert!(!encoded.contains("RAW_SECRET"));
-        assert!(encoded.contains("developer requested human input"));
+        let snapshot = core.snapshot();
+        assert_eq!(
+            snapshot.tasks[0].latest_developer_final_path.as_deref(),
+            Some("/artifacts/developer/turn-1/native-final.partial")
+        );
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(!encoded.contains("summary"));
+        assert!(!encoded.contains("findings"));
     }
 
     #[test]
@@ -4043,6 +4015,7 @@ mod tests {
                 turn: developer.turn,
                 completion_token: developer.token.into(),
                 outcome: ready(),
+                final_message_path: PathBuf::from("/artifacts/developer/wrong-task.md"),
             })
             .unwrap_err();
         assert_eq!(error.code, SupervisorErrorCode::InvalidIdentity);

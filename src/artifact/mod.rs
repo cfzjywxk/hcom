@@ -383,6 +383,31 @@ impl ArtifactAttempt {
         })
     }
 
+    /// Open the exec lane's final-message sink.
+    ///
+    /// Unlike diagnostic native streams, an agent final is an opaque message
+    /// transported to the next role. It is therefore preserved byte-for-byte:
+    /// no secret redaction, lossy conversion, or truncation is permitted.
+    pub fn start_exact_native_final(&self, hard_cap: u64) -> Result<ExactFinalWriter> {
+        if hard_cap == 0 || hard_cap > ArtifactKind::NativeFinal.hard_cap() {
+            bail!("exact native final cap exceeds the contract maximum");
+        }
+        reserve_receipt(&self.registry, ArtifactKind::NativeFinal)?;
+        let file = create_private_file(
+            self.directory.as_raw_fd(),
+            ArtifactKind::NativeFinal.file_name(),
+        )?;
+        Ok(ExactFinalWriter {
+            file,
+            hard_cap,
+            received: 0,
+            written: 0,
+            utf8_carry: Vec::new(),
+            hasher: Sha256::new(),
+            registry: self.registry.clone(),
+        })
+    }
+
     pub fn start_activity_log(&self, hard_cap: u64) -> Result<ActivityLogWriter> {
         if hard_cap == 0 || hard_cap > MAX_ACTIVITY_ARTIFACT_BYTES {
             bail!("activity artifact cap exceeds the contract maximum");
@@ -576,6 +601,70 @@ const TRUNCATION_MARKER: &[u8] = b"\n[hcom: truncated at the artifact cap]\n";
 pub enum ArtifactWriteStatus {
     Accepted,
     Truncated,
+}
+
+/// Exact, bounded UTF-8 writer used only for routed agent final messages.
+pub struct ExactFinalWriter {
+    file: File,
+    hard_cap: u64,
+    received: u64,
+    written: u64,
+    /// At most the three-byte incomplete suffix of a UTF-8 scalar.
+    utf8_carry: Vec<u8>,
+    hasher: Sha256,
+    registry: Arc<Mutex<ReceiptRegistry>>,
+}
+
+impl ExactFinalWriter {
+    pub fn write_chunk(&mut self, bytes: &[u8]) -> Result<()> {
+        let received = self
+            .received
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("exact native final size overflow"))?;
+        if received > self.hard_cap {
+            bail!("exact native final exceeds its declared bound");
+        }
+        self.received = received;
+        self.utf8_carry.extend_from_slice(bytes);
+
+        let valid_len = match std::str::from_utf8(&self.utf8_carry) {
+            Ok(_) => self.utf8_carry.len(),
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            Err(_) => bail!("exact native final is not valid UTF-8"),
+        };
+        if valid_len > 0 {
+            let valid: Vec<u8> = self.utf8_carry.drain(..valid_len).collect();
+            self.file.write_all(&valid)?;
+            self.hasher.update(&valid);
+            self.written += valid.len() as u64;
+        }
+        if self.utf8_carry.len() > 3 {
+            bail!("exact native final UTF-8 carry exceeded its bound");
+        }
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<ArtifactReceipt> {
+        if self.received == 0 {
+            bail!("exact native final is empty");
+        }
+        if !self.utf8_carry.is_empty() || self.written != self.received {
+            bail!("exact native final ends with incomplete UTF-8");
+        }
+        self.file.flush()?;
+        self.file.sync_all()?;
+        verify_private_regular_file(&self.file, ArtifactKind::NativeFinal.file_name())?;
+        let receipt = ArtifactReceipt {
+            kind: ArtifactKind::NativeFinal,
+            file_name: ArtifactKind::NativeFinal.file_name().into(),
+            bytes: self.written,
+            sha256: hex_bytes(&self.hasher.finalize()),
+            truncated: false,
+        };
+        receipt.validate()?;
+        complete_receipt(&self.registry, receipt.clone())?;
+        Ok(receipt)
+    }
 }
 
 pub struct ActivityLogWriter {
@@ -1507,6 +1596,55 @@ mod tests {
         assert!(!stored.contains("top-secret"));
         assert!(stored.contains("[REDACTED]"));
         assert!(stored.contains("kept"));
+    }
+
+    #[test]
+    fn exact_native_final_preserves_unicode_markdown_and_fake_credentials() {
+        let (_temp, root) = fixture_root();
+        let environment =
+            fixture_environment(Some("http://worker-user:top-secret@proxy.invalid:8080"));
+        let attempt = ArtifactAttempt::create(&root, scope(), &environment, TEST_PROMPT).unwrap();
+        let message = "# 完成 🦀\n\n- fake bearer: Bearer fake-token-123\n- env: top-secret\n";
+        let bytes = message.as_bytes();
+        let split = message.find('🦀').unwrap() + 1;
+        let mut writer = attempt.start_exact_native_final(4096).unwrap();
+        writer.write_chunk(&bytes[..split]).unwrap();
+        writer.write_chunk(&bytes[split..]).unwrap();
+        let receipt = writer.finish().unwrap();
+
+        assert!(!receipt.truncated);
+        assert_eq!(receipt.bytes, bytes.len() as u64);
+        let stored = fs::read(attempt.artifact_path(ArtifactKind::NativeFinal)).unwrap();
+        assert_eq!(stored, bytes);
+        assert!(!std::str::from_utf8(&stored).unwrap().contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn exact_native_final_rejects_empty_invalid_utf8_and_oversize() {
+        let (_temp, root) = fixture_root();
+
+        let empty = create_attempt(&root, scope());
+        assert!(
+            empty
+                .start_exact_native_final(16)
+                .unwrap()
+                .finish()
+                .is_err()
+        );
+
+        let mut invalid_scope = scope();
+        invalid_scope.attempt = 2;
+        let invalid = create_attempt(&root, invalid_scope);
+        let mut invalid_writer = invalid.start_exact_native_final(16).unwrap();
+        assert!(invalid_writer.write_chunk(&[0xff]).is_err());
+        assert!(invalid_writer.finish().is_err());
+
+        let mut oversized_scope = scope();
+        oversized_scope.attempt = 3;
+        let oversized = create_attempt(&root, oversized_scope);
+        let mut oversized_writer = oversized.start_exact_native_final(4).unwrap();
+        assert!(oversized_writer.write_chunk(b"five!").is_err());
+        assert!(oversized_writer.finish().is_err());
     }
 
     #[test]

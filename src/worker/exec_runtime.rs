@@ -5,18 +5,17 @@
 //! mounts) and afterwards observes the world: process exit status, the
 //! `thread.started` line on stdout (the only JSON parsed, as the session
 //! identity proof), and the native `--output-last-message` file. Model output
-//! is payload, never protocol: the reviewer verdict is classified leniently
-//! from the final message's text, and every other byte is drained into
-//! redacted evidence artifacts without interpretation.
+//! is payload, never protocol: only the reviewer's exact first verdict line is
+//! classified, while each complete UTF-8 final message is preserved unchanged
+//! in a durable artifact and handed to the next role by path.
 
 use super::environment::{ExecutionEnvironmentLease, SecretRedactor};
 use super::process::{ProcessGroupBinding, configure_worker_child};
 use super::runtime::{
-    DeveloperOutcomeStatus, DeveloperOutcomeV1, MAX_OUTCOME_SUMMARY_CHARS,
-    MAX_REVIEW_FINDING_MESSAGE_CHARS, ReviewFindingSeverity, ReviewFindingV1, ReviewerOutcomeV1,
-    ReviewerVerdict, RoleSessionSpec, RuntimeContractIdentity, RuntimeError, RuntimeOutcome,
-    RuntimeSessionKey, RuntimeTelemetry, RuntimeTurnKey, RuntimeTurnPoll, RuntimeTurnSpec,
-    SanitizedRuntimeFailure, TaskWorkerRuntime,
+    DeveloperOutcomeStatus, DeveloperOutcomeV1, ReviewerOutcomeV1, ReviewerVerdict,
+    RoleSessionSpec, RuntimeContractIdentity, RuntimeError, RuntimeOutcome, RuntimeSessionKey,
+    RuntimeTelemetry, RuntimeTurnKey, RuntimeTurnPoll, RuntimeTurnSpec, SanitizedRuntimeFailure,
+    TaskWorkerRuntime,
 };
 use super::verdict::{Verdict, VerdictClassification, classify_verdict};
 use crate::artifact::{ArtifactAttempt, ArtifactKind, ArtifactRoot, ArtifactScope};
@@ -38,18 +37,10 @@ const THREAD_STARTED_LINE_CAP: usize = 8 * 1024;
 const PIPE_CHUNK: usize = 32 * 1024;
 const NATIVE_STREAM_CAP: u64 = 1024 * 1024 * 1024;
 const RAW_FINAL_CHUNK: usize = 64 * 1024;
-/// How much of a final message the supervisor may quote onward. The full text
-/// is always sealed into the artifacts regardless of this bound.
-const RELAY_WINDOW_BYTES: usize = 256 * 1024;
 const STDERR_TAIL_BYTES: usize = 320;
 const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 const REAPER_ATTEMPTS: usize = 30;
 const REAPER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-
-const CLARIFICATION_PROMPT: &str = "Your previous final message did not contain a usable \
-verdict. Reply once more: the FIRST line of your final message must be exactly \
-`VERDICT: LGTM` or `VERDICT: REQUEST_CHANGES` (a single line, no decoration, no other \
-text on that line), followed by your findings in free-form markdown.";
 
 /// Task-private directories prepared by the driver for one task runtime.
 #[derive(Debug, Clone)]
@@ -133,9 +124,9 @@ struct RunningTurn {
     stderr_thread: Option<JoinHandle<StderrDrained>>,
     stdin_thread: Option<JoinHandle<Option<String>>>,
     clarification_used: bool,
-    /// The pre-clarification final message, carried forward so the relayed
-    /// outcome keeps the reviewer's original findings alongside the verdict.
-    prior_text: Option<String>,
+    /// The pre-clarification durable final remains a separate message in the
+    /// same review round and is never copied into the follow-up prompt.
+    preceding_final_message_path: Option<PathBuf>,
     attempt_no: u32,
 }
 
@@ -231,7 +222,7 @@ impl ExecTaskWorkerRuntime {
         attempt_no: u32,
         prompt_override: Option<String>,
         clarification_used: bool,
-        prior_text: Option<String>,
+        preceding_final_message_path: Option<PathBuf>,
     ) -> Result<RunningTurn, RuntimeError> {
         let session = self
             .sessions
@@ -361,7 +352,7 @@ impl ExecTaskWorkerRuntime {
             stderr_thread,
             stdin_thread,
             clarification_used,
-            prior_text,
+            preceding_final_message_path,
             attempt_no,
         })
     }
@@ -410,30 +401,20 @@ impl ExecTaskWorkerRuntime {
             notification_count: 0,
         };
 
-        // Ingest the raw final message: pin identity, bound the read, seal a
-        // redacted copy into the durable artifacts, and remove the raw file.
+        // Ingest the raw final message exactly: pin identity, enforce the
+        // existing hard cap and UTF-8 contract, and remove the private source.
+        // Invalid, empty, or oversized messages never produce a routable path.
+        let final_message_path = running.attempt.artifact_path(ArtifactKind::NativeFinal);
         let mut final_writer = running
             .attempt
-            .start_native_stream(ArtifactKind::NativeFinal, NATIVE_STREAM_CAP)
+            .start_exact_native_final(NATIVE_STREAM_CAP)
             .map_err(|error| RuntimeError::internal(single_line(&error.to_string())))?;
         let raw = ingest_raw_final(
             &running.raw_final,
             running.raw_final_identity,
-            &running.redactor,
             &mut final_writer,
         );
-        let sealed_result = final_writer.finish();
-        let sealed = match (&raw, sealed_result) {
-            (Ok(Some(text)), Ok(_)) => Some(text.clone()),
-            (Ok(_), Err(error)) => {
-                return fail(
-                    RuntimeFailureClass::Process,
-                    single_line(&format!("final message evidence seal failed: {error}")),
-                    telemetry,
-                );
-            }
-            _ => None,
-        };
+        let sealed = raw.is_ok().then(|| final_writer.finish());
 
         let session_key = {
             let turn = self
@@ -443,9 +424,10 @@ impl ExecTaskWorkerRuntime {
             turn.session
         };
 
-        // Routing preconditions: exit 0 AND session proof AND non-empty final
-        // message. Anything else is a process-level failure; artifacts stay as
-        // evidence but never route.
+        // Process and native-session failures take precedence over final
+        // transport failures. In particular, a crashing worker commonly
+        // leaves the pre-created raw-final target empty; keep its exit status
+        // and stderr diagnostic instead of reporting only that symptom.
         if let Some(error) = prompt_error
             .or_else(|| stdout.io_error.clone())
             .or(stderr_io_error)
@@ -490,21 +472,20 @@ impl ExecTaskWorkerRuntime {
                 telemetry,
             );
         }
-        if let Err(error) = &raw {
+        if let Err(error) = raw {
             return fail(
                 RuntimeFailureClass::Protocol,
                 single_line(&format!("raw final message ingestion failed: {error}")),
                 telemetry,
             );
         }
-        let Some(final_text) = sealed.filter(|text| !text.trim().is_empty()) else {
+        if let Some(Err(error)) = sealed {
             return fail(
-                RuntimeFailureClass::Process,
-                "codex exec produced an empty final message".into(),
+                RuntimeFailureClass::Protocol,
+                single_line(&format!("final message evidence seal failed: {error}")),
                 telemetry,
             );
-        };
-
+        }
         let session = self
             .sessions
             .get_mut(&session_key)
@@ -514,43 +495,29 @@ impl ExecTaskWorkerRuntime {
         }
         let role = session.role;
 
-        // After a format clarification the relayed text keeps BOTH turns: the
-        // original findings and the clarified verdict. Relaying only the
-        // second (usually a bare `VERDICT:` line) would drop the substance the
-        // developer needs.
-        let relay_text = match &running.prior_text {
-            Some(prior) => format!(
-                "{}\n\n---\n[hcom: verdict clarification follow-up]\n\n{}",
-                prior.trim_end(),
-                final_text.trim_start()
-            ),
-            None => final_text.clone(),
-        };
-
         let outcome = match role {
             WorkerRole::Developer => RuntimeOutcome::Developer(DeveloperOutcomeV1 {
                 status: DeveloperOutcomeStatus::Ready,
-                summary: truncate_chars(&relay_text, MAX_OUTCOME_SUMMARY_CHARS),
-                questions: Vec::new(),
             }),
-            WorkerRole::Reviewer => match classify_verdict(&final_text) {
+            WorkerRole::Reviewer => match classify_verdict_file(&final_message_path)? {
                 VerdictClassification::Determined(Verdict::Lgtm) => {
                     RuntimeOutcome::Reviewer(ReviewerOutcomeV1 {
                         verdict: ReviewerVerdict::Lgtm,
-                        summary: truncate_chars(&relay_text, MAX_OUTCOME_SUMMARY_CHARS),
-                        findings: Vec::new(),
+                        preceding_final_message_paths: running
+                            .preceding_final_message_path
+                            .clone()
+                            .into_iter()
+                            .collect(),
                     })
                 }
                 VerdictClassification::Determined(Verdict::RequestChanges) => {
                     RuntimeOutcome::Reviewer(ReviewerOutcomeV1 {
                         verdict: ReviewerVerdict::RequestChanges,
-                        summary: truncate_chars(&relay_text, MAX_OUTCOME_SUMMARY_CHARS),
-                        findings: vec![ReviewFindingV1 {
-                            severity: ReviewFindingSeverity::Major,
-                            path: None,
-                            line: None,
-                            message: truncate_chars(&relay_text, MAX_REVIEW_FINDING_MESSAGE_CHARS),
-                        }],
+                        preceding_final_message_paths: running
+                            .preceding_final_message_path
+                            .clone()
+                            .into_iter()
+                            .collect(),
                     })
                 }
                 VerdictClassification::Undetermined(reason) => {
@@ -558,8 +525,7 @@ impl ExecTaskWorkerRuntime {
                         return fail(
                             RuntimeFailureClass::Contract,
                             single_line(&format!(
-                                "reviewer verdict undetermined after clarification ({reason:?}): {}",
-                                truncate_chars(&final_text, 200)
+                                "reviewer verdict undetermined after clarification ({reason:?})"
                             )),
                             telemetry,
                         );
@@ -570,13 +536,14 @@ impl ExecTaskWorkerRuntime {
                     // both attempts' artifacts stay on disk.
                     let spec = running.spec.clone();
                     let next_attempt = running.attempt_no + 1;
+                    let clarification_prompt = verdict_clarification_prompt(&final_message_path);
                     let clarification = self.spawn_invocation(
                         session_key,
                         spec,
                         next_attempt,
-                        Some(CLARIFICATION_PROMPT.to_string()),
+                        Some(clarification_prompt),
                         true,
-                        Some(final_text.clone()),
+                        Some(final_message_path),
                     )?;
                     let turn = self
                         .turns
@@ -588,7 +555,11 @@ impl ExecTaskWorkerRuntime {
             },
         };
         outcome.validate()?;
-        Ok(RuntimeTurnPoll::Completed { outcome, telemetry })
+        Ok(RuntimeTurnPoll::Completed {
+            outcome,
+            final_message_path,
+            telemetry,
+        })
     }
 }
 
@@ -1010,27 +981,18 @@ fn parse_thread_started(line: &[u8]) -> Option<String> {
     Some(thread.to_owned())
 }
 
-/// Stream the CLI's final-message file through the redactor, then delete it.
-///
-/// Identity is pinned (same inode, still a regular file). Memory is bounded,
-/// not the file: the whole message is redacted and sealed, so a legal long
-/// final message keeps its tail. Chunks overlap by `guard` bytes so a
-/// credential straddling a read boundary is still recognized.
+/// Stream the CLI's final-message file unchanged into its durable artifact,
+/// then delete the private source. The sink enforces UTF-8 and the hard cap.
 fn ingest_raw_final(
     path: &Path,
     expected: (u64, u64),
-    redactor: &SecretRedactor,
-    sink: &mut crate::artifact::BoundedArtifactWriter,
-) -> Result<Option<String>> {
-    let file = match OpenOptions::new()
+    sink: &mut crate::artifact::ExactFinalWriter,
+) -> Result<()> {
+    let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
-    };
+        .with_context(|| format!("open {}", path.display()))?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         bail!("raw final message target is not a regular file");
@@ -1038,53 +1000,68 @@ fn ingest_raw_final(
     if (metadata.dev(), metadata.ino()) != expected {
         bail!("raw final message file identity changed since it was created");
     }
-    // Read in bounded chunks, splitting the carry only where the redactor
-    // proves the cut cannot bisect a secret: the guard window is held back
-    // and no visible occurrence is ever cut in half. `relayed` keeps only the
-    // leading window the supervisor may quote; the sealed artifact gets
-    // everything.
-    let mut reader = std::io::BufReader::new(file);
-    let mut carry: Vec<u8> = Vec::new();
     let mut chunk = vec![0_u8; RAW_FINAL_CHUNK];
-    let mut relayed = String::new();
-    let mut total: u64 = 0;
-    loop {
-        let read = reader.read(&mut chunk)?;
-        if read == 0 {
-            break;
-        }
-        total += read as u64;
-        carry.extend_from_slice(&chunk[..read]);
-        let boundary = redactor.safe_stream_split(&carry);
-        if boundary == 0 {
-            if carry.len() > redactor.max_stream_carry_bytes() {
-                bail!("raw final message redaction carry exceeded its bound");
+    let ingest_result = (|| -> Result<()> {
+        loop {
+            let read = file.read(&mut chunk)?;
+            if read == 0 {
+                break;
             }
-            continue;
+            sink.write_chunk(&chunk[..read])?;
         }
-        let piece: Vec<u8> = carry.drain(..boundary).collect();
-        let redacted = redactor.redact(&String::from_utf8_lossy(&piece));
-        sink.write_chunk(redacted.as_bytes())?;
-        if relayed.len() < RELAY_WINDOW_BYTES {
-            relayed.push_str(&redacted);
+        let after = file.metadata()?;
+        if (after.dev(), after.ino()) != expected || after.len() != metadata.len() {
+            bail!("raw final message changed while it was ingested");
         }
-        if carry.len() > redactor.max_stream_carry_bytes() {
-            bail!("raw final message redaction carry exceeded its bound");
-        }
+        Ok(())
+    })();
+    drop(file);
+    let remove_result = fs::remove_file(path).with_context(|| format!("remove {}", path.display()));
+    ingest_result?;
+    remove_result
+}
+
+fn classify_verdict_file(path: &Path) -> Result<VerdictClassification, RuntimeError> {
+    const FIRST_LINE_CAP: u64 = 8 * 1024;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            RuntimeError::internal(single_line(&format!(
+                "failed to open durable reviewer final: {error}"
+            )))
+        })?;
+    let mut prefix = Vec::new();
+    (&mut file)
+        .take(FIRST_LINE_CAP + 1)
+        .read_to_end(&mut prefix)
+        .map_err(|error| {
+            RuntimeError::internal(single_line(&format!(
+                "failed to read durable reviewer final: {error}"
+            )))
+        })?;
+    let line_end = prefix.iter().position(|byte| *byte == b'\n');
+    if line_end.is_none() && prefix.len() as u64 > FIRST_LINE_CAP {
+        return Ok(VerdictClassification::Undetermined(
+            super::verdict::UndeterminedReason::UnrecognizedForm,
+        ));
     }
-    if !carry.is_empty() {
-        let redacted = redactor.redact(&String::from_utf8_lossy(&carry));
-        sink.write_chunk(redacted.as_bytes())?;
-        if relayed.len() < RELAY_WINDOW_BYTES {
-            relayed.push_str(&redacted);
-        }
-    }
-    let _ = fs::remove_file(path);
-    if total == 0 {
-        Ok(None)
-    } else {
-        Ok(Some(relayed))
-    }
+    let line = &prefix[..line_end.unwrap_or(prefix.len())];
+    let line = std::str::from_utf8(line).map_err(|_| {
+        RuntimeError::internal("durable reviewer final violated its UTF-8 contract")
+    })?;
+    Ok(classify_verdict(line))
+}
+
+fn verdict_clarification_prompt(previous_final: &Path) -> String {
+    format!(
+        "Your previous final message is stored at:\n{}\n\nRead that file. Its first line did not \
+         contain a usable verdict. Reply once more: the FIRST line of your final message must be \
+         exactly `VERDICT: LGTM` or `VERDICT: REQUEST_CHANGES` (a single line, no decoration, no \
+         other text on that line). Do not repeat the previous findings; they remain in that file.",
+        previous_final.display()
+    )
 }
 
 fn exit_failure_detail(
@@ -1108,20 +1085,6 @@ fn exit_failure_detail(
     } else {
         single_line(&format!("{cause}; stderr tail: {tail}"))
     }
-}
-
-/// Cut a relayed message to `limit` characters, always leaving a visible
-/// marker: the next role must be able to tell that it is reading a prefix.
-fn truncate_chars(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        return text.to_string();
-    }
-    const MARKER: &str =
-        "\n\n[hcom: message truncated for relay; the full text is in this run's artifacts]";
-    let keep = limit.saturating_sub(MARKER.chars().count());
-    let mut out: String = text.chars().take(keep).collect();
-    out.push_str(MARKER);
-    out
 }
 
 fn utf8_prefix(text: &str, max_bytes: usize) -> &str {
@@ -1344,14 +1307,22 @@ printf 'implemented the change' > "$OUT"
             RuntimeTurnPurpose::InitialDevelopment,
         );
         let poll = poll_terminal(&mut fixture, turn);
-        let RuntimeTurnPoll::Completed { outcome, telemetry } = poll else {
+        let RuntimeTurnPoll::Completed {
+            outcome,
+            final_message_path,
+            telemetry,
+        } = poll
+        else {
             panic!("expected completion, got {poll:?}");
         };
         let RuntimeOutcome::Developer(outcome) = outcome else {
             panic!("expected developer outcome");
         };
         assert_eq!(outcome.status, DeveloperOutcomeStatus::Ready);
-        assert!(outcome.summary.contains("implemented the change"));
+        assert_eq!(
+            fs::read_to_string(&final_message_path).unwrap(),
+            "implemented the change"
+        );
         assert!(telemetry.protocol_bytes > 0);
         // Raw target removed from the private runtime dir; sealed artifacts exist.
         let leftovers: Vec<_> = fs::read_dir(&fixture.runtime_dir).unwrap().collect();
@@ -1373,6 +1344,12 @@ printf 'implemented the change' > "$OUT"
         let stdin = fs::read_to_string(fixture.capture.join("stdin.log")).unwrap();
         assert!(stdin.contains("You are the worker."));
         assert!(stdin.contains("do the task"));
+        fixture.runtime.shutdown().unwrap();
+        assert_eq!(
+            fs::read_to_string(final_message_path).unwrap(),
+            "implemented the change",
+            "durable final must survive task runtime shutdown"
+        );
     }
 
     #[test]
@@ -1413,13 +1390,22 @@ printf 'ran the updated native executable' > "$OUT"
             WorkerRole::Developer,
             RuntimeTurnPurpose::InitialDevelopment,
         );
-        let RuntimeTurnPoll::Completed { outcome, .. } = poll_terminal(&mut fixture, turn) else {
+        let RuntimeTurnPoll::Completed {
+            outcome,
+            final_message_path,
+            ..
+        } = poll_terminal(&mut fixture, turn)
+        else {
             panic!("updated native executable did not complete");
         };
         let RuntimeOutcome::Developer(outcome) = outcome else {
             panic!("expected developer outcome");
         };
-        assert!(outcome.summary.contains("updated native executable"));
+        assert_eq!(outcome.status, DeveloperOutcomeStatus::Ready);
+        assert_eq!(
+            fs::read_to_string(final_message_path).unwrap(),
+            "ran the updated native executable"
+        );
     }
 
     #[test]
@@ -1445,7 +1431,38 @@ exit 7
     }
 
     #[test]
-    fn empty_final_message_is_a_process_failure() {
+    fn nonzero_exit_without_final_preserves_exit_and_stderr_diagnostic() {
+        let mut fixture = fixture(
+            r#"
+printf '{"type":"thread.started","thread_id":"thread-fake-1"}\n'
+printf 'codex: authentication failed\n' >&2
+exit 7
+"#,
+        );
+        let (_key, turn) = start(
+            &mut fixture,
+            WorkerRole::Developer,
+            RuntimeTurnPurpose::InitialDevelopment,
+        );
+        let RuntimeTurnPoll::Failed { failure, .. } = poll_terminal(&mut fixture, turn) else {
+            panic!("crashed worker unexpectedly completed");
+        };
+        assert_eq!(failure.class, RuntimeFailureClass::Process);
+        assert!(failure.detail.contains("status 7"), "{}", failure.detail);
+        assert!(
+            failure.detail.contains("codex: authentication failed"),
+            "{}",
+            failure.detail
+        );
+        assert!(
+            !failure.detail.contains("exact native final is empty"),
+            "{}",
+            failure.detail
+        );
+    }
+
+    #[test]
+    fn empty_final_message_is_not_routable() {
         let mut fixture = fixture(
             r#"
 printf '{"type":"thread.started","thread_id":"thread-fake-1"}\n'
@@ -1460,9 +1477,33 @@ printf '{"type":"thread.started","thread_id":"thread-fake-1"}\n'
         let RuntimeTurnPoll::Failed { failure, .. } = poll else {
             panic!("expected failure, got {poll:?}");
         };
-        assert_eq!(failure.class, RuntimeFailureClass::Process);
+        assert_eq!(failure.class, RuntimeFailureClass::Protocol);
         assert!(
-            failure.detail.contains("empty final message"),
+            failure.detail.contains("exact native final is empty"),
+            "{}",
+            failure.detail
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_final_message_is_not_routable() {
+        let mut fixture = fixture(
+            r#"
+printf '{"type":"thread.started","thread_id":"thread-fake-1"}\n'
+printf '\377' > "$OUT"
+"#,
+        );
+        let (_key, turn) = start(
+            &mut fixture,
+            WorkerRole::Developer,
+            RuntimeTurnPurpose::InitialDevelopment,
+        );
+        let RuntimeTurnPoll::Failed { failure, .. } = poll_terminal(&mut fixture, turn) else {
+            panic!("invalid UTF-8 final unexpectedly completed");
+        };
+        assert_eq!(failure.class, RuntimeFailureClass::Protocol);
+        assert!(
+            failure.detail.contains("not valid UTF-8"),
             "{}",
             failure.detail
         );
@@ -1664,7 +1705,10 @@ printf 'done after huge output' > "$OUT"
             RuntimeTurnPurpose::InitialDevelopment,
         );
         let poll = poll_terminal(&mut fixture, turn);
-        let RuntimeTurnPoll::Completed { outcome, telemetry } = poll else {
+        let RuntimeTurnPoll::Completed {
+            outcome, telemetry, ..
+        } = poll
+        else {
             panic!("expected completion, got {poll:?}");
         };
         assert!(matches!(outcome, RuntimeOutcome::Developer(_)));
@@ -1692,7 +1736,7 @@ printf 'VERDICT: LGTM\nlooks solid' > "$OUT"
             panic!("expected reviewer outcome");
         };
         assert_eq!(outcome.verdict, ReviewerVerdict::Lgtm);
-        assert!(outcome.findings.is_empty());
+        assert!(outcome.preceding_final_message_paths.is_empty());
 
         let mut fixture = fixture2(
             r#"
@@ -1713,8 +1757,7 @@ printf 'VERDICT: REQUEST_CHANGES\n- fix the frobnicator' > "$OUT"
             panic!("expected reviewer outcome");
         };
         assert_eq!(outcome.verdict, ReviewerVerdict::RequestChanges);
-        assert_eq!(outcome.findings.len(), 1);
-        assert!(outcome.findings[0].message.contains("frobnicator"));
+        assert!(outcome.preceding_final_message_paths.is_empty());
     }
 
     fn fixture2(body: &str) -> Fixture {
@@ -1742,13 +1785,30 @@ fi
             RuntimeTurnPurpose::InitialReview,
         );
         let poll = poll_terminal(&mut fixture, turn);
-        let RuntimeTurnPoll::Completed { outcome, .. } = poll else {
+        let RuntimeTurnPoll::Completed {
+            outcome,
+            final_message_path,
+            ..
+        } = poll
+        else {
             panic!("expected completion, got {poll:?}");
         };
         let RuntimeOutcome::Reviewer(outcome) = outcome else {
             panic!("expected reviewer outcome");
         };
         assert_eq!(outcome.verdict, ReviewerVerdict::Lgtm);
+        let turn_dir = fixture
+            .artifacts
+            .join("run-1/task-1/reviewer/session-1/turn-1");
+        let original = turn_dir.join("attempt-1/native-final.partial");
+        assert_eq!(
+            outcome.preceding_final_message_paths,
+            vec![original.clone()]
+        );
+        assert_eq!(
+            final_message_path,
+            turn_dir.join("attempt-2/native-final.partial")
+        );
         // Clarification was a resume of the same thread with the fixed re-ask
         // prompt, and both attempts kept their artifacts.
         let args = fs::read_to_string(fixture.capture.join("args.log")).unwrap();
@@ -1760,9 +1820,8 @@ fi
         assert!(invocations[1].contains("resume\nthread-fake-1"));
         let stdin = fs::read_to_string(fixture.capture.join("stdin.log")).unwrap();
         assert!(stdin.contains("did not contain a usable"));
-        let turn_dir = fixture
-            .artifacts
-            .join("run-1/task-1/reviewer/session-1/turn-1");
+        assert!(stdin.contains(original.to_str().unwrap()));
+        assert!(!stdin.contains("I think it is probably fine overall"));
         assert!(turn_dir.join("attempt-1/native-final.partial").is_file());
         assert!(turn_dir.join("attempt-2/native-final.partial").is_file());
     }
@@ -1795,7 +1854,7 @@ printf 'still no clear verdict here' > "$OUT"
     }
 
     #[test]
-    fn secrets_never_reach_outcomes_or_sealed_artifacts() {
+    fn final_message_preserves_fake_secret_shaped_text_exactly() {
         let mut fixture = fixture(
             r#"
 printf '{"type":"thread.started","thread_id":"thread-fake-1"}\n'
@@ -1808,27 +1867,21 @@ printf 'work done; leaked value: %s' "$FAKE_SECRET_TOKEN" > "$OUT"
             RuntimeTurnPurpose::InitialDevelopment,
         );
         let poll = poll_terminal(&mut fixture, turn);
-        let RuntimeTurnPoll::Completed { outcome, .. } = poll else {
+        let RuntimeTurnPoll::Completed {
+            outcome,
+            final_message_path,
+            ..
+        } = poll
+        else {
             panic!("expected completion, got {poll:?}");
         };
         let RuntimeOutcome::Developer(outcome) = outcome else {
             panic!("expected developer outcome");
         };
-        assert!(
-            !outcome.summary.contains(SECRET_VALUE),
-            "summary leaked the secret"
-        );
-        assert!(outcome.summary.contains("work done"));
-        let sealed = fs::read_to_string(
-            fixture
-                .artifacts
-                .join("run-1/task-1/developer/session-1/turn-1/attempt-1/native-final.partial"),
-        )
-        .unwrap();
-        assert!(
-            !sealed.contains(SECRET_VALUE),
-            "sealed artifact leaked the secret"
-        );
+        assert_eq!(outcome.status, DeveloperOutcomeStatus::Ready);
+        let sealed = fs::read_to_string(final_message_path).unwrap();
+        assert_eq!(sealed, format!("work done; leaked value: {SECRET_VALUE}"));
+        assert!(!sealed.contains("[REDACTED]"));
     }
 
     #[test]
@@ -1949,9 +2002,7 @@ echo "$!" > "$CAPTURE/descendant.pid"
     }
 
     #[test]
-    fn a_long_final_message_keeps_its_tail_and_hides_a_straddling_secret() {
-        // The final message is padded so the synthetic secret lands exactly on
-        // the truncation boundary; the guard must drop the surviving prefix.
+    fn a_long_final_message_keeps_its_tail_and_fake_secret_exactly() {
         let mut fixture = fixture(&format!(
             r#"
 printf '{{"type":"thread.started","thread_id":"thread-fake-1"}}\n'
@@ -1967,26 +2018,21 @@ head -c 4096 /dev/zero | tr '\0' 'b' >> "$OUT"
             RuntimeTurnPurpose::InitialDevelopment,
         );
         let poll = poll_terminal(&mut fixture, turn);
-        let RuntimeTurnPoll::Completed { outcome, .. } = poll else {
+        let RuntimeTurnPoll::Completed {
+            outcome,
+            final_message_path,
+            ..
+        } = poll
+        else {
             panic!("expected completion, got {poll:?}");
         };
         let RuntimeOutcome::Developer(outcome) = outcome else {
             panic!("expected developer outcome");
         };
-        for fragment_len in [SECRET_VALUE.len(), SECRET_VALUE.len() / 2] {
-            let fragment = &SECRET_VALUE[..fragment_len];
-            assert!(
-                !outcome.summary.contains(fragment),
-                "summary leaked {fragment:?}"
-            );
-        }
-        let sealed = fs::read_to_string(
-            fixture
-                .artifacts
-                .join("run-1/task-1/developer/session-1/turn-1/attempt-1/native-final.partial"),
-        )
-        .unwrap();
-        assert!(!sealed.contains(&SECRET_VALUE[..SECRET_VALUE.len() / 2]));
+        assert_eq!(outcome.status, DeveloperOutcomeStatus::Ready);
+        let sealed = fs::read_to_string(final_message_path).unwrap();
+        assert!(sealed.contains(SECRET_VALUE));
+        assert!(!sealed.contains("[REDACTED]"));
         // The message continues past the chunk boundary; the tail must survive
         // rather than being silently dropped.
         assert!(
@@ -2021,8 +2067,7 @@ head -c 4096 /dev/zero | tr '\0' 'b' >> "$OUT"
 
     #[test]
     fn a_final_message_larger_than_the_old_cap_is_persisted_whole() {
-        // 3 MiB: comfortably past the previous 1 MiB durable cap, and past
-        // the relay window, so both behaviours are exercised at once.
+        // 3 MiB: comfortably past the previous 1 MiB durable cap.
         let mut fixture = fixture(
             r#"
 printf '{"type":"thread.started","thread_id":"thread-fake-1"}
@@ -2037,30 +2082,19 @@ printf 'TAILMARK' >> "$OUT"
             RuntimeTurnPurpose::InitialDevelopment,
         );
         let poll = poll_terminal(&mut fixture, turn);
-        let RuntimeTurnPoll::Completed { outcome, .. } = poll else {
+        let RuntimeTurnPoll::Completed {
+            outcome,
+            final_message_path,
+            ..
+        } = poll
+        else {
             panic!("expected completion, got {poll:?}");
         };
         let RuntimeOutcome::Developer(outcome) = outcome else {
             panic!("expected developer outcome");
         };
-        // Relayed onward: bounded, and the cut is explicitly marked.
-        assert!(
-            outcome.summary.len() <= 300 * 1024,
-            "{}",
-            outcome.summary.len()
-        );
-        assert!(
-            outcome
-                .summary
-                .contains("[hcom: message truncated for relay")
-        );
-        // Persisted: the whole message, tail included.
-        let sealed = fs::read_to_string(
-            fixture
-                .artifacts
-                .join("run-1/task-1/developer/session-1/turn-1/attempt-1/native-final.partial"),
-        )
-        .unwrap();
+        assert_eq!(outcome.status, DeveloperOutcomeStatus::Ready);
+        let sealed = fs::read_to_string(final_message_path).unwrap();
         assert!(
             sealed.len() > 3 * 1024 * 1024,
             "sealed {} bytes",

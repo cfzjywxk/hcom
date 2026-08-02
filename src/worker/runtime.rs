@@ -24,12 +24,6 @@ pub const MAX_RUNTIME_PROMPT_BYTES: usize = 256 * 1024;
 pub const MAX_RUNTIME_INSTRUCTIONS_BYTES: usize = 64 * 1024;
 pub const MAX_RUNTIME_OUTCOME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_RUNTIME_DIAGNOSTIC_BYTES: usize = 1024;
-pub const MAX_OUTCOME_SUMMARY_CHARS: usize = 256 * 1024;
-pub const MAX_OUTCOME_QUESTIONS: usize = 8;
-pub const MAX_OUTCOME_QUESTION_CHARS: usize = 2048;
-pub const MAX_REVIEW_FINDINGS: usize = 32;
-pub const MAX_REVIEW_FINDING_PATH_CHARS: usize = 4096;
-pub const MAX_REVIEW_FINDING_MESSAGE_CHARS: usize = 256 * 1024;
 
 const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 const DEFAULT_REASONING_EFFORT: &str = "xhigh";
@@ -512,96 +506,17 @@ impl RuntimeTurnSpec {
 #[serde(rename_all = "snake_case")]
 pub enum DeveloperOutcomeStatus {
     Ready,
-    NeedsHuman,
-    Blocked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DeveloperOutcomeV1 {
     pub status: DeveloperOutcomeStatus,
-    pub summary: String,
-    pub questions: Vec<String>,
 }
 
 impl DeveloperOutcomeV1 {
     pub fn validate(&self) -> Result<(), RuntimeError> {
-        validate_chars(
-            "developer outcome summary",
-            &self.summary,
-            MAX_OUTCOME_SUMMARY_CHARS,
-            false,
-        )?;
-        if self.questions.len() > MAX_OUTCOME_QUESTIONS {
-            return Err(RuntimeError::invalid_outcome(
-                "developer outcome has too many questions",
-            ));
-        }
-        let mut unique = BTreeSet::new();
-        for question in &self.questions {
-            validate_chars(
-                "developer outcome question",
-                question,
-                MAX_OUTCOME_QUESTION_CHARS,
-                false,
-            )?;
-            if !unique.insert(question) {
-                return Err(RuntimeError::invalid_outcome(
-                    "developer outcome questions must be unique",
-                ));
-            }
-        }
-        match self.status {
-            DeveloperOutcomeStatus::Ready if !self.questions.is_empty() => Err(
-                RuntimeError::invalid_outcome("ready developer outcome must not contain questions"),
-            ),
-            DeveloperOutcomeStatus::NeedsHuman if self.questions.is_empty() => {
-                Err(RuntimeError::invalid_outcome(
-                    "needs_human developer outcome must contain a concrete question",
-                ))
-            }
-            _ => Ok(()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub enum ReviewFindingSeverity {
-    Major,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(deny_unknown_fields)]
-pub struct ReviewFindingV1 {
-    pub severity: ReviewFindingSeverity,
-    pub path: Option<String>,
-    pub line: Option<u32>,
-    pub message: String,
-}
-
-impl ReviewFindingV1 {
-    pub fn validate(&self) -> Result<(), RuntimeError> {
-        if let Some(path) = &self.path {
-            validate_chars(
-                "review finding path",
-                path,
-                MAX_REVIEW_FINDING_PATH_CHARS,
-                false,
-            )?;
-            validate_repository_relative_path(path)?;
-        }
-        if self.line == Some(0) {
-            return Err(RuntimeError::invalid_outcome(
-                "review finding line must be positive",
-            ));
-        }
-        validate_chars(
-            "review finding message",
-            &self.message,
-            MAX_REVIEW_FINDING_MESSAGE_CHARS,
-            false,
-        )
+        Ok(())
     }
 }
 
@@ -609,43 +524,23 @@ impl ReviewFindingV1 {
 #[serde(deny_unknown_fields)]
 pub struct ReviewerOutcomeV1 {
     pub verdict: ReviewerVerdict,
-    pub summary: String,
-    pub findings: Vec<ReviewFindingV1>,
+    /// Earlier durable final messages that belong to the same review round.
+    /// This is empty for a normal review and contains the original reviewer
+    /// final after the single verdict-clarification turn.
+    pub preceding_final_message_paths: Vec<PathBuf>,
 }
 
 impl ReviewerOutcomeV1 {
     pub fn validate(&self) -> Result<(), RuntimeError> {
-        validate_chars(
-            "reviewer outcome summary",
-            &self.summary,
-            MAX_OUTCOME_SUMMARY_CHARS,
-            false,
-        )?;
-        if self.findings.len() > MAX_REVIEW_FINDINGS {
+        if self.preceding_final_message_paths.len() > 1 {
             return Err(RuntimeError::invalid_outcome(
-                "reviewer outcome has too many findings",
+                "reviewer outcome may carry at most one preceding final message path",
             ));
         }
-        let mut unique = BTreeSet::new();
-        for finding in &self.findings {
-            finding.validate()?;
-            if !unique.insert(finding) {
-                return Err(RuntimeError::invalid_outcome(
-                    "reviewer outcome findings must be unique",
-                ));
-            }
+        for path in &self.preceding_final_message_paths {
+            validate_absolute_path("preceding reviewer final message path", path)?;
         }
-        match self.verdict {
-            ReviewerVerdict::Lgtm if !self.findings.is_empty() => Err(
-                RuntimeError::invalid_outcome("lgtm reviewer outcome must not contain findings"),
-            ),
-            ReviewerVerdict::RequestChanges if self.findings.is_empty() => {
-                Err(RuntimeError::invalid_outcome(
-                    "request_changes reviewer outcome must contain a Major finding",
-                ))
-            }
-            _ => Ok(()),
-        }
+        Ok(())
     }
 }
 
@@ -727,6 +622,7 @@ pub enum RuntimeTurnPoll {
     },
     Completed {
         outcome: RuntimeOutcome,
+        final_message_path: PathBuf,
         telemetry: RuntimeTelemetry,
     },
     Failed {
@@ -738,6 +634,19 @@ pub enum RuntimeTurnPoll {
 impl RuntimeTurnPoll {
     pub fn is_terminal(&self) -> bool {
         !matches!(self, Self::Pending { .. })
+    }
+
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        if let Self::Completed {
+            outcome,
+            final_message_path,
+            ..
+        } = self
+        {
+            outcome.validate()?;
+            validate_absolute_path("runtime final message path", final_message_path)?;
+        }
+        Ok(())
     }
 }
 
@@ -867,30 +776,6 @@ fn validate_absolute_path(label: &str, value: &Path) -> Result<(), RuntimeError>
     Ok(())
 }
 
-fn validate_repository_relative_path(value: &str) -> Result<(), RuntimeError> {
-    let path = Path::new(value);
-    if path.is_absolute()
-        || value.ends_with('/')
-        || value.contains('\\')
-        || value.contains('\0')
-        || path.components().next().is_none()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::RootDir
-                    | Component::Prefix(_)
-                    | Component::ParentDir
-                    | Component::CurDir
-            )
-        })
-    {
-        return Err(RuntimeError::invalid_outcome(
-            "review finding path must be a normalized repository-relative path",
-        ));
-    }
-    Ok(())
-}
-
 fn validate_single_line(
     label: &str,
     value: &str,
@@ -918,24 +803,6 @@ fn validate_single_line_or_multiline(
     if (!allow_empty && value.is_empty()) || value.len() > max_bytes || value.contains('\0') {
         return Err(RuntimeError::invalid_contract(format!(
             "{label} must be {}UTF-8 no longer than {max_bytes} bytes",
-            if allow_empty { "" } else { "non-empty " }
-        )));
-    }
-    Ok(())
-}
-
-fn validate_chars(
-    label: &str,
-    value: &str,
-    max_chars: usize,
-    allow_empty: bool,
-) -> Result<(), RuntimeError> {
-    if (!allow_empty && value.is_empty())
-        || value.chars().count() > max_chars
-        || value.contains('\0')
-    {
-        return Err(RuntimeError::invalid_outcome(format!(
-            "{label} must be {}UTF-8 no longer than {max_chars} characters",
             if allow_empty { "" } else { "non-empty " }
         )));
     }
@@ -1110,100 +977,53 @@ mod tests {
     }
 
     #[test]
-    fn outcome_contracts_are_closed_and_enforce_cross_field_rules() {
-        let ready = br#"{"status":"ready","summary":"done","questions":[]}"#;
+    fn outcome_contracts_are_closed_and_carry_no_peer_body() {
+        let ready = br#"{"status":"ready"}"#;
         assert!(matches!(
             OutcomeContract::DeveloperV1.parse(ready).unwrap(),
             RuntimeOutcome::Developer(_)
         ));
         for invalid in [
-            br#"{"status":"ready","summary":"done","questions":["why?"]}"#.as_slice(),
-            br#"{"status":"needs_human","summary":"blocked","questions":[]}"#.as_slice(),
-            br#"{"status":"ready","summary":"done","questions":[],"extra":true}"#.as_slice(),
-            br#"{"status":"unknown","summary":"done","questions":[]}"#.as_slice(),
+            br#"{"status":"ready","summary":"done"}"#.as_slice(),
+            br#"{"status":"needs_human"}"#.as_slice(),
+            br#"{"status":"ready","extra":true}"#.as_slice(),
+            br#"{"status":"unknown"}"#.as_slice(),
         ] {
             assert!(OutcomeContract::DeveloperV1.parse(invalid).is_err());
         }
 
-        let lgtm = br#"{"verdict":"lgtm","summary":"sound","findings":[]}"#;
+        let lgtm = br#"{"verdict":"lgtm","preceding_final_message_paths":[]}"#;
         assert!(matches!(
             OutcomeContract::ReviewerV1.parse(lgtm).unwrap(),
             RuntimeOutcome::Reviewer(_)
         ));
         for invalid in [
-            br#"{"verdict":"lgtm","summary":"bad","findings":[{"severity":"major","message":"x"}]}"#.as_slice(),
-            br#"{"verdict":"request_changes","summary":"bad","findings":[]}"#.as_slice(),
-            br#"{"verdict":"request_changes","summary":"bad","findings":[{"severity":"major","path":"../escape","message":"x"}]}"#.as_slice(),
+            br#"{"verdict":"lgtm","preceding_final_message_paths":[],"summary":"bad"}"#.as_slice(),
+            br#"{"verdict":"request_changes","preceding_final_message_paths":["relative.md"]}"#
+                .as_slice(),
+            br#"{"verdict":"request_changes","preceding_final_message_paths":["/one","/two"]}"#
+                .as_slice(),
         ] {
             assert!(OutcomeContract::ReviewerV1.parse(invalid).is_err());
         }
     }
 
     #[test]
-    fn outcome_bounds_cover_below_equal_and_above_every_collection_limit() {
-        for length in [
-            MAX_OUTCOME_SUMMARY_CHARS - 1,
-            MAX_OUTCOME_SUMMARY_CHARS,
-            MAX_OUTCOME_SUMMARY_CHARS + 1,
+    fn completed_poll_requires_a_normalized_absolute_final_path() {
+        let outcome = RuntimeOutcome::Developer(DeveloperOutcomeV1 {
+            status: DeveloperOutcomeStatus::Ready,
+        });
+        for (path, valid) in [
+            ("/durable/native-final.partial", true),
+            ("relative/native-final.partial", false),
+            ("/durable/../escape", false),
         ] {
-            let outcome = DeveloperOutcomeV1 {
-                status: DeveloperOutcomeStatus::Ready,
-                summary: "s".repeat(length),
-                questions: Vec::new(),
+            let poll = RuntimeTurnPoll::Completed {
+                outcome: outcome.clone(),
+                final_message_path: PathBuf::from(path),
+                telemetry: RuntimeTelemetry::default(),
             };
-            assert_eq!(
-                outcome.validate().is_ok(),
-                length <= MAX_OUTCOME_SUMMARY_CHARS
-            );
-        }
-        for length in [
-            MAX_OUTCOME_QUESTION_CHARS - 1,
-            MAX_OUTCOME_QUESTION_CHARS,
-            MAX_OUTCOME_QUESTION_CHARS + 1,
-        ] {
-            let outcome = DeveloperOutcomeV1 {
-                status: DeveloperOutcomeStatus::NeedsHuman,
-                summary: "needs a decision".into(),
-                questions: vec!["q".repeat(length)],
-            };
-            assert_eq!(
-                outcome.validate().is_ok(),
-                length <= MAX_OUTCOME_QUESTION_CHARS
-            );
-        }
-        for count in [
-            MAX_OUTCOME_QUESTIONS - 1,
-            MAX_OUTCOME_QUESTIONS,
-            MAX_OUTCOME_QUESTIONS + 1,
-        ] {
-            let outcome = DeveloperOutcomeV1 {
-                status: DeveloperOutcomeStatus::NeedsHuman,
-                summary: "needs decisions".into(),
-                questions: (0..count)
-                    .map(|index| format!("question-{index}"))
-                    .collect(),
-            };
-            assert_eq!(outcome.validate().is_ok(), count <= MAX_OUTCOME_QUESTIONS);
-        }
-
-        for count in [
-            MAX_REVIEW_FINDINGS - 1,
-            MAX_REVIEW_FINDINGS,
-            MAX_REVIEW_FINDINGS + 1,
-        ] {
-            let outcome = ReviewerOutcomeV1 {
-                verdict: ReviewerVerdict::RequestChanges,
-                summary: "changes required".into(),
-                findings: (0..count)
-                    .map(|index| ReviewFindingV1 {
-                        severity: ReviewFindingSeverity::Major,
-                        path: Some(format!("src/file-{index}.rs")),
-                        line: Some(1),
-                        message: format!("finding-{index}"),
-                    })
-                    .collect(),
-            };
-            assert_eq!(outcome.validate().is_ok(), count <= MAX_REVIEW_FINDINGS);
+            assert_eq!(poll.validate().is_ok(), valid);
         }
     }
 
@@ -1214,45 +1034,17 @@ mod tests {
                 .parse(&vec![b' '; MAX_RUNTIME_OUTCOME_BYTES + 1])
                 .is_err()
         );
+        assert!(OutcomeContract::DeveloperV1.parse(br#"{}"#).is_err());
         for missing in [
-            br#"{"summary":"x","questions":[]}"#.as_slice(),
-            br#"{"status":"ready","questions":[]}"#.as_slice(),
-            br#"{"status":"ready","summary":"x"}"#.as_slice(),
-        ] {
-            assert!(OutcomeContract::DeveloperV1.parse(missing).is_err());
-        }
-        for missing in [
-            br#"{"summary":"x","findings":[]}"#.as_slice(),
-            br#"{"verdict":"lgtm","findings":[]}"#.as_slice(),
-            br#"{"verdict":"lgtm","summary":"x"}"#.as_slice(),
+            br#"{"preceding_final_message_paths":[]}"#.as_slice(),
+            br#"{"verdict":"lgtm"}"#.as_slice(),
         ] {
             assert!(OutcomeContract::ReviewerV1.parse(missing).is_err());
         }
     }
 
     #[test]
-    fn encoded_outcome_accepts_exactly_its_bound_and_rejects_one_byte_more() {
-        let mut outcome = DeveloperOutcomeV1 {
-            status: DeveloperOutcomeStatus::Blocked,
-            summary: String::new(),
-            questions: (0..MAX_OUTCOME_QUESTIONS)
-                .map(|index| format!("q{index}"))
-                .collect(),
-        };
-        // Character limits bind before the byte bound, so a maximal outcome
-        // is accepted; the byte bound is what stops an oversized encoding.
-        outcome.summary = "\u{1f980}".repeat(MAX_OUTCOME_SUMMARY_CHARS);
-        for (index, question) in outcome.questions.iter_mut().enumerate() {
-            // Questions must stay unique.
-            *question = format!("{index}{}", "x".repeat(MAX_OUTCOME_QUESTION_CHARS - 1));
-        }
-        let maximal = serde_json::to_vec(&outcome).unwrap();
-        assert!(maximal.len() <= MAX_RUNTIME_OUTCOME_BYTES);
-        assert!(
-            OutcomeContract::DeveloperV1.parse(&maximal).is_ok(),
-            "a maximal in-contract outcome must be accepted"
-        );
-
+    fn encoded_outcome_rejects_more_than_its_bound() {
         let oversized = vec![b'x'; MAX_RUNTIME_OUTCOME_BYTES + 1];
         assert!(OutcomeContract::DeveloperV1.parse(&oversized).is_err());
     }
@@ -1286,7 +1078,7 @@ mod tests {
         .is_err());
         assert!(
             serde_json::from_str::<ReviewerOutcomeV1>(
-                r#"{"verdict":"lgtm","summary":"ok","findings":[],"extra":true}"#
+                r#"{"verdict":"lgtm","preceding_final_message_paths":[],"extra":true}"#
             )
             .is_err()
         );
