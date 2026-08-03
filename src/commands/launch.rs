@@ -32,6 +32,12 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     if count > max_count {
         bail!("Too many agents requested (max {}).", max_count);
     }
+    if matches!(launch_tool, LaunchTool::Codex) {
+        let validation_errors = launcher::validate_tool_args(&launch_tool, &tool_args);
+        if !validation_errors.is_empty() {
+            bail!("{}", validation_errors.join("\n"));
+        }
+    }
 
     let tag = hcom_flags.tag;
     let terminal = hcom_flags.terminal;

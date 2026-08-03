@@ -454,6 +454,29 @@ fn removed_architect_forms_are_unknown_without_opening_v24_state() {
     }
 }
 
+#[test]
+fn misordered_architect_form_fails_before_opening_state() {
+    let h = Hcom::new();
+    let db_path = h.path().join("hcom.db");
+    assert!(!db_path.exists());
+
+    let (code, stdout, stderr) = h.run(["codex", "arch"]);
+    assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.is_empty(), "stdout={stdout}");
+    assert!(
+        stderr.contains("unexpected argument `arch` after `codex`"),
+        "stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("`hcom arch codex [architect-profile-options]`"),
+        "stderr={stderr}"
+    );
+    assert!(
+        !db_path.exists(),
+        "misordered Architect command must fail before initializing hcom state"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn architect_help_is_additive_and_does_not_open_v24_state() {

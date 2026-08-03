@@ -2191,6 +2191,18 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 /// Validate tool args (pure parsing, no mutation).
 pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<String> {
     match tool {
+        LaunchTool::Codex
+            if args
+                .first()
+                .is_some_and(|argument| argument.as_str() == "arch") =>
+        {
+            vec![
+                "unexpected argument `arch` after `codex`.\n\
+                 `arch` is a top-level hcom command; use \
+                 `hcom arch codex [architect-profile-options]` instead."
+                    .to_string(),
+            ]
+        }
         LaunchTool::Claude | LaunchTool::ClaudePty | LaunchTool::Codex => Vec::new(),
         LaunchTool::Gemini => {
             validate_rejected_args("Gemini", "hcom gemini", args, GEMINI_REJECTED_ARGS)
@@ -2430,6 +2442,28 @@ mod tests {
         let errors = validate_tool_args(&LaunchTool::Cursor, &["--print".to_string()]);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("not supported"));
+    }
+
+    #[test]
+    fn validate_codex_rejects_misordered_architect_invocation() {
+        let errors = validate_tool_args(
+            &LaunchTool::Codex,
+            &[
+                "arch".to_string(),
+                "--model".to_string(),
+                "gpt-test".to_string(),
+            ],
+        );
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("unexpected argument `arch` after `codex`"));
+        assert!(errors[0].contains("`hcom arch codex"));
+        assert!(
+            validate_tool_args(
+                &LaunchTool::Codex,
+                &["--model".to_string(), "gpt-test".to_string()]
+            )
+            .is_empty()
+        );
     }
 
     #[test]

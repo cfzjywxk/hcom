@@ -1086,6 +1086,12 @@ mod tests {
     }
 
     #[test]
+    fn codex_arch_stays_in_generic_launch_routing() {
+        let args = sv(&["codex", "arch"]);
+        assert_eq!(resolve_action(&args), Action::Launch { args: args.clone() });
+    }
+
+    #[test]
     fn removed_architect_command_routes_to_the_unknown_command_lane() {
         let args = sv(&["architect", "codex"]);
         assert_eq!(
