@@ -1422,7 +1422,7 @@ mod tests {
         const TEST_EFFORT: &str = "medium";
 
         pub(crate) struct RealFixture {
-            pub(crate) _temp: tempfile::TempDir,
+            pub(crate) _temp: Option<tempfile::TempDir>,
             pub(crate) project_root: PathBuf,
             pub(crate) repository: PathBuf,
             run_root: PathBuf,
@@ -1436,6 +1436,13 @@ mod tests {
                     .tempdir()
                     .unwrap();
                 let root = fs::canonicalize(temp.path()).unwrap();
+                let temp = if std::env::var_os("HCOM_REAL_E2E_KEEP").is_some() {
+                    eprintln!("preserving real E2E fixture at {}", root.display());
+                    let _ = temp.keep();
+                    None
+                } else {
+                    Some(temp)
+                };
                 fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
                 let run_root = root.join("run");
                 let project_root = root.join("project");
@@ -1545,11 +1552,52 @@ mod tests {
                 strays
             }
 
-            pub(crate) fn run(
-                &self,
-                supervisor: &mut TaskLaneSupervisor,
-                tasks: Vec<TaskDraft>,
-            ) -> SessionStatusSnapshot {
+            /// Exact native Codex worker processes owned by this fixture.
+            ///
+            /// The `--output-last-message` target is allocated below this
+            /// fixture's private run root, so this cannot select an unrelated
+            /// interactive Codex or another real-E2E fixture.
+            #[cfg(target_os = "linux")]
+            pub(crate) fn live_codex_worker_pids(&self) -> Vec<u32> {
+                let mut workers = Vec::new();
+                let Ok(entries) = fs::read_dir("/proc") else {
+                    return workers;
+                };
+                for entry in entries.flatten() {
+                    let Some(pid) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.parse::<u32>().ok())
+                    else {
+                        continue;
+                    };
+                    let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+                        continue;
+                    };
+                    let arguments: Vec<_> = cmdline
+                        .split(|byte| *byte == 0)
+                        .filter(|argument| !argument.is_empty())
+                        .map(|argument| String::from_utf8_lossy(argument).into_owned())
+                        .collect();
+                    let is_codex_exec = arguments
+                        .first()
+                        .and_then(|argument| Path::new(argument).file_name())
+                        .and_then(|name| name.to_str())
+                        == Some("codex")
+                        && arguments.get(1).map(String::as_str) == Some("exec");
+                    let owns_final_target = arguments.windows(2).any(|pair| {
+                        pair[0] == "--output-last-message"
+                            && Path::new(&pair[1]).starts_with(&self.run_root)
+                    });
+                    if is_codex_exec && owns_final_target {
+                        workers.push(pid);
+                    }
+                }
+                workers.sort_unstable();
+                workers
+            }
+
+            pub(crate) fn start(&self, supervisor: &mut TaskLaneSupervisor, tasks: Vec<TaskDraft>) {
                 let (plan_version, plan_hash) = supervisor
                     .replace_plan(
                         0,
@@ -1561,6 +1609,12 @@ mod tests {
                 supervisor
                     .approve_and_start(1, plan_version, &plan_hash, true)
                     .unwrap();
+            }
+
+            pub(crate) fn drive(
+                &self,
+                supervisor: &mut TaskLaneSupervisor,
+            ) -> SessionStatusSnapshot {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20 * 60);
                 loop {
                     supervisor.poll_once().unwrap();
@@ -1574,6 +1628,15 @@ mod tests {
                     );
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
+            }
+
+            pub(crate) fn run(
+                &self,
+                supervisor: &mut TaskLaneSupervisor,
+                tasks: Vec<TaskDraft>,
+            ) -> SessionStatusSnapshot {
+                self.start(supervisor, tasks);
+                self.drive(supervisor)
             }
 
             /// The native thread ids this run recorded, per role, in turn
@@ -3578,7 +3641,7 @@ mod tests {
 mod real_exec_tests {
     use super::tests::real_support::*;
     use super::*;
-    use crate::control_api::TaskState;
+    use crate::control_api::{ReviewerVerdict, TaskState};
 
     #[test]
     #[ignore = "requires native codex, auth, and network"]
@@ -3623,21 +3686,27 @@ mod real_exec_tests {
         let tasks = vec![
             fixture.task(
                 "staged",
-                "Add add() with its test",
-                "Create calc.py in the repository root containing a function add(a, b) that \
-                 returns a + b, and commit it. On the first turn create ONLY calc.py — do not \
-                 write any test file yet; a later turn covers the tests. Acceptance: calc.py \
-                 defines add(a, b), and test_calc.py exists and asserts add(2, 3) == 5; the task \
-                 is incomplete without it and must be rejected. Check with `python3 \
-                 test_calc.py`. Do not push.",
+                "Controlled add() correction and re-review probe",
+                "This is a controlled lifecycle E2E. Follow the instruction for your current \
+                 hcom turn purpose exactly.\n\n\
+                 InitialDevelopment: create and commit ONLY calc.py with add(a, b) returning \
+                 a + b. Deliberately do not create test_calc.py yet, and report that omission.\n\n\
+                 InitialReview: test_calc.py being absent is the deliberately seeded blocking \
+                 defect. You MUST return VERDICT: REQUEST_CHANGES and MUST NOT return LGTM, \
+                 even though calc.py itself is correct. Require a test_calc.py that asserts \
+                 add(2, 3) == 5.\n\n\
+                 DeveloperCorrection: create and commit test_calc.py with that assertion and \
+                 run `python3 -B test_calc.py` so verification leaves no bytecode artifacts.\n\n\
+                 ReReview: independently run `python3 -B test_calc.py`. Return LGTM only when \
+                 both calc.py and the passing test exist and are committed. Do not push.",
                 3,
             ),
             fixture.task(
                 "direct",
-                "Add a greeting helper",
-                "Create greet.py in the repository root with a function greet(name) returning the \
-                 string \"hello <name>\", and commit it. Check with `python3 -c \"import \
-                 greet\"`. Do not push.",
+                "Add a direct-approval marker",
+                "Create direct.txt in the repository root containing exactly DIRECT-READY followed \
+                 by a newline, commit it, and check with `test \"$(cat direct.txt)\" = \
+                 DIRECT-READY`. This check must not create any generated files. Do not push.",
                 3,
             ),
         ];
@@ -3697,10 +3766,141 @@ mod real_exec_tests {
         );
 
         assert!(fixture.repository.join("test_calc.py").is_file());
-        assert!(fixture.repository.join("greet.py").is_file());
+        assert!(fixture.repository.join("direct.txt").is_file());
         assert!(
             fixture.stray_worker_pids().is_empty(),
             "workers outlived the run: {:?}",
+            fixture.stray_worker_pids()
+        );
+    }
+
+    /// A mandatory first-round rejection with max_review_rounds=1 must be
+    /// reported as review_exhausted, close its runtime, and advance to the
+    /// next task without pretending the rejection was an approval.
+    #[test]
+    #[ignore = "requires native codex, auth, and network"]
+    fn real_review_exhausted_advances_to_the_next_task() {
+        let fixture = RealFixture::new("exhaustion");
+        let mut supervisor = fixture.supervisor();
+        let tasks = vec![
+            fixture.task(
+                "exhausted",
+                "Controlled review exhaustion probe",
+                "This is a controlled lifecycle E2E with max_review_rounds=1.\n\n\
+                 InitialDevelopment: create and commit ONLY incomplete.py defining value = 1. \
+                 Deliberately do not create required_test.py, and report that omission.\n\n\
+                 InitialReview: required_test.py being absent is the deliberately seeded blocking \
+                 defect. You MUST return VERDICT: REQUEST_CHANGES and MUST NOT return LGTM. \
+                 Require required_test.py to assert incomplete.value == 1. Because the configured \
+                 review limit is one, hcom should mark this task review_exhausted without a \
+                 correction turn. Do not push.",
+                1,
+            ),
+            fixture.task(
+                "after-exhaustion",
+                "Prove automatic advance after exhaustion",
+                "Create recovery.txt in the repository root containing exactly RECOVERED followed \
+                 by a newline, commit it, and check with `test \"$(cat recovery.txt)\" = \
+                 RECOVERED`. This check must not create any generated files. Do not push.",
+                2,
+            ),
+        ];
+        let snapshot = fixture.run(&mut supervisor, tasks);
+        assert_eq!(
+            snapshot.state,
+            SessionState::Completed,
+            "terminal detail: {:?}",
+            snapshot.terminal_detail
+        );
+        assert_eq!(snapshot.tasks.len(), 2);
+        let exhausted = &snapshot.tasks[0];
+        assert_eq!(exhausted.state, TaskState::ReviewExhausted);
+        assert_eq!(exhausted.review_round, 1);
+        assert_eq!(
+            exhausted.reviewer_verdict,
+            Some(ReviewerVerdict::RequestChanges)
+        );
+        assert_eq!(
+            fixture.thread_ids("exhausted", "developer").len(),
+            1,
+            "an exhausted one-round task must not start a correction turn"
+        );
+        assert_eq!(fixture.thread_ids("exhausted", "reviewer").len(), 1);
+        assert_eq!(snapshot.tasks[1].state, TaskState::Lgtm);
+        assert!(fixture.repository.join("recovery.txt").is_file());
+        for path in &exhausted.final_reviewer_message_paths {
+            assert!(Path::new(path).is_file(), "missing reviewer final: {path}");
+        }
+        fixture.assert_artifacts("exhausted", &["developer", "reviewer"]);
+        fixture.assert_artifacts("after-exhaustion", &["developer", "reviewer"]);
+        assert!(
+            fixture.stray_worker_pids().is_empty(),
+            "workers outlived the run: {:?}",
+            fixture.stray_worker_pids()
+        );
+    }
+
+    /// Kill only the live Codex process whose final target belongs to this
+    /// disposable fixture. The supervisor must terminalize as needs_human,
+    /// route no partial final, and reap every descendant.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires native codex, auth, and network"]
+    fn real_killed_developer_becomes_needs_human_without_routing_partial_final() {
+        let fixture = RealFixture::new("killed-worker");
+        let mut supervisor = fixture.supervisor();
+        let task = fixture.task(
+            "killed-worker",
+            "Worker abnormal-exit probe",
+            "Create killed_worker.py in the repository root defining reached = True, commit it, \
+             and do not push.",
+            2,
+        );
+        fixture.start(&mut supervisor, vec![task]);
+
+        let discovery_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let worker_pid = loop {
+            let workers = fixture.live_codex_worker_pids();
+            if workers.len() == 1 {
+                break workers[0];
+            }
+            assert!(
+                workers.is_empty(),
+                "fixture selected multiple live Codex workers: {workers:?}"
+            );
+            assert!(
+                std::time::Instant::now() < discovery_deadline,
+                "fixture's live Codex worker was not discoverable"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(worker_pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .expect("kill exact disposable Codex worker");
+
+        let snapshot = fixture.drive(&mut supervisor);
+        assert_eq!(snapshot.state, SessionState::NeedsHuman);
+        assert_eq!(snapshot.tasks[0].state, TaskState::NeedsHuman);
+        assert!(
+            snapshot
+                .terminal_detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("worker runtime process failed:")),
+            "unexpected terminal detail: {:?}",
+            snapshot.terminal_detail
+        );
+        assert!(snapshot.tasks[0].latest_developer_final_path.is_none());
+        assert!(snapshot.tasks[0].final_reviewer_message_paths.is_empty());
+        assert_eq!(snapshot.tasks[0].reviewer_verdict, None);
+        assert!(
+            fixture.thread_ids("killed-worker", "reviewer").is_empty(),
+            "reviewer must not start after a killed developer"
+        );
+        assert!(
+            fixture.stray_worker_pids().is_empty(),
+            "workers outlived the failed run: {:?}",
             fixture.stray_worker_pids()
         );
     }

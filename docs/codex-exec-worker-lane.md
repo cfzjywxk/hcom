@@ -218,15 +218,74 @@ group would hang the supervisor itself.
   to `gpt-5.3-codex-spark` with `medium` reasoning and verify native global
   plus project AGENTS.md loading as well as explicit external-repository
   instruction discovery.
-- **Real acceptance** (`cargo test --lib real_exec -- --ignored`) — four runs
+- **Real acceptance** (`cargo test --lib real_exec -- --ignored`) — six runs
   against the real binary on disposable projects: a single task, a Rust
-  hello-world, a two-task run, and **Gate 1**: one run whose first task goes
-  through a real REQUEST_CHANGES with an exact developer resume and an exact
-  reviewer re-review, whose second task is approved on its first review, and
-  whose four role sessions are all fresh. Every task must reach LGTM —
-  exhaustion is not success. Gate 1 reads the native thread ids back out of the
-  sealed stdout evidence rather than trusting the runtime's own bookkeeping. Every run also
-  asserts it left no stray worker processes behind.
+  hello-world, a two-task run, **Gate 1**, review exhaustion, and a Linux-only
+  abnormal worker exit. Gate 1 uses an explicit controlled lifecycle probe:
+  its first task must go through REQUEST_CHANGES with an exact developer resume
+  and exact reviewer re-review, its second task must be approved on the first
+  review, and all four role sessions must be fresh. The exhaustion run requires
+  a first-round rejection with `max_review_rounds=1`, proves no correction turn
+  starts, and proves the next task still runs. The abnormal-exit run SIGKILLs
+  only the Codex process whose `--output-last-message` target belongs to that
+  fixture, then requires `needs_human`, no routed partial final, no Reviewer,
+  and no surviving descendant. Gate 1 reads native thread ids back out of the
+  sealed stdout evidence rather than trusting the runtime's own bookkeeping.
+  Every run also asserts it left no stray worker processes behind.
+
+Set `HCOM_REAL_E2E_KEEP=1` to preserve each disposable fixture after the test
+for failure diagnosis. By default the fixtures are deleted. The controlled
+review tasks and side-effect-free checks are intentional: model-backed
+infrastructure tests must not depend on a Reviewer inferring an unstated staged
+contract, and their own verification commands must not dirty the checkout.
+
+### Reusable real-E2E entry points
+
+The real-model coverage is intentionally opt-in and split by cost and purpose:
+
+```bash
+# Native Codex CLI/config/session/path contract; ten disposable probes.
+SMOKE_MODEL=gpt-5.3-codex-spark \
+SMOKE_EFFORT=medium \
+SMOKE_TIMEOUT=280 \
+scripts/codex-exec-contract-smokes
+
+# Ordered tasks, mandatory correction, exact Developer/Reviewer resume,
+# cross-task fresh sessions, and direct approval of the second task.
+cargo test --lib \
+  real_gate_one_review_loop_then_direct_approval_in_one_run \
+  -- --ignored --nocapture --test-threads=1
+
+# Review exhaustion must remain distinct from LGTM and advance to the next task.
+cargo test --lib \
+  real_review_exhausted_advances_to_the_next_task \
+  -- --ignored --nocapture --test-threads=1
+
+# Linux only: kill the exact disposable Developer and verify needs_human.
+cargo test --lib \
+  real_killed_developer_becomes_needs_human_without_routing_partial_final \
+  -- --ignored --nocapture --test-threads=1
+```
+
+The Rust fixtures fix every real role to `gpt-5.3-codex-spark` with `medium`
+reasoning; they do not inherit the production role defaults. Run the expensive
+tests serially. Prefix a command with `HCOM_REAL_E2E_KEEP=1` only when retained
+artifacts are useful: it deliberately disables the fixture's automatic
+`TempDir` deletion and prints the retained root.
+
+Reusable support lives in `real_support` beside the task-lane tests. It
+provides disposable project/repository/run roots, `start` plus `drive` for
+failure injection between supervisor polls, sealed-native-stdout thread ID
+inspection, durable artifact assertions, and stray-worker checks. On Linux,
+the abnormal-exit helper selects a worker only when it is a `codex exec` whose
+`--output-last-message` path is below that fixture's private run root; it must
+never target a process by name alone.
+
+There is currently no aggregate `scripts/real-session-lane-e2e` wrapper. The
+named tests above are the durable entry points and let an operator run only the
+scenario whose model cost is justified. A future wrapper should remain
+explicitly opt-in, preserve the Spark/medium defaults and serial execution,
+report retained fixture paths, and summarize each scenario independently.
 
 ## Capability boundaries
 
