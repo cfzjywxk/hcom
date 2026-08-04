@@ -18,7 +18,7 @@ use super::profile::{
 use super::result::{
     CheckStatus, DeveloperDecision, DeveloperResult, MAX_RESULT_BYTES, ReviewerResult,
 };
-use super::sandbox::{HostRootAccess, HostRootContract, HostRootMounts};
+use super::sandbox::{HostRootContract, HostRootMounts};
 use super::validation::{MAX_PATH_BYTES, validate_git_oid, validate_text};
 use crate::control_api::{CapabilitySnapshot, NativeSessionMode, WorkerRole};
 use anyhow::{Context, Result, anyhow, bail};
@@ -1500,7 +1500,6 @@ impl WorkerSandbox {
             writable_roots: &writable_roots,
             read_only_files: &[&native.canonical_path],
             extra_writable_dirs: &extra_writable_dirs,
-            host_root_access: HostRootAccess::Hidden,
             masked_dirs: &[],
         })?;
         if argv.iter().any(|argument| {

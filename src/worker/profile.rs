@@ -9,7 +9,7 @@ pub const CLAUDE_DEVELOPER_ADAPTER: &str = "claude-developer-2.1.220";
 pub const CODEX_REVIEWER_ADAPTER: &str = "codex-reviewer";
 pub const CLAUDE_REVIEWER_ADAPTER: &str = "claude-reviewer-2.1.220";
 pub const CODEX_ARCHITECT_ADAPTER: &str = "codex";
-pub const CLAUDE_ARCHITECT_ADAPTER: &str = "claude-2.1.220";
+pub const CLAUDE_ARCHITECT_ADAPTER: &str = "claude";
 
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
 const DEFAULT_CLAUDE_DEVELOPER_MODEL: &str = "claude-opus-5";
@@ -411,6 +411,12 @@ impl SessionInvocationProfiles {
 
     pub fn reviewer_adapter_name(&self) -> &'static str {
         self.reviewer.adapter_name()
+    }
+
+    pub fn uses_claude(&self) -> bool {
+        self.architect.adapter() == ArchitectAdapter::Claude
+            || matches!(&self.developer, DeveloperInvocationProfile::Claude { .. })
+            || matches!(&self.reviewer, ReviewerInvocationProfile::Claude { .. })
     }
 
     pub fn canonical_hash(&self) -> String {

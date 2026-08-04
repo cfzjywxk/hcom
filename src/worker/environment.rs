@@ -8,6 +8,11 @@ use std::ffi::{OsStr, OsString};
 
 const MAX_POLICY_ENTRIES: usize = 64;
 const MAX_ENVIRONMENT_VALUE_BYTES: usize = 16 * 1024;
+pub const CLAUDE_PROXY_VALUE: &str = "http://127.0.0.1:7890";
+pub const CLAUDE_ADDITIONAL_DIRECTORIES_INSTRUCTIONS: &str =
+    "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD";
+pub const CLAUDE_DISABLE_BACKGROUND_TASKS: &str = "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS";
+const CLAUDE_PROXY_NAMES: [&str; 4] = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"];
 // Substring redaction cannot safely treat low-entropy operational atoms such
 // as "1" or "false" as secrets: doing so corrupts otherwise valid structured
 // worker output (for example `task1.txt`) and makes every ordinary occurrence
@@ -20,10 +25,8 @@ pub struct ParentEnvironment {
 }
 
 impl ParentEnvironment {
-    pub fn capture_current() -> Self {
-        Self {
-            values: std::env::vars_os().collect(),
-        }
+    pub fn capture_current() -> Result<Self> {
+        Self::from_raw_entries(std::env::vars_os())
     }
 
     pub fn from_unicode(values: BTreeMap<String, String>) -> Self {
@@ -36,10 +39,8 @@ impl ParentEnvironment {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_os(values: Vec<(OsString, OsString)>) -> Self {
-        Self {
-            values: values.into_iter().collect(),
-        }
+    pub(crate) fn from_os(values: Vec<(OsString, OsString)>) -> Result<Self> {
+        Self::from_raw_entries(values)
     }
 
     pub fn unicode(&self, name: &str) -> Result<Option<&str>> {
@@ -57,10 +58,39 @@ impl ParentEnvironment {
         &self.values
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
-        self.values
-            .iter()
-            .map(|(name, value)| (name.as_os_str(), value.as_os_str()))
+    pub fn materialize_claude(&self) -> Result<MaterializedWorkerEnvironment> {
+        validate_claude_proxy_values(&self.values)?;
+        let mut values = self.values.clone();
+        for name in [
+            CLAUDE_ADDITIONAL_DIRECTORIES_INSTRUCTIONS,
+            CLAUDE_DISABLE_BACKGROUND_TASKS,
+        ] {
+            match values.get(OsStr::new(name)) {
+                Some(value) if value == OsStr::new("1") => {}
+                Some(_) => {
+                    bail!(
+                        "parent environment conflicts with required Claude policy variable {name}"
+                    )
+                }
+                None => {
+                    values.insert(name.into(), "1".into());
+                }
+            }
+        }
+        Ok(MaterializedWorkerEnvironment { values })
+    }
+
+    fn from_raw_entries(entries: impl IntoIterator<Item = (OsString, OsString)>) -> Result<Self> {
+        let mut values = BTreeMap::new();
+        for (name, value) in entries {
+            if values.insert(name.clone(), value).is_some() {
+                bail!(
+                    "parent environment contains duplicate name {}",
+                    environment_name_descriptor(&name)
+                );
+            }
+        }
+        Ok(Self { values })
     }
 }
 
@@ -337,10 +367,33 @@ impl MaterializedWorkerEnvironment {
         Ok(())
     }
 
+    pub fn validate_claude_proxy(&self) -> Result<()> {
+        validate_claude_proxy_values(&self.values)
+    }
+
     #[cfg(test)]
     pub(crate) fn get(&self, name: &OsStr) -> Option<&OsStr> {
         self.values.get(name).map(OsString::as_os_str)
     }
+}
+
+pub fn validate_claude_proxy_environment(environment: &ParentEnvironment) -> Result<()> {
+    validate_claude_proxy_values(environment.values())
+}
+
+fn validate_claude_proxy_values(values: &BTreeMap<OsString, OsString>) -> Result<()> {
+    for name in CLAUDE_PROXY_NAMES {
+        let Some(value) = values.get(OsStr::new(name)) else {
+            bail!("Claude proxy environment variable {name} is missing");
+        };
+        let Some(value) = value.to_str() else {
+            bail!("Claude proxy environment variable {name} is not valid UTF-8");
+        };
+        if value != CLAUDE_PROXY_VALUE {
+            bail!("Claude proxy environment variable {name} does not match the required value");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1129,6 +1182,121 @@ mod tests {
         );
     }
 
+    fn exact_claude_proxy_parent() -> ParentEnvironment {
+        ParentEnvironment::from_unicode(BTreeMap::from([
+            ("HTTP_PROXY".into(), CLAUDE_PROXY_VALUE.into()),
+            ("HTTPS_PROXY".into(), CLAUDE_PROXY_VALUE.into()),
+            ("http_proxy".into(), CLAUDE_PROXY_VALUE.into()),
+            ("https_proxy".into(), CLAUDE_PROXY_VALUE.into()),
+        ]))
+    }
+
+    #[test]
+    fn raw_parent_capture_rejects_duplicate_names_before_canonicalization() {
+        let error = ParentEnvironment::from_os(vec![
+            (
+                OsString::from("HTTP_PROXY"),
+                OsString::from(CLAUDE_PROXY_VALUE),
+            ),
+            (
+                OsString::from("HTTP_PROXY"),
+                OsString::from("must-not-appear"),
+            ),
+        ])
+        .err()
+        .expect("duplicate raw name must fail");
+        let detail = error.to_string();
+        assert!(detail.contains("duplicate name"));
+        assert!(detail.contains("HTTP_PROXY"));
+        assert!(!detail.contains(CLAUDE_PROXY_VALUE));
+        assert!(!detail.contains("must-not-appear"));
+    }
+
+    #[test]
+    fn claude_proxy_gate_rejects_missing_mismatch_and_non_utf8_without_echoing_values() {
+        let mut missing = exact_claude_proxy_parent().values;
+        missing.remove(OsStr::new("http_proxy"));
+        let error = validate_claude_proxy_values(&missing)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("http_proxy"));
+        assert!(error.contains("missing"));
+
+        let mut mismatch = exact_claude_proxy_parent().values;
+        mismatch.insert("HTTPS_PROXY".into(), "unexpected-secret-value".into());
+        let error = validate_claude_proxy_values(&mismatch)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("HTTPS_PROXY"));
+        assert!(error.contains("required value"));
+        assert!(!error.contains("unexpected-secret-value"));
+
+        use std::os::unix::ffi::OsStringExt;
+        let mut non_utf8 = exact_claude_proxy_parent().values;
+        non_utf8.insert(
+            "https_proxy".into(),
+            OsString::from_vec(b"http://127.0.0.1:7890\xff".to_vec()),
+        );
+        let error = validate_claude_proxy_values(&non_utf8)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("https_proxy"));
+        assert!(error.contains("UTF-8"));
+    }
+
+    #[test]
+    fn claude_environment_adds_only_explicit_pins_and_rejects_conflicts() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let mut values = exact_claude_proxy_parent().values;
+        values.insert("HCOM_DIR".into(), "/parent/hcom-state".into());
+        values.insert("CLAUDE_CONFIG_DIR".into(), "/parent/claude-config".into());
+        values.insert(
+            OsString::from_vec(b"RAW_\xff_NAME".to_vec()),
+            OsString::from_vec(b"value-\xfe".to_vec()),
+        );
+        let parent = ParentEnvironment { values };
+        let parent_count = parent.values.len();
+        let materialized = parent.materialize_claude().unwrap();
+        assert_eq!(materialized.values.len(), parent_count + 2);
+        assert_eq!(
+            materialized.get(OsStr::new("HCOM_DIR")),
+            Some(OsStr::new("/parent/hcom-state"))
+        );
+        assert_eq!(
+            materialized.get(OsStr::new("CLAUDE_CONFIG_DIR")),
+            Some(OsStr::new("/parent/claude-config"))
+        );
+        assert_eq!(
+            materialized
+                .get(&OsString::from_vec(b"RAW_\xff_NAME".to_vec()))
+                .unwrap()
+                .as_bytes(),
+            b"value-\xfe"
+        );
+        assert_eq!(
+            materialized.get(OsStr::new(CLAUDE_ADDITIONAL_DIRECTORIES_INSTRUCTIONS)),
+            Some(OsStr::new("1"))
+        );
+        assert_eq!(
+            materialized.get(OsStr::new(CLAUDE_DISABLE_BACKGROUND_TASKS)),
+            Some(OsStr::new("1"))
+        );
+        materialized.validate_claude_proxy().unwrap();
+
+        let mut values = exact_claude_proxy_parent().values;
+        values.insert(
+            CLAUDE_DISABLE_BACKGROUND_TASKS.into(),
+            "conflicting-value".into(),
+        );
+        let error = ParentEnvironment { values }
+            .materialize_claude()
+            .err()
+            .expect("conflicting Claude pin must fail")
+            .to_string();
+        assert!(error.contains(CLAUDE_DISABLE_BACKGROUND_TASKS));
+        assert!(!error.contains("conflicting-value"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn complete_parent_environment_preserves_non_utf8_name_and_value_bytes() {
@@ -1139,7 +1307,8 @@ mod tests {
         let parent = ParentEnvironment::from_os(vec![
             (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
             (raw_name.clone(), raw_value.clone()),
-        ]);
+        ])
+        .unwrap();
         let lease = ExecutionEnvironmentLease::capture_complete(
             "lease-non-utf8",
             "epoch-1",

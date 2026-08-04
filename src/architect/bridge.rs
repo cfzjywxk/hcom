@@ -16,7 +16,7 @@ use crate::control_api::supervisor::ControlPaths;
 use crate::control_api::{CallerAuth, ControlAction, ControlRequest, ControlResponse};
 use crate::worker::ExecutableIdentity;
 use crate::worker::profile::{
-    CLAUDE_DEVELOPER_ADAPTER, CLAUDE_REVIEWER_ADAPTER, CODEX_DEVELOPER_ADAPTER,
+    ArchitectAdapter, CLAUDE_DEVELOPER_ADAPTER, CLAUDE_REVIEWER_ADAPTER, CODEX_DEVELOPER_ADAPTER,
     CODEX_REVIEWER_ADAPTER,
 };
 use crate::worker::runtime::CODEX_TASK_WORKER_ADAPTER;
@@ -25,6 +25,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
@@ -67,6 +68,8 @@ pub(super) struct BridgeConfiguration {
     pub control_socket_path: PathBuf,
     pub relay_executable: ExecutableIdentity,
     pub relay_runtime_scope_hash: String,
+    pub architect_adapter: String,
+    pub architect_additional_directories: Vec<PathBuf>,
     pub developer_adapter: String,
     pub reviewer_adapter: String,
 }
@@ -243,6 +246,22 @@ fn validate_bridge_configuration(configuration: &BridgeConfiguration) -> Result<
         bail!("architect relay runtime scope drifted before bridge start");
     }
     configuration.relay_executable.revalidate()?;
+    let architect_adapter = ArchitectAdapter::parse(&configuration.architect_adapter)?;
+    if architect_adapter == ArchitectAdapter::Codex
+        && !configuration.architect_additional_directories.is_empty()
+    {
+        bail!("Codex Architect bridge binding cannot carry Claude --add-dir roots");
+    }
+    if configuration.architect_additional_directories.len() > 64 {
+        bail!("architect bridge binding contains too many --add-dir roots");
+    }
+    let mut previous = BTreeSet::new();
+    for directory in &configuration.architect_additional_directories {
+        validate_canonical_directory("Claude Architect --add-dir", directory, None)?;
+        if !previous.insert(directory) {
+            bail!("architect bridge binding contains duplicate --add-dir roots");
+        }
+    }
     validate_worker_adapter_binding(
         &configuration.developer_adapter,
         &configuration.reviewer_adapter,
@@ -939,6 +958,8 @@ mod tests {
                     control_socket_path: root.join("control.sock"),
                     relay_executable: executable,
                     relay_runtime_scope_hash: relay_runtime_scope_hash(&root).unwrap(),
+                    architect_adapter: "codex".into(),
+                    architect_additional_directories: Vec::new(),
                     developer_adapter: "codex-developer".into(),
                     reviewer_adapter: "claude-reviewer-2.1.220".into(),
                 },
@@ -1072,6 +1093,8 @@ mod tests {
             control_socket_path: root.join("control.sock"),
             relay_executable: executable,
             relay_runtime_scope_hash: "unused-by-authorization".into(),
+            architect_adapter: "codex".into(),
+            architect_additional_directories: Vec::new(),
             developer_adapter: "codex-developer".into(),
             reviewer_adapter: "claude-reviewer-2.1.220".into(),
         };
@@ -1827,6 +1850,8 @@ mod tests {
             control_socket_path: run_root.join("control.sock"),
             relay_executable: executable,
             relay_runtime_scope_hash: relay_runtime_scope_hash(&relay_root).unwrap(),
+            architect_adapter: "codex".into(),
+            architect_additional_directories: Vec::new(),
             developer_adapter: "codex-developer".into(),
             reviewer_adapter: "claude-reviewer-2.1.220".into(),
         };
@@ -1840,5 +1865,21 @@ mod tests {
         let mut drifted = configuration.clone();
         drifted.control_socket_path = root.join("other.sock");
         assert!(validate_bridge_configuration(&drifted).is_err());
+
+        let external = root.join("external");
+        fs::create_dir(&external).unwrap();
+        let mut claude = configuration.clone();
+        claude.architect_adapter = "claude".into();
+        claude.architect_additional_directories = vec![external.clone()];
+        validate_bridge_configuration(&claude).unwrap();
+
+        let mut duplicate = claude.clone();
+        duplicate.architect_additional_directories.push(external);
+        assert!(validate_bridge_configuration(&duplicate).is_err());
+
+        let mut codex_with_claude_root = configuration;
+        codex_with_claude_root.architect_additional_directories =
+            duplicate.architect_additional_directories;
+        assert!(validate_bridge_configuration(&codex_with_claude_root).is_err());
     }
 }

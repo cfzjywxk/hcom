@@ -18,7 +18,7 @@ starting another run does not revive or modify it.
 cd /path/to/project
 hcom arch codex
 # or
-hcom arch claude
+hcom arch claude [--add-dir /absolute/external/repository]...
 ```
 
 The current directory is the project context. It must be an existing canonical
@@ -42,51 +42,67 @@ Both public entrypoints currently use the same native Codex exec worker lane:
 Configuring a Claude Developer or Reviewer fails before the Architect starts.
 Claude worker support is not part of this lane.
 
-## Native Codex projection
+## Native Architect projection
 
-The Codex Architect and workers behave like directly launched native Codex
-sessions:
+The foreground Architect and Codex workers behave like directly launched
+native CLI sessions:
 
 - complete parent OS environment;
-- real HOME and CODEX_HOME;
+- real HOME and native config directory;
 - native config.toml, auth, trust and custom model providers;
-- global and project AGENTS.md;
+- global and project instruction files;
 - rules, hooks, skills, plugins, apps, MCP servers and feature flags;
 - ordinary host filesystem view;
 - native caches and session history.
 
-hcom does not write a Codex config, preselect project trust, clear MCP servers,
-ignore user config/rules, disable features, or create a private HOME,
-CODEX_HOME, TMPDIR, XDG, Cargo or Rustup tree.
+hcom does not write a native config, preselect project trust, clear MCP servers,
+ignore user config/rules, or create a private HOME, CODEX_HOME,
+CLAUDE_CONFIG_DIR, TMPDIR, XDG, Cargo or Rustup tree. It selects bare `codex`
+or `claude` from inherited `PATH` without executable, version, or help pinning.
 
 The intentional exceptions are small:
 
 - Codex Architect/Developer/Reviewer built-in model and effort are passed
   explicitly as `gpt-5.6-sol` and `xhigh`, so those two defaults do not come
   from native config;
-- typed sandbox and approval values are explicit;
-- the Architect receives one exact hcom task-control MCP table in addition to
-  native MCP servers;
-- every Architect and worker parent environment variable, including
+- Claude Architect built-in model and effort are passed explicitly as `opus`
+  and `xhigh`;
+- typed sandbox/approval or Claude permission values are explicit;
+- the Architect receives one additive hcom task-control MCP binding in addition
+  to native MCP servers;
+- every Codex Architect and worker parent environment variable, including
   `HCOM_DIR`, is preserved byte-for-byte; hcom adds or replaces none;
+- Claude additionally requires exact inherited `http_proxy`, `https_proxy`,
+  `HTTP_PROXY`, and `HTTPS_PROXY` values of `http://127.0.0.1:7890`, and adds
+  only `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` and
+  `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`; every other parent entry is
+  preserved and conflicting pin values fail closed;
 - workers start from the complete parent environment; native Codex
   `shell_environment_policy` controls what model-started tool commands receive.
 
-The Codex Architect is a direct child process launched as the bare program name
-`codex`. There is no bubblewrap, mount/user/PID namespace, launch gate, private
-environment reconstruction, or Codex HOME/auth/session-store preflight. hcom
-records the spawned PID for its task-control relay and uses parent-death
-lifecycle handling; neither changes the child's host capabilities.
-
-The Claude foreground Architect retains its existing adapter-specific
-containment. This Codex-native change does not add Claude worker support or
-change Claude worker semantics.
+The Codex Architect is a direct child process. The Claude Architect is launched
+through the Linux descendant Guardian in `ForegroundArchitect` mode while
+retaining the same terminal fds and human input ownership. There is no
+bubblewrap, mount/user/PID namespace, private environment reconstruction, or
+HOME/auth/session-store preflight. hcom records the native PID for its
+task-control relay; neither relay nor lifecycle ownership changes the native
+process's host capabilities. Claude task workers remain unsupported in this
+implementation phase.
 
 ## Project and source instructions
 
 The primary project is the Codex cwd, so native global/project instruction
 discovery applies normally. When `repository_root` differs, hcom passes
 `--add-dir <repository_root>` to both Developer and Reviewer.
+
+For a Claude Architect, external task repositories must be declared before
+launch with repeatable `hcom arch claude --add-dir <canonical-absolute-root>`.
+The ordered roots are frozen into the session and bridge binding and shown in
+the startup summary. A later typed plan may use a project-local repository or
+an exact declared external root; any other external root is rejected before
+plan approval. This is an instruction-loading contract, not a filesystem
+allowlist, and hcom neither infers roots from task documents nor restarts the
+Architect.
 
 A secondary `--add-dir` root is not the primary Codex instruction-discovery
 chain. Therefore every task prompt explicitly tells both roles to inspect and

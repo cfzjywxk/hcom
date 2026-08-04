@@ -11,6 +11,7 @@ use nix::unistd::dup;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -82,6 +83,80 @@ fn wait_pid_file(path: &std::path::Path) -> (u32, u64) {
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn exact_proxy_environment(command: &mut GuardedCommand) {
+    for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+        command.env(name, "http://127.0.0.1:7890");
+    }
+}
+
+fn assert_guardian_rejects_before_native_spawn(
+    mut command: GuardedCommand,
+    marker: &std::path::Path,
+) {
+    match command.spawn() {
+        Err(GuardianSpawnFailure::Reaped(_)) | Err(GuardianSpawnFailure::OwnershipLost(_)) => {}
+        Err(GuardianSpawnFailure::CleanupPending { mut handle, .. }) => {
+            let _ = handle.terminate_and_reap(
+                GuardianCleanupReason::ProtocolFailure,
+                Duration::from_secs(3),
+            );
+        }
+        Ok(mut handle) => {
+            let _ = handle.terminate_and_reap(
+                GuardianCleanupReason::ProtocolFailure,
+                Duration::from_secs(3),
+            );
+            panic!("Guardian accepted an invalid Claude proxy environment");
+        }
+    }
+    assert!(
+        !marker.exists(),
+        "fake native executable ran before the proxy gate"
+    );
+}
+
+#[test]
+fn guardian_revalidates_exact_claude_proxy_environment_before_native_spawn() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("spawned");
+    let script = executable(
+        &root,
+        "proxy-gated-native",
+        &format!("printf spawned > {}", marker.display()),
+    );
+
+    let mut positive = guarded(&script);
+    positive.env_clear().require_claude_proxy();
+    exact_proxy_environment(&mut positive);
+    let mut handle = positive.spawn().unwrap();
+    let completion = wait_completion(&mut handle);
+    assert_eq!(completion.disposition, GuardianCleanupDisposition::Clean);
+    assert!(marker.exists());
+    fs::remove_file(&marker).unwrap();
+
+    let mut missing = guarded(&script);
+    missing.env_clear().require_claude_proxy();
+    for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy"] {
+        missing.env(name, "http://127.0.0.1:7890");
+    }
+    assert_guardian_rejects_before_native_spawn(missing, &marker);
+
+    let mut mismatch = guarded(&script);
+    mismatch.env_clear().require_claude_proxy();
+    exact_proxy_environment(&mut mismatch);
+    mismatch.env("HTTPS_PROXY", "unexpected-value");
+    assert_guardian_rejects_before_native_spawn(mismatch, &marker);
+
+    let mut non_utf8 = guarded(script);
+    non_utf8.env_clear().require_claude_proxy();
+    exact_proxy_environment(&mut non_utf8);
+    non_utf8.env(
+        "https_proxy",
+        std::ffi::OsString::from_vec(b"http://127.0.0.1:7890\xff".to_vec()),
+    );
+    assert_guardian_rejects_before_native_spawn(non_utf8, &marker);
 }
 
 #[test]
@@ -403,7 +478,13 @@ fn guardian_capability_failure_occurs_before_native_spawn() {
         .arg("__hcom_internal_claude_guardian_v1")
         .args(["--control-fd", &control_fd.to_string()])
         .args(["--expected-parent", &std::process::id().to_string()])
-        .args(["--mode", "headless", "--"])
+        .args([
+            "--mode",
+            "headless",
+            "--environment-policy",
+            "inherit",
+            "--",
+        ])
         .arg(native)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

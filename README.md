@@ -100,10 +100,10 @@ hcom arch codex
 The Codex Architect, Developer, and Reviewer all default to `gpt-5.6-sol`
 with `xhigh` reasoning, `danger-full-access`, and approval policy `never`.
 These values are explicit and therefore do not inherit model/effort defaults
-from native Codex config. `hcom arch claude` keeps a Claude `opus`/`xhigh`
-foreground Architect but uses the same Codex worker defaults. The
-capability-bound session-control MCP server is added as one hcom-owned config
-leaf, so all other native MCP servers remain available. A human request that
+from native Codex config. `hcom arch claude` uses a native Claude `opus`/`xhigh`
+foreground Architect and the same Codex worker defaults. The capability-bound
+session-control MCP server is additive, so all other native MCP servers remain
+available. A human request that
 explicitly says to follow or execute a named existing detailed plan,
 specification, or `current_todo` authorizes the Architect to derive the typed
 plan and start it in the same turn. So does a request to plan or define the
@@ -121,11 +121,19 @@ an OS-level human keystroke.
 The Codex Architect and workers use the launching terminal's real
 HOME/CODEX_HOME and native Codex config, authentication, trust, AGENTS.md,
 rules, hooks, skills, plugins, MCP servers, feature flags, custom providers,
-caches, and session history. hcom neither generates a Codex config nor passes
-the old `--ignore-user-config`/`--ignore-rules`/feature-disable shape.
-Architect session identity remains exact in the shared native store: hcom
-snapshots pre-launch rollout identities and binds only the new matching
-session.
+caches, and session history. The Claude Architect likewise uses the real
+HOME/CLAUDE_CONFIG_DIR and native settings, authentication, instructions,
+hooks, skills, MCP servers, provider, and managed policy. Both foreground
+Architects are selected as bare programs from inherited `PATH`; hcom does not
+pin their executable, version, or help output, and does not inspect or freeze
+their native session stores.
+
+Claude launch additionally requires all four inherited `http_proxy`,
+`https_proxy`, `HTTP_PROXY`, and `HTTPS_PROXY` entries to equal
+`http://127.0.0.1:7890`. It adds only
+`CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` and
+`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`, then runs the native process through
+the descendant Guardian. Conflicting pin values fail closed.
 
 The exact current directory is the Architect's project context and does not
 need to be a Git repository. The Architect can read and write project plans,
@@ -147,15 +155,15 @@ profile schema, parent-terminal inheritance, and exact-session invariants.
 The Architect and every session task worker inherit the complete environment
 of the process that started `hcom arch`, captured once without a name
 allowlist. Arbitrary and secret-shaped names, upper/lower-case pairs, empty
-values, and non-UTF-8 OS strings are preserved. For Codex workers hcom replaces
-only private `HCOM_DIR` and its own run/task/role identity; HOME, CODEX_HOME,
-TMPDIR, XDG, Cargo/Rustup, proxies, and authentication stay native. Ordinary
-hcom work terminals likewise inherit the parent OS environment directly, then
-replace hcom-owned and new-terminal identity. Hcom neither enumerates nor
-persists the complete environment as a name/value inventory. Artifact
-containment is intentionally narrower than inheritance: it redacts values
-carried by secret-shaped names, URI userinfo, and adapter-declared secrets
-without hiding ordinary PWD, PATH, shell, or locale evidence.
+values, and non-UTF-8 OS strings are preserved. Codex receives that environment
+without hcom additions or replacements, including the original `HCOM_DIR`.
+Claude receives the same environment plus the two explicit pins above.
+Ordinary hcom work terminals likewise inherit the parent OS environment
+directly, then replace hcom-owned and new-terminal identity. Hcom neither
+enumerates nor persists the complete environment as a name/value inventory.
+Artifact containment is intentionally narrower than inheritance: it redacts
+values carried by secret-shaped names, URI userinfo, and adapter-declared
+secrets without hiding ordinary PWD, PATH, shell, or locale evidence.
 
 Inherited marker-shaped values such as `HCOM_AGENT` do not grant hcom control
 authority: workers receive no control socket or interactive TTY, and private

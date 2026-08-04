@@ -1056,7 +1056,8 @@ mod tests {
                 OsString::from("wrong-parent-role"),
             ),
             (raw_name, raw_value),
-        ]);
+        ])
+        .unwrap();
         let environment = ExecutionEnvironmentLease::capture_complete(
             "lease-complete-parent",
             "epoch-1",

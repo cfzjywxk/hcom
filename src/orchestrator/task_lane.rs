@@ -16,6 +16,7 @@ use crate::worker::exec_runtime::{
     ExecRuntimeConfig, ExecTaskPaths, ExecTaskWorkerRuntime, codex_exec_contract_identity,
 };
 use crate::worker::guardian::{CleanupRegistryInterlock, GuardianCleanupRegistry};
+use crate::worker::profile::ArchitectAdapter;
 use crate::worker::runtime::{
     CODEX_TASK_WORKER_ADAPTER, OutcomeContract, RoleSessionSpec, RuntimeContractIdentity,
     RuntimeError, RuntimeErrorCode, RuntimeFailureClass, RuntimeProfile, RuntimeSessionKey,
@@ -224,10 +225,11 @@ impl TaskLaneSupervisor {
         let contract = factory.contract();
         contract.validate().map_err(|error| anyhow!(error.detail))?;
         let profile_hash = sha256_hex(&serde_json::to_vec(&(
-            "hcom-codex-exec-session-binding-v1",
+            "hcom-codex-exec-session-binding-v2",
             session_profiles.canonical_hash(),
             profiles.canonical_hash(),
             contract.canonical_hash(),
+            &sources.architect_additional_directories,
         ))?);
         let startup = SessionStartup {
             run_id: run_id.clone(),
@@ -333,6 +335,37 @@ impl TaskLaneSupervisor {
                     task.task_key,
                     root.display()
                 );
+            }
+            if self
+                .sources
+                .profiles
+                .as_ref()
+                .is_some_and(|profiles| profiles.architect.adapter() == ArchitectAdapter::Claude)
+            {
+                let canonical = fs::canonicalize(&root).with_context(|| {
+                    format!(
+                        "failed to canonicalize task {} repository_root",
+                        task.task_key
+                    )
+                })?;
+                if canonical != root {
+                    bail!(
+                        "task {} repository_root must be canonical for a Claude Architect session",
+                        task.task_key
+                    );
+                }
+                if !root.starts_with(&self.startup.project_root)
+                    && !self
+                        .sources
+                        .architect_additional_directories
+                        .contains(&root)
+                {
+                    bail!(
+                        "task {} uses external repository_root {} that the Claude Architect did not predeclare with --add-dir",
+                        task.task_key,
+                        root.display()
+                    );
+                }
             }
         }
         let plan_version = self
@@ -1742,7 +1775,8 @@ mod tests {
                     OsString::from("XDG_CACHE_HOME"),
                     OsString::from("/native/xdg-cache"),
                 ),
-            ]);
+            ])
+            .unwrap();
             Self {
                 _temp: temp,
                 run_root,
@@ -1875,7 +1909,7 @@ mod tests {
                 let mut sources = SessionRuntimeSources::fake(Path::new(&home));
                 sources.set_profiles_for_test(profiles);
                 // Complete parent inheritance, exactly like production.
-                sources.parent_environment = ParentEnvironment::capture_current();
+                sources.parent_environment = ParentEnvironment::capture_current().unwrap();
 
                 Self {
                     _temp: temp,
@@ -4116,6 +4150,58 @@ mod tests {
                 .is_err()
         );
         assert_eq!(supervisor.snapshot().state, SessionState::AwaitingPlan);
+    }
+
+    #[test]
+    fn claude_architect_requires_external_repository_roots_to_be_predeclared() {
+        let mut fixture = Fixture::new();
+        fixture.sources.profiles =
+            Some(SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Claude).unwrap());
+        let task = fixture.task("external-root", &["src"], 2);
+
+        let mut rejected = fixture.supervisor(Vec::new(), Arc::new(Mutex::new(Audit::default())));
+        let error = rejected
+            .replace_plan(
+                0,
+                CODEX_TASK_WORKER_ADAPTER,
+                CODEX_TASK_WORKER_ADAPTER,
+                vec![task.clone()],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--add-dir"));
+        assert_eq!(rejected.snapshot().state, SessionState::AwaitingPlan);
+
+        fixture
+            .sources
+            .architect_additional_directories
+            .push(fixture.repository.clone());
+        let mut accepted = fixture.supervisor(Vec::new(), Arc::new(Mutex::new(Audit::default())));
+        accepted
+            .replace_plan(
+                0,
+                CODEX_TASK_WORKER_ADAPTER,
+                CODEX_TASK_WORKER_ADAPTER,
+                vec![task],
+            )
+            .unwrap();
+        assert_eq!(accepted.snapshot().state, SessionState::AwaitingApproval);
+
+        let project_local = fixture.project_root.join("local-repository");
+        fs::create_dir(&project_local).unwrap();
+        fixture.sources.architect_additional_directories.clear();
+        let mut local_task = fixture.task("project-local", &["src"], 2);
+        local_task.repository_root = project_local.to_string_lossy().into_owned();
+        let mut local = fixture.supervisor(Vec::new(), Arc::new(Mutex::new(Audit::default())));
+        local
+            .replace_plan(
+                0,
+                CODEX_TASK_WORKER_ADAPTER,
+                CODEX_TASK_WORKER_ADAPTER,
+                vec![local_task],
+            )
+            .unwrap();
+        assert_eq!(local.snapshot().state, SessionState::AwaitingApproval);
     }
 
     #[test]

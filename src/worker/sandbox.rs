@@ -83,14 +83,7 @@ pub(crate) struct HostRootMounts<'a> {
     pub(crate) writable_roots: &'a [&'a Path],
     pub(crate) read_only_files: &'a [&'a Path],
     pub(crate) extra_writable_dirs: &'a [&'a Path],
-    pub(crate) host_root_access: HostRootAccess,
     pub(crate) masked_dirs: &'a [&'a Path],
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HostRootAccess {
-    Hidden,
-    ReadWrite,
 }
 
 impl HostRootContract {
@@ -181,92 +174,6 @@ impl HostRootContract {
         .into_iter()
         .chain(mounts.extra_writable_dirs.iter().copied())
         .collect();
-
-        if let HostRootAccess::ReadWrite = mounts.host_root_access {
-            let mut argv = vec![
-                "--die-with-parent".into(),
-                "--unshare-pid".into(),
-                "--unshare-ipc".into(),
-                "--unshare-uts".into(),
-                "--bind".into(),
-                "/".into(),
-                "/".into(),
-                "--proc".into(),
-                "/proc".into(),
-                "--dev".into(),
-                "/dev".into(),
-                "--tmpfs".into(),
-                "/dev/shm".into(),
-            ];
-            for directory in mounts.masked_dirs {
-                argv.extend(["--tmpfs".into(), text("masked directory", directory)?]);
-            }
-            let mut directory_targets = BTreeSet::new();
-            for target in mounts
-                .readable_roots
-                .iter()
-                .copied()
-                .chain(mounts.writable_roots.iter().copied())
-                .chain(private_writable_dirs.iter().copied())
-            {
-                collect_directory_chain(target, true, &mut directory_targets)?;
-            }
-            for target in mounts
-                .read_only_files
-                .iter()
-                .copied()
-                .chain([mounts.auth_target])
-            {
-                collect_directory_chain(target, false, &mut directory_targets)?;
-            }
-            for directory in directory_targets {
-                if mounts
-                    .masked_dirs
-                    .iter()
-                    .any(|masked| directory != **masked && directory.starts_with(masked))
-                {
-                    argv.extend(["--dir".into(), text("private mount target", &directory)?]);
-                }
-            }
-            for directory in mounts.writable_roots {
-                argv.extend([
-                    "--bind".into(),
-                    text("writable root", directory)?,
-                    text("writable root", directory)?,
-                ]);
-            }
-            for directory in &private_writable_dirs {
-                argv.extend([
-                    "--bind".into(),
-                    text("private writable directory", directory)?,
-                    text("private writable directory", directory)?,
-                ]);
-            }
-            // Persistent control/config roots must win over a writable project
-            // parent (for example project_root == $HOME).
-            for directory in mounts.readable_roots {
-                argv.extend([
-                    "--ro-bind".into(),
-                    text("readable root", directory)?,
-                    text("readable root", directory)?,
-                ]);
-            }
-            for file in mounts.read_only_files {
-                argv.extend([
-                    "--ro-bind".into(),
-                    text("read-only file", file)?,
-                    text("read-only file", file)?,
-                ]);
-            }
-            argv.extend([
-                "--ro-bind".into(),
-                text("native auth source", mounts.auth_source)?,
-                text("native auth target", mounts.auth_target)?,
-                "--chdir".into(),
-                text("launch cwd", mounts.launch_cwd)?,
-            ]);
-            return Ok(argv);
-        }
 
         let mut argv = vec![
             "--die-with-parent".into(),

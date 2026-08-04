@@ -413,13 +413,13 @@ fn fork_version_help_and_status_use_human_visible_version() {
 
     let (code, stdout, stderr) = h.run(["--version"]);
     assert_eq!(code, 0);
-    assert_eq!(stdout, "hcom 1.0.04\n");
+    assert_eq!(stdout, "hcom 1.0.05\n");
     assert!(stderr.is_empty(), "stderr={stderr}");
 
     let (code, stdout, stderr) = h.run(["--help"]);
     assert_eq!(code, 0, "stderr={stderr}");
     assert!(
-        stdout.starts_with("hcom (hook-comms) v1.0.04 "),
+        stdout.starts_with("hcom (hook-comms) v1.0.05 "),
         "stdout={stdout}"
     );
     assert!(
@@ -430,14 +430,14 @@ fn fork_version_help_and_status_use_human_visible_version() {
 
     let (code, stdout, stderr) = h.run(["status"]);
     assert_eq!(code, 0, "stderr={stderr}");
-    assert_eq!(stdout.lines().next(), Some("hcom 1.0.04"));
+    assert_eq!(stdout.lines().next(), Some("hcom 1.0.05"));
     assert!(stderr.is_empty(), "stderr={stderr}");
 
     let (code, stdout, stderr) = h.run(["status", "--json"]);
     assert_eq!(code, 0, "stderr={stderr}");
     assert!(stderr.is_empty(), "stderr={stderr}");
     let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(status["version"]["current"], "1.0.04");
+    assert_eq!(status["version"]["current"], "1.0.05");
     assert!(status["version"]["latest"].is_null());
     assert_eq!(status["version"]["update_available"], false);
     assert!(status["version"]["update_cmd"].is_null());
@@ -694,21 +694,21 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     );
     assert!(
         normalized_stdout.contains(
-            "Codex Architect and every Codex exec worker inherit the complete parent environment, real HOME/CODEX_HOME, native config"
+            "Codex and Claude Architects, and every Codex exec worker, inherit the complete parent environment"
         ) && normalized_stdout.contains(
             "hcom does not replace any parent environment variable, including HCOM_DIR"
         ) && normalized_stdout.contains(
-            "does not add role/run/task environment variables to Codex worker processes"
+            "Claude adds only CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1"
         ) && normalized_stdout.contains(
-            "hcom does not inspect, register, or freeze a native Codex Architect session"
+            "hcom does not inspect or freeze native Architect session storage"
         ),
         "stdout={stdout}"
     );
     assert!(
         normalized_stdout.contains(
-            "hcom adds one exact task-control MCP config leaf; all other native user/project config"
+            "For Codex, hcom adds one exact task-control MCP config leaf"
         ) && normalized_stdout.contains(
-            "trust, AGENTS.md, rules, hooks, skills, plugins, feature flags, providers, and MCP servers remain loaded"
+            "For Claude, hcom adds one non-strict --mcp-config server and preserves native MCP configuration"
         ) && normalized_stdout.contains(
             "project directory as native cwd and receive that directory through --add-dir"
         ),

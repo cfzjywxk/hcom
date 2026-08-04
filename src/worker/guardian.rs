@@ -6,6 +6,7 @@
 //! over one inherited `SOCK_SEQPACKET` socket. It never reads or forwards the
 //! native process's stdin/stdout/stderr.
 
+use super::environment::{ParentEnvironment, validate_claude_proxy_environment};
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -358,6 +359,7 @@ pub struct GuardedCommand {
     stdin: Option<Stdio>,
     stdout: Option<Stdio>,
     stderr: Option<Stdio>,
+    require_claude_proxy: bool,
 }
 
 impl GuardedCommand {
@@ -389,6 +391,7 @@ impl GuardedCommand {
             stdin: None,
             stdout: None,
             stderr: None,
+            require_claude_proxy: false,
         })
     }
 
@@ -456,6 +459,11 @@ impl GuardedCommand {
         self
     }
 
+    pub fn require_claude_proxy(&mut self) -> &mut Self {
+        self.require_claude_proxy = true;
+        self
+    }
+
     pub fn spawn(&mut self) -> std::result::Result<GuardianHandle, GuardianSpawnFailure> {
         if let Err(error) = validate_command_shape(&self.native_program, &self.native_args) {
             return Err(GuardianSpawnFailure::Reaped(error));
@@ -482,6 +490,12 @@ impl GuardedCommand {
             .arg(expected_parent.to_string())
             .arg("--mode")
             .arg(self.mode.argument())
+            .arg("--environment-policy")
+            .arg(if self.require_claude_proxy {
+                "claude-exact-proxy"
+            } else {
+                "inherit"
+            })
             .arg("--")
             .arg(&self.native_program)
             .args(&self.native_args);
@@ -1273,6 +1287,7 @@ struct InternalArguments {
     control_fd: RawFd,
     expected_parent: u32,
     mode: GuardianMode,
+    require_claude_proxy: bool,
     native_program: OsString,
     native_args: Vec<OsString>,
 }
@@ -1291,6 +1306,7 @@ impl InternalArguments {
         let mut control_fd = None;
         let mut expected_parent = None;
         let mut mode = None;
+        let mut require_claude_proxy = None;
         let mut index = 0;
         while index < metadata.len() {
             let flag = metadata[index].as_bytes();
@@ -1307,6 +1323,13 @@ impl InternalArguments {
                 b"--mode" if mode.is_none() => {
                     mode = Some(GuardianMode::parse(value)?);
                 }
+                b"--environment-policy" if require_claude_proxy.is_none() => {
+                    require_claude_proxy = Some(match value.as_bytes() {
+                        b"inherit" => false,
+                        b"claude-exact-proxy" => true,
+                        _ => bail!("internal Guardian environment policy is invalid"),
+                    });
+                }
                 _ => bail!("internal Guardian metadata is invalid or duplicated"),
             }
             index += 2;
@@ -1319,6 +1342,8 @@ impl InternalArguments {
             expected_parent: expected_parent
                 .ok_or_else(|| anyhow!("internal expected parent is missing"))?,
             mode: mode.ok_or_else(|| anyhow!("internal Guardian mode is missing"))?,
+            require_claude_proxy: require_claude_proxy
+                .ok_or_else(|| anyhow!("internal Guardian environment policy is missing"))?,
             native_program,
             native_args,
         })
@@ -1354,6 +1379,12 @@ fn guardian_main(
     configure_guardian_process(parsed.expected_parent, parsed.mode)?;
     verify_seqpacket(control)?;
     probe_runtime_capabilities()?;
+    if parsed.require_claude_proxy {
+        let environment = ParentEnvironment::capture_current()
+            .context("Guardian could not capture the Claude launch environment")?;
+        validate_claude_proxy_environment(&environment)
+            .context("Guardian rejected the Claude launch environment")?;
+    }
     set_close_on_exec(control.as_raw_fd())?;
 
     let signal_fd = create_signal_fd()?;
@@ -2566,6 +2597,8 @@ mod tests {
             "123".into(),
             "--mode".into(),
             "headless".into(),
+            "--environment-policy".into(),
+            "inherit".into(),
             "--".into(),
             "fake-native".into(),
             raw.clone(),
@@ -2574,6 +2607,7 @@ mod tests {
         assert_eq!(parsed.control_fd, 9);
         assert_eq!(parsed.expected_parent, 123);
         assert_eq!(parsed.mode, GuardianMode::HeadlessWorker);
+        assert!(!parsed.require_claude_proxy);
         assert_eq!(parsed.native_program, "fake-native");
         assert_eq!(parsed.native_args, [raw]);
     }
@@ -2590,6 +2624,8 @@ mod tests {
                 "123".into(),
                 "--mode".into(),
                 "headless".into(),
+                "--environment-policy".into(),
+                "inherit".into(),
                 "--".into(),
                 "fake-native".into(),
             ])

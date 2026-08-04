@@ -61,6 +61,7 @@ Architect CLI overrides (higher priority than TOML):
           --approval <untrusted|on-request|never>
   --ask-for-approval is an alias for --approval
   Claude: --effort <low|medium|high|xhigh|max>
+          --add-dir <absolute-external-repository> (repeatable)
 
 Built-in Architect defaults are Codex gpt-5.6-sol/xhigh with
 danger-full-access/never, or Claude opus/xhigh with
@@ -71,10 +72,11 @@ worker tables must also select Codex with danger-full-access/never; Claude
 workers are unsupported and fail closed.
 
 The capability-bound session-control MCP tools do not add a second native
-approval prompt. For Codex, hcom adds one exact task-control MCP config leaf;
-all other native user/project config, trust, AGENTS.md, rules, hooks, skills,
-plugins, feature flags, providers, and MCP servers remain loaded. This does not
-override the explicit danger-full-access/never profile.
+approval prompt. For Codex, hcom adds one exact task-control MCP config leaf.
+For Claude, hcom adds one non-strict --mcp-config server and preserves native
+MCP configuration. All other native user/project config, trust, instructions,
+rules, hooks, skills/plugins, feature flags, providers, and managed policy
+remain loaded.
 The Architect may start in the same turn when the human explicitly directs it
 to follow or execute a named existing detailed plan/specification/current_todo,
 or directs it to plan/define the solution and then implement, proceed, finish,
@@ -94,15 +96,18 @@ frozen for every sequential run in that foreground Architect invocation.
 No prompt argument, stdin payload, terminal injection, or automatic first turn
 is used. The human owns every architect terminal input. The Architect has a
 path-preserving whole-host read-write view for project plans, current_todo, and
-coordination records. A Codex Architect and every Codex exec worker inherit the
-complete parent environment, real HOME/CODEX_HOME, native config, auth, caches,
-session history, and ordinary same-user host view. hcom does not replace any
-parent environment variable, including HCOM_DIR, and does not add role/run/task
-environment variables to Codex worker processes.
+coordination records. Codex and Claude Architects, and every Codex exec worker,
+inherit the complete parent environment, real HOME and native config/auth/cache/
+session state, plus the ordinary same-user host view. hcom does not replace any
+parent environment variable, including HCOM_DIR. Claude adds only
+CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1 and
+CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1, refusing conflicting parent values.
 Native shell_environment_policy decides what model-started commands inherit.
-hcom does not inspect, register, or freeze a native Codex Architect session.
-The existing Claude foreground Architect keeps its separately documented
-private config/containment behavior; Claude task workers remain unsupported.
+hcom does not inspect or freeze native Architect session storage. Every Claude
+launch requires unique exact http_proxy/https_proxy/HTTP_PROXY/HTTPS_PROXY
+entries set to http://127.0.0.1:7890 before any Claude executable starts, and
+runs through the Linux descendant Guardian. Claude task workers remain
+unsupported in this implementation phase.
 
 Each authorized task binds the exact canonical source directory, absolute task
 document path, ordered absolute design document paths, and task selector
@@ -111,6 +116,9 @@ strings without reading, copying, hashing, locking, or drift-checking the
 documents. Developer tasks read the original files, then work and commit
 directly in the source directory; hcom has no repository-root allowlist and
 does not inspect or repair Git.
+For a Claude Architect, an external task source root must exactly match an
+ordered --add-dir root declared at foreground startup. This gate ensures native
+external instructions were loaded; it is not a filesystem access restriction.
 Execution approval for the standard lane includes exactly one signed-off local
 candidate commit per task and amendments of that same commit during correction.
 A general instruction requiring human authorization for commits is satisfied

@@ -7,9 +7,10 @@ pub(crate) mod task_lane;
 pub mod workspace;
 
 use crate::worker::environment::ParentEnvironment;
-use crate::worker::profile::SessionInvocationProfiles;
+use crate::worker::profile::{ArchitectAdapter, SessionInvocationProfiles};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -24,17 +25,24 @@ pub(crate) struct SessionStartup {
 pub(crate) struct SessionRuntimeSources {
     parent_environment: ParentEnvironment,
     profiles: Option<SessionInvocationProfiles>,
+    architect_additional_directories: Vec<PathBuf>,
 }
 
 impl SessionRuntimeSources {
     pub(crate) fn capture(
         parent_environment: impl Into<ParentEnvironment>,
         profiles: SessionInvocationProfiles,
+        architect_additional_directories: Vec<PathBuf>,
     ) -> Result<Self> {
         profiles.validate()?;
+        validate_architect_additional_directories(
+            profiles.architect.adapter(),
+            &architect_additional_directories,
+        )?;
         Ok(Self {
             parent_environment: parent_environment.into(),
             profiles: Some(profiles),
+            architect_additional_directories,
         })
     }
 
@@ -47,6 +55,7 @@ impl SessionRuntimeSources {
             )])
             .into(),
             profiles: None,
+            architect_additional_directories: Vec::new(),
         }
     }
 
@@ -54,6 +63,37 @@ impl SessionRuntimeSources {
     pub(crate) fn set_profiles_for_test(&mut self, profiles: SessionInvocationProfiles) {
         self.profiles = Some(profiles);
     }
+}
+
+fn validate_architect_additional_directories(
+    adapter: ArchitectAdapter,
+    directories: &[PathBuf],
+) -> Result<()> {
+    if adapter == ArchitectAdapter::Codex && !directories.is_empty() {
+        bail!("Codex Architect cannot bind Claude --add-dir roots");
+    }
+    if directories.len() > 64 {
+        bail!("Claude Architect accepts at most 64 --add-dir roots");
+    }
+    let mut unique = BTreeSet::new();
+    for directory in directories {
+        if !directory.is_absolute() || directory.as_os_str().as_encoded_bytes().len() > 4096 {
+            bail!("Claude Architect --add-dir must be an existing canonical absolute directory");
+        }
+        let canonical = fs::canonicalize(directory).map_err(|_| {
+            anyhow::anyhow!(
+                "Claude Architect --add-dir must be an existing canonical absolute directory"
+            )
+        })?;
+        let metadata = fs::symlink_metadata(directory)?;
+        if canonical != *directory || metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("Claude Architect --add-dir must be an existing canonical absolute directory");
+        }
+        if !unique.insert(directory.clone()) {
+            bail!("Claude Architect --add-dir roots must be unique");
+        }
+    }
+    Ok(())
 }
 
 fn canonical_project_directory(path: &Path) -> Result<PathBuf> {
