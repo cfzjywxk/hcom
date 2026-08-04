@@ -29,6 +29,7 @@ pub(crate) struct SessionRuntimeSources {
     parent_environment: ParentEnvironment,
     profiles: Option<SessionInvocationProfiles>,
     architect_additional_directories: Vec<PathBuf>,
+    guardian_executable: PathBuf,
 }
 
 impl SessionRuntimeSources {
@@ -46,6 +47,8 @@ impl SessionRuntimeSources {
             parent_environment: parent_environment.into(),
             profiles: Some(profiles),
             architect_additional_directories,
+            guardian_executable: std::env::current_exe()
+                .context("failed to resolve the current hcom Guardian executable")?,
         })
     }
 
@@ -59,12 +62,19 @@ impl SessionRuntimeSources {
             .into(),
             profiles: None,
             architect_additional_directories: Vec::new(),
+            guardian_executable: std::env::current_exe()
+                .expect("test process executable must be available"),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn set_profiles_for_test(&mut self, profiles: SessionInvocationProfiles) {
         self.profiles = Some(profiles);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_guardian_executable_for_test(&mut self, executable: PathBuf) {
+        self.guardian_executable = executable;
     }
 }
 

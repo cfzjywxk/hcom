@@ -311,6 +311,13 @@ scenario whose model cost is justified. A future wrapper should remain
 explicitly opt-in, preserve the Spark/medium defaults and serial execution,
 report retained fixture paths, and summarize each scenario independently.
 
+Claude worker contract, mixed-provider task-lane, exact-resume, exhaustion,
+abnormal-exit, and Guardian lifecycle probes have separate serial opt-in
+entry points in
+[Claude task-lane test tooling](claude-task-lane-testing.md). Those tests
+require explicit Haiku/medium selection and the exact inherited four-proxy
+gate; they do not change these Codex/Spark defaults.
+
 ## Capability boundaries
 
 What this lane deliberately does **not** guarantee. These are decided

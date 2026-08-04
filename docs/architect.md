@@ -207,6 +207,11 @@ contract and E2E tests deliberately default to the cheaper
 `haiku`/`medium`; ordinary source tests use fake executables and never call a
 provider.
 
+The serial, opt-in contract and task-lane entry points are documented in
+[Claude task-lane test tooling](claude-task-lane-testing.md). They validate the
+explicit Haiku/medium profile and exact inherited proxy gate before every real
+Claude spawn and never run an interactive Architect TUI.
+
 At startup hcom prints all three effective role profiles, the invocation
 profile hash, the exact session binding hash, the Guardian platform boundary,
 and the additional-directory instruction policy. The session binding hash

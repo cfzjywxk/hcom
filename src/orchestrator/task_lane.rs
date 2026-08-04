@@ -98,6 +98,7 @@ impl RuntimeFactory for ProductionRuntimeFactory {
             run_id,
             cleanup_registry,
             profiles,
+            guardian_executable,
         } = request;
         let uses_codex = [profiles.developer.provider, profiles.reviewer.provider]
             .contains(&RuntimeProvider::CodexExec);
@@ -134,11 +135,7 @@ impl RuntimeFactory for ProductionRuntimeFactory {
             Some(ClaudeExecTaskWorkerRuntime::open(
                 ClaudeExecRuntimeConfig {
                     claude: "claude".into(),
-                    guardian_executable: std::env::current_exe().map_err(|error| {
-                        RuntimeError::internal(format!(
-                            "failed to resolve the current hcom Guardian executable: {error}"
-                        ))
-                    })?,
+                    guardian_executable,
                     environment: claude_environment
                         .expect("a Claude binding materializes its role environment"),
                     lease,
@@ -187,6 +184,7 @@ struct RuntimeOpenRequest {
     run_id: String,
     cleanup_registry: GuardianCleanupRegistry,
     profiles: TaskWorkerProfiles,
+    guardian_executable: PathBuf,
 }
 
 struct RuntimeOpenFailure {
@@ -1026,6 +1024,7 @@ impl TaskLaneSupervisor {
             run_id: self.startup.run_id.clone(),
             cleanup_registry: self.cleanup_registry.clone(),
             profiles: self.profiles.clone(),
+            guardian_executable: self.sources.guardian_executable.clone(),
         };
         let runtime = self.factory.open(request).map_err(|error| {
             RuntimeOpenFailure::new(DriverFailureClass::Runtime, anyhow!(error.detail))
@@ -1981,18 +1980,20 @@ mod tests {
     /// project + repository driven by the production runtime factory.
     pub(super) mod real_support {
         use super::super::*;
+        use crate::worker::claude_test::ClaudeModelTestGate;
         use crate::worker::environment::ParentEnvironment;
         use crate::worker::profile::{
-            ArchitectAdapter, CodexInvocationProfile, DeveloperInvocationProfile,
-            ReviewerInvocationProfile, SessionInvocationProfiles,
+            ArchitectAdapter, ClaudeInvocationProfile, CodexInvocationProfile,
+            DeveloperInvocationProfile, ReviewerInvocationProfile, SessionInvocationProfiles,
         };
-        use crate::worker::runtime::CODEX_TASK_WORKER_ADAPTER;
+        use crate::worker::runtime::RuntimeProvider;
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
         /// Cheap model for acceptance runs; production defaults stay untouched.
-        const TEST_MODEL: &str = "gpt-5.3-codex-spark";
-        const TEST_EFFORT: &str = "medium";
+        const CODEX_TEST_MODEL: &str = "gpt-5.3-codex-spark";
+        const CODEX_TEST_EFFORT: &str = "medium";
+        const REAL_HCOM_BINARY_ENV: &str = "HCOM_REAL_E2E_HCOM_BIN";
 
         pub(crate) struct RealFixture {
             pub(crate) _temp: Option<tempfile::TempDir>,
@@ -2000,10 +2001,29 @@ mod tests {
             pub(crate) repository: PathBuf,
             run_root: PathBuf,
             sources: SessionRuntimeSources,
+            developer_adapter: String,
+            reviewer_adapter: String,
         }
 
         impl RealFixture {
             pub(crate) fn new(label: &str) -> Self {
+                Self::new_with_workers(
+                    label,
+                    ArchitectAdapter::Codex,
+                    RuntimeProvider::CodexExec,
+                    RuntimeProvider::CodexExec,
+                )
+            }
+
+            pub(crate) fn new_with_workers(
+                label: &str,
+                architect: ArchitectAdapter,
+                developer: RuntimeProvider,
+                reviewer: RuntimeProvider,
+            ) -> Self {
+                let claude_gate = [developer, reviewer]
+                    .contains(&RuntimeProvider::ClaudeExec)
+                    .then(|| ClaudeModelTestGate::capture().unwrap());
                 let temp = tempfile::Builder::new()
                     .prefix(&format!("hcom-real-exec-{label}."))
                     .tempdir()
@@ -2031,23 +2051,66 @@ mod tests {
                 let repository = fs::canonicalize(repository).unwrap();
 
                 let home = std::env::var("HOME").expect("HOME");
-                let mut profiles =
-                    SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Codex).unwrap();
-                let cheap = CodexInvocationProfile {
-                    model: TEST_MODEL.into(),
-                    reasoning_effort: TEST_EFFORT.into(),
+                let mut profiles = SessionInvocationProfiles::for_task_lane(architect).unwrap();
+                let cheap_codex = CodexInvocationProfile {
+                    model: CODEX_TEST_MODEL.into(),
+                    reasoning_effort: CODEX_TEST_EFFORT.into(),
                     sandbox: crate::worker::profile::CodexSandbox::DangerFullAccess,
                     approval_policy: crate::worker::profile::CodexApprovalPolicy::Never,
                 };
-                profiles.developer = DeveloperInvocationProfile::Codex {
-                    profile: cheap.clone(),
+                let cheap_claude = claude_gate
+                    .as_ref()
+                    .map(|gate| gate.profile().clone())
+                    .unwrap_or_else(|| ClaudeInvocationProfile {
+                        model: "haiku".into(),
+                        effort: "medium".into(),
+                        dangerously_skip_permissions: true,
+                    });
+                profiles.developer = match developer {
+                    RuntimeProvider::CodexExec => DeveloperInvocationProfile::Codex {
+                        profile: cheap_codex.clone(),
+                    },
+                    RuntimeProvider::ClaudeExec => DeveloperInvocationProfile::Claude {
+                        profile: cheap_claude.clone(),
+                    },
                 };
-                profiles.reviewer = ReviewerInvocationProfile::Codex { profile: cheap };
+                profiles.reviewer = match reviewer {
+                    RuntimeProvider::CodexExec => ReviewerInvocationProfile::Codex {
+                        profile: cheap_codex,
+                    },
+                    RuntimeProvider::ClaudeExec => ReviewerInvocationProfile::Claude {
+                        profile: cheap_claude,
+                    },
+                };
 
                 let mut sources = SessionRuntimeSources::fake(Path::new(&home));
                 sources.set_profiles_for_test(profiles);
                 // Complete parent inheritance, exactly like production.
-                sources.parent_environment = ParentEnvironment::capture_current().unwrap();
+                sources.parent_environment = claude_gate
+                    .as_ref()
+                    .map(|gate| gate.parent_environment().clone())
+                    .unwrap_or_else(|| ParentEnvironment::capture_current().unwrap());
+                if claude_gate.is_some() {
+                    let configured = std::env::var_os(REAL_HCOM_BINARY_ENV).unwrap_or_else(|| {
+                        panic!(
+                            "{REAL_HCOM_BINARY_ENV} must name the freshly built hcom binary for real Claude task-lane tests"
+                        )
+                    });
+                    let configured = PathBuf::from(configured);
+                    let guardian = fs::canonicalize(&configured).unwrap_or_else(|error| {
+                        panic!(
+                            "{REAL_HCOM_BINARY_ENV} does not resolve to the hcom binary: {error}"
+                        )
+                    });
+                    let metadata = fs::metadata(&guardian).unwrap();
+                    assert!(
+                        guardian.is_absolute()
+                            && metadata.is_file()
+                            && metadata.permissions().mode() & 0o111 != 0,
+                        "{REAL_HCOM_BINARY_ENV} must resolve to an executable regular file"
+                    );
+                    sources.set_guardian_executable_for_test(guardian);
+                }
 
                 Self {
                     _temp: temp,
@@ -2055,6 +2118,8 @@ mod tests {
                     repository,
                     run_root,
                     sources,
+                    developer_adapter: developer.as_str().into(),
+                    reviewer_adapter: reviewer.as_str().into(),
                 }
             }
 
@@ -2091,6 +2156,12 @@ mod tests {
                     max_review_rounds,
                     max_clarification_rounds: 2,
                 }
+            }
+
+            pub(crate) fn commit_fixture_instruction(&self, name: &str, contents: &str) {
+                fs::write(self.repository.join(name), contents).unwrap();
+                super::git(&self.repository, &["add", "--", name]);
+                super::git_commit(&self.repository, "Add controlled E2E instruction");
             }
 
             /// Worker processes this fixture's own run leaves behind. A real
@@ -2173,12 +2244,7 @@ mod tests {
 
             pub(crate) fn start(&self, supervisor: &mut TaskLaneSupervisor, tasks: Vec<TaskDraft>) {
                 let (plan_version, plan_hash) = supervisor
-                    .replace_plan(
-                        0,
-                        CODEX_TASK_WORKER_ADAPTER,
-                        CODEX_TASK_WORKER_ADAPTER,
-                        tasks,
-                    )
+                    .replace_plan(0, &self.developer_adapter, &self.reviewer_adapter, tasks)
                     .unwrap();
                 supervisor
                     .approve_and_start(1, plan_version, &plan_hash, true)
@@ -2217,7 +2283,7 @@ mod tests {
             /// order — read back out of the sealed stdout evidence, so the
             /// assertion sees what Codex actually did rather than what the
             /// runtime believes.
-            pub(crate) fn thread_ids(&self, task_key: &str, role: &str) -> Vec<String> {
+            pub(crate) fn native_session_ids(&self, task_key: &str, role: &str) -> Vec<String> {
                 let role_dir = self
                     .project_root
                     .join("hcom-tasks/run-real-exec")
@@ -2234,7 +2300,10 @@ mod tests {
                     let Some(first) = text.lines().next() else {
                         continue;
                     };
-                    let Some(rest) = first.split("\"thread_id\":\"").nth(1) else {
+                    let Some(rest) = ["\"thread_id\":\"", "\"session_id\":\""]
+                        .into_iter()
+                        .find_map(|field| first.split(field).nth(1))
+                    else {
                         continue;
                     };
                     if let Some(id) = rest.split('"').next() {
@@ -2243,6 +2312,10 @@ mod tests {
                 }
                 found.sort_by(|a, b| a.0.cmp(&b.0));
                 found.into_iter().map(|(_, id)| id).collect()
+            }
+
+            pub(crate) fn thread_ids(&self, task_key: &str, role: &str) -> Vec<String> {
+                self.native_session_ids(task_key, role)
             }
 
             /// Every role of a task left durable evidence in `hcom-tasks/`.
@@ -2266,6 +2339,58 @@ mod tests {
                         "no sealed final message for {task_key}/{role}"
                     );
                 }
+            }
+
+            /// Exact native Claude workers owned by this fixture.
+            ///
+            /// The disposable project cwd plus the fixed headless role name
+            /// avoids selecting an existing interactive/user Claude session.
+            #[cfg(target_os = "linux")]
+            pub(crate) fn live_claude_worker_pids(&self) -> Vec<u32> {
+                let mut workers = Vec::new();
+                let Ok(entries) = fs::read_dir("/proc") else {
+                    return workers;
+                };
+                for entry in entries.flatten() {
+                    let Some(pid) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.parse::<u32>().ok())
+                    else {
+                        continue;
+                    };
+                    if fs::read_link(format!("/proc/{pid}/cwd")).ok().as_deref()
+                        != Some(self.project_root.as_path())
+                    {
+                        continue;
+                    }
+                    let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+                        continue;
+                    };
+                    let arguments: Vec<_> = cmdline
+                        .split(|byte| *byte == 0)
+                        .filter(|argument| !argument.is_empty())
+                        .map(|argument| String::from_utf8_lossy(argument).into_owned())
+                        .collect();
+                    let is_claude_print = arguments
+                        .first()
+                        .and_then(|argument| Path::new(argument).file_name())
+                        .and_then(|name| name.to_str())
+                        == Some("claude")
+                        && arguments.iter().any(|argument| argument == "-p")
+                        && arguments.windows(2).any(|pair| {
+                            pair[0] == "--name"
+                                && matches!(
+                                    pair[1].as_str(),
+                                    "hcom-task-developer" | "hcom-task-reviewer"
+                                )
+                        });
+                    if is_claude_print {
+                        workers.push(pid);
+                    }
+                }
+                workers.sort_unstable();
+                workers
             }
         }
 
@@ -5074,6 +5199,95 @@ mod real_exec_tests {
     use super::tests::real_support::*;
     use super::*;
     use crate::control_api::{ReviewerVerdict, TaskState};
+    use crate::worker::profile::ArchitectAdapter;
+    use crate::worker::runtime::RuntimeProvider;
+
+    fn real_claude_fixture(
+        label: &str,
+        developer: RuntimeProvider,
+        reviewer: RuntimeProvider,
+    ) -> RealFixture {
+        RealFixture::new_with_workers(label, ArchitectAdapter::Codex, developer, reviewer)
+    }
+
+    fn process_birth(pid: u32) -> Option<u64> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let close = stat.rfind(')')?;
+        stat[close + 1..].split_whitespace().nth(19)?.parse().ok()
+    }
+
+    fn read_process_identity(path: &Path) -> (u32, u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            if let Ok(value) = std::fs::read_to_string(path) {
+                let mut fields = value.split_ascii_whitespace();
+                if let (Some(pid), Some(birth)) = (fields.next(), fields.next())
+                    && let (Ok(pid), Ok(birth)) = (pid.parse(), birth.parse())
+                {
+                    return (pid, birth);
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "real Claude did not execute the escaped-descendant helper"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    fn wait_process_identity_gone(pid: u32, birth: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while process_birth(pid) == Some(birth) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_ne!(
+            process_birth(pid),
+            Some(birth),
+            "escaped descendant {pid}/{birth} survived Guardian cleanup"
+        );
+    }
+
+    fn write_escaped_descendant_helper(
+        fixture: &RealFixture,
+        label: &str,
+        foreground_hang: bool,
+    ) -> (PathBuf, PathBuf) {
+        let helper = fixture.project_root.join(format!("{label}-helper.py"));
+        let identity = fixture
+            .project_root
+            .join(format!("{label}-descendant.identity"));
+        let foreground_hang = if foreground_hang { "True" } else { "False" };
+        std::fs::write(
+            &helper,
+            format!(
+                r#"#!/usr/bin/python3
+import os
+import sys
+import time
+
+identity_path = sys.argv[1]
+first = os.fork()
+if first == 0:
+    os.setsid()
+    second = os.fork()
+    if second == 0:
+        stat = open(f"/proc/{{os.getpid()}}/stat", encoding="ascii").read()
+        birth = stat.rsplit(")", 1)[1].split()[19]
+        with open(identity_path, "w", encoding="ascii") as output:
+            output.write(f"{{os.getpid()}} {{birth}}\n")
+            output.flush()
+            os.fsync(output.fileno())
+        time.sleep(300)
+    os._exit(0)
+os.waitpid(first, 0)
+if {foreground_hang}:
+    time.sleep(300)
+"#,
+            ),
+        )
+        .unwrap();
+        (helper, identity)
+    }
 
     #[test]
     #[ignore = "requires native codex, auth, and network"]
@@ -5335,6 +5549,298 @@ mod real_exec_tests {
             "workers outlived the failed run: {:?}",
             fixture.stray_worker_pids()
         );
+    }
+
+    /// Default Codex Developer + Claude Reviewer: the Reviewer rejects once,
+    /// then exact-resumes for the re-review after the Codex correction.
+    #[test]
+    #[ignore = "requires explicit Haiku/medium profile, exact Claude proxy, native CLIs, auth, and network"]
+    fn real_claude_default_mixed_review_loop_and_reviewer_exact_resume() {
+        let fixture = real_claude_fixture(
+            "claude-default-mixed",
+            RuntimeProvider::CodexExec,
+            RuntimeProvider::ClaudeExec,
+        );
+        fixture.commit_fixture_instruction(
+            "CLAUDE.md",
+            "For task selector mixed-review, follow the current hcom turn purpose exactly. \
+             On InitialReview, the first line MUST be VERDICT: REQUEST_CHANGES because the \
+             missing test is a controlled transport defect, regardless of any other quality \
+             judgment. On ReviewerRereview, run the requested check and return VERDICT: LGTM \
+             only if it passes and the exact candidate commit remains signed off.\n",
+        );
+        let mut supervisor = fixture.supervisor();
+        let task = fixture.task(
+            "mixed-review",
+            "Controlled mixed-provider review correction",
+            "This is a controlled lifecycle E2E. Follow the instruction for the current hcom \
+             turn purpose exactly.\n\n\
+             InitialDevelopment: create calc.py with add(a, b) returning a + b. Create exactly \
+             one signed-off commit containing calc.py. Deliberately omit test_calc.py and report \
+             the omission.\n\n\
+             InitialReview: test_calc.py is a deliberately seeded blocking defect. Return \
+             VERDICT: REQUEST_CHANGES and require a test asserting add(2, 3) == 5.\n\n\
+             DeveloperCorrection: add test_calc.py with that assertion, run \
+             `python3 -B test_calc.py`, and amend the existing task commit with sign-off.\n\n\
+             ReReview: independently run `python3 -B test_calc.py`; return VERDICT: LGTM only \
+             if it passes and the exact single candidate commit is signed off. Do not push.",
+            3,
+        );
+        let snapshot = fixture.run(&mut supervisor, vec![task]);
+        assert_eq!(snapshot.state, SessionState::Completed);
+        assert_eq!(snapshot.tasks[0].state, TaskState::Lgtm);
+        assert_eq!(snapshot.tasks[0].review_round, 2);
+        let developer = fixture.native_session_ids("mixed-review", "developer");
+        let reviewer = fixture.native_session_ids("mixed-review", "reviewer");
+        assert!(developer.len() >= 2 && developer.windows(2).all(|ids| ids[0] == ids[1]));
+        assert!(reviewer.len() >= 2 && reviewer.windows(2).all(|ids| ids[0] == ids[1]));
+        assert_ne!(developer[0], reviewer[0]);
+        assert!(fixture.stray_worker_pids().is_empty());
+    }
+
+    /// Claude Developer + Codex Reviewer: the correction must resume the exact
+    /// Claude session rather than silently starting a new conversation.
+    #[test]
+    #[ignore = "requires explicit Haiku/medium profile, exact Claude proxy, native CLIs, auth, and network"]
+    fn real_claude_developer_codex_reviewer_exact_resume() {
+        let fixture = real_claude_fixture(
+            "claude-developer-resume",
+            RuntimeProvider::ClaudeExec,
+            RuntimeProvider::CodexExec,
+        );
+        let mut supervisor = fixture.supervisor();
+        let task = fixture.task(
+            "claude-developer",
+            "Controlled Claude Developer correction",
+            "Follow the instruction for the current hcom turn purpose exactly.\n\n\
+             InitialDevelopment: create value.py containing value = 7, make exactly one \
+             signed-off task commit, deliberately omit test_value.py, and report the omission.\n\n\
+             InitialReview: the omitted test is deliberately blocking. Return \
+             VERDICT: REQUEST_CHANGES and require test_value.py to assert value.value == 7.\n\n\
+             DeveloperCorrection: add test_value.py, run `python3 -B test_value.py`, and amend \
+             the existing signed-off candidate commit.\n\n\
+             ReReview: return VERDICT: LGTM only after the check passes and the exact candidate \
+             commit remains signed off. Do not push.",
+            3,
+        );
+        let snapshot = fixture.run(&mut supervisor, vec![task]);
+        assert_eq!(snapshot.state, SessionState::Completed);
+        assert_eq!(snapshot.tasks[0].state, TaskState::Lgtm);
+        let developer = fixture.native_session_ids("claude-developer", "developer");
+        assert!(developer.len() >= 2);
+        assert!(developer.windows(2).all(|ids| ids[0] == ids[1]));
+        assert!(fixture.stray_worker_pids().is_empty());
+    }
+
+    /// Claude Developer + Claude Reviewer across two tasks proves each role
+    /// resumes only within one task and receives a fresh UUID for the next.
+    #[test]
+    #[ignore = "requires explicit Haiku/medium profile, exact Claude proxy, native CLI, auth, and network"]
+    fn real_claude_pair_uses_fresh_cross_task_sessions() {
+        let fixture = real_claude_fixture(
+            "claude-pair-fresh",
+            RuntimeProvider::ClaudeExec,
+            RuntimeProvider::ClaudeExec,
+        );
+        let mut supervisor = fixture.supervisor();
+        let tasks = ["one", "two"]
+            .into_iter()
+            .map(|key| {
+                fixture.task(
+                    key,
+                    &format!("Create marker {key}"),
+                    &format!(
+                        "Create {key}.txt containing exactly {key}-READY followed by a newline. \
+                         Create exactly one signed-off task commit, verify the exact content with \
+                         a side-effect-free shell check, and do not push. Reviewer: return \
+                         VERDICT: LGTM when the marker and signed-off commit are correct."
+                    ),
+                    2,
+                )
+            })
+            .collect();
+        let snapshot = fixture.run(&mut supervisor, tasks);
+        assert_eq!(snapshot.state, SessionState::Completed);
+        assert!(
+            snapshot
+                .tasks
+                .iter()
+                .all(|task| task.state == TaskState::Lgtm)
+        );
+        for role in ["developer", "reviewer"] {
+            let first = fixture.native_session_ids("one", role);
+            let second = fixture.native_session_ids("two", role);
+            assert!(!first.is_empty() && !second.is_empty());
+            assert_ne!(first[0], second[0], "{role} reused a cross-task session");
+        }
+        assert!(fixture.stray_worker_pids().is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires explicit Haiku/medium profile, exact Claude proxy, native CLIs, auth, and network"]
+    fn real_claude_review_exhaustion_advances_to_next_task() {
+        let fixture = real_claude_fixture(
+            "claude-exhaustion",
+            RuntimeProvider::CodexExec,
+            RuntimeProvider::ClaudeExec,
+        );
+        let mut supervisor = fixture.supervisor();
+        let tasks = vec![
+            fixture.task(
+                "claude-exhausted",
+                "Controlled Claude review exhaustion",
+                "InitialDevelopment: create incomplete.py containing value = 1 in exactly one \
+                 signed-off commit, and deliberately omit required_test.py.\n\n\
+                 InitialReview: the omitted required_test.py is deliberately blocking. You MUST \
+                 return VERDICT: REQUEST_CHANGES and MUST NOT return LGTM. The configured review \
+                 budget is one, so no correction should start. Do not push.",
+                1,
+            ),
+            fixture.task(
+                "after-claude-exhaustion",
+                "Advance after Claude review exhaustion",
+                "Create recovered.txt containing exactly RECOVERED followed by a newline in \
+                 exactly one signed-off commit. Verify it with a side-effect-free shell check. \
+                 Reviewer: return VERDICT: LGTM when correct. Do not push.",
+                2,
+            ),
+        ];
+        let snapshot = fixture.run(&mut supervisor, tasks);
+        assert_eq!(snapshot.state, SessionState::Completed);
+        assert_eq!(snapshot.tasks[0].state, TaskState::ReviewExhausted);
+        assert_eq!(snapshot.tasks[0].review_round, 1);
+        assert_eq!(
+            snapshot.tasks[0].reviewer_verdict,
+            Some(ReviewerVerdict::RequestChanges)
+        );
+        assert_eq!(snapshot.tasks[1].state, TaskState::Lgtm);
+        assert!(fixture.stray_worker_pids().is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires explicit Haiku/medium profile, exact Claude proxy, native CLI, auth, and network"]
+    fn real_killed_claude_developer_never_routes_a_partial_final() {
+        let fixture = real_claude_fixture(
+            "killed-claude-worker",
+            RuntimeProvider::ClaudeExec,
+            RuntimeProvider::CodexExec,
+        );
+        let mut supervisor = fixture.supervisor();
+        let task = fixture.task(
+            "killed-claude-worker",
+            "Exact disposable Claude abnormal-exit probe",
+            "Create killed_claude.py containing reached = True in exactly one signed-off commit. \
+             Do not push.",
+            2,
+        );
+        fixture.start(&mut supervisor, vec![task]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let worker = loop {
+            let workers = fixture.live_claude_worker_pids();
+            if workers.len() == 1 {
+                break workers[0];
+            }
+            assert!(
+                workers.is_empty(),
+                "selected multiple Claude workers: {workers:?}"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture's exact Claude worker was not discoverable"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(worker as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+        let snapshot = fixture.drive(&mut supervisor);
+        assert_eq!(snapshot.state, SessionState::NeedsHuman);
+        assert_eq!(snapshot.tasks[0].state, TaskState::NeedsHuman);
+        assert!(snapshot.tasks[0].latest_developer_final_path.is_none());
+        assert!(snapshot.tasks[0].final_reviewer_message_paths.is_empty());
+        assert!(
+            fixture
+                .native_session_ids("killed-claude-worker", "reviewer")
+                .is_empty()
+        );
+        assert!(fixture.stray_worker_pids().is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires explicit Haiku/medium profile, exact Claude proxy, native CLI, auth, and network"]
+    fn real_claude_nested_double_fork_is_reaped_and_success_is_not_routed() {
+        let fixture = real_claude_fixture(
+            "claude-nested-descendant",
+            RuntimeProvider::ClaudeExec,
+            RuntimeProvider::CodexExec,
+        );
+        let (helper, identity_path) = write_escaped_descendant_helper(&fixture, "nested", false);
+        let mut supervisor = fixture.supervisor();
+        let task = fixture.task(
+            "nested-descendant",
+            "Nested setsid/double-fork lifecycle probe",
+            &format!(
+                "Before any other task action, use the Bash tool to run exactly:\n\
+                 `python3 '{}' '{}'`\n\
+                 Wait until that command exits and the identity file exists. Then return a \
+                 normal STATUS: READY final. The helper intentionally creates a setsid + \
+                 double-fork descendant, so hcom must reject the success-shaped turn after \
+                 Guardian cleanup. Do not push.",
+                helper.display(),
+                identity_path.display()
+            ),
+            2,
+        );
+        let snapshot = fixture.run(&mut supervisor, vec![task]);
+        let identity = read_process_identity(&identity_path);
+        assert_eq!(snapshot.state, SessionState::NeedsHuman);
+        assert!(snapshot.tasks[0].latest_developer_final_path.is_none());
+        assert!(
+            snapshot
+                .terminal_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("residual descendants")),
+            "{:?}",
+            snapshot.terminal_detail
+        );
+        wait_process_identity_gone(identity.0, identity.1);
+        assert!(fixture.stray_worker_pids().is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires explicit Haiku/medium profile, exact Claude proxy, native CLI, auth, and network"]
+    fn real_claude_cancel_reaps_escaped_descendants() {
+        let fixture = real_claude_fixture(
+            "claude-cancel-descendant",
+            RuntimeProvider::ClaudeExec,
+            RuntimeProvider::CodexExec,
+        );
+        let (helper, identity_path) = write_escaped_descendant_helper(&fixture, "cancel", true);
+        let mut supervisor = fixture.supervisor();
+        let task = fixture.task(
+            "cancel-descendant",
+            "Cancel an active Claude tool tree",
+            &format!(
+                "Your first action must be to use the Bash tool to run exactly:\n\
+                 `python3 '{}' '{}'`\n\
+                 The command intentionally remains active; do not substitute another command.",
+                helper.display(),
+                identity_path.display()
+            ),
+            2,
+        );
+        fixture.start(&mut supervisor, vec![task]);
+        let identity = read_process_identity(&identity_path);
+        let version = supervisor.snapshot().version;
+        supervisor
+            .cancel(version, "real Claude cancellation lifecycle probe")
+            .unwrap();
+        let snapshot = fixture.drive(&mut supervisor);
+        assert_eq!(snapshot.state, SessionState::Canceled);
+        wait_process_identity_gone(identity.0, identity.1);
+        assert!(fixture.stray_worker_pids().is_empty());
     }
 
     /// End-to-end acceptance on a real Rust project: the developer writes and

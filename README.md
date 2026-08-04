@@ -7,6 +7,10 @@
 
 `hcom` is a CLI that agents can use to message, watch, and spawn each other across terminals. It integrates with Claude Code, Gemini, Codex, OpenCode, Kilo Code, Pi, Oh My Pi, Antigravity, Cursor, Kimi and Copilot without changing how you use them.
 
+Real Claude task-lane validation is always an explicit, serial,
+Haiku/medium-only opt-in; see
+[Claude task-lane test tooling](docs/claude-task-lane-testing.md).
+
 Use it to coordinate pipelines, run different AI CLIs as each other's subagents, or just instead of copy-paste.
 
 Single Rust binary, no background services. Start an agent with `hcom` in front, then prompt normally.

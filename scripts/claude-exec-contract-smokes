@@ -1,0 +1,24 @@
+#!/bin/bash
+# Opt-in real Claude native/config/session contract smoke.
+#
+# The Rust harness performs the authoritative raw-environment proxy check
+# before it resolves or starts the native Claude executable. The Rust fixture
+# supplies disposable project-local settings and never sets or repairs any
+# proxy variable.
+set -euo pipefail
+
+if [ "${CLAUDE_TEST_MODEL-}" != "haiku" ]; then
+  printf 'CLAUDE_TEST_MODEL must be explicitly set to haiku\n' >&2
+  exit 64
+fi
+if [ "${CLAUDE_TEST_EFFORT-}" != "medium" ]; then
+  printf 'CLAUDE_TEST_EFFORT must be explicitly set to medium\n' >&2
+  exit 64
+fi
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+cd "$repo_root"
+cargo test --locked --test real_claude_contract \
+  real_claude_native_contract_create_and_exact_resume \
+  -- --ignored --nocapture --test-threads=1
