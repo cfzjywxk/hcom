@@ -225,8 +225,30 @@ documents, and it does not parse Markdown to infer a task.
 A human message explicitly directing the Architect to
 follow/execute/implement a named existing detailed plan, specification, or
 `current_todo` authorizes same-turn plan derivation and start.
+A message directing it to plan or define the solution and then implement,
+proceed, finish, or drive the requested work also authorizes same-turn start of
+the faithful derived plan. That prospective authorization remains valid after
+the complete typed binding is displayed even though the detailed plan did not
+exist when the human spoke; the Architect does not ask for duplicate approval
+unless it introduced a new unresolved material decision.
 Read/analyze/discuss/summarize/draft/update alone does not authorize execution,
-and an explicit “do not start” always wins.
+and an explicit “do not start” always wins. A bare generic
+implement/proceed/finish/drive request selects the delegated workflow rather
+than Architect-side implementation, but does not by itself authorize start.
+
+Execution approval for the standard task lane includes exactly one signed-off
+local Developer candidate commit per task. Reviewer corrections amend that same
+commit, and LGTM applies to the final exact candidate range; there is no extra
+post-LGTM commit. A general instruction that commits require human
+authorization is satisfied by approval of this run. An explicit requirement
+that the run remain uncommitted is incompatible with the lane and must be
+resolved before binding or start. If that conflict reaches a Developer, the
+Developer returns `CLARIFICATION_REQUIRED` without modifying the repository,
+and the Architect must call `session_clarification_require_human` regardless of
+remaining autonomous clarification budget. It cannot autonomously reinterpret
+run approval as overriding the explicit instruction. Developer commit and
+amend instructions require a matching `Signed-off-by` trailer; the Reviewer
+checks it. Candidate commits do not authorize push, install, or release.
 
 Both role prompts carry the exact project/source paths, task document path,
 ordered design document paths, selector, instruction-discovery rule, and fixed
@@ -243,8 +265,12 @@ prompts. Same-task correction and re-review resume the exact respective role
 session.
 
 After a run reaches a terminal state, the Architect first completes its
-Reviewer and clarification evidence handoff. If the human later requests more
-delegated work, the same foreground Architect creates a new empty run:
+Reviewer and clarification evidence handoff. For LGTM it reports the final
+local candidate commit as already reviewed at the exact range; it neither asks
+whether to retain or revert that commit merely for lack of separate commit
+authorization nor creates another commit after LGTM. Push, install, and release
+remain separate human decisions. If the human later requests more delegated
+work, the same foreground Architect creates a new empty run:
 
 ```text
 session_run_begin({

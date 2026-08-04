@@ -413,13 +413,13 @@ fn fork_version_help_and_status_use_human_visible_version() {
 
     let (code, stdout, stderr) = h.run(["--version"]);
     assert_eq!(code, 0);
-    assert_eq!(stdout, "hcom 1.0.01\n");
+    assert_eq!(stdout, "hcom 1.0.02\n");
     assert!(stderr.is_empty(), "stderr={stderr}");
 
     let (code, stdout, stderr) = h.run(["--help"]);
     assert_eq!(code, 0, "stderr={stderr}");
     assert!(
-        stdout.starts_with("hcom (hook-comms) v1.0.01 "),
+        stdout.starts_with("hcom (hook-comms) v1.0.02 "),
         "stdout={stdout}"
     );
     assert!(
@@ -430,14 +430,14 @@ fn fork_version_help_and_status_use_human_visible_version() {
 
     let (code, stdout, stderr) = h.run(["status"]);
     assert_eq!(code, 0, "stderr={stderr}");
-    assert_eq!(stdout.lines().next(), Some("hcom 1.0.01"));
+    assert_eq!(stdout.lines().next(), Some("hcom 1.0.02"));
     assert!(stderr.is_empty(), "stderr={stderr}");
 
     let (code, stdout, stderr) = h.run(["status", "--json"]);
     assert_eq!(code, 0, "stderr={stderr}");
     assert!(stderr.is_empty(), "stderr={stderr}");
     let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(status["version"]["current"], "1.0.01");
+    assert_eq!(status["version"]["current"], "1.0.02");
     assert!(status["version"]["latest"].is_null());
     assert_eq!(status["version"]["update_available"], false);
     assert!(status["version"]["update_cmd"].is_null());
@@ -740,11 +740,35 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     );
     assert!(
         normalized_stdout.contains(
+            "plan/define the solution and then implement, proceed, finish, or drive the requested work"
+        ) && normalized_stdout.contains(
+            "does not need to be repeated merely because the exact plan did not exist when the human spoke"
+        ) && normalized_stdout.contains(
+            "does not by itself authorize starting the delegated loop"
+        ),
+        "stdout={stdout}"
+    );
+    assert!(
+        normalized_stdout.contains(
+            "Execution approval for the standard lane includes exactly one signed-off local candidate commit per task"
+        ) && normalized_stdout.contains(
+            "Local candidate commits do not authorize push, install, release, or an extra commit after LGTM"
+        ) && normalized_stdout.contains(
+            "Architect must escalate it to the human regardless of remaining autonomous clarification budget"
+        ) && normalized_stdout.contains(
+            "Reviewer checks it"
+        ),
+        "stdout={stdout}"
+    );
+    assert!(
+        normalized_stdout.contains(
             "terminal snapshot contains each task's latest Developer final path, ordered final Reviewer message paths, and Reviewer verdict, never the Reviewer body"
         ) && normalized_stdout.contains(
             "Architect reads every final Reviewer file in order and delivers its original verdict and findings"
         ) && normalized_stdout.contains(
             "does not rerun tests, review, or validation unless the human explicitly requests that work"
+        ) && normalized_stdout.contains(
+            "Architect reports it without asking whether to retain or revert it merely because commit was not separately authorized"
         ),
         "stdout={stdout}"
     );

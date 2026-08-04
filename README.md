@@ -82,6 +82,10 @@ in-memory, ordered task supervisor. Each approved task gets fresh no-TUI Codex
 Developer and Reviewer sessions. Both entrypoints currently use the same
 native `codex exec` worker lane; same-task review changes resume those exact
 native threads, while a configured Claude Developer or Reviewer fails closed.
+Execution approval for this standard lane includes one signed-off local
+candidate commit per task. Review corrections amend that same commit; LGTM
+applies to the final exact candidate range, so there is no extra post-LGTM
+commit. Push, install, and release remain separately authorized.
 If a developer exits with only allowed-path uncommitted changes, the
 supervisor exact-resumes that developer once to finish checks and commit before
 starting the reviewer; it does not terminate the whole run merely because the
@@ -102,11 +106,17 @@ capability-bound session-control MCP server is added as one hcom-owned config
 leaf, so all other native MCP servers remain available. A human request that
 explicitly says to follow or execute a named existing detailed plan,
 specification, or `current_todo` authorizes the Architect to derive the typed
-plan and start it in the same turn. A request only to analyze, discuss,
-summarize, or draft does not; an explicit instruction not to start always
-wins. The supervisor validates the exact plan version/hash and required
-confirmation bit, but does not independently attest an OS-level human
-keystroke.
+plan and start it in the same turn. So does a request to plan or define the
+solution and then implement, proceed, finish, or drive the requested work: that
+prospective authorization remains valid after the faithful detailed plan is
+derived and displayed, even though it did not exist when the human spoke. The
+Architect asks again only for a new unresolved material decision. A request
+only to analyze, discuss, summarize, or draft does not authorize execution; an
+explicit instruction not to start always wins. A bare generic
+implement/proceed/finish/drive request selects the delegated workflow but does
+not by itself authorize starting it. The supervisor validates the exact plan
+version/hash and required confirmation bit, but does not independently attest
+an OS-level human keystroke.
 
 The Codex Architect and workers use the launching terminal's real
 HOME/CODEX_HOME and native Codex config, authentication, trust, AGENTS.md,
@@ -156,13 +166,26 @@ Before starting, the Architect must display every task's ordinal, key,
 repository root, task/design document paths, selector, review and clarification
 budgets, material assumptions, and the exact plan version and hash. An explicit
 follow/execute/implement request for a named existing plan may authorize
-same-turn start; otherwise the Architect waits for a later approval. Unless the
-human explicitly assigns implementation to the current Architect session,
-generic implementation requests mean planning and delegation through the
-Developer/Reviewer loop. Repository identity is selected by the Architect from
-that plan; there is no host-path allowlist. The Codex Architect has the native
-same-user host view; hcom commands inside it use private per-run state so the
-live retained hcom store is not addressed through the normal CLI.
+same-turn start. An explicit request to first plan/define the solution and then
+implement/proceed/finish/drive it does too, provided the derived plan is
+faithful and adds no unresolved material decision; the human is not asked to
+repeat that authorization merely because the exact binding was created later.
+Unless the human explicitly assigns implementation to the current Architect
+session, generic implementation requests mean planning and delegation through
+the Developer/Reviewer loop; standing alone, they do not authorize starting
+that loop. The standard lane requires one signed-off local task commit before
+review and same-commit amendments during correction. The Developer is
+instructed to add and preserve the matching `Signed-off-by` trailer, and the
+Reviewer checks it.
+An explicit no-commit requirement is incompatible and must be resolved before
+start; a general commit-authorization rule is satisfied by run approval. If an
+explicit no-commit conflict nevertheless reaches a Developer, the Developer
+must not modify or commit, and the Architect must require a human decision
+regardless of remaining autonomous clarification budget.
+Repository identity is selected by the Architect from that plan; there is no
+host-path allowlist. The Codex Architect has the native same-user host view;
+hcom commands inside it use private per-run state so the live retained hcom
+store is not addressed through the normal CLI.
 
 After dispatch, the Codex Architect makes a blocking `session_wait` call bound
 to the exact current run ID.

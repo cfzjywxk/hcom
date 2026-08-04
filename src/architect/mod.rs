@@ -76,9 +76,16 @@ all other native user/project config, trust, AGENTS.md, rules, hooks, skills,
 plugins, feature flags, providers, and MCP servers remain loaded. This does not
 override the explicit danger-full-access/never profile.
 The Architect may start in the same turn when the human explicitly directs it
-to follow or execute a named existing detailed plan/specification/current_todo;
-analysis or drafting alone still waits for approval. hcom validates the typed
-plan revision/hash and confirmation bit, not OS-level keyboard provenance.
+to follow or execute a named existing detailed plan/specification/current_todo,
+or directs it to plan/define the solution and then implement, proceed, finish,
+or drive the requested work. The latter authorization remains valid after a
+faithful plan is derived and displayed; it does not need to be repeated merely
+because the exact plan did not exist when the human spoke. A new unresolved
+material decision still requires approval, and analysis or drafting without an
+execution directive still waits. A bare generic implement/proceed/finish/drive
+request selects delegation rather than Architect-side development, but does not
+by itself authorize starting the delegated loop. hcom validates the typed plan
+revision/hash and confirmation bit, not OS-level keyboard provenance.
 
 Only typed profile fields are accepted; arbitrary native argv is not. The
 effective sanitized profiles and their SHA-256 hash are printed at startup and
@@ -104,6 +111,17 @@ strings without reading, copying, hashing, locking, or drift-checking the
 documents. Developer tasks read the original files, then work and commit
 directly in the source directory; hcom has no repository-root allowlist and
 does not inspect or repair Git.
+Execution approval for the standard lane includes exactly one signed-off local
+candidate commit per task and amendments of that same commit during correction.
+A general instruction requiring human authorization for commits is satisfied
+by that run approval. An explicit no-commit requirement is incompatible with
+the standard lane and must be resolved before start. If that conflict reaches a
+Developer turn, the Developer requests clarification without modifying the
+repository and the Architect must escalate it to the human regardless of
+remaining autonomous clarification budget. The Developer is instructed to add
+and preserve a matching Signed-off-by trailer, and the Reviewer checks it.
+Local candidate commits do not authorize push, install, release, or an extra
+commit after LGTM.
 The Reviewer receives the same native host view; source/Git/install
 non-mutation is a role instruction rather than an OS read-only mount. It reads
 the Developer's exact durable final through its path. Corrections and
@@ -136,9 +154,13 @@ final Reviewer message paths, and Reviewer verdict, never the Reviewer body.
 The Architect reads every final Reviewer file in order and delivers its
 original verdict and findings, distinguishing LGTM, review exhaustion, and
 lifecycle failure. It does not rerun tests, review, or validation unless the
-human explicitly requests that work. A terminal run remains immutable but does
-not end the foreground Architect. After completing that evidence handoff, a
-later human request can call session_run_begin with the exact terminal run_id
+human explicitly requests that work. An LGTM task's final local candidate
+commit is already reviewed at the reported exact range; the Architect reports
+it without asking whether to retain or revert it merely because commit was not
+separately authorized. Push, install, and release remain separate. A terminal
+run remains immutable but does not end the foreground Architect. After
+completing that evidence handoff, a later human request can call
+session_run_begin with the exact terminal run_id
 and version to create a fresh empty run under the same parent. The new run gets
 a new run_id, monotonically advances the session version, resets run-local
 task/worker identity, and still requires a separately bound and approved plan.

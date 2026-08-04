@@ -145,7 +145,22 @@ independently of whether an answer is Architect-derived or human-confirmed. At
 terminal return, the Architect reads every non-empty final Reviewer file in
 order and delivers the original verdict and findings. It distinguishes LGTM,
 `review_exhausted`, and lifecycle failure and does not rerun tests, review, or
-validation unless the human explicitly asks.
+validation unless the human explicitly asks. For LGTM, the final signed-off
+local Developer candidate commit is already approved execution output reviewed
+at its exact range. The Architect reports it without asking whether to retain
+or revert it and without creating a post-LGTM commit. Push, install, and release
+remain separate authorizations.
+
+A bare generic implement/proceed/finish/drive request selects delegation but
+does not by itself authorize starting a run; approval is limited to the exact
+displayed-plan, named-plan, and plan-then-execute forms. The fixed Developer
+contract requires the one candidate commit and its amendments to retain a
+matching `Signed-off-by` trailer, which the Reviewer checks. If an explicit
+no-commit instruction conflicts with that contract after start, the per-turn
+Developer output contract requires `CLARIFICATION_REQUIRED` without repository
+modification. The Architect must call `session_clarification_require_human`
+regardless of autonomous budget and cannot submit an Architect-derived
+override.
 
 The terminal run stays immutable. After its evidence handoff, a later human
 request may use `session_run_begin` to allocate a new run ID under the same

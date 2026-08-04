@@ -7,9 +7,11 @@ You are the foreground hcom Architect. Unless the human explicitly says that \
 this current Architect session itself must implement the code, do not develop, \
 edit the task repository, run the task's implementation checks as its \
 Developer, or complete implementation work yourself. Generic requests such as \
-\"implement\", \"proceed\", or \"finish\" mean: analyze and bind concrete tasks, \
-then delegate implementation and review through the hcom Developer/Reviewer \
-loop.
+\"implement\", \"proceed\", \"finish\", or \"drive\" mean: analyze and bind concrete \
+tasks, then delegate implementation and review through the hcom \
+Developer/Reviewer loop. These generic requests select delegation rather than \
+Architect-side implementation; standing alone, they do not authorize starting \
+the delegated loop. Execution authorization is limited to the forms below.
 
 Analyze every human request before dispatch. If it is already concrete, bind it \
 faithfully with no gratuitous rewriting. If its intended behavior and scope are \
@@ -23,6 +25,31 @@ them in the normal approval step. If you introduce a material assumption not \
 already authorized by the human's current execution request, display it and \
 wait for explicit approval instead of auto-starting in the same turn.
 
+An explicit human request to plan or define the solution and then implement, \
+proceed, finish, or drive the work authorizes same-turn start of the faithful \
+plan you derive, even when that detailed plan did not exist when the human \
+spoke. Display the complete typed binding first, but do not ask the human to \
+repeat the authorization merely because the exact plan was produced afterward. \
+A direction to follow or execute a named existing detailed plan has the same \
+effect. Read, analyze, discuss, summarize, draft, or update-a-plan requests \
+without an execution directive do not authorize start. An explicit instruction \
+not to start always wins.
+
+The standard delegated loop requires each Developer to create exactly one \
+signed-off local candidate commit for its task before review and to amend only \
+that same task commit for corrections. Approval of the run includes this local \
+candidate-commit topology; it does not authorize push, install, release, or an \
+extra commit after LGTM. Do not write or bind a task/design source that forbids \
+the required local candidate commit. A general rule that local commits require \
+human authorization is satisfied by the human's execution authorization for \
+this run. If the human explicitly requires this run to remain uncommitted, \
+explain that the standard lane is incompatible and ask before binding or \
+starting it. If a Developer reports this authority conflict after start, it is \
+never an Architect-derivable clarification: call \
+session_clarification_require_human even while autonomous clarification budget \
+remains. Do not submit an autonomous clarification or reinterpret run approval \
+as overriding the explicit no-commit instruction.
+
 After a plan is approved and until that run is terminal, do not modify its bound \
 task/design sources or task repository. The only task-related file you may \
 create is a new clarification document at the exact clarification_output_path \
@@ -33,7 +60,11 @@ artifacts remain immutable, but terminal does not end this foreground \
 Architect. After completing the terminal evidence handoff, a later human \
 request may update planning sources and begin a fresh empty run in this same \
 Architect session; the new run still requires an exact plan binding and \
-explicit execution authorization.";
+explicit execution authorization. For an LGTM task, the final Developer task \
+commit has already been reviewed at its exact candidate range. Report that \
+local reviewed commit and the absence of any separately authorized push or \
+install; do not ask whether to retain or revert it merely because commit was \
+not separately authorized, and do not create another post-LGTM commit.";
 
 pub(crate) fn tool_definitions(developer_adapter: &str, reviewer_adapter: &str) -> Vec<Value> {
     ActionName::ARCHITECT
@@ -86,22 +117,22 @@ fn tool_description(action: ActionName) -> &'static str {
             "Begin a fresh empty run inside this same foreground Architect after the current run is terminal. The old run, its terminal snapshot, and its durable artifacts remain immutable; this action creates a new run_id, preserves the frozen project/profile binding, advances the session version, and resets run-local task and worker identity. Call it only after reading and reporting every required terminal Reviewer/clarification artifact from the old run and only when the human has supplied a later request that needs a new delegated plan. Bind terminal_run_id and expected_session_version to the exact terminal snapshot. This action does not bind a plan, approve execution, or start a worker. After success, use the returned new run_id and version for plan binding. Never use it to skip, abandon, reorder, or replace a non-terminal run."
         }
         ActionName::SessionPlanReplace => {
-            "The current Architect session plans and delegates; it does not implement or complete the task unless the human explicitly assigns implementation to this Architect session. Generic requests to implement, proceed, or finish mean analyze, bind, and delegate through the Developer/Reviewer loop. Draft or replace the bounded ordered task plan using file pointers after analyzing the human request and current project documentation. Bind a clear task faithfully; refine or split it only when needed to make execution concrete. Record important inferable assumptions in durable task/design documents. Ask the human before approval only when a decision cannot be derived and different answers materially change behavior, acceptance, scope, or the task set. For every task, set repository_root to the real absolute source directory, task_document_path to the absolute objective/acceptance/checks/scope/actions file, design_document_paths to required design files, task_selector to the exact task section, max_review_rounds to the review budget, and max_clarification_rounds to the maximum Architect-autonomous clarification submissions. There is no configured host-path allowlist. hcom preserves these exact strings; it does not read, canonicalize, hash, lock, drift-check, check document existence, or inspect Git. repository_root must be an existing directory. Before this call you may update planning documents. After it and until the run is terminal, do not modify any bound repository or task/design source: a concurrent Architect write can be silently swept into the Developer's commit. This call never starts a worker. Display every ordinal, task_key, repository_root, task_document_path, design_document_paths entry, task_selector, both round limits, all material assumptions, plan version, and plan hash; do not abbreviate or omit them. A current human instruction to follow or execute a named detailed plan, specification, or current_todo permits same-turn start only when the draft is faithful and introduces no new material decision; examples include \"按照 current_todo\" and \"按照 <named plan> 推进完成开发\". Otherwise wait for explicit approval. An explicit instruction not to start always wins."
+            "The current Architect session plans and delegates; it does not implement or complete the task unless the human explicitly assigns implementation to this Architect session. Generic requests to implement, proceed, finish, or drive mean analyze, bind, and delegate through the Developer/Reviewer loop. Draft or replace the bounded ordered task plan using file pointers after analyzing the human request and current project documentation. Bind a clear task faithfully; refine or split it only when needed to make execution concrete. Record important inferable assumptions in durable task/design documents. Ask the human before approval only when a decision cannot be derived and different answers materially change behavior, acceptance, scope, or the task set. For every task, set repository_root to the real absolute source directory, task_document_path to the absolute objective/acceptance/checks/scope/actions file, design_document_paths to required design files, task_selector to the exact task section, max_review_rounds to the review budget, and max_clarification_rounds to the maximum Architect-autonomous clarification submissions. There is no configured host-path allowlist. hcom preserves these exact strings; it does not read, canonicalize, hash, lock, drift-check, check document existence, or inspect Git. repository_root must be an existing directory. Before this call you may update planning documents. After it and until the run is terminal, do not modify any bound repository or task/design source: a concurrent Architect write can be silently swept into the Developer's commit. This call never starts a worker. Every standard task must permit the fixed local candidate-commit topology: one signed-off Developer task commit before review, amended in place for corrections, with no extra commit after LGTM. Execution approval for the run includes that local commit topology but never push, install, or release. Do not bind a task/design source that forbids the candidate commit. A general rule requiring human authorization for commits is satisfied by execution authorization for this standard lane; an explicit human no-commit requirement is incompatible and must be resolved before this call. Display every ordinal, task_key, repository_root, task_document_path, design_document_paths entry, task_selector, both round limits, all material assumptions, plan version, and plan hash; do not abbreviate or omit them. A current human instruction either to follow or execute a named detailed plan, specification, or current_todo, or to plan or define the solution and then implement, proceed, finish, or drive the requested work, permits same-turn start when the draft is faithful and introduces no new material decision; examples include \"按照 current_todo\", \"按照 <named plan> 推进完成开发\", and \"先明确技术方案，然后 drive 开发完成\". Do not ask again merely because the faithful detailed plan was created after that execution instruction. Read/analyze/discuss/summarize/draft/update-a-plan alone does not authorize start, and an explicit instruction not to start always wins."
         }
         ActionName::SessionApproveAndStart => {
-            "The current Architect session starts the delegated Developer/Reviewer workflow; it does not implement or complete the task unless the human explicitly assigns implementation to this Architect session. Generic requests to implement, proceed, or finish authorize planning and delegation, not Architect-side development. Start the exact draft only with explicit human execution authorization in this Architect conversation. Authorization is either approval of the complete displayed task binding list (ordinal, task_key, repository_root, task_document_path, design_document_paths, task_selector, and both round limits) with material assumptions, plan version, and plan hash, or the human's current explicit direction to follow or execute a named existing detailed plan, specification, or current_todo from which the draft is faithfully derived without a new material decision. Examples include \"按照 current_todo\" and \"按照 <named plan> 推进完成开发\". Read, analyze, discuss, summarize, draft, or update-a-plan requests are not execution authorization; an instruction not to start always wins. A faithful named-plan instruction may start in the same turn. When this returns Running, immediately call session_wait with run_id equal to the returned session.run_id and after_session_version equal to the returned session.version. Do not poll."
+            "The current Architect session starts the delegated Developer/Reviewer workflow; it does not implement or complete the task unless the human explicitly assigns implementation to this Architect session. Generic requests to implement, proceed, finish, or drive select Architect planning and later delegation rather than Architect-side development, but standing alone they do not authorize starting the delegated loop. Start the exact draft only with explicit human execution authorization in this Architect conversation. Authorization is any of: approval of the complete displayed task binding list (ordinal, task_key, repository_root, task_document_path, design_document_paths, task_selector, and both round limits) with material assumptions, plan version, and plan hash; an explicit direction to follow or execute a named existing detailed plan, specification, or current_todo; or an explicit direction to plan or define the solution and then implement, proceed, finish, or drive the requested work. The latter prospective authorization remains valid after you derive and display the faithful detailed plan even though it did not exist when the human spoke; do not ask for a duplicate confirmation solely for that reason. The draft may start in the same turn only when it faithfully implements the authorized request and introduces no unresolved new material decision. Examples include \"按照 current_todo\", \"按照 <named plan> 推进完成开发\", and \"先明确技术方案，然后 drive 开发完成\". Read, analyze, discuss, summarize, draft, or update-a-plan requests without an execution directive are not authorization; an instruction not to start always wins. Starting this standard lane also authorizes one signed-off local Developer candidate commit per task and amendments of that same commit during correction. It does not authorize push, install, release, or a new commit after LGTM. When this returns Running, immediately call session_wait with run_id equal to the returned session.run_id and after_session_version equal to the returned session.version. Do not poll."
         }
         ActionName::SessionClarificationSubmit => {
-            "Submit one new clarification document for the exact latched Developer request. Read the Developer request file and relevant approved sources first. Create only the exact clarification_document_path supplied as clarification_output_path by session_wait or session_status; never edit task/design sources, the repository, or an older clarification. The document should answer the specific issue without expanding approved scope. Set human_decision_confirmed=false only for an Architect-derived answer while autonomous budget remains. Set it true only after hcom says human_decision_required and the human has actually decided. This boolean is an Architect attestation; hcom cannot independently verify the keyboard source of the decision. On success, immediately call session_wait again with run_id equal to the returned session.run_id and after_session_version equal to the returned session.version."
+            "Submit one new clarification document for the exact latched Developer request. Read the Developer request file and relevant approved sources first. Create only the exact clarification_document_path supplied as clarification_output_path by session_wait or session_status; never edit task/design sources, the repository, or an older clarification. The document should answer the specific issue without expanding approved scope. Set human_decision_confirmed=false only for an Architect-derived answer while autonomous budget remains. Never use false for a conflict between an explicit no-commit instruction and the standard lane's required candidate commit; that authority conflict must first go through session_clarification_require_human. Set human_decision_confirmed=true only after hcom says human_decision_required and the human has actually resolved the conflict or other decision. This boolean is an Architect attestation; hcom cannot independently verify the keyboard source of the decision. On success, immediately call session_wait again with run_id equal to the returned session.run_id and after_session_version equal to the returned session.version."
         }
         ActionName::SessionClarificationRequireHuman => {
-            "Escalate the exact latched Developer request when the Architect cannot derive a defensible answer or a material human decision is needed before the autonomous budget is exhausted. After this call, explain the decision, alternatives, consequences, Developer-reported repository state, and that the foreground run is only in memory; ask the human and END the turn. Do not call session_wait while awaiting the human. When the human answers, create the exact pending clarification_output_path and call session_clarification_submit with human_decision_confirmed=true. On that successful response, immediately re-arm session_wait with run_id equal to the returned session.run_id and after_session_version equal to the returned session.version. If the human decides the task cannot continue, the only exit is explicit session_cancel followed by a separately approved new plan/run; do not invent skip, abandon, reorder, or in-place plan replacement."
+            "Escalate the exact latched Developer request when the Architect cannot derive a defensible answer or a material human decision is needed before the autonomous budget is exhausted. This call is mandatory when the request reports a conflict between an explicit no-commit instruction and the standard lane's required candidate commit, regardless of remaining autonomous budget; run approval must not be used to override that explicit instruction. After this call, explain the decision, alternatives, consequences, Developer-reported repository state, and that the foreground run is only in memory; ask the human and END the turn. Do not call session_wait while awaiting the human. When the human answers, create the exact pending clarification_output_path and call session_clarification_submit with human_decision_confirmed=true. On that successful response, immediately re-arm session_wait with run_id equal to the returned session.run_id and after_session_version equal to the returned session.version. If the human decides the task cannot continue, the only exit is explicit session_cancel followed by a separately approved new plan/run; do not invent skip, abandon, reorder, or in-place plan replacement."
         }
         ActionName::SessionClarificationsList => {
             "Read a bounded page of durable clarification records for one exact task in the exact current run_id. Status snapshots expose only clarification_record_count so control responses stay bounded. Start with after_sequence=0 and a limit from 1 through 8; if next_after_sequence is present, pass it as the next after_sequence until it is absent. Finish reading the terminal run before session_run_begin, because an earlier run is immutable durable evidence rather than the current in-memory control target. This read-only action does not consume a clarification round and is not a wait or polling mechanism."
         }
         ActionName::SessionWait => {
-            "Passively wait within the exact current run_id for either a terminal session or a latched pending_architect_action. This is event-driven, not polling: normal Developer and Reviewer transitions do not return. A pending action carries published_version and is retained across interruption or reconnect: a wait from an older version in the same run re-delivers it, while a repeated wait at or after published_version is rejected until you resolve the action. On an action response, read the exact Developer request path. If you can derive a bounded answer, create the exact clarification_output_path, submit it, and immediately wait again in the same turn. If hcom already requires a human decision, or you choose to escalate with session_clarification_require_human, ask the human and end the turn without waiting. After a terminal response, read all listed Reviewer final files; when clarification_record_count is nonzero, use session_clarifications_list with that run_id to read the bounded record pages before reporting the original outcomes. A later human request may then use session_run_begin to create a fresh run without restarting this Architect. Cancellation or interruption of this tool never cancels the run."
+            "Passively wait within the exact current run_id for either a terminal session or a latched pending_architect_action. This is event-driven, not polling: normal Developer and Reviewer transitions do not return. A pending action carries published_version and is retained across interruption or reconnect: a wait from an older version in the same run re-delivers it, while a repeated wait at or after published_version is rejected until you resolve the action. On an action response, read the exact Developer request path. If it reports a conflict between an explicit no-commit instruction and the standard lane's required candidate commit, do not answer autonomously even when clarification budget remains: call session_clarification_require_human, ask the human, and end the turn without waiting. For other requests, if you can derive a bounded answer, create the exact clarification_output_path, submit it, and immediately wait again in the same turn. If hcom already requires a human decision, or you choose to escalate with session_clarification_require_human, ask the human and end the turn without waiting. After a terminal response, read all listed Reviewer final files; when clarification_record_count is nonzero, use session_clarifications_list with that run_id to read the bounded record pages before reporting the original outcomes. For an LGTM task, the final Developer candidate commit was already reviewed at the reported exact range: report it as the local reviewed result, do not ask whether to retain or revert it merely for lack of separate commit authorization, and do not create another post-LGTM commit. Push, install, and release remain separately authorized actions. A later human request may then use session_run_begin to create a fresh run without restarting this Architect. Cancellation or interruption of this tool never cancels the run."
         }
         ActionName::SessionStatus => {
             "Read the in-memory status only when the human asks. It includes any latched pending Architect action, clarification record counts, round budgets, and whether a worker turn is active. Use session_clarifications_list for bounded record pages. It is not a keepalive or polling tool. If the run is active with no human question pending, use session_wait."
@@ -171,7 +202,7 @@ fn action_schema(action: ActionName, developer_adapter: &str, reviewer_adapter: 
                     json!({
                         "type":"boolean",
                         "const":true,
-                        "description":"Attest that the human explicitly authorized execution either by approving this exact displayed draft or by directing the Architect to follow/implement/execute the named existing detailed plan/specification/current_todo from which this draft was faithfully derived."
+                        "description":"Attest that the human explicitly authorized execution by approving this exact displayed draft, by directing the Architect to follow/implement/execute a named existing detailed plan/specification/current_todo, or by directing the Architect to plan/define the solution and then implement/proceed/finish/drive the requested work. A faithful derived plan may use the last form in the same turn when it adds no unresolved material decision. Standard-lane execution includes one local signed-off candidate commit per task and same-commit amendments, but not push/install/release."
                     }),
                 ),
             ],
@@ -193,7 +224,13 @@ fn action_schema(action: ActionName, developer_adapter: &str, reviewer_adapter: 
                 ("action_sequence", positive_uint32_schema()),
                 ("developer_request_path", absolute_path_schema()),
                 ("clarification_document_path", absolute_path_schema()),
-                ("human_decision_confirmed", json!({"type":"boolean"})),
+                (
+                    "human_decision_confirmed",
+                    json!({
+                        "type":"boolean",
+                        "description":"False only for a permitted Architect-derived clarification. A conflict between an explicit no-commit instruction and the standard lane's required candidate commit must first use session_clarification_require_human, then submit true only after the human actually resolves it."
+                    }),
+                ),
             ],
         ),
         ActionName::SessionClarificationRequireHuman => object_schema(
@@ -597,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_authorization_contract_supports_exact_or_named_plan_start() {
+    fn execution_authorization_contract_supports_exact_named_or_prospective_start() {
         let tools = tool_definitions("codex-developer", "claude-reviewer-2.1.220");
         let plan = tools
             .iter()
@@ -629,6 +666,11 @@ mod tests {
         assert!(plan.contains("silently swept into the Developer's commit"));
         assert!(plan.contains("按照 current_todo"));
         assert!(plan.contains("按照 <named plan> 推进完成开发"));
+        assert!(plan.contains("先明确技术方案，然后 drive 开发完成"));
+        assert!(plan.contains("Do not ask again"));
+        assert!(plan.contains("local candidate-commit topology"));
+        assert!(plan.contains("no extra commit after LGTM"));
+        assert!(plan.contains("never push, install, or release"));
 
         let approve_tool = tools
             .iter()
@@ -649,6 +691,11 @@ mod tests {
             "current_todo",
             "follow",
             "new material decision",
+            "plan or define the solution",
+            "prospective authorization",
+            "duplicate confirmation",
+            "local Developer candidate commit",
+            "new commit after LGTM",
         ] {
             assert!(
                 approve.contains(required),
@@ -665,6 +712,14 @@ mod tests {
             approve_tool["inputSchema"]["properties"]["approval_confirmed"]["const"],
             true
         );
+        let attestation =
+            approve_tool["inputSchema"]["properties"]["approval_confirmed"]["description"]
+                .as_str()
+                .unwrap();
+        assert!(attestation.contains("plan/define the solution"));
+        assert!(attestation.contains("same-commit amendments"));
+        assert!(attestation.contains("not push/install/release"));
+        assert!(approve.contains("standing alone they do not authorize starting"));
     }
 
     #[test]
@@ -780,6 +835,14 @@ mod tests {
             "Analyze every human request",
             "materially change behavior",
             "wait for explicit approval",
+            "plan or define the solution and then implement",
+            "do not ask the human to repeat the authorization",
+            "standing alone, they do not authorize starting",
+            "exactly one signed-off local candidate commit",
+            "does not authorize push, install, release",
+            "never an Architect-derivable clarification",
+            "session_clarification_require_human",
+            "do not ask whether to retain or revert it",
             "clarification_output_path",
             "does not interpret",
             "fresh empty run",
@@ -798,6 +861,8 @@ mod tests {
             .unwrap();
         assert!(submit.contains("exact clarification_document_path"));
         assert!(submit.contains("human_decision_confirmed=false"));
+        assert!(submit.contains("Never use false"));
+        assert!(submit.contains("explicit no-commit instruction"));
         assert!(submit.contains("Architect attestation"));
         assert!(submit.contains("immediately call session_wait again"));
         assert!(submit.contains("returned session.run_id"));
@@ -810,11 +875,29 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(require_human.contains("END the turn"));
+        assert!(require_human.contains("This call is mandatory"));
+        assert!(require_human.contains("regardless of remaining autonomous budget"));
         assert!(require_human.contains("Do not call session_wait"));
         assert!(require_human.contains("foreground run is only in memory"));
         assert!(require_human.contains("do not invent skip"));
         assert!(require_human.contains("returned session.run_id"));
         assert!(require_human.contains("returned session.version"));
+
+        let wait = tools
+            .iter()
+            .find(|tool| tool["name"] == "session_wait")
+            .unwrap()["description"]
+            .as_str()
+            .unwrap();
+        assert!(wait.contains("do not answer autonomously even when clarification budget remains"));
+
+        let human_attestation = tools
+            .iter()
+            .find(|tool| tool["name"] == "session_clarification_submit")
+            .unwrap()["inputSchema"]["properties"]["human_decision_confirmed"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(human_attestation.contains("must first use session_clarification_require_human"));
 
         let list = tools
             .iter()

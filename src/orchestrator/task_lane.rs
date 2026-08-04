@@ -1122,12 +1122,17 @@ impl TaskLaneSupervisor {
                         }
                         prompt.push_str(
                             "\nRead every Reviewer final file and address the requested changes. \
-                             If your task commit exists, fold the fix into that SAME commit with \
+                             If an explicit human, task, design, or applicable instruction still \
+                             requires this run to remain uncommitted, do not modify or amend \
+                             anything: return `STATUS: CLARIFICATION_REQUIRED` for a human \
+                             authority decision. Otherwise, if your task commit exists, fold the \
+                             fix into that SAME commit with \
                              `git commit --amend`, updating its message so it still describes the \
-                             whole task. If the Reviewer reported that your task commit is missing, \
-                             create it only after the complete fix. This task must end as exactly \
-                             one commit. Do not amend anything older than your own commit. Then \
-                             report as before.\n",
+                             whole task and ensuring it retains a valid `Signed-off-by` trailer for \
+                             the committing identity. If the Reviewer reported that your task \
+                             commit is missing, create it with that sign-off only after the complete \
+                             fix. This task must end as exactly one commit. Do not amend anything \
+                             older than your own commit. Then report as before.\n",
                         );
                     }
                     RuntimeTurnPurpose::DeveloperClarificationResume => {
@@ -1138,7 +1143,11 @@ impl TaskLaneSupervisor {
                             "\nResume the same task using clarification sequence {}. Re-read your \
                              request at {} and the Architect response at {} before continuing. \
                              Preserve any existing task commit exactly until you have a complete \
-                             correction to amend into it.\n",
+                             correction to amend into it. If the request reported an explicit \
+                             no-commit conflict, proceed only when the newest clarification records \
+                             the human's decision resolving that authority conflict; otherwise \
+                             return `STATUS: CLARIFICATION_REQUIRED` again without modifying or \
+                             committing the repository.\n",
                             latest.sequence,
                             latest.developer_request_path,
                             latest.architect_clarification_path,
@@ -1310,10 +1319,14 @@ such assumption on its own `ASSUMPTION:` line.
 
 Use CLARIFICATION_REQUIRED only when no defensible implementation choice can be
 derived from the task, design, clarification records, applicable instructions,
-and existing implementation, or when choosing would decide material behavior,
-acceptance, or scope. After the first line, state the exact decision needed,
-viable alternatives, consequences, what you inspected, and the current
-repository/commit state.
+and existing implementation; when choosing would decide material behavior,
+acceptance, or scope; or when an explicit human, task, design, or applicable
+instruction requires the run to remain uncommitted, which conflicts with the
+standard lane's required candidate commit. For that authority conflict, do not
+modify or commit the repository, and require an explicit human resolution rather
+than accepting an Architect-derived override. After the first line, state the
+exact decision needed, viable alternatives, consequences, what you inspected,
+and the current repository/commit state.
 
 Use BLOCKED only for an external or mechanical blocker you actually attempted
 to overcome. After the first line, state what you tried, the exact observed
@@ -1329,10 +1342,10 @@ hcom does not parse them.
 fn role_instructions(role: WorkerRole) -> &'static str {
     match role {
         WorkerRole::Developer => {
-            "You are the task Developer: execute the concrete approved task; do not redesign its product scope. First seek answers in the task file, design and clarification files, applicable instructions, existing implementation, and tests. Make ordinary local implementation decisions yourself. If an uncertain choice has a defensible candidate, is consistent with the approved behavior and scope, and can be corrected in review, choose the smallest-impact option, continue, and disclose it as `ASSUMPTION:` in your final. Ask for clarification only when you cannot derive any defensible candidate or the choice would decide material externally visible behavior, acceptance, or scope. Report BLOCKED only after actual attempts establish an external or mechanical obstacle; include concrete observations. Work directly in the exact repository and complete the bounded task. Run the required checks, then commit the complete work as ONE NEW commit whose message describes this task as a whole. Never amend, squash, reword, or otherwise rewrite a commit that existed when your first task turn began. On correction or clarification resume, amend your existing task commit if it exists; if no task commit exists yet, create the one task commit only after the implementation is complete. Never create a second task commit. Do not create a commit merely to pause. If a pause is necessary after your task commit already exists, leave that commit unchanged and report the exact repository state. Never add any `hcom-tasks` artifact to the task commit. Do not push, install, wait for interactive input, or modify the task/design/clarification source files."
+            "You are the task Developer: execute the concrete approved task; do not redesign its product scope. First seek answers in the task file, design and clarification files, applicable instructions, existing implementation, and tests. Make ordinary local implementation decisions yourself. If an uncertain choice has a defensible candidate, is consistent with the approved behavior and scope, and can be corrected in review, choose the smallest-impact option, continue, and disclose it as `ASSUMPTION:` in your final. Ask for clarification only when you cannot derive any defensible candidate or the choice would decide material externally visible behavior, acceptance, or scope. Report BLOCKED only after actual attempts establish an external or mechanical obstacle; include concrete observations. Work directly in the exact repository and complete the bounded task. The human's execution approval for this standard hcom lane authorizes exactly one signed-off local candidate commit for this task; a general instruction that commits require human authorization is satisfied by that run approval. If an explicit human, task, design, or applicable instruction instead requires this run to remain uncommitted, do not modify or commit the repository: return `STATUS: CLARIFICATION_REQUIRED` because that requirement is incompatible with the standard review lane and requires an explicit human resolution. Otherwise run the required checks, then commit the complete work as ONE NEW commit whose message describes this task as a whole and whose `Signed-off-by` trailer matches the committing identity (for example, create it with `git commit --signoff`). Never amend, squash, reword, or otherwise rewrite a commit that existed when your first task turn began. On correction or clarification resume, amend your existing task commit if it exists and ensure that it retains a valid matching `Signed-off-by` trailer; if no task commit exists yet, create the one signed-off task commit only after the implementation is complete. Never create a second task commit. Do not create a commit merely to pause. If a pause is necessary after your task commit already exists, leave that commit unchanged and report the exact repository state. Never add any `hcom-tasks` artifact to the task commit. This local candidate commit and its same-task amendments do not authorize push, install, or release. Do not push, install, wait for interactive input, or modify the task/design/clarification source files."
         }
         WorkerRole::Reviewer => {
-            "You are the task Reviewer. Independently inspect the committed task range and decide whether it is sound against the approved task, design files, and every ordered clarification record. Review disclosed Developer assumptions rather than accepting them automatically. Confirm the developer left the work committed as a single commit for this task, with a message covering it, and did not include any `hcom-tasks` artifact; uncommitted work or a task split across several commits is a reason to request changes. Distinguish requirement ambiguity from implementation defects and label the former `REQUIREMENT_AMBIGUITY:` in findings. You must not edit reviewed source, stage, commit, change branch or HEAD, push, or install; verifying by copying the tree into your own writable sandbox is allowed and encouraged when it helps."
+            "You are the task Reviewer. Independently inspect the committed task range and decide whether it is sound against the approved task, design files, and every ordered clarification record. The human's execution approval for this standard hcom lane includes exactly one signed-off local Developer candidate commit and same-commit amendments during correction; it never includes push, install, or release. Review disclosed Developer assumptions rather than accepting them automatically. Confirm the developer left the work committed as a single commit for this task, with a message covering it, a valid `Signed-off-by` trailer matching the committing identity, and no `hcom-tasks` artifact; uncommitted work, a missing or mismatched sign-off, or a task split across several commits is a reason to request changes. If an explicit human, task, design, or applicable instruction requires the run to remain uncommitted, return `VERDICT: REQUEST_CHANGES` and label the incompatible workflow requirement `REQUIREMENT_AMBIGUITY:` instead of accepting either side of the contradiction. Distinguish other requirement ambiguity from implementation defects and label the former `REQUIREMENT_AMBIGUITY:` in findings. An LGTM applies to the exact final candidate range already committed; it does not call for another post-LGTM commit or a human decision about retaining that reviewed commit. You must not edit reviewed source, stage, commit, change branch or HEAD, push, or install; verifying by copying the tree into your own writable sandbox is allowed and encouraged when it helps."
         }
     }
 }
@@ -1378,6 +1391,53 @@ mod tests {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::process::Command;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn role_contract_separates_local_candidate_commits_from_release_authority() {
+        let developer = role_instructions(WorkerRole::Developer);
+        for required in [
+            "execution approval for this standard hcom lane authorizes exactly one signed-off local candidate commit",
+            "general instruction that commits require human authorization is satisfied",
+            "STATUS: CLARIFICATION_REQUIRED",
+            "incompatible with the standard review lane",
+            "requires an explicit human resolution",
+            "git commit --signoff",
+            "Signed-off-by",
+            "do not authorize push, install, or release",
+        ] {
+            assert!(
+                developer.contains(required),
+                "Developer role contract omitted {required}"
+            );
+        }
+
+        let reviewer = role_instructions(WorkerRole::Reviewer);
+        for required in [
+            "exactly one signed-off local Developer candidate commit",
+            "VERDICT: REQUEST_CHANGES",
+            "REQUIREMENT_AMBIGUITY:",
+            "valid `Signed-off-by` trailer matching the committing identity",
+            "exact final candidate range already committed",
+            "does not call for another post-LGTM commit",
+        ] {
+            assert!(
+                reviewer.contains(required),
+                "Reviewer role contract omitted {required}"
+            );
+        }
+
+        for required in [
+            "human, task, design, or applicable",
+            "requires the run to remain uncommitted",
+            "standard lane's required candidate commit",
+            "require an explicit human resolution",
+        ] {
+            assert!(
+                DEVELOPER_OUTPUT_CONTRACT.contains(required),
+                "per-turn Developer output contract omitted {required}"
+            );
+        }
+    }
 
     #[derive(Clone)]
     enum Mutation {
@@ -2976,6 +3036,8 @@ mod tests {
             .map(|(_, _, prompt)| prompt.clone())
             .expect("correction prompt");
         assert!(!correction_prompt.contains("the overflow case is unhandled"));
+        assert!(correction_prompt.contains("do not modify or amend anything"));
+        assert!(correction_prompt.contains("valid `Signed-off-by` trailer"));
         let original_review_path = message_path(
             WorkerRole::Reviewer,
             "the overflow case is unhandled-original",
@@ -4596,6 +4658,8 @@ mod tests {
             .map(|(_, _, prompt)| prompt)
             .unwrap();
         assert!(resume_prompt.contains("Previously supplied Reviewer final messages"));
+        assert!(resume_prompt.contains("human's decision resolving that authority conflict"));
+        assert!(resume_prompt.contains("STATUS: CLARIFICATION_REQUIRED"));
     }
 }
 

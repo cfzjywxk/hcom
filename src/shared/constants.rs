@@ -185,8 +185,8 @@ mod tests {
 
     #[test]
     fn package_and_human_versions_have_distinct_representations() {
-        assert_eq!(PACKAGE_VERSION, "1.0.1");
-        assert_eq!(human_version(), "1.0.01");
+        assert_eq!(PACKAGE_VERSION, "1.0.2");
+        assert_eq!(human_version(), "1.0.02");
     }
 
     #[test]

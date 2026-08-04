@@ -21,6 +21,19 @@ verify independently at whatever depth they choose, and the human plus real CI
 are the last word. hcom neither pushes nor installs, so a wrong judgment costs
 a review round or a local commit, both cheap and revertible.
 
+**The approved lane includes its local candidate commit.** Each Developer
+creates exactly one signed-off local task commit before review and amends only
+that commit for corrections. Its create/amend instructions require a matching
+`Signed-off-by` trailer, which the Reviewer checks. A general instruction
+requiring human authorization for commits is satisfied by approval of the
+standard run. An explicit no-commit requirement is incompatible and routes to
+clarification instead of being silently ignored. That authority conflict is
+included in the per-turn `CLARIFICATION_REQUIRED` output contract; the Architect
+must escalate it to the human regardless of remaining autonomous clarification
+budget and cannot autonomously override it. Reviewer LGTM applies to the exact
+final candidate range already committed; it does not authorize or require
+another commit. Push, install, and release always remain separate.
+
 ## Invocation
 
 `ExecTaskWorkerRuntime` (`src/worker/exec_runtime.rs`) builds one bounded
@@ -397,4 +410,6 @@ Architect reads every non-empty Reviewer file in order and reports its
 original verdict/findings, distinguishing LGTM,
 `review_exhausted`, and lifecycle failure. Neither MCP response shape embeds
 the Reviewer body, and the Architect does not rerun tests, review, or
-validation unless the human asks.
+validation unless the human asks. For LGTM, it reports the final reviewed local
+candidate without asking whether to retain/revert it or creating a post-LGTM
+commit; push/install/release remain separately authorized.
