@@ -296,26 +296,61 @@ unclassifiable Reviewer verdict moves the run to a human-visible terminal
 state. Parent exit/cancel stops the active process group. hcom never pushes,
 installs, resets, rebases, or automatically recovers after the parent exits.
 
-After dispatch, the Codex Architect calls `session_wait` once with the returned
-session version. This is one blocking, terminal-only MCP subscription: the
-local supervisor continues lifecycle monitoring and advances normal
-Developer-to-Reviewer and correction transitions without Architect model
-calls. It completes the subscription only when the run becomes `completed`,
-`needs_human`, `failed`, or `canceled`. Codex may display `Working` for the
+After dispatch, the Codex Architect calls `session_wait` with the returned
+session version. This blocking MCP subscription completes when the run becomes
+`completed`, `needs_human`, `failed`, or `canceled`, or when a Developer
+clarification/blocker action is latched. The local supervisor continues
+lifecycle monitoring and advances normal Developer-to-Reviewer and correction
+transitions without Architect model calls. Codex may display `Working` for the
 duration, but it does not sleep, poll `session_status`, or repeatedly infer.
 
 Esc or MCP cancellation closes only the current wait subscription; it does not
-cancel the supervisor run. Codex cannot autonomously reissue a tool call after
-its turn was interrupted. If the human explicitly asks it to resume waiting,
-the new `session_wait` replaces any abandoned subscription. A terminal snapshot
-is retained in memory and returns immediately if the run finished during the
-gap. `session_status` remains available only for an explicit human progress
-query.
+cancel the supervisor run. A pending Architect action records the session
+version at which it was published. While it remains unresolved, a reconnect
+from an older version immediately redelivers it; a repeated wait at or after
+that published version is rejected so it cannot spin on the same action. A
+terminal snapshot is retained in memory and likewise returns immediately if
+the run finished during the gap.
+
+Task-lane polling is fail-closed at both ownership layers. The driver does not
+drop its active-turn handle until the cloned core accepts the completion
+event. Any poll/reducer bookkeeping error closes the task runtime, records a
+bounded driver diagnostic, and moves the run to `needs_human` before returning
+the error. The outer control loop additionally converts any future backend
+violation of that terminal-on-error contract into a shutdown terminal and
+services the pending wait, so `session_wait` cannot be stranded by a discarded
+poll error.
+
+For an action the Architect can answer defensibly from approved sources, it
+writes only the exact new clarification path supplied by hcom, submits it, and
+immediately re-arms `session_wait` with the returned version in the same turn.
+If the action needs a material human decision, the Architect marks it as such,
+reports the question and current repository state, and ends the turn without
+calling `session_wait`. After the human answers, it submits the exact pending
+clarification as human-confirmed and re-arms the wait. `session_status` remains
+available only for an explicit human progress query. `human_decision_confirmed`
+is an Architect attestation, like execution approval; hcom does not identify
+the physical keyboard source. Independent hard limits of 64 clarification
+records per task and 1280 per run prevent that attestation from bypassing
+control-plane resource bounds.
+
+Mutating control requests use a bounded recent replay window of 1024 completed
+responses. A retained request ID remains payload-bound and replays its exact
+response. When the window is full, the supervisor evicts the oldest completed
+record before accepting another mutation; it never evicts an in-progress
+record. Every mutation still carries an exact expected session version, so an
+evicted successful request cannot execute again after its original state
+transition. Cancellation remains available even if no completed replay record
+can be evicted, so replay bookkeeping cannot wedge the run without a
+protocol-level exit.
 
 Every terminal snapshot carries, for every task, its
 `latest_developer_final_path`, ordered `final_reviewer_message_paths`, and
-`reviewer_verdict`. The Reviewer body is not copied into either the MCP
-compatibility text or `structuredContent`. After `session_wait` returns, the
+`reviewer_verdict`. It carries `clarification_record_count` rather than the
+accumulating record vector; the Architect uses `session_clarifications_list`
+with pages of at most eight to read the ordered chain. The Reviewer body is not
+copied into either the MCP compatibility text or `structuredContent`. After
+`session_wait` returns, the
 Architect reads every non-empty Reviewer path in order and uses the original
 verdict and findings for the human-facing delivery. It distinguishes `lgtm`,
 `review_exhausted`, and lifecycle failure from the typed task/session state;

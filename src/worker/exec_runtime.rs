@@ -5,10 +5,11 @@
 //! mounts) and afterwards observes the world: process exit status, the
 //! `thread.started` line on stdout (the only JSON parsed, as the session
 //! identity proof), and the native `--output-last-message` file. Model output
-//! is payload, never protocol: only the reviewer's exact first verdict line is
-//! classified, while each complete UTF-8 final message is preserved unchanged
+//! is payload except for exact first-line routing signals: Developer STATUS and
+//! Reviewer VERDICT. Each complete UTF-8 final message is preserved unchanged
 //! in a durable artifact and handed to the next role by path.
 
+use super::developer_status::classify_developer_status;
 use super::environment::{ExecutionEnvironmentLease, SecretRedactor};
 use super::process::{ProcessGroupBinding, configure_worker_child};
 use super::runtime::{
@@ -497,7 +498,7 @@ impl ExecTaskWorkerRuntime {
 
         let outcome = match role {
             WorkerRole::Developer => RuntimeOutcome::Developer(DeveloperOutcomeV1 {
-                status: DeveloperOutcomeStatus::Ready,
+                status: classify_developer_status_file(&final_message_path)?,
             }),
             WorkerRole::Reviewer => match classify_verdict_file(&final_message_path)? {
                 VerdictClassification::Determined(Verdict::Lgtm) => {
@@ -1054,6 +1055,41 @@ fn classify_verdict_file(path: &Path) -> Result<VerdictClassification, RuntimeEr
     Ok(classify_verdict(line))
 }
 
+fn classify_developer_status_file(path: &Path) -> Result<DeveloperOutcomeStatus, RuntimeError> {
+    let line = read_bounded_first_line(path, "Developer")?;
+    Ok(classify_developer_status(&line))
+}
+
+fn read_bounded_first_line(path: &Path, role: &str) -> Result<String, RuntimeError> {
+    const FIRST_LINE_CAP: u64 = 8 * 1024;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            RuntimeError::internal(single_line(&format!(
+                "failed to open durable {role} final: {error}"
+            )))
+        })?;
+    let mut prefix = Vec::new();
+    (&mut file)
+        .take(FIRST_LINE_CAP + 1)
+        .read_to_end(&mut prefix)
+        .map_err(|error| {
+            RuntimeError::internal(single_line(&format!(
+                "failed to read durable {role} final: {error}"
+            )))
+        })?;
+    let line_end = prefix.iter().position(|byte| *byte == b'\n');
+    if line_end.is_none() && prefix.len() as u64 > FIRST_LINE_CAP {
+        return Ok(String::new());
+    }
+    let line = &prefix[..line_end.unwrap_or(prefix.len())];
+    std::str::from_utf8(line).map(str::to_owned).map_err(|_| {
+        RuntimeError::internal(format!("durable {role} final violated its UTF-8 contract"))
+    })
+}
+
 fn verdict_clarification_prompt(previous_final: &Path) -> String {
     format!(
         "Your previous final message is stored at:\n{}\n\nRead that file. Its first line did not \
@@ -1350,6 +1386,57 @@ printf 'implemented the change' > "$OUT"
             "implemented the change",
             "durable final must survive task runtime shutdown"
         );
+    }
+
+    #[test]
+    fn developer_status_uses_exact_first_line_and_never_retries_formatting() {
+        for (message, expected) in [
+            (
+                "STATUS: CLARIFICATION_REQUIRED\nChoose A or B.",
+                DeveloperOutcomeStatus::ClarificationRequired,
+            ),
+            (
+                "STATUS: BLOCKED\nObserved external failure.",
+                DeveloperOutcomeStatus::Blocked,
+            ),
+            (
+                "**STATUS: CLARIFICATION_REQUIRED**",
+                DeveloperOutcomeStatus::Ready,
+            ),
+            (
+                "summary first\nSTATUS: BLOCKED",
+                DeveloperOutcomeStatus::Ready,
+            ),
+        ] {
+            let script = format!(
+                "printf '{{\"type\":\"thread.started\",\"thread_id\":\"thread-status\"}}\\n'\n\
+                 echo '{{\"type\":\"turn.completed\"}}'\n\
+                 printf '%s' '{message}' > \"$OUT\""
+            );
+            let mut fixture = fixture(&script);
+            let (_key, turn) = start(
+                &mut fixture,
+                WorkerRole::Developer,
+                RuntimeTurnPurpose::InitialDevelopment,
+            );
+            let RuntimeTurnPoll::Completed { outcome, .. } = poll_terminal(&mut fixture, turn)
+            else {
+                panic!("Developer status case did not complete")
+            };
+            let RuntimeOutcome::Developer(outcome) = outcome else {
+                panic!("Developer status case returned the wrong role")
+            };
+            assert_eq!(outcome.status, expected, "{message:?}");
+            let role_root = fixture
+                .artifacts
+                .join("run-1/task-1/developer/session-1/turn-1");
+            let attempts: Vec<_> = fs::read_dir(role_root).unwrap().collect();
+            assert_eq!(
+                attempts.len(),
+                1,
+                "Developer formatting must never trigger a retry"
+            );
+        }
     }
 
     #[test]

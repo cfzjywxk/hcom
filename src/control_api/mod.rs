@@ -15,7 +15,10 @@ pub mod supervisor;
 pub(crate) mod peer;
 
 pub use protocol::{
-    ActionName, CallerAuth, CapabilitySnapshot, ControlAction, ControlErrorBody, ControlErrorCode,
-    ControlRequest, ControlResponse, ControlResult, NativeSessionMode, ReviewerVerdict,
-    SessionState, SessionStatusSnapshot, TaskDraft, TaskState, TaskStatusSnapshot, WorkerRole,
+    ActionName, ActiveWorkerSnapshot, ArchitectActionReason, CallerAuth, CapabilitySnapshot,
+    ClarificationPage, ClarificationRecord, ControlAction, ControlErrorBody, ControlErrorCode,
+    ControlRequest, ControlResponse, ControlResult, MAX_CLARIFICATION_PAGE_RECORDS,
+    MAX_CLARIFICATION_RECORDS_PER_RUN, MAX_CLARIFICATION_RECORDS_PER_TASK, NativeSessionMode,
+    PendingArchitectActionSnapshot, ReviewerVerdict, SessionState, SessionStatusSnapshot,
+    TaskDraft, TaskState, TaskStatusSnapshot, WorkerRole,
 };

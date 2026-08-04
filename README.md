@@ -169,24 +169,33 @@ authority: workers receive no control socket or interactive TTY, and private
 HCOM_DIR prevents retained-state access through hcom itself. Unrelated
 non-UTF-8 entries remain byte-exact.
 
-Before starting, the Architect must display every task's repository root,
-branch, and start HEAD together with the exact plan version and hash. An
-explicit follow/execute/implement request for a named existing plan may
-authorize same-turn start; otherwise the Architect waits for a later approval.
-Repository identity is selected by the Architect from that plan; there is no
-host-path allowlist. The Codex Architect has the native same-user host view;
-hcom commands inside it use private per-run state so the live retained hcom
-store is not addressed through the normal CLI.
+Before starting, the Architect must display every task's ordinal, key,
+repository root, task/design document paths, selector, review and clarification
+budgets, material assumptions, and the exact plan version and hash. An explicit
+follow/execute/implement request for a named existing plan may authorize
+same-turn start; otherwise the Architect waits for a later approval. Unless the
+human explicitly assigns implementation to the current Architect session,
+generic implementation requests mean planning and delegation through the
+Developer/Reviewer loop. Repository identity is selected by the Architect from
+that plan; there is no host-path allowlist. The Codex Architect has the native
+same-user host view; hcom commands inside it use private per-run state so the
+live retained hcom store is not addressed through the normal CLI.
 
-After dispatch, the Codex Architect makes one blocking `session_wait` call.
+After dispatch, the Codex Architect makes a blocking `session_wait` call.
 The foreground supervisor advances Developer and Reviewer without Architect
-model calls and returns only when the run is `completed`, `needs_human`,
-`failed`, or `canceled`; normal role transitions do not wake it. The UI may
-remain `Working` while this MCP call is pending, but no timer, status polling,
-or repeated Architect inference is involved. Esc cancels only the wait
-subscription, not the run. If the human later asks to wait again, a terminal
-result reached during the gap is returned immediately. `session_status` is for
-an explicit human progress query only.
+model calls and returns for a terminal state or a latched Developer
+clarification/blocker action; normal role transitions do not wake it. A
+defensible clarification is submitted through its exact artifact path and the
+wait is immediately re-armed. A material human decision ends the Architect
+turn until the human answers. The UI may remain `Working` while the call is
+pending, but no timer or status polling is involved. Esc cancels only the wait
+subscription, not the run. A pending action records its `published_version`:
+an older-version reconnect re-delivers it, while a same-version repeat is
+rejected until the action is resolved. Terminal results reached during a gap
+remain immediately available. `session_status` is for an explicit human
+progress query only and carries clarification counts, not the accumulating
+record list; `session_clarifications_list` reads records in pages of at most
+eight.
 
 ---
 

@@ -115,13 +115,21 @@ state only in memory and performs no daemon, project store, or cross-session
 recovery. Same-task corrections use the exact native Developer/Reviewer thread.
 After dispatch, the Codex Architect opens one blocking session_wait MCP call.
 The foreground supervisor advances Developer and Reviewer without Architect
-model calls and completes that wait only for completed, needs_human, failed, or
-canceled. Normal role and correction transitions do not wake the Architect, and
-session_status is reserved for an explicit human status request. While the wait
-is pending Codex may display Working, but it is not issuing model turns or
-status polls. Interrupting the wait cancels only that subscription, never the
-run; after the human explicitly asks to wait again, a retained terminal result
-returns immediately even if it happened during the gap.
+model calls and completes that wait for a terminal state or a latched
+Developer clarification/blocker action. The Architect answers a defensible
+action through the exact new clarification document path and immediately
+re-arms session_wait in the same turn. When a material human decision is
+required, it ends the turn after asking the human and resumes only after the
+human answers. Normal role and correction transitions do not wake the
+Architect, and session_status is reserved for an explicit human status request.
+While the wait is pending Codex may display Working, but it is not issuing
+model turns or status polls. Interrupting the wait cancels only that
+subscription, never the run. A still-latched action is redelivered only to a
+wait from a version older than its published_version; a same-version repeated
+wait is rejected until the action is resolved. A retained terminal result
+reached during the gap remains immediately available. Status snapshots carry
+clarification counts; session_clarifications_list reads the ordered records in
+bounded pages.
 The terminal snapshot contains each task's latest Developer final path, ordered
 final Reviewer message paths, and Reviewer verdict, never the Reviewer body.
 The Architect reads every final Reviewer file in order and delivers its

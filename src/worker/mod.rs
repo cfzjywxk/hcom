@@ -5,6 +5,7 @@ pub(crate) mod validation;
 #[cfg(target_os = "linux")]
 pub mod codex;
 pub mod contract;
+pub mod developer_status;
 pub mod environment;
 #[cfg(target_os = "linux")]
 pub mod exec_runtime;

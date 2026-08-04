@@ -370,13 +370,14 @@ impl TaskLaneSupervisor {
         for (ordinal, task) in self.core.tasks().iter().enumerate() {
             let spec = &task.spec;
             plan.push_str(&format!(
-                "## task {ordinal}: {}\n\n- title: {}\n- repository root: {}\n- task document path: {}\n- task selector: {}\n- max review rounds: {}\n- design document paths:\n",
+                "## task {ordinal}: {}\n\n- title: {}\n- repository root: {}\n- task document path: {}\n- task selector: {}\n- max review rounds: {}\n- max clarification rounds: {}\n- design document paths:\n",
                 spec.task_key,
                 spec.title,
                 spec.repository_root,
                 spec.task_document_path,
                 spec.task_selector,
                 spec.max_review_rounds,
+                spec.max_clarification_rounds,
             ));
             if spec.design_document_paths.is_empty() {
                 plan.push_str("  - (none)\n");
@@ -408,11 +409,115 @@ impl TaskLaneSupervisor {
         self.execute_effects(effects)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn submit_clarification(
+        &mut self,
+        expected_session_version: u64,
+        task_ordinal: u32,
+        task_key: &str,
+        action_sequence: u32,
+        developer_request_path: &str,
+        clarification_document_path: &str,
+        human_decision_confirmed: bool,
+    ) -> Result<()> {
+        let task_ordinal =
+            usize::try_from(task_ordinal).map_err(|_| anyhow!("task ordinal is out of range"))?;
+        let pending = self
+            .core
+            .snapshot()
+            .pending_architect_action
+            .ok_or_else(|| anyhow!("no Architect action is pending"))?;
+        if pending.task_ordinal as usize != task_ordinal
+            || pending.task_key != task_key
+            || pending.sequence != action_sequence
+            || pending.developer_request_path != developer_request_path
+            || pending.clarification_output_path != clarification_document_path
+        {
+            bail!("clarification submission does not match the pending Architect action");
+        }
+        let workspace = self
+            .tasks_workspace
+            .as_ref()
+            .ok_or_else(|| anyhow!("hcom-tasks workspace is not open"))?;
+        workspace.validate_clarification_document(Path::new(clarification_document_path))?;
+        let effects = self
+            .core
+            .reduce(SupervisorEvent::ClarificationSubmitted {
+                expected_version: expected_session_version,
+                task_ordinal,
+                task_key: task_key.into(),
+                action_sequence,
+                developer_request_path: developer_request_path.into(),
+                clarification_document_path: clarification_document_path.into(),
+                human_decision_confirmed,
+            })
+            .map_err(|error| anyhow!(error.to_string()))?;
+        self.note(&format!(
+            "task {task_ordinal}: clarification {action_sequence} submitted (human_confirmed={human_decision_confirmed})"
+        ));
+        self.execute_effects(effects)
+    }
+
+    pub(crate) fn require_human_for_clarification(
+        &mut self,
+        expected_session_version: u64,
+        task_ordinal: u32,
+        task_key: &str,
+        action_sequence: u32,
+        developer_request_path: &str,
+    ) -> Result<()> {
+        let task_ordinal =
+            usize::try_from(task_ordinal).map_err(|_| anyhow!("task ordinal is out of range"))?;
+        let effects = self
+            .core
+            .reduce(SupervisorEvent::ClarificationHumanRequired {
+                expected_version: expected_session_version,
+                task_ordinal,
+                task_key: task_key.into(),
+                action_sequence,
+                developer_request_path: developer_request_path.into(),
+            })
+            .map_err(|error| anyhow!(error.to_string()))?;
+        self.note(&format!(
+            "task {task_ordinal}: clarification {action_sequence} escalated to human"
+        ));
+        self.execute_effects(effects)
+    }
+
     pub(crate) fn snapshot(&self) -> SessionStatusSnapshot {
         self.core.snapshot()
     }
 
+    pub(crate) fn clarification_page(
+        &self,
+        task_ordinal: u32,
+        task_key: &str,
+        after_sequence: u32,
+        limit: u8,
+    ) -> Result<crate::control_api::ClarificationPage> {
+        self.core
+            .clarification_page(task_ordinal, task_key, after_sequence, limit)
+            .map_err(|error| anyhow!(error.to_string()))
+    }
+
     pub(crate) fn poll_once(&mut self) -> Result<()> {
+        let fallback_task_ordinal = self.active.as_ref().map(|active| active.task_ordinal);
+        let result = self.poll_once_inner();
+        if result.is_ok() || self.core.session_state().is_terminal() {
+            return result;
+        }
+        let task_ordinal = self
+            .core
+            .snapshot()
+            .current_task_ordinal
+            .and_then(|ordinal| usize::try_from(ordinal).ok())
+            .or(fallback_task_ordinal)
+            .ok_or_else(|| anyhow!("poll failure has no current task to terminalize"))?;
+        let error = result.expect_err("poll result was checked");
+        self.fail_driver_effect(task_ordinal, DriverFailureClass::Contract, error)
+    }
+
+    fn poll_once_inner(&mut self) -> Result<()> {
         if self.core.session_state() != SessionState::Running || self.active.is_none() {
             return Ok(());
         }
@@ -459,7 +564,6 @@ impl TaskLaneSupervisor {
                 failure: runtime_error_failure(error)?,
             },
         };
-        self.active = None;
         // Two-phase commit, same as `execute_effects`: a verdict that closes a
         // task must not be committed unless the runtime actually closes. The
         // reviewer's verdict now lands here directly, so the guard has to live
@@ -468,6 +572,7 @@ impl TaskLaneSupervisor {
         let effects = next_core
             .reduce(event)
             .map_err(|error| anyhow!(error.to_string()))?;
+        self.active = None;
         if let Some(task_ordinal) = successful_task_close(&next_core, &effects)
             && let Err(error) = self.close_task_runtime(task_ordinal)
         {
@@ -563,6 +668,45 @@ impl TaskLaneSupervisor {
                 }
                 SupervisorEffect::CloseTaskRuntime { task_ordinal } => {
                     self.close_task_runtime(task_ordinal)?;
+                    continue;
+                }
+                SupervisorEffect::PrepareClarificationArtifact {
+                    task_ordinal,
+                    task_key,
+                    sequence,
+                    path,
+                } => {
+                    let prepared = match self.tasks_workspace.as_ref() {
+                        Some(workspace) => {
+                            match workspace.prepare_clarification_path(&task_key, sequence) {
+                                Ok(path) => path,
+                                Err(error) => {
+                                    return self.fail_driver_effect(
+                                        task_ordinal,
+                                        DriverFailureClass::Contract,
+                                        error,
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            return self.fail_driver_effect(
+                                task_ordinal,
+                                DriverFailureClass::Contract,
+                                anyhow!("hcom-tasks workspace is not open"),
+                            );
+                        }
+                    };
+                    if prepared != path {
+                        return self.fail_driver_effect(
+                            task_ordinal,
+                            DriverFailureClass::Contract,
+                            anyhow!("clarification artifact path differs from the core binding"),
+                        );
+                    }
+                    self.note(&format!(
+                        "task {task_ordinal}: awaiting Architect action {sequence}"
+                    ));
                     continue;
                 }
             };
@@ -875,6 +1019,27 @@ impl TaskLaneSupervisor {
                 prompt.push_str(&format!("- {path}\n"));
             }
         }
+        prompt.push_str("\nClarification records, oldest to newest:\n");
+        if task.clarification_records().is_empty() {
+            prompt.push_str("- (none)\n");
+        } else {
+            for record in task.clarification_records() {
+                prompt.push_str(&format!(
+                    "- sequence {} ({:?})\n  - Developer request: {}\n  - Architect clarification: {}\n  - human decision confirmed: {}\n",
+                    record.sequence,
+                    record.reason,
+                    record.developer_request_path,
+                    record.architect_clarification_path,
+                    record.human_decision_confirmed,
+                ));
+            }
+            prompt.push_str(
+                "\nThese clarification documents supplement the approved task and design files. \
+                 For the specific issue a clarification addresses, a newer clarification takes \
+                 precedence over an older clarification or conflicting original wording. A \
+                 clarification does not expand the task beyond the approved scope.\n",
+            );
+        }
         prompt.push_str(&format!("\nTask selector:\n{}\n", spec.task_selector));
         prompt.push_str(
             "\nRead the task and design files and work only on the selected task. Before doing \
@@ -886,24 +1051,52 @@ impl TaskLaneSupervisor {
 
         match role {
             WorkerRole::Developer => {
-                if purpose == RuntimeTurnPurpose::DeveloperCorrection {
-                    let paths = task.latest_reviewer_final_paths();
-                    if paths.is_empty() {
-                        bail!("developer correction has no reviewer final message path");
+                match purpose {
+                    RuntimeTurnPurpose::DeveloperCorrection => {
+                        let paths = task.latest_reviewer_final_paths();
+                        if paths.is_empty() {
+                            bail!("developer correction has no reviewer final message path");
+                        }
+                        prompt.push_str("\nReviewer final messages, in order:\n");
+                        for path in paths {
+                            prompt.push_str(&format!("- {path}\n"));
+                        }
+                        prompt.push_str(
+                            "\nRead every Reviewer final file and address the requested changes. \
+                             If your task commit exists, fold the fix into that SAME commit with \
+                             `git commit --amend`, updating its message so it still describes the \
+                             whole task. If the Reviewer reported that your task commit is missing, \
+                             create it only after the complete fix. This task must end as exactly \
+                             one commit. Do not amend anything older than your own commit. Then \
+                             report as before.\n",
+                        );
                     }
-                    prompt.push_str("\nReviewer final messages, in order:\n");
-                    for path in paths {
-                        prompt.push_str(&format!("- {path}\n"));
+                    RuntimeTurnPurpose::DeveloperClarificationResume => {
+                        let latest = task.clarification_records().last().ok_or_else(|| {
+                            anyhow!("Developer clarification resume has no clarification record")
+                        })?;
+                        prompt.push_str(&format!(
+                            "\nResume the same task using clarification sequence {}. Re-read your \
+                             request at {} and the Architect response at {} before continuing. \
+                             Preserve any existing task commit exactly until you have a complete \
+                             correction to amend into it.\n",
+                            latest.sequence,
+                            latest.developer_request_path,
+                            latest.architect_clarification_path,
+                        ));
+                        if !task.latest_reviewer_final_paths().is_empty() {
+                            prompt.push_str(
+                                "\nPreviously supplied Reviewer final messages remain applicable:\n",
+                            );
+                            for path in task.latest_reviewer_final_paths() {
+                                prompt.push_str(&format!("- {path}\n"));
+                            }
+                        }
                     }
-                    prompt.push_str(
-                        "\nRead every Reviewer final file and address the requested changes. Then \
-                         fold the fix into the SAME commit you \
-                         created earlier in this task with `git commit --amend`, updating its \
-                         message so it still describes the whole task. This task must end as \
-                         exactly one commit. Do not amend anything older than your own commit. \
-                         Then report as before.\n",
-                    );
+                    RuntimeTurnPurpose::InitialDevelopment => {}
+                    _ => bail!("unsupported Developer turn purpose"),
                 }
+                prompt.push_str(DEVELOPER_OUTPUT_CONTRACT);
             }
             WorkerRole::Reviewer => {
                 let developer_path = task
@@ -916,7 +1109,14 @@ impl TaskLaneSupervisor {
                 };
                 prompt.push_str(&format!(
                     "\n{label}:\n{developer_path}\n\nRead the Developer final file and \
-                     independently review the selected task.\n"
+                     independently review the selected task. Check every `ASSUMPTION:` the \
+                     Developer reported against the approved task, design, and clarification \
+                     records. Confirm the task is represented by one task commit and that no \
+                     hcom-tasks artifact was included in it. If the implementation follows an \
+                     applicable clarification, do not report a defect merely because the original \
+                     task or design wording was ambiguous. If a finding comes from unresolved \
+                     task/design ambiguity rather than an implementation defect, label that \
+                     finding `REQUIREMENT_AMBIGUITY:` while still returning the normal verdict.\n"
                 ));
                 prompt.push_str(REVIEWER_OUTPUT_CONTRACT);
             }
@@ -1031,13 +1231,49 @@ tree elsewhere and build or test that copy when it helps obtain independent
 evidence.
 ";
 
+/// The Developer's control output obligation, appended to every turn because
+/// role instructions are only transported when a native session is created.
+const DEVELOPER_OUTPUT_CONTRACT: &str = "
+## Required output format
+
+The FIRST line of your final message MUST be exactly one of:
+
+STATUS: READY
+STATUS: CLARIFICATION_REQUIRED
+STATUS: BLOCKED
+
+on its own line, with no decoration and no other text on that line.
+
+Use READY when the task is implemented and ready for review, including when you
+made a smallest-impact, defensible local assumption. After the first line,
+report changes, verification, repository/commit state, remaining work, and each
+such assumption on its own `ASSUMPTION:` line.
+
+Use CLARIFICATION_REQUIRED only when no defensible implementation choice can be
+derived from the task, design, clarification records, applicable instructions,
+and existing implementation, or when choosing would decide material behavior,
+acceptance, or scope. After the first line, state the exact decision needed,
+viable alternatives, consequences, what you inspected, and the current
+repository/commit state.
+
+Use BLOCKED only for an external or mechanical blocker you actually attempted
+to overcome. After the first line, state what you tried, the exact observed
+evidence, why no in-scope path remains, what human or external action is needed,
+and the current repository/commit state. Compilation failure, test failure,
+dependency setup work, or work taking longer than expected is not by itself a
+blocker.
+
+`ASSUMPTION:` and `REQUIREMENT_AMBIGUITY:` are agent-readable conventions;
+hcom does not parse them.
+";
+
 fn role_instructions(role: WorkerRole) -> &'static str {
     match role {
         WorkerRole::Developer => {
-            "You are the task Developer. Work directly in the exact repository and complete the bounded task. Run whatever checks the task requires, then commit your work as ONE NEW commit whose message describes this task as a whole. Never amend, squash, reword, or otherwise rewrite any commit that already existed when your turn began — earlier commits belong to earlier tasks and are not yours to touch. Do not push, install, or wait for interactive input. Your final message is your report to the reviewer: state what you changed, what you verified, and anything you left undone."
+            "You are the task Developer: execute the concrete approved task; do not redesign its product scope. First seek answers in the task file, design and clarification files, applicable instructions, existing implementation, and tests. Make ordinary local implementation decisions yourself. If an uncertain choice has a defensible candidate, is consistent with the approved behavior and scope, and can be corrected in review, choose the smallest-impact option, continue, and disclose it as `ASSUMPTION:` in your final. Ask for clarification only when you cannot derive any defensible candidate or the choice would decide material externally visible behavior, acceptance, or scope. Report BLOCKED only after actual attempts establish an external or mechanical obstacle; include concrete observations. Work directly in the exact repository and complete the bounded task. Run the required checks, then commit the complete work as ONE NEW commit whose message describes this task as a whole. Never amend, squash, reword, or otherwise rewrite a commit that existed when your first task turn began. On correction or clarification resume, amend your existing task commit if it exists; if no task commit exists yet, create the one task commit only after the implementation is complete. Never create a second task commit. Do not create a commit merely to pause. If a pause is necessary after your task commit already exists, leave that commit unchanged and report the exact repository state. Never add any `hcom-tasks` artifact to the task commit. Do not push, install, wait for interactive input, or modify the task/design/clarification source files."
         }
         WorkerRole::Reviewer => {
-            "You are the task Reviewer. Independently inspect the committed task range and decide whether it is sound. Also confirm the developer left the work committed as a single commit for this task, with a message covering it; uncommitted work or a task split across several commits is a reason to request changes. You must not edit reviewed source, stage, commit, change branch or HEAD, push, or install; verifying by copying the tree into your own writable sandbox is allowed and encouraged when it helps."
+            "You are the task Reviewer. Independently inspect the committed task range and decide whether it is sound against the approved task, design files, and every ordered clarification record. Review disclosed Developer assumptions rather than accepting them automatically. Confirm the developer left the work committed as a single commit for this task, with a message covering it, and did not include any `hcom-tasks` artifact; uncommitted work or a task split across several commits is a reason to request changes. Distinguish requirement ambiguity from implementation defects and label the former `REQUIREMENT_AMBIGUITY:` in findings. You must not edit reviewed source, stage, commit, change branch or HEAD, push, or install; verifying by copying the tree into your own writable sandbox is allowed and encouraged when it helps."
         }
     }
 }
@@ -1383,6 +1619,7 @@ mod tests {
                 design_document_paths: vec![design_document_path.to_string_lossy().into_owned()],
                 task_selector: key.into(),
                 max_review_rounds: max_rounds,
+                max_clarification_rounds: 2,
             }
         }
 
@@ -1403,6 +1640,16 @@ mod tests {
             )
             .unwrap()
         }
+    }
+
+    fn create_deep_directory(mut path: PathBuf, minimum_bytes: usize) -> PathBuf {
+        while path.as_os_str().as_bytes().len() < minimum_bytes {
+            let remaining = minimum_bytes - path.as_os_str().as_bytes().len();
+            let component_bytes = remaining.saturating_sub(1).clamp(1, 200);
+            path.push("p".repeat(component_bytes));
+            fs::create_dir(&path).unwrap();
+        }
+        fs::canonicalize(path).unwrap()
     }
 
     /// Support for the opt-in real-Codex acceptance tests: a disposable
@@ -1516,6 +1763,7 @@ mod tests {
                     design_document_paths: Vec::new(),
                     task_selector: task_key.into(),
                     max_review_rounds,
+                    max_clarification_rounds: 2,
                 }
             }
 
@@ -1763,6 +2011,24 @@ mod tests {
         completed(
             RuntimeOutcome::Developer(DeveloperOutcomeV1 {
                 status: DeveloperOutcomeStatus::Ready,
+            }),
+            message_seed,
+        )
+    }
+
+    fn clarification_required(message_seed: &str) -> RuntimeTurnPoll {
+        completed(
+            RuntimeOutcome::Developer(DeveloperOutcomeV1 {
+                status: DeveloperOutcomeStatus::ClarificationRequired,
+            }),
+            message_seed,
+        )
+    }
+
+    fn blocked(message_seed: &str) -> RuntimeTurnPoll {
+        completed(
+            RuntimeOutcome::Developer(DeveloperOutcomeV1 {
+                status: DeveloperOutcomeStatus::Blocked,
             }),
             message_seed,
         )
@@ -3628,6 +3894,446 @@ mod tests {
             Some("task worker runtime cleanup failed")
         );
         assert_eq!(audit.lock().unwrap().shutdowns, ["cleanup-failure"]);
+    }
+
+    #[test]
+    fn clarification_action_resumes_same_developer_and_persists_into_review() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script(
+            "clarify",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [clarification_required("need-decision")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::DeveloperClarificationResume,
+                    [ready("implemented-after-clarification")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [lgtm("reviewed-with-clarification")],
+                ),
+            ],
+            vec![
+                Mutation::None,
+                Mutation::Commit {
+                    path: "src/clarified.txt",
+                    contents: "clarified\n",
+                },
+                Mutation::None,
+            ],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
+        start(&mut supervisor, vec![fixture.task("clarify", &[], 3)]);
+
+        supervisor.poll_once().unwrap();
+        let action_snapshot = supervisor.snapshot();
+        assert_eq!(action_snapshot.state, SessionState::Running);
+        assert!(action_snapshot.active_worker.is_none());
+        let pending = action_snapshot
+            .pending_architect_action
+            .clone()
+            .expect("Developer clarification must wake the Architect");
+        assert_eq!(
+            pending.reason,
+            crate::control_api::ArchitectActionReason::Clarification
+        );
+        assert!(!pending.human_decision_required);
+        let expected_path = fixture
+            .project_root
+            .join("hcom-tasks/run-driver-test/clarify/clarification/turn-1.md")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(pending.clarification_output_path, expected_path);
+        fs::write(
+            &pending.clarification_output_path,
+            "# Clarification\n\nUse the bounded option already implied by the design.\n",
+        )
+        .unwrap();
+        supervisor
+            .submit_clarification(
+                action_snapshot.version,
+                pending.task_ordinal,
+                &pending.task_key,
+                pending.sequence,
+                &pending.developer_request_path,
+                &pending.clarification_output_path,
+                false,
+            )
+            .unwrap();
+        let resumed = supervisor.snapshot();
+        assert!(resumed.pending_architect_action.is_none());
+        assert_eq!(
+            resumed.active_worker.as_ref().map(|worker| worker.role),
+            Some(WorkerRole::Developer)
+        );
+        assert_eq!(
+            resumed
+                .active_worker
+                .as_ref()
+                .map(|worker| worker.purpose.as_str()),
+            Some("developer_clarification_resume")
+        );
+
+        let terminal = drive_terminal(&mut supervisor);
+        assert_eq!(terminal.state, SessionState::Completed);
+        let task = &terminal.tasks[0];
+        assert_eq!(task.state, TaskState::Lgtm);
+        assert_eq!(task.review_round, 1);
+        assert_eq!(task.clarification_rounds_used, 1);
+        assert_eq!(task.clarification_record_count, 1);
+        let clarification_page = supervisor.clarification_page(0, "clarify", 0, 8).unwrap();
+        assert_eq!(clarification_page.records.len(), 1);
+        assert_eq!(
+            clarification_page.records[0].architect_clarification_path,
+            pending.clarification_output_path
+        );
+        assert!(!clarification_page.records[0].human_decision_confirmed);
+
+        let audit = audit.lock().unwrap();
+        let developer_sessions: Vec<_> = audit
+            .turns
+            .iter()
+            .filter(|(_, role, _, _)| *role == WorkerRole::Developer)
+            .map(|(_, _, purpose, session)| (*purpose, *session))
+            .collect();
+        assert_eq!(
+            developer_sessions,
+            vec![
+                (RuntimeTurnPurpose::InitialDevelopment, 1),
+                (RuntimeTurnPurpose::DeveloperClarificationResume, 1),
+            ]
+        );
+        for (_, purpose, prompt) in audit
+            .prompts
+            .iter()
+            .filter(|(role, _, _)| *role == WorkerRole::Developer)
+        {
+            assert!(
+                prompt.contains("STATUS: CLARIFICATION_REQUIRED"),
+                "{purpose:?} omitted the per-turn Developer output contract"
+            );
+        }
+        let resume_prompt = audit
+            .prompts
+            .iter()
+            .find(|(_, purpose, _)| *purpose == RuntimeTurnPurpose::DeveloperClarificationResume)
+            .map(|(_, _, prompt)| prompt)
+            .unwrap();
+        assert!(resume_prompt.contains(&pending.clarification_output_path));
+        let reviewer_prompt = audit
+            .prompts
+            .iter()
+            .find(|(role, _, _)| *role == WorkerRole::Reviewer)
+            .map(|(_, _, prompt)| prompt)
+            .unwrap();
+        assert!(reviewer_prompt.contains(&pending.clarification_output_path));
+        assert!(reviewer_prompt.contains("newer clarification takes precedence"));
+    }
+
+    #[test]
+    fn derived_clarification_path_overflow_terminalizes_instead_of_losing_the_active_turn() {
+        let mut fixture = Fixture::new();
+        fixture.project_root = create_deep_directory(fixture._temp.path().to_path_buf(), 3_950);
+        let task_key = "k".repeat(128);
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script(
+            &task_key,
+            vec![FakeTurnScript::new(
+                WorkerRole::Developer,
+                RuntimeTurnPurpose::InitialDevelopment,
+                [clarification_required("derived-path-overflow")],
+            )],
+            vec![Mutation::None],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
+        start(&mut supervisor, vec![fixture.task(&task_key, &[], 3)]);
+
+        let error = supervisor.poll_once().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("clarification output path is empty or exceeds its bound"),
+            "{error:#}"
+        );
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, SessionState::NeedsHuman);
+        assert_eq!(snapshot.tasks[0].state, TaskState::NeedsHuman);
+        assert_eq!(
+            snapshot.terminal_detail.as_deref(),
+            Some("session runtime contract failed")
+        );
+        assert!(snapshot.pending_architect_action.is_none());
+        assert!(snapshot.active_worker.is_none());
+        assert!(supervisor.active.is_none());
+        assert!(supervisor.task_runtime.is_none());
+        assert_eq!(audit.lock().unwrap().shutdowns, [task_key]);
+        let decisions = fs::read_to_string(
+            fixture
+                .project_root
+                .join("hcom-tasks/run-driver-test/decision.log"),
+        )
+        .unwrap();
+        assert!(
+            decisions.contains("clarification output path is empty or exceeds its bound"),
+            "{decisions}"
+        );
+    }
+
+    #[test]
+    fn preexisting_clarification_artifact_terminalizes_instead_of_wedging_the_run() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script(
+            "clarification-collision",
+            vec![FakeTurnScript::new(
+                WorkerRole::Developer,
+                RuntimeTurnPurpose::InitialDevelopment,
+                [clarification_required("need-decision")],
+            )],
+            vec![Mutation::None],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], audit);
+        start(
+            &mut supervisor,
+            vec![fixture.task("clarification-collision", &[], 3)],
+        );
+
+        let collision = fixture
+            .project_root
+            .join("hcom-tasks/run-driver-test/clarification-collision/clarification/turn-1.md");
+        fs::create_dir_all(collision.parent().unwrap()).unwrap();
+        fs::write(&collision, "must not be reused\n").unwrap();
+
+        let error = supervisor.poll_once().unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, SessionState::NeedsHuman);
+        assert_eq!(snapshot.tasks[0].state, TaskState::NeedsHuman);
+        assert!(snapshot.pending_architect_action.is_none());
+        assert_eq!(
+            snapshot.terminal_detail.as_deref(),
+            Some("session runtime contract failed")
+        );
+        assert_eq!(
+            fs::read_to_string(collision).unwrap(),
+            "must not be reused\n"
+        );
+        supervisor.poll_once().unwrap();
+        assert_eq!(supervisor.snapshot(), snapshot);
+    }
+
+    #[test]
+    fn clarification_budget_exhaustion_requires_but_never_blocks_human_answer() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script(
+            "human-answer",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [clarification_required("first-question")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::DeveloperClarificationResume,
+                    [blocked("second-question")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::DeveloperClarificationResume,
+                    [ready("ready-after-human")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [lgtm("lgtm-after-human")],
+                ),
+            ],
+            vec![
+                Mutation::None,
+                Mutation::None,
+                Mutation::Commit {
+                    path: "src/human-answer.txt",
+                    contents: "answered\n",
+                },
+                Mutation::None,
+            ],
+        );
+        let mut task = fixture.task("human-answer", &[], 3);
+        task.max_clarification_rounds = 1;
+        let mut supervisor = fixture.supervisor(vec![script], audit);
+        start(&mut supervisor, vec![task]);
+
+        supervisor.poll_once().unwrap();
+        let first_snapshot = supervisor.snapshot();
+        let first = first_snapshot.pending_architect_action.clone().unwrap();
+        fs::write(&first.clarification_output_path, "Architect answer.\n").unwrap();
+        supervisor
+            .submit_clarification(
+                first_snapshot.version,
+                first.task_ordinal,
+                &first.task_key,
+                first.sequence,
+                &first.developer_request_path,
+                &first.clarification_output_path,
+                false,
+            )
+            .unwrap();
+
+        supervisor.poll_once().unwrap();
+        let second_snapshot = supervisor.snapshot();
+        let second = second_snapshot.pending_architect_action.clone().unwrap();
+        assert_eq!(
+            second.reason,
+            crate::control_api::ArchitectActionReason::Blocker
+        );
+        assert!(second.human_decision_required);
+        assert_eq!(second.clarification_rounds_used, 1);
+        fs::write(
+            &second.clarification_output_path,
+            "Human decided to continue.\n",
+        )
+        .unwrap();
+        assert!(
+            supervisor
+                .submit_clarification(
+                    second_snapshot.version,
+                    second.task_ordinal,
+                    &second.task_key,
+                    second.sequence,
+                    &second.developer_request_path,
+                    &second.clarification_output_path,
+                    false,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            supervisor
+                .snapshot()
+                .pending_architect_action
+                .as_ref()
+                .map(|action| action.sequence),
+            Some(second.sequence)
+        );
+        supervisor
+            .submit_clarification(
+                second_snapshot.version,
+                second.task_ordinal,
+                &second.task_key,
+                second.sequence,
+                &second.developer_request_path,
+                &second.clarification_output_path,
+                true,
+            )
+            .unwrap();
+
+        let terminal = drive_terminal(&mut supervisor);
+        assert_eq!(terminal.state, SessionState::Completed);
+        let task = &terminal.tasks[0];
+        assert_eq!(task.clarification_rounds_used, 1);
+        assert_eq!(task.clarification_record_count, 2);
+        let clarification_page = supervisor
+            .clarification_page(0, "human-answer", 0, 8)
+            .unwrap();
+        assert!(!clarification_page.records[0].human_decision_confirmed);
+        assert!(clarification_page.records[1].human_decision_confirmed);
+    }
+
+    #[test]
+    fn clarification_during_correction_does_not_consume_a_review_round() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script(
+            "correction-clarify",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("initial-ready")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [request_changes("changes")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::DeveloperCorrection,
+                    [clarification_required("correction-question")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::DeveloperClarificationResume,
+                    [ready("corrected-ready")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::ReviewerRereview,
+                    [lgtm("corrected-lgtm")],
+                ),
+            ],
+            vec![
+                Mutation::Commit {
+                    path: "src/correction.txt",
+                    contents: "initial\n",
+                },
+                Mutation::None,
+                Mutation::None,
+                Mutation::Dirty {
+                    path: "src/correction.txt",
+                    contents: "corrected\n",
+                },
+                Mutation::None,
+            ],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
+        start(
+            &mut supervisor,
+            vec![fixture.task("correction-clarify", &[], 3)],
+        );
+        supervisor.poll_once().unwrap();
+        supervisor.poll_once().unwrap();
+        assert_eq!(supervisor.snapshot().tasks[0].review_round, 1);
+        supervisor.poll_once().unwrap();
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.tasks[0].review_round, 1);
+        let pending = snapshot.pending_architect_action.clone().unwrap();
+        fs::write(
+            &pending.clarification_output_path,
+            "Apply the narrow correction.\n",
+        )
+        .unwrap();
+        supervisor
+            .submit_clarification(
+                snapshot.version,
+                pending.task_ordinal,
+                &pending.task_key,
+                pending.sequence,
+                &pending.developer_request_path,
+                &pending.clarification_output_path,
+                false,
+            )
+            .unwrap();
+        assert_eq!(supervisor.snapshot().tasks[0].review_round, 1);
+
+        let terminal = drive_terminal(&mut supervisor);
+        assert_eq!(terminal.state, SessionState::Completed);
+        assert_eq!(terminal.tasks[0].review_round, 2);
+        let audit = audit.lock().unwrap();
+        let resume_prompt = audit
+            .prompts
+            .iter()
+            .find(|(_, purpose, _)| *purpose == RuntimeTurnPurpose::DeveloperClarificationResume)
+            .map(|(_, _, prompt)| prompt)
+            .unwrap();
+        assert!(resume_prompt.contains("Previously supplied Reviewer final messages"));
     }
 }
 

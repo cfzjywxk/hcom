@@ -6,8 +6,8 @@ use super::peer::{
     process_is_live_identity, process_owns_foreground_tty,
 };
 use super::protocol::{
-    ActionName, CallerAuth, ControlAction, ControlErrorCode, ControlRequest, ControlResponse,
-    ControlResult, canonical_action_set, parse_canonical_action_set,
+    ActionName, CallerAuth, ClarificationPage, ControlAction, ControlErrorCode, ControlRequest,
+    ControlResponse, ControlResult, canonical_action_set, parse_canonical_action_set,
 };
 use super::registration::{
     REGISTRATION_REFUSAL_GENERIC, RegistrationAction, RegistrationCaller, RegistrationRequest,
@@ -17,7 +17,7 @@ use crate::orchestrator::task_lane::TaskLaneSupervisor;
 use crate::orchestrator::{SessionRuntimeSources, SessionStartup};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -28,6 +28,8 @@ use std::time::Duration;
 
 const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_RECORDS: usize = 1024;
+
+type RequestKey = (String, String);
 
 #[derive(Debug, Clone)]
 pub struct ControlPaths {
@@ -144,8 +146,7 @@ impl SessionSupervisorEndpoint {
                     break;
                 }
             }
-            let _ = self.control.supervisor.poll_once();
-            self.control.service_pending_wait();
+            self.control.poll_and_service_wait()?;
             if !handled {
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -162,7 +163,8 @@ struct SessionSupervisorControl {
     parent_pid: u32,
     parent_birth: String,
     bindings: BTreeMap<String, ArchitectBinding>,
-    requests: BTreeMap<(String, String), RequestRecord>,
+    requests: BTreeMap<RequestKey, RequestRecord>,
+    request_order: VecDeque<RequestKey>,
     pending_wait: Option<PendingSessionWait>,
 }
 
@@ -185,9 +187,38 @@ trait SupervisorBackend: Send {
         approval_confirmed: bool,
     ) -> Result<()>;
 
+    #[allow(clippy::too_many_arguments)]
+    fn submit_clarification(
+        &mut self,
+        expected_session_version: u64,
+        task_ordinal: u32,
+        task_key: &str,
+        action_sequence: u32,
+        developer_request_path: &str,
+        clarification_document_path: &str,
+        human_decision_confirmed: bool,
+    ) -> Result<()>;
+
+    fn require_human_for_clarification(
+        &mut self,
+        expected_session_version: u64,
+        task_ordinal: u32,
+        task_key: &str,
+        action_sequence: u32,
+        developer_request_path: &str,
+    ) -> Result<()>;
+
     fn cancel(&mut self, expected_session_version: u64, reason: &str) -> Result<()>;
 
     fn snapshot(&self) -> crate::control_api::SessionStatusSnapshot;
+
+    fn clarification_page(
+        &self,
+        task_ordinal: u32,
+        task_key: &str,
+        after_sequence: u32,
+        limit: u8,
+    ) -> Result<ClarificationPage>;
 
     fn poll_once(&mut self) -> Result<()>;
 
@@ -233,8 +264,56 @@ impl SupervisorBackend for TaskLaneSupervisor {
         self.cancel(expected_session_version, reason)
     }
 
+    fn submit_clarification(
+        &mut self,
+        expected_session_version: u64,
+        task_ordinal: u32,
+        task_key: &str,
+        action_sequence: u32,
+        developer_request_path: &str,
+        clarification_document_path: &str,
+        human_decision_confirmed: bool,
+    ) -> Result<()> {
+        self.submit_clarification(
+            expected_session_version,
+            task_ordinal,
+            task_key,
+            action_sequence,
+            developer_request_path,
+            clarification_document_path,
+            human_decision_confirmed,
+        )
+    }
+
+    fn require_human_for_clarification(
+        &mut self,
+        expected_session_version: u64,
+        task_ordinal: u32,
+        task_key: &str,
+        action_sequence: u32,
+        developer_request_path: &str,
+    ) -> Result<()> {
+        self.require_human_for_clarification(
+            expected_session_version,
+            task_ordinal,
+            task_key,
+            action_sequence,
+            developer_request_path,
+        )
+    }
+
     fn snapshot(&self) -> crate::control_api::SessionStatusSnapshot {
         self.snapshot()
+    }
+
+    fn clarification_page(
+        &self,
+        task_ordinal: u32,
+        task_key: &str,
+        after_sequence: u32,
+        limit: u8,
+    ) -> Result<ClarificationPage> {
+        self.clarification_page(task_ordinal, task_key, after_sequence, limit)
     }
 
     fn poll_once(&mut self) -> Result<()> {
@@ -300,6 +379,7 @@ impl SessionSupervisorControl {
             parent_birth,
             bindings: BTreeMap::new(),
             requests: BTreeMap::new(),
+            request_order: VecDeque::new(),
             pending_wait: None,
         })
     }
@@ -328,6 +408,20 @@ impl SessionSupervisorControl {
             }
         };
         write_registration_response(stream, &response)
+    }
+
+    fn poll_and_service_wait(&mut self) -> Result<()> {
+        if self.supervisor.poll_once().is_err() && !self.supervisor.snapshot().state.is_terminal() {
+            // TaskLaneSupervisor promises that every poll failure is
+            // terminalized before it is returned. Keep a final lifecycle
+            // fallback here so a future backend cannot strand a pending
+            // session_wait by violating that contract.
+            let containment = self.supervisor.shutdown();
+            self.service_pending_wait();
+            return containment.context("failed to contain a non-terminal supervisor poll failure");
+        }
+        self.service_pending_wait();
+        Ok(())
     }
 
     fn handle_registration_request(
@@ -551,6 +645,25 @@ impl SessionSupervisorControl {
                 ),
             );
         }
+        if let Some(pending) = snapshot.pending_architect_action.as_ref() {
+            if *after_session_version < pending.published_version {
+                return write_response(
+                    &mut stream,
+                    &ControlResponse::success(
+                        &request.request_id,
+                        ControlResult::Session { session: snapshot },
+                    ),
+                );
+            }
+            return write_response(
+                &mut stream,
+                &ControlResponse::error(
+                    &request.request_id,
+                    ControlErrorCode::Conflict,
+                    "pending Architect action was already published at this session version; resolve it instead of waiting again",
+                ),
+            );
+        }
         if snapshot.state != super::SessionState::Running {
             return write_response(
                 &mut stream,
@@ -590,7 +703,7 @@ impl SessionSupervisorControl {
             return;
         }
         let snapshot = self.supervisor.snapshot();
-        if !snapshot.state.is_terminal() {
+        if !snapshot.state.is_terminal() && snapshot.pending_architect_action.is_none() {
             return;
         }
         let Some(mut wait) = self.pending_wait.take() else {
@@ -649,30 +762,51 @@ impl SessionSupervisorControl {
                 )
             };
         }
-        if matches!(&request.action, ControlAction::SessionStatus) {
+        if matches!(
+            &request.action,
+            ControlAction::SessionStatus | ControlAction::SessionClarificationsList { .. }
+        ) {
             return match self.dispatch_action(&request.action) {
                 Ok(result) => ControlResponse::success(&request.request_id, result),
-                Err(_) => ControlResponse::error(
-                    &request.request_id,
-                    ControlErrorCode::Internal,
-                    "session status could not be read",
-                ),
+                Err(_) => {
+                    let (code, message) = match &request.action {
+                        ControlAction::SessionClarificationsList { .. } => (
+                            ControlErrorCode::Conflict,
+                            "clarification page does not match the exact task or cursor",
+                        ),
+                        _ => (
+                            ControlErrorCode::Internal,
+                            "session read-only state could not be read",
+                        ),
+                    };
+                    ControlResponse::error(&request.request_id, code, message)
+                }
             };
         }
-        if self.requests.len() >= MAX_REQUEST_RECORDS {
+        let record_response = if self.make_request_replay_room() {
+            self.requests.insert(
+                key.clone(),
+                RequestRecord {
+                    payload_hash,
+                    response: None,
+                },
+            );
+            self.request_order.push_back(key.clone());
+            true
+        } else if matches!(&request.action, ControlAction::SessionCancel { .. }) {
+            // Cancellation remains the protocol-level escape hatch even if an
+            // impossible re-entrant caller fills the window entirely with
+            // in-progress requests. The single-threaded production endpoint
+            // normally reaches this branch only after a completed entry can
+            // be evicted above.
+            false
+        } else {
             return ControlResponse::error(
                 &request.request_id,
                 ControlErrorCode::Conflict,
-                "session request replay capacity is exhausted",
+                "session request replay window has no completed entry to evict",
             );
-        }
-        self.requests.insert(
-            key.clone(),
-            RequestRecord {
-                payload_hash,
-                response: None,
-            },
-        );
+        };
         let response = match self.dispatch_action(&request.action) {
             Ok(result) => ControlResponse::success(&request.request_id, result),
             Err(_) => ControlResponse::error(
@@ -685,10 +819,41 @@ impl SessionSupervisorControl {
                 "session action failed its exact state, approval, or checkout gate",
             ),
         };
-        if let Some(record) = self.requests.get_mut(&key) {
+        if record_response && let Some(record) = self.requests.get_mut(&key) {
             record.response = Some(response.clone());
         }
         response
+    }
+
+    fn make_request_replay_room(&mut self) -> bool {
+        while self.requests.len() >= MAX_REQUEST_RECORDS {
+            let mut index = 0;
+            let mut evicted = false;
+            while index < self.request_order.len() {
+                let key = &self.request_order[index];
+                match self.requests.get(key) {
+                    None => {
+                        self.request_order.remove(index);
+                    }
+                    Some(record) if record.response.is_some() => {
+                        let key = self
+                            .request_order
+                            .remove(index)
+                            .expect("request order index was checked");
+                        self.requests.remove(&key);
+                        evicted = true;
+                        break;
+                    }
+                    Some(_) => {
+                        index += 1;
+                    }
+                }
+            }
+            if !evicted {
+                return false;
+            }
+        }
+        true
     }
 
     fn dispatch_action(&mut self, action: &ControlAction) -> Result<ControlResult> {
@@ -727,6 +892,59 @@ impl SessionSupervisorControl {
                     session: self.supervisor.snapshot(),
                 })
             }
+            ControlAction::SessionClarificationSubmit {
+                expected_session_version,
+                task_ordinal,
+                task_key,
+                action_sequence,
+                developer_request_path,
+                clarification_document_path,
+                human_decision_confirmed,
+            } => {
+                self.supervisor.submit_clarification(
+                    *expected_session_version,
+                    *task_ordinal,
+                    task_key,
+                    *action_sequence,
+                    developer_request_path,
+                    clarification_document_path,
+                    *human_decision_confirmed,
+                )?;
+                Ok(ControlResult::Session {
+                    session: self.supervisor.snapshot(),
+                })
+            }
+            ControlAction::SessionClarificationRequireHuman {
+                expected_session_version,
+                task_ordinal,
+                task_key,
+                action_sequence,
+                developer_request_path,
+            } => {
+                self.supervisor.require_human_for_clarification(
+                    *expected_session_version,
+                    *task_ordinal,
+                    task_key,
+                    *action_sequence,
+                    developer_request_path,
+                )?;
+                Ok(ControlResult::Session {
+                    session: self.supervisor.snapshot(),
+                })
+            }
+            ControlAction::SessionClarificationsList {
+                task_ordinal,
+                task_key,
+                after_sequence,
+                limit,
+            } => Ok(ControlResult::Clarifications {
+                page: self.supervisor.clarification_page(
+                    *task_ordinal,
+                    task_key,
+                    *after_sequence,
+                    *limit,
+                )?,
+            }),
             ControlAction::SessionWait { .. } => {
                 bail!("session wait must be served by the deferred control path")
             }
@@ -1094,6 +1312,7 @@ mod tests {
     struct FakeSupervisor {
         startup: SessionStartup,
         snapshot: crate::control_api::SessionStatusSnapshot,
+        fail_poll: bool,
     }
 
     impl SupervisorBackend for FakeSupervisor {
@@ -1121,6 +1340,30 @@ mod tests {
             bail!("unused fake approve_and_start")
         }
 
+        fn submit_clarification(
+            &mut self,
+            _expected_session_version: u64,
+            _task_ordinal: u32,
+            _task_key: &str,
+            _action_sequence: u32,
+            _developer_request_path: &str,
+            _clarification_document_path: &str,
+            _human_decision_confirmed: bool,
+        ) -> Result<()> {
+            bail!("unused fake submit_clarification")
+        }
+
+        fn require_human_for_clarification(
+            &mut self,
+            _expected_session_version: u64,
+            _task_ordinal: u32,
+            _task_key: &str,
+            _action_sequence: u32,
+            _developer_request_path: &str,
+        ) -> Result<()> {
+            bail!("unused fake require_human_for_clarification")
+        }
+
         fn cancel(&mut self, expected_session_version: u64, reason: &str) -> Result<()> {
             if self.snapshot.version != expected_session_version {
                 bail!("fake session version is stale");
@@ -1138,8 +1381,37 @@ mod tests {
             self.snapshot.clone()
         }
 
+        fn clarification_page(
+            &self,
+            task_ordinal: u32,
+            task_key: &str,
+            after_sequence: u32,
+            _limit: u8,
+        ) -> Result<ClarificationPage> {
+            let task = self
+                .snapshot
+                .tasks
+                .get(usize::try_from(task_ordinal)?)
+                .filter(|task| task.task_key == task_key)
+                .ok_or_else(|| anyhow::anyhow!("fake clarification task mismatch"))?;
+            Ok(ClarificationPage {
+                run_id: self.snapshot.run_id.clone(),
+                session_version: self.snapshot.version,
+                task_ordinal,
+                task_key: task.task_key.clone(),
+                total_records: task.clarification_record_count,
+                after_sequence,
+                records: Vec::new(),
+                next_after_sequence: None,
+            })
+        }
+
         fn poll_once(&mut self) -> Result<()> {
-            Ok(())
+            if self.fail_poll {
+                bail!("injected non-terminal poll failure")
+            } else {
+                Ok(())
+            }
         }
 
         fn shutdown(&mut self) -> Result<()> {
@@ -1154,6 +1426,7 @@ mod tests {
     fn fake_wait_control(
         state: crate::control_api::SessionState,
         version: u64,
+        pending_action: bool,
     ) -> (SessionSupervisorControl, CallerAuth, PeerCredentials) {
         let project_root = PathBuf::from("/project");
         let (task_state, reviewer_verdict) = match state {
@@ -1174,10 +1447,28 @@ mod tests {
                 crate::control_api::ReviewerVerdict::RequestChanges,
             ),
             _ => (
-                crate::control_api::TaskState::Developing,
+                if pending_action {
+                    crate::control_api::TaskState::AwaitingArchitectAction
+                } else {
+                    crate::control_api::TaskState::Developing
+                },
                 crate::control_api::ReviewerVerdict::RequestChanges,
             ),
         };
+        let pending_architect_action =
+            pending_action.then(|| crate::control_api::PendingArchitectActionSnapshot {
+                task_ordinal: 0,
+                task_key: "wait-task".into(),
+                sequence: 1,
+                reason: crate::control_api::ArchitectActionReason::Clarification,
+                developer_request_path: "/artifacts/developer/request.md".into(),
+                clarification_output_path:
+                    "/project/hcom-tasks/run-wait-test/wait-task/clarification/turn-1.md".into(),
+                clarification_rounds_used: 0,
+                max_clarification_rounds: 2,
+                human_decision_required: false,
+                published_version: version,
+            });
         let snapshot = crate::control_api::SessionStatusSnapshot {
             run_id: "run-wait-test".into(),
             state,
@@ -1186,6 +1477,8 @@ mod tests {
             plan_version: Some(1),
             plan_hash: Some("a".repeat(64)),
             current_task_ordinal: Some(0),
+            active_worker: None,
+            pending_architect_action,
             terminal_detail: state
                 .is_terminal()
                 .then(|| "terminal before subscription".into()),
@@ -1200,6 +1493,9 @@ mod tests {
                 branch: None,
                 review_round: 1,
                 max_review_rounds: 3,
+                clarification_rounds_used: 0,
+                max_clarification_rounds: 2,
+                clarification_record_count: 0,
                 base_revision: None,
                 head_revision: None,
                 developer_session_bound: true,
@@ -1242,6 +1538,7 @@ mod tests {
                     project_root,
                 },
                 snapshot,
+                fail_poll: false,
             }),
             // SAFETY: geteuid has no preconditions.
             expected_uid: unsafe { libc::geteuid() },
@@ -1249,6 +1546,7 @@ mod tests {
             parent_birth: birth,
             bindings: BTreeMap::from([(binding_id.into(), binding)]),
             requests: BTreeMap::new(),
+            request_order: VecDeque::new(),
             pending_wait: None,
         };
         let caller = CallerAuth::Architect {
@@ -1286,7 +1584,7 @@ mod tests {
     #[test]
     fn deferred_session_wait_returns_terminal_snapshot_without_losing_the_gap() {
         let (mut control, caller, _) =
-            fake_wait_control(crate::control_api::SessionState::Running, 7);
+            fake_wait_control(crate::control_api::SessionState::Running, 7, false);
         let request = wait_request(caller.clone(), "wait-running", 7);
         let mut client = serve_wait(&mut control, &request);
         assert!(control.pending_wait.is_some());
@@ -1316,7 +1614,7 @@ mod tests {
         );
 
         let (mut terminal_control, terminal_caller, _) =
-            fake_wait_control(crate::control_api::SessionState::Completed, 11);
+            fake_wait_control(crate::control_api::SessionState::Completed, 11, false);
         let mut replay = serve_wait(
             &mut terminal_control,
             &wait_request(terminal_caller, "wait-after-gap", 7),
@@ -1332,9 +1630,72 @@ mod tests {
     }
 
     #[test]
+    fn nonterminal_poll_failure_fallback_terminalizes_and_releases_session_wait() {
+        let (mut control, caller, _) =
+            fake_wait_control(crate::control_api::SessionState::Running, 7, false);
+        control.supervisor = Box::new(FakeSupervisor {
+            startup: control.supervisor.startup().clone(),
+            snapshot: control.supervisor.snapshot(),
+            fail_poll: true,
+        });
+        let mut client = serve_wait(&mut control, &wait_request(caller, "wait-poll-failure", 7));
+        assert!(control.pending_wait.is_some());
+
+        control.poll_and_service_wait().unwrap();
+        assert!(control.pending_wait.is_none());
+        let frame = read_response_frame(&mut client).unwrap();
+        let response: ControlResponse = serde_json::from_slice(&frame).unwrap();
+        let Some(ControlResult::Session { session }) = response.result else {
+            panic!("poll-failure fallback must release the pending wait")
+        };
+        assert_eq!(session.state, crate::control_api::SessionState::Canceled);
+        assert_eq!(session.version, 8);
+        assert_eq!(
+            session.terminal_detail.as_deref(),
+            Some("fake parent stopped")
+        );
+    }
+
+    #[test]
+    fn pending_architect_action_redelivers_only_from_an_older_version() {
+        let (mut control, caller, _) =
+            fake_wait_control(crate::control_api::SessionState::Running, 9, true);
+
+        let mut gap_client = serve_wait(
+            &mut control,
+            &wait_request(caller.clone(), "wait-action-gap", 7),
+        );
+        assert!(control.pending_wait.is_none());
+        let frame = read_response_frame(&mut gap_client).unwrap();
+        let response: ControlResponse = serde_json::from_slice(&frame).unwrap();
+        let Some(ControlResult::Session { session }) = response.result else {
+            panic!("older-version wait must redeliver the pending action")
+        };
+        let pending = session
+            .pending_architect_action
+            .expect("latched action disappeared");
+        assert_eq!(pending.sequence, 1);
+        assert_eq!(pending.published_version, 9);
+        assert_eq!(session.version, 9);
+
+        let mut current_client = serve_wait(
+            &mut control,
+            &wait_request(caller, "wait-action-current", 9),
+        );
+        assert!(control.pending_wait.is_none());
+        let frame = read_response_frame(&mut current_client).unwrap();
+        let response: ControlResponse = serde_json::from_slice(&frame).unwrap();
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.map(|error| error.code),
+            Some(ControlErrorCode::Conflict)
+        );
+    }
+
+    #[test]
     fn disconnecting_session_wait_only_removes_the_subscription() {
         let (mut control, caller, _) =
-            fake_wait_control(crate::control_api::SessionState::Running, 3);
+            fake_wait_control(crate::control_api::SessionState::Running, 3, false);
         let client = serve_wait(&mut control, &wait_request(caller, "wait-disconnect", 3));
         assert!(control.pending_wait.is_some());
         drop(client);
@@ -1354,7 +1715,7 @@ mod tests {
     #[test]
     fn session_status_remains_available_while_terminal_wait_is_pending() {
         let (mut control, caller, _) =
-            fake_wait_control(crate::control_api::SessionState::Running, 5);
+            fake_wait_control(crate::control_api::SessionState::Running, 5, false);
         let wait_client = serve_wait(
             &mut control,
             &wait_request(caller.clone(), "wait-before-status", 5),
@@ -1398,6 +1759,35 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(control.pending_wait.is_none());
+    }
+
+    #[test]
+    fn clarification_pages_are_read_only_and_do_not_consume_replay_capacity() {
+        let (mut control, caller, _) =
+            fake_wait_control(crate::control_api::SessionState::Completed, 12, false);
+        let request = ControlRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: "clarification-page".into(),
+            caller,
+            action: ControlAction::SessionClarificationsList {
+                task_ordinal: 0,
+                task_key: "wait-task".into(),
+                after_sequence: 0,
+                limit: 8,
+            },
+        };
+        let (mut client, server) = UnixStream::pair().unwrap();
+        write_request_frame(&mut client, &serde_json::to_vec(&request).unwrap()).unwrap();
+        control.serve_stream(server).unwrap();
+        let response: ControlResponse =
+            serde_json::from_slice(&read_response_frame(&mut client).unwrap()).unwrap();
+        let Some(ControlResult::Clarifications { page }) = response.result else {
+            panic!("clarification list must return a bounded page")
+        };
+        assert_eq!(page.task_key, "wait-task");
+        assert_eq!(page.total_records, 0);
+        assert!(page.records.is_empty());
+        assert!(control.requests.is_empty());
     }
 
     #[test]
@@ -1543,93 +1933,161 @@ mod tests {
     }
 
     #[test]
-    fn request_replay_memory_has_a_hard_session_bound() {
-        let fixture = Fixture::new();
-        let mut control = SessionSupervisorControl::open(
-            &fixture.paths,
-            "run-request-bound".into(),
-            fixture.repository,
-            fixture.sources,
-        )
-        .unwrap();
-        let binding_id = "binding-request-bound";
-        let launch_nonce = "launch-nonce-request-bound";
-        let capability = "capability-request-bound";
-        let (action_set_json, _) = canonical_action_set(ActionName::ARCHITECT).unwrap();
-        let birth = process_birth_identity(std::process::id()).unwrap();
-        control.bindings.insert(
-            binding_id.into(),
-            ArchitectBinding {
-                id: binding_id.into(),
-                project_root: control.supervisor.startup().project_root.clone(),
-                launch_nonce_hash: secret_hash(b"hcom-session/launch-nonce/v1", launch_nonce),
-                capability_hash: secret_hash(b"hcom-session/capability/v1", capability),
-                action_set_hash: sha256_hex(action_set_json.as_bytes()),
-                action_set_json,
-                state: BindingState::ProcessBound,
-                version: 1,
-                architect_pid: Some(std::process::id()),
-                architect_process_birth: Some(birth.clone()),
-                bridge_pid: Some(std::process::id()),
-                bridge_process_birth: Some(birth),
-                relay_executable_contract_hash: Some("a".repeat(64)),
-                relay_runtime_scope_hash: Some("b".repeat(64)),
-            },
-        );
+    fn completed_request_replay_window_evicts_oldest_and_keeps_recent_replays() {
+        let (mut control, caller, peer) =
+            fake_wait_control(crate::control_api::SessionState::AwaitingPlan, 0, false);
+        let mut newest_request = None;
+        let mut newest_response = None;
         for index in 0..MAX_REQUEST_RECORDS {
+            let request = ControlRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: format!("bounded-{index}"),
+                caller: caller.clone(),
+                action: ControlAction::SessionCancel {
+                    expected_session_version: 99,
+                    reason: format!("stale bounded request {index}"),
+                },
+            };
+            let response = control.handle_request(peer, &request);
+            assert_eq!(
+                response.error.as_ref().unwrap().code,
+                ControlErrorCode::Conflict
+            );
+            newest_request = Some(request);
+            newest_response = Some(response);
+        }
+        assert_eq!(control.requests.len(), MAX_REQUEST_RECORDS);
+        assert_eq!(control.request_order.len(), MAX_REQUEST_RECORDS);
+        assert_eq!(
+            control.handle_request(peer, newest_request.as_ref().unwrap()),
+            newest_response.unwrap(),
+            "the newest completed request remains replayable"
+        );
+
+        let cancel = ControlRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: "bounded-cancel".into(),
+            caller,
+            action: ControlAction::SessionCancel {
+                expected_session_version: 0,
+                reason: "cancel remains available at replay capacity".into(),
+            },
+        };
+        let response = control.handle_request(peer, &cancel);
+        assert!(response.ok);
+        assert_eq!(
+            control.supervisor.snapshot().state,
+            crate::control_api::SessionState::Canceled
+        );
+        assert_eq!(control.requests.len(), MAX_REQUEST_RECORDS);
+        assert_eq!(control.request_order.len(), MAX_REQUEST_RECORDS);
+        assert!(
+            !control
+                .requests
+                .contains_key(&("architect:binding-wait-test".into(), "bounded-0".into())),
+            "the oldest completed request leaves the recent replay window"
+        );
+        assert!(control.requests.contains_key(&(
+            "architect:binding-wait-test".into(),
+            "bounded-cancel".into()
+        )));
+    }
+
+    #[test]
+    fn evicted_successful_request_cannot_reapply_after_session_version_changes() {
+        let (mut control, caller, peer) =
+            fake_wait_control(crate::control_api::SessionState::AwaitingPlan, 0, false);
+        let successful = ControlRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: "successful-before-eviction".into(),
+            caller: caller.clone(),
+            action: ControlAction::SessionCancel {
+                expected_session_version: 0,
+                reason: "first cancellation".into(),
+            },
+        };
+        assert!(control.handle_request(peer, &successful).ok);
+        assert_eq!(control.supervisor.snapshot().version, 1);
+
+        for index in 0..MAX_REQUEST_RECORDS {
+            let response = control.handle_request(
+                peer,
+                &ControlRequest {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: format!("post-success-{index}"),
+                    caller: caller.clone(),
+                    action: ControlAction::SessionCancel {
+                        expected_session_version: 0,
+                        reason: format!("stale post-success request {index}"),
+                    },
+                },
+            );
+            assert_eq!(
+                response.error.as_ref().unwrap().code,
+                ControlErrorCode::Conflict
+            );
+        }
+        assert!(
+            !control.requests.contains_key(&(
+                "architect:binding-wait-test".into(),
+                successful.request_id.clone()
+            )),
+            "the oldest successful response was evicted"
+        );
+
+        let replay = control.handle_request(peer, &successful);
+        assert_eq!(
+            replay.error.as_ref().unwrap().code,
+            ControlErrorCode::Conflict
+        );
+        let snapshot = control.supervisor.snapshot();
+        assert_eq!(snapshot.state, crate::control_api::SessionState::Canceled);
+        assert_eq!(
+            snapshot.version, 1,
+            "the evicted successful action cannot execute again"
+        );
+        assert_eq!(
+            snapshot.terminal_detail.as_deref(),
+            Some("first cancellation")
+        );
+    }
+
+    #[test]
+    fn cancellation_bypasses_a_window_containing_only_in_progress_requests() {
+        let (mut control, caller, peer) =
+            fake_wait_control(crate::control_api::SessionState::AwaitingPlan, 0, false);
+        for index in 0..MAX_REQUEST_RECORDS {
+            let key = (
+                format!("in-progress-caller-{index}"),
+                format!("in-progress-{index}"),
+            );
             control.requests.insert(
-                (
-                    format!("bounded-caller-{index}"),
-                    format!("bounded-{index}"),
-                ),
+                key.clone(),
                 RequestRecord {
                     payload_hash: "a".repeat(64),
                     response: None,
                 },
             );
+            control.request_order.push_back(key);
         }
-        // SAFETY: geteuid/getegid have no preconditions.
-        let peer = PeerCredentials {
-            pid: std::process::id(),
-            uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
-        };
-        let overflow = control.handle_request(
+
+        let response = control.handle_request(
             peer,
             &ControlRequest {
                 protocol_version: PROTOCOL_VERSION,
-                request_id: "bounded-overflow".into(),
-                caller: CallerAuth::Architect {
-                    binding_id: binding_id.into(),
-                    launch_nonce: launch_nonce.into(),
-                    capability: capability.into(),
-                },
+                request_id: "cancel-with-all-requests-in-progress".into(),
+                caller,
                 action: ControlAction::SessionCancel {
                     expected_session_version: 0,
-                    reason: "must not execute after replay capacity is exhausted".into(),
+                    reason: "emergency unrecorded cancellation".into(),
                 },
             },
         );
-        assert_eq!(overflow.error.unwrap().code, ControlErrorCode::Conflict);
+        assert!(response.ok);
         assert_eq!(control.requests.len(), MAX_REQUEST_RECORDS);
         assert_eq!(
             control.supervisor.snapshot().state,
-            crate::control_api::SessionState::AwaitingPlan
+            crate::control_api::SessionState::Canceled
         );
-        let status = control.handle_request(
-            peer,
-            &ControlRequest {
-                protocol_version: PROTOCOL_VERSION,
-                request_id: "bounded-read-only-status".into(),
-                caller: CallerAuth::Architect {
-                    binding_id: binding_id.into(),
-                    launch_nonce: launch_nonce.into(),
-                    capability: capability.into(),
-                },
-                action: ControlAction::SessionStatus,
-            },
-        );
-        assert!(status.ok);
-        assert_eq!(control.requests.len(), MAX_REQUEST_RECORDS);
     }
 }

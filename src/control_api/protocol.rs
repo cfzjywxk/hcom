@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
@@ -10,6 +10,10 @@ const MAX_ID_BYTES: usize = 128;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_TASKS: usize = 64;
 const MAX_LIST_ITEMS: usize = 256;
+const MAX_CLARIFICATION_ROUNDS: u8 = 20;
+pub const MAX_CLARIFICATION_PAGE_RECORDS: u8 = 8;
+pub const MAX_CLARIFICATION_RECORDS_PER_TASK: usize = 64;
+pub const MAX_CLARIFICATION_RECORDS_PER_RUN: usize = MAX_TASKS * MAX_CLARIFICATION_ROUNDS as usize;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -69,25 +73,34 @@ impl CallerAuth {
 pub enum ActionName {
     SessionPlanReplace,
     SessionApproveAndStart,
+    SessionClarificationSubmit,
+    SessionClarificationRequireHuman,
+    SessionClarificationsList,
     SessionWait,
     SessionStatus,
     SessionCancel,
 }
 
 impl ActionName {
-    pub const ARCHITECT: [Self; 5] = [
+    pub const ARCHITECT: [Self; 8] = [
         Self::SessionPlanReplace,
         Self::SessionApproveAndStart,
+        Self::SessionClarificationSubmit,
+        Self::SessionClarificationRequireHuman,
+        Self::SessionClarificationsList,
         Self::SessionWait,
         Self::SessionStatus,
         Self::SessionCancel,
     ];
-    pub const ALL: [Self; 5] = Self::ARCHITECT;
+    pub const ALL: [Self; 8] = Self::ARCHITECT;
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SessionPlanReplace => "session_plan_replace",
             Self::SessionApproveAndStart => "session_approve_and_start",
+            Self::SessionClarificationSubmit => "session_clarification_submit",
+            Self::SessionClarificationRequireHuman => "session_clarification_require_human",
+            Self::SessionClarificationsList => "session_clarifications_list",
             Self::SessionWait => "session_wait",
             Self::SessionStatus => "session_status",
             Self::SessionCancel => "session_cancel",
@@ -110,6 +123,28 @@ pub enum ControlAction {
         plan_hash: String,
         approval_confirmed: bool,
     },
+    SessionClarificationSubmit {
+        expected_session_version: u64,
+        task_ordinal: u32,
+        task_key: String,
+        action_sequence: u32,
+        developer_request_path: String,
+        clarification_document_path: String,
+        human_decision_confirmed: bool,
+    },
+    SessionClarificationRequireHuman {
+        expected_session_version: u64,
+        task_ordinal: u32,
+        task_key: String,
+        action_sequence: u32,
+        developer_request_path: String,
+    },
+    SessionClarificationsList {
+        task_ordinal: u32,
+        task_key: String,
+        after_sequence: u32,
+        limit: u8,
+    },
     SessionWait {
         after_session_version: u64,
     },
@@ -125,6 +160,11 @@ impl ControlAction {
         match self {
             Self::SessionPlanReplace { .. } => ActionName::SessionPlanReplace,
             Self::SessionApproveAndStart { .. } => ActionName::SessionApproveAndStart,
+            Self::SessionClarificationSubmit { .. } => ActionName::SessionClarificationSubmit,
+            Self::SessionClarificationRequireHuman { .. } => {
+                ActionName::SessionClarificationRequireHuman
+            }
+            Self::SessionClarificationsList { .. } => ActionName::SessionClarificationsList,
             Self::SessionWait { .. } => ActionName::SessionWait,
             Self::SessionStatus => ActionName::SessionStatus,
             Self::SessionCancel { .. } => ActionName::SessionCancel,
@@ -162,6 +202,47 @@ impl ControlAction {
                 if !approval_confirmed {
                     return Err(ProtocolValidationError::new(
                         "approval_confirmed must be true",
+                    ));
+                }
+                Ok(())
+            }
+            Self::SessionClarificationSubmit {
+                task_key,
+                action_sequence,
+                developer_request_path,
+                clarification_document_path,
+                ..
+            } => {
+                validate_id("task_key", task_key)?;
+                if *action_sequence == 0 {
+                    return Err(ProtocolValidationError::new(
+                        "action_sequence must be positive",
+                    ));
+                }
+                validate_document_path("developer request path", developer_request_path)?;
+                validate_document_path("clarification document path", clarification_document_path)
+            }
+            Self::SessionClarificationRequireHuman {
+                task_key,
+                action_sequence,
+                developer_request_path,
+                ..
+            } => {
+                validate_id("task_key", task_key)?;
+                if *action_sequence == 0 {
+                    return Err(ProtocolValidationError::new(
+                        "action_sequence must be positive",
+                    ));
+                }
+                validate_document_path("developer request path", developer_request_path)
+            }
+            Self::SessionClarificationsList {
+                task_key, limit, ..
+            } => {
+                validate_id("task_key", task_key)?;
+                if !(1..=MAX_CLARIFICATION_PAGE_RECORDS).contains(limit) {
+                    return Err(ProtocolValidationError::new(
+                        "clarification page limit is out of range",
                     ));
                 }
                 Ok(())
@@ -222,6 +303,7 @@ pub struct TaskDraft {
     pub design_document_paths: Vec<String>,
     pub task_selector: String,
     pub max_review_rounds: u8,
+    pub max_clarification_rounds: u8,
 }
 
 impl TaskDraft {
@@ -257,6 +339,11 @@ impl TaskDraft {
                 "max_review_rounds must be between 1 and 20",
             ));
         }
+        if !(1..=MAX_CLARIFICATION_ROUNDS).contains(&self.max_clarification_rounds) {
+            return Err(ProtocolValidationError::new(
+                "max_clarification_rounds must be between 1 and 20",
+            ));
+        }
         Ok(())
     }
 }
@@ -287,12 +374,54 @@ impl SessionState {
 pub enum TaskState {
     Pending,
     Developing,
+    AwaitingArchitectAction,
     Reviewing,
     Lgtm,
     ReviewExhausted,
     NeedsHuman,
     Failed,
     Canceled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchitectActionReason {
+    Clarification,
+    Blocker,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClarificationRecord {
+    pub sequence: u32,
+    pub reason: ArchitectActionReason,
+    pub developer_request_path: String,
+    pub architect_clarification_path: String,
+    pub human_decision_confirmed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PendingArchitectActionSnapshot {
+    pub task_ordinal: u32,
+    pub task_key: String,
+    pub sequence: u32,
+    pub reason: ArchitectActionReason,
+    pub developer_request_path: String,
+    pub clarification_output_path: String,
+    pub clarification_rounds_used: u32,
+    pub max_clarification_rounds: u8,
+    pub human_decision_required: bool,
+    pub published_version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveWorkerSnapshot {
+    pub task_ordinal: u32,
+    pub task_key: String,
+    pub role: WorkerRole,
+    pub purpose: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -368,6 +497,22 @@ pub enum ControlResult {
         plan_version: u64,
         plan_hash: String,
     },
+    Clarifications {
+        page: ClarificationPage,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClarificationPage {
+    pub run_id: String,
+    pub session_version: u64,
+    pub task_ordinal: u32,
+    pub task_key: String,
+    pub total_records: u32,
+    pub after_sequence: u32,
+    pub records: Vec<ClarificationRecord>,
+    pub next_after_sequence: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -380,6 +525,8 @@ pub struct SessionStatusSnapshot {
     pub plan_version: Option<u64>,
     pub plan_hash: Option<String>,
     pub current_task_ordinal: Option<u32>,
+    pub active_worker: Option<ActiveWorkerSnapshot>,
+    pub pending_architect_action: Option<PendingArchitectActionSnapshot>,
     pub terminal_detail: Option<String>,
     pub tasks: Vec<TaskStatusSnapshot>,
 }
@@ -397,6 +544,9 @@ pub struct TaskStatusSnapshot {
     pub branch: Option<String>,
     pub review_round: u32,
     pub max_review_rounds: u8,
+    pub clarification_rounds_used: u32,
+    pub max_clarification_rounds: u8,
+    pub clarification_record_count: u32,
     pub base_revision: Option<String>,
     pub head_revision: Option<String>,
     pub developer_session_bound: bool,
@@ -621,6 +771,7 @@ mod tests {
             design_document_paths: vec!["/project/design.md".into()],
             task_selector: key.into(),
             max_review_rounds: 2,
+            max_clarification_rounds: 2,
         }
     }
 
@@ -673,6 +824,11 @@ mod tests {
         assert!(candidate.validate().is_err());
         candidate.task_selector = "FBTC-01\nhidden".into();
         assert!(candidate.validate().is_err());
+        candidate.task_selector = "FBTC-01".into();
+        candidate.max_clarification_rounds = 0;
+        assert!(candidate.validate().is_err());
+        candidate.max_clarification_rounds = 21;
+        assert!(candidate.validate().is_err());
     }
 
     #[test]
@@ -700,11 +856,58 @@ mod tests {
     }
 
     #[test]
+    fn clarification_actions_require_exact_bounded_identity_fields() {
+        let submit = ControlAction::SessionClarificationSubmit {
+            expected_session_version: 8,
+            task_ordinal: 0,
+            task_key: "task-one".into(),
+            action_sequence: 1,
+            developer_request_path: "/artifacts/developer/request.md".into(),
+            clarification_document_path: "/project/hcom-tasks/run/task-one/clarification/turn-1.md"
+                .into(),
+            human_decision_confirmed: false,
+        };
+        assert!(submit.validate().is_ok());
+        let mut zero_sequence = submit.clone();
+        let ControlAction::SessionClarificationSubmit {
+            action_sequence, ..
+        } = &mut zero_sequence
+        else {
+            unreachable!()
+        };
+        *action_sequence = 0;
+        assert!(zero_sequence.validate().is_err());
+
+        let require_human = ControlAction::SessionClarificationRequireHuman {
+            expected_session_version: 8,
+            task_ordinal: 0,
+            task_key: "task-one".into(),
+            action_sequence: 1,
+            developer_request_path: "/artifacts/developer/request.md".into(),
+        };
+        assert!(require_human.validate().is_ok());
+
+        let page = ControlAction::SessionClarificationsList {
+            task_ordinal: 0,
+            task_key: "task-one".into(),
+            after_sequence: 0,
+            limit: MAX_CLARIFICATION_PAGE_RECORDS,
+        };
+        assert!(page.validate().is_ok());
+        let mut oversized_page = page;
+        let ControlAction::SessionClarificationsList { limit, .. } = &mut oversized_page else {
+            unreachable!()
+        };
+        *limit = MAX_CLARIFICATION_PAGE_RECORDS + 1;
+        assert!(oversized_page.validate().is_err());
+    }
+
+    #[test]
     fn previous_protocol_version_fails_closed() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 5);
         let request = ControlRequest {
-            protocol_version: 3,
-            request_id: "v3-request".into(),
+            protocol_version: 4,
+            request_id: "v4-request".into(),
             caller: CallerAuth::Human {
                 process_birth: "123:456".into(),
             },
@@ -713,8 +916,8 @@ mod tests {
         assert!(request.validate().is_err());
 
         let response = ControlResponse {
-            protocol_version: 3,
-            request_id: "v3-response".into(),
+            protocol_version: 4,
+            request_id: "v4-response".into(),
             ok: false,
             result: None,
             error: Some(ControlErrorBody {
@@ -736,6 +939,9 @@ mod tests {
             [
                 "session_plan_replace",
                 "session_approve_and_start",
+                "session_clarification_submit",
+                "session_clarification_require_human",
+                "session_clarifications_list",
                 "session_wait",
                 "session_status",
                 "session_cancel",

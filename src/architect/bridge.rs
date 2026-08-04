@@ -1,4 +1,4 @@
-use super::tools::{control_action, tool_definitions};
+use super::tools::{ARCHITECT_INSTRUCTIONS, control_action, tool_definitions};
 use crate::control_api::client::ControlClient;
 use crate::control_api::codec::{
     read_request_frame, read_response_frame, write_request_frame, write_response_frame,
@@ -448,7 +448,8 @@ fn serve_mcp_connection(
                     "result":{
                         "protocolVersion":MCP_PROTOCOL_VERSION,
                         "capabilities":{"tools":{"listChanged":false}},
-                        "serverInfo":{"name":"hcom-session-task-control","version":"1"}
+                        "serverInfo":{"name":"hcom-session-task-control","version":"1"},
+                        "instructions":ARCHITECT_INSTRUCTIONS
                     }
                 })
             }),
@@ -989,6 +990,8 @@ mod tests {
             plan_version: None,
             plan_hash: None,
             current_task_ordinal: None,
+            active_worker: None,
+            pending_architect_action: None,
             terminal_detail: None,
             tasks: Vec::new(),
         }
@@ -1006,6 +1009,9 @@ mod tests {
             branch: None,
             review_round: 1,
             max_review_rounds: 3,
+            clarification_rounds_used: 0,
+            max_clarification_rounds: 2,
+            clarification_record_count: 0,
             base_revision: None,
             head_revision: None,
             developer_session_bound: true,
@@ -1570,7 +1576,8 @@ mod tests {
                             "task_document_path":"/project/current_todo.md",
                             "design_document_paths":["/project/architecture.md"],
                             "task_selector":"FBTC-01",
-                            "max_review_rounds":3
+                            "max_review_rounds":3,
+                            "max_clarification_rounds":2
                         }]
                     },
                     "_meta":{"progressToken":2}
@@ -1591,6 +1598,10 @@ mod tests {
         assert_eq!(
             responses[0]["result"]["protocolVersion"],
             MCP_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            responses[0]["result"]["instructions"],
+            ARCHITECT_INSTRUCTIONS
         );
         assert_eq!(responses[1]["id"], 1);
         assert_eq!(

@@ -105,6 +105,11 @@ fn validate_frame_text(payload: &[u8]) -> Result<(), FrameError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_api::protocol::PROTOCOL_VERSION;
+    use crate::control_api::{
+        ArchitectActionReason, ClarificationPage, ClarificationRecord, ControlResponse,
+        ControlResult, MAX_CLARIFICATION_PAGE_RECORDS,
+    };
     use std::io::Cursor;
 
     #[test]
@@ -151,5 +156,43 @@ mod tests {
             frame.extend_from_slice(payload);
             assert!(read_request_frame(&mut Cursor::new(frame)).is_err());
         }
+    }
+
+    #[test]
+    fn maximum_clarification_page_stays_within_the_control_response_frame() {
+        let worst_case_path = format!("/{}", "\\".repeat(4095));
+        let records = (1..=u32::from(MAX_CLARIFICATION_PAGE_RECORDS))
+            .map(|sequence| ClarificationRecord {
+                sequence,
+                reason: ArchitectActionReason::Clarification,
+                developer_request_path: worst_case_path.clone(),
+                architect_clarification_path: worst_case_path.clone(),
+                human_decision_confirmed: true,
+            })
+            .collect();
+        let response = ControlResponse {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: "maximum-clarification-page".into(),
+            ok: true,
+            result: Some(ControlResult::Clarifications {
+                page: ClarificationPage {
+                    run_id: "run".into(),
+                    session_version: 1,
+                    task_ordinal: 0,
+                    task_key: "task".into(),
+                    total_records: 64,
+                    after_sequence: 0,
+                    records,
+                    next_after_sequence: Some(u32::from(MAX_CLARIFICATION_PAGE_RECORDS)),
+                },
+            }),
+            error: None,
+        };
+        let payload = serde_json::to_vec(&response).unwrap();
+        assert!(payload.len() < MAX_RESPONSE_BYTES);
+        let mut frame = Vec::new();
+        write_response_frame(&mut frame, &payload).unwrap();
+        let decoded = read_response_frame(&mut Cursor::new(frame)).unwrap();
+        assert_eq!(decoded, payload);
     }
 }

@@ -8,10 +8,10 @@
 
 use anyhow::{Context, Result, bail};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub const WORKSPACE_DIR_NAME: &str = "hcom-tasks";
 const MARKER_FILE: &str = ".hcom-arch-tasks";
@@ -20,6 +20,7 @@ const GITIGNORE_FILE: &str = ".gitignore";
 const LATEST_LINK: &str = "latest";
 const LATEST_TMP: &str = ".latest.tmp";
 const MAX_RUN_FILE_BYTES: usize = 256 * 1024;
+const MAX_CLARIFICATION_FILE_BYTES: usize = 256 * 1024;
 const MAX_DECISION_LINE_BYTES: usize = 4096;
 
 /// The per-run workspace under `<project>/hcom-tasks/<run-id>/`, holding the
@@ -144,6 +145,72 @@ impl TasksWorkspace {
         &self.run_id
     }
 
+    /// Reserve the exact path the Architect may use for one clarification.
+    ///
+    /// The file itself is intentionally not created: the Architect must
+    /// create one new document at the returned path. Existing files are never
+    /// edited or reused.
+    pub fn prepare_clarification_path(&self, task_key: &str, sequence: u32) -> Result<PathBuf> {
+        validate_task_key(task_key)?;
+        if sequence == 0 {
+            bail!("clarification sequence must be positive");
+        }
+        let task_dir = self.run_dir.join(task_key);
+        ensure_private_plain_directory(&task_dir)?;
+        let clarification_dir = task_dir.join("clarification");
+        ensure_private_plain_directory(&clarification_dir)?;
+        let path = clarification_dir.join(format!("turn-{sequence}.md"));
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path),
+            Ok(_) => bail!("clarification path already exists: {}", path.display()),
+            Err(error) => Err(error).with_context(|| {
+                format!("failed to inspect clarification path {}", path.display())
+            }),
+        }
+    }
+
+    /// Validate the Architect-created clarification as bounded path transport.
+    ///
+    /// This deliberately does not interpret Markdown or infer requirements.
+    pub fn validate_clarification_document(&self, expected: &Path) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(expected)
+            .with_context(|| {
+                format!(
+                    "failed to open clarification document {}",
+                    expected.display()
+                )
+            })?;
+        let before = file.metadata()?;
+        if !before.is_file() {
+            bail!(
+                "clarification document is not a regular file: {}",
+                expected.display()
+            );
+        }
+        if before.len() == 0 || before.len() > MAX_CLARIFICATION_FILE_BYTES as u64 {
+            bail!(
+                "clarification document must contain 1..={} bytes",
+                MAX_CLARIFICATION_FILE_BYTES
+            );
+        }
+        let mut bytes = Vec::with_capacity(before.len() as usize);
+        (&mut file)
+            .take(MAX_CLARIFICATION_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        let after = file.metadata()?;
+        if (before.dev(), before.ino(), before.len()) != (after.dev(), after.ino(), after.len()) {
+            bail!("clarification document changed while it was validated");
+        }
+        if bytes.len() != before.len() as usize {
+            bail!("clarification document could not be read completely");
+        }
+        std::str::from_utf8(&bytes).context("clarification document must be valid UTF-8")?;
+        Ok(())
+    }
+
     /// Write a run-level control file (for example `plan.md`) exactly once.
     pub fn write_run_file(&self, name: &str, contents: &[u8]) -> Result<()> {
         validate_file_name(name)?;
@@ -184,6 +251,44 @@ fn validate_run_id(run_id: &str) -> Result<()> {
         bail!("run id must be 1..=64 chars of [a-z0-9-]");
     }
     Ok(())
+}
+
+fn validate_task_key(task_key: &str) -> Result<()> {
+    if task_key.is_empty()
+        || task_key.len() > 128
+        || !task_key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
+        || !matches!(
+            Path::new(task_key)
+                .components()
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [Component::Normal(_)]
+        )
+    {
+        bail!("task key must be a bounded plain path component");
+    }
+    Ok(())
+}
+
+fn ensure_private_plain_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => bail!(
+            "refusing to use {}: not a directory (symlinks are rejected)",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path)
+                .with_context(|| format!("failed to create directory {}", path.display()))?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("failed to set mode on {}", path.display()))
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to inspect directory {}", path.display()))
+        }
+    }
 }
 
 fn validate_file_name(name: &str) -> Result<()> {
@@ -279,6 +384,47 @@ mod tests {
         assert_eq!(
             fs::metadata(root).unwrap().permissions().mode() & 0o777,
             0o700
+        );
+    }
+
+    #[test]
+    fn clarification_paths_are_unique_and_documents_are_bounded_plain_utf8_files() {
+        const TEST_NAME: &str =
+            "clarification_paths_are_unique_and_documents_are_bounded_plain_utf8_files";
+        let project = test_project(TEST_NAME);
+        let workspace = TasksWorkspace::open(&project, "run-1").unwrap();
+        assert!(workspace.prepare_clarification_path("..", 1).is_err());
+
+        let first = workspace.prepare_clarification_path("task-one", 1).unwrap();
+        assert_eq!(
+            first,
+            project.join("hcom-tasks/run-1/task-one/clarification/turn-1.md")
+        );
+        fs::write(&first, "bounded clarification\n").unwrap();
+        workspace.validate_clarification_document(&first).unwrap();
+        assert!(
+            workspace.prepare_clarification_path("task-one", 1).is_err(),
+            "an existing clarification must never be reused"
+        );
+
+        let empty = workspace.prepare_clarification_path("task-one", 2).unwrap();
+        fs::write(&empty, []).unwrap();
+        assert!(workspace.validate_clarification_document(&empty).is_err());
+
+        let invalid_utf8 = workspace.prepare_clarification_path("task-one", 3).unwrap();
+        fs::write(&invalid_utf8, [0xff]).unwrap();
+        assert!(
+            workspace
+                .validate_clarification_document(&invalid_utf8)
+                .is_err()
+        );
+
+        let symlink_path = workspace.prepare_clarification_path("task-one", 4).unwrap();
+        symlink(&first, &symlink_path).unwrap();
+        assert!(
+            workspace
+                .validate_clarification_document(&symlink_path)
+                .is_err()
         );
     }
 

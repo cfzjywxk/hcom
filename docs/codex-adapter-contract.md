@@ -131,10 +131,20 @@ snapshot exposes each task's latest Developer path, ordered final Reviewer
 paths, and Reviewer verdict. Both MCP response representations contain that
 metadata but never the Reviewer body.
 
-After the one terminal `session_wait` returns, the Architect reads every
-non-empty final Reviewer file in order and delivers the original verdict and
-findings. It distinguishes LGTM, `review_exhausted`, and lifecycle failure and
-does not rerun tests, review, or validation unless the human explicitly asks.
+Developer clarification/blocker requests also route only through durable
+paths. Each accepted clarification becomes ordered task runtime evidence and
+is supplied by path to every later Developer and Reviewer turn; it does not
+change the approved plan hash. `session_wait` returns for a latched action or a
+terminal state. Each action has a `published_version`: an interrupted client
+can recover it by waiting from an older version, while a repeated wait at the
+published version is rejected until the action is resolved. Status snapshots
+carry only each task's clarification count; the ordered records are available
+through pages of at most eight. The runtime enforces 64 records per task and
+1280 per run independently of whether an answer is Architect-derived or
+human-confirmed. At terminal return, the Architect reads every non-empty final
+Reviewer file in order and delivers the original verdict and findings. It
+distinguishes LGTM, `review_exhausted`, and lifecycle failure and does not rerun
+tests, review, or validation unless the human explicitly asks.
 
 ## Test map
 
@@ -146,6 +156,8 @@ does not rerun tests, review, or validation unless the human explicitly asks.
 | native worker argv/config | `worker::exec_runtime::tests::happy_developer_turn_completes_and_captures_thread_id`, `reviewer_registers_the_external_repository_as_a_native_workspace_root` |
 | byte-exact native environment with no additions | `orchestrator::task_lane::tests::complete_parent_environment_is_preserved_byte_for_byte` |
 | path-only peer and terminal handoff | `orchestrator::task_lane::tests::request_changes_round_routes_only_ordered_durable_paths`, `architect::bridge::tests::session_wait_keeps_mcp_responsive_and_returns_terminal_result` |
+| bounded clarification control plane | `orchestrator::core::tests::status_snapshot_is_bounded_and_clarification_records_are_exactly_paginated`, `control_api::codec::tests::maximum_clarification_page_stays_within_the_control_response_frame`, `orchestrator::core::tests::clarification_capacity_exhaustion_terminalizes_instead_of_latching_more_state` |
+| clarification artifact failure closes the run | `orchestrator::task_lane::tests::preexisting_clarification_artifact_terminalizes_instead_of_wedging_the_run` |
 | real CLI assumptions | `scripts/codex-exec-contract-smokes` |
 
 The standard source gate is:

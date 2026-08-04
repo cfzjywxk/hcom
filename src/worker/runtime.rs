@@ -370,7 +370,7 @@ impl RuntimeTurnKey {
 pub enum RuntimeTurnPurpose {
     InitialDevelopment,
     DeveloperCorrection,
-    DeveloperCompletionRecovery,
+    DeveloperClarificationResume,
     InitialReview,
     ReviewerRereview,
 }
@@ -380,8 +380,18 @@ impl RuntimeTurnPurpose {
         match self {
             Self::InitialDevelopment
             | Self::DeveloperCorrection
-            | Self::DeveloperCompletionRecovery => WorkerRole::Developer,
+            | Self::DeveloperClarificationResume => WorkerRole::Developer,
             Self::InitialReview | Self::ReviewerRereview => WorkerRole::Reviewer,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InitialDevelopment => "initial_development",
+            Self::DeveloperCorrection => "developer_correction",
+            Self::DeveloperClarificationResume => "developer_clarification_resume",
+            Self::InitialReview => "initial_review",
+            Self::ReviewerRereview => "reviewer_rereview",
         }
     }
 }
@@ -506,6 +516,8 @@ impl RuntimeTurnSpec {
 #[serde(rename_all = "snake_case")]
 pub enum DeveloperOutcomeStatus {
     Ready,
+    ClarificationRequired,
+    Blocked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

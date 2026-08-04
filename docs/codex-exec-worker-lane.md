@@ -194,6 +194,14 @@ Developer path and the current ordered Reviewer path or paths for each task.
 Collapsing failures to a fixed string destroys the only evidence of what broke —
 the exact defect that made the previous protocol lane's failures unreadable.
 
+Driver poll and reducer bookkeeping failures follow the same terminal
+discipline. The local active-turn handle is cleared only after a cloned core
+accepts the completion event; an error before that point closes the runtime,
+writes a bounded decision-log diagnostic, and transitions the original core to
+`needs_human`. The outer control loop has a final shutdown fallback for any
+backend that returns a poll error while still non-terminal, and services the
+pending `session_wait` before propagating containment failure.
+
 Per-turn wall clock is 6 hours, monotonic, never reset by output; on expiry the
 whole process group is terminated, evidence is drained and redacted, and the
 turn fails as a timeout. If the group survives SIGKILL the failure says so and
@@ -368,14 +376,25 @@ bypassing the foreground launch path under test.
 A turn is killed after 6 hours of wall clock, monotonic and never reset by
 output. A genuinely slow turn is indistinguishable from a hung one; a wedged
 worker burns up to six hours before the watchdog fires. The foreground
-supervisor reports the resulting terminal state through the one pending
+supervisor reports the resulting terminal state through the pending
 `session_wait`; a human who needs an earlier progress check can interrupt that
-wait and explicitly request `session_status` or cancellation.
+wait and explicitly request `session_status` or cancellation. The same wait
+also returns for a latched Developer clarification/blocker action. An action
+survives an interrupted wait and is immediately redelivered when the reconnect
+uses a version older than the action's `published_version`; a same-version
+repeat is rejected until the action is resolved.
+
+The six-hour watchdog applies only to an active Developer or Reviewer turn.
+`AwaitingArchitectAction` has no timeout: it may be waiting for a human
+decision, consumes no resident worker process, and remains owned by the
+foreground in-memory parent. Parent or terminal exit still cancels the run.
 
 At terminal return, every task snapshot exposes
 `latest_developer_final_path`, ordered `final_reviewer_message_paths`, and
-`reviewer_verdict`. The Architect reads every non-empty Reviewer file in order
-and reports its original verdict/findings, distinguishing LGTM,
+`reviewer_verdict`, plus a bounded clarification record count. Ordered
+clarification records are read separately in pages of at most eight. The
+Architect reads every non-empty Reviewer file in order and reports its
+original verdict/findings, distinguishing LGTM,
 `review_exhausted`, and lifecycle failure. Neither MCP response shape embeds
 the Reviewer body, and the Architect does not rerun tests, review, or
 validation unless the human asks.

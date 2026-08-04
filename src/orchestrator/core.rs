@@ -6,7 +6,10 @@
 //! feeds observations back as new events.
 
 use crate::control_api::{
-    SessionState, SessionStatusSnapshot, TaskDraft, TaskState, TaskStatusSnapshot, WorkerRole,
+    ActiveWorkerSnapshot, ArchitectActionReason, ClarificationPage, ClarificationRecord,
+    MAX_CLARIFICATION_PAGE_RECORDS, MAX_CLARIFICATION_RECORDS_PER_RUN,
+    MAX_CLARIFICATION_RECORDS_PER_TASK, PendingArchitectActionSnapshot, SessionState,
+    SessionStatusSnapshot, TaskDraft, TaskState, TaskStatusSnapshot, WorkerRole,
 };
 use crate::worker::runtime::{
     DeveloperOutcomeStatus, ReviewerOutcomeV1, ReviewerVerdict, RuntimeFailureClass,
@@ -31,6 +34,8 @@ pub enum SupervisorEventKind {
     RoleSessionOpened,
     TurnStarted,
     TurnCompleted,
+    ClarificationSubmitted,
+    ClarificationHumanRequired,
     TurnFailed,
     DriverFailed,
     Timeout,
@@ -40,13 +45,15 @@ pub enum SupervisorEventKind {
 }
 
 impl SupervisorEventKind {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 14] = [
         Self::PlanBound,
         Self::ExecutionAuthorized,
         Self::TaskRuntimeOpened,
         Self::RoleSessionOpened,
         Self::TurnStarted,
         Self::TurnCompleted,
+        Self::ClarificationSubmitted,
+        Self::ClarificationHumanRequired,
         Self::TurnFailed,
         Self::DriverFailed,
         Self::Timeout,
@@ -98,6 +105,22 @@ pub enum SupervisorEvent {
         outcome: RuntimeOutcome,
         final_message_path: PathBuf,
     },
+    ClarificationSubmitted {
+        expected_version: u64,
+        task_ordinal: usize,
+        task_key: String,
+        action_sequence: u32,
+        developer_request_path: String,
+        clarification_document_path: String,
+        human_decision_confirmed: bool,
+    },
+    ClarificationHumanRequired {
+        expected_version: u64,
+        task_ordinal: usize,
+        task_key: String,
+        action_sequence: u32,
+        developer_request_path: String,
+    },
     TurnFailed {
         expected_version: u64,
         task_ordinal: usize,
@@ -139,6 +162,10 @@ impl SupervisorEvent {
             Self::RoleSessionOpened { .. } => SupervisorEventKind::RoleSessionOpened,
             Self::TurnStarted { .. } => SupervisorEventKind::TurnStarted,
             Self::TurnCompleted { .. } => SupervisorEventKind::TurnCompleted,
+            Self::ClarificationSubmitted { .. } => SupervisorEventKind::ClarificationSubmitted,
+            Self::ClarificationHumanRequired { .. } => {
+                SupervisorEventKind::ClarificationHumanRequired
+            }
             Self::TurnFailed { .. } => SupervisorEventKind::TurnFailed,
             Self::DriverFailed { .. } => SupervisorEventKind::DriverFailed,
             Self::Timeout { .. } => SupervisorEventKind::Timeout,
@@ -166,6 +193,12 @@ impl SupervisorEvent {
                 expected_version, ..
             }
             | Self::TurnCompleted {
+                expected_version, ..
+            }
+            | Self::ClarificationSubmitted {
+                expected_version, ..
+            }
+            | Self::ClarificationHumanRequired {
                 expected_version, ..
             }
             | Self::TurnFailed {
@@ -227,6 +260,12 @@ pub enum SupervisorEffect {
     CloseTaskRuntime {
         task_ordinal: usize,
     },
+    PrepareClarificationArtifact {
+        task_ordinal: usize,
+        task_key: String,
+        sequence: u32,
+        path: PathBuf,
+    },
     FinishSession {
         state: SessionState,
         detail: String,
@@ -242,18 +281,20 @@ enum SupervisorEffectKind {
     StartTurn,
     InterruptTurn,
     CloseTaskRuntime,
+    PrepareClarificationArtifact,
     FinishSession,
     PublishStatus,
 }
 
 #[cfg(test)]
 impl SupervisorEffectKind {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::OpenTaskRuntime,
         Self::OpenRoleSession,
         Self::StartTurn,
         Self::InterruptTurn,
         Self::CloseTaskRuntime,
+        Self::PrepareClarificationArtifact,
         Self::FinishSession,
         Self::PublishStatus,
     ];
@@ -268,6 +309,9 @@ impl SupervisorEffect {
             Self::StartTurn { .. } => SupervisorEffectKind::StartTurn,
             Self::InterruptTurn { .. } => SupervisorEffectKind::InterruptTurn,
             Self::CloseTaskRuntime { .. } => SupervisorEffectKind::CloseTaskRuntime,
+            Self::PrepareClarificationArtifact { .. } => {
+                SupervisorEffectKind::PrepareClarificationArtifact
+            }
             Self::FinishSession { .. } => SupervisorEffectKind::FinishSession,
             Self::PublishStatus => SupervisorEffectKind::PublishStatus,
         }
@@ -348,12 +392,14 @@ pub struct CoreTask {
     pub spec: TaskDraft,
     pub state: TaskState,
     pub review_round: u32,
+    pub clarification_rounds_used: u32,
     pub developer_session: Option<RuntimeSessionKey>,
     pub reviewer_session: Option<RuntimeSessionKey>,
     pub outcome_detail: Option<String>,
     latest_developer_final_path: Option<String>,
     latest_reviewer_final_paths: Vec<String>,
     latest_reviewer_verdict: Option<ReviewerVerdict>,
+    clarification_records: Vec<ClarificationRecord>,
 }
 
 impl CoreTask {
@@ -362,12 +408,14 @@ impl CoreTask {
             spec,
             state: TaskState::Pending,
             review_round: 0,
+            clarification_rounds_used: 0,
             developer_session: None,
             reviewer_session: None,
             outcome_detail: None,
             latest_developer_final_path: None,
             latest_reviewer_final_paths: Vec::new(),
             latest_reviewer_verdict: None,
+            clarification_records: Vec::new(),
         }
     }
 
@@ -377,6 +425,10 @@ impl CoreTask {
 
     pub fn latest_reviewer_final_paths(&self) -> &[String] {
         &self.latest_reviewer_final_paths
+    }
+
+    pub fn clarification_records(&self) -> &[ClarificationRecord] {
+        &self.clarification_records
     }
 }
 
@@ -417,6 +469,7 @@ pub struct SupervisorCore {
     tasks: Vec<CoreTask>,
     current_task: Option<usize>,
     terminal_detail: Option<String>,
+    pending_architect_action: Option<PendingArchitectActionSnapshot>,
     pending_runtime_open: Option<usize>,
     runtime_open: Option<usize>,
     pending_session_open: Option<ExpectedSessionOpen>,
@@ -451,6 +504,7 @@ impl SupervisorCore {
             tasks: Vec::new(),
             current_task: None,
             terminal_detail: None,
+            pending_architect_action: None,
             pending_runtime_open: None,
             runtime_open: None,
             pending_session_open: None,
@@ -508,7 +562,7 @@ impl SupervisorCore {
 
     pub fn expected_plan_hash(&self, plan_version: u64, tasks: &[TaskDraft]) -> String {
         canonical_hash(&(
-            "hcom-codex-exec-session-plan-v2",
+            "hcom-codex-exec-session-plan-v3",
             plan_version,
             &self.project_root,
             &self.profile_hash,
@@ -527,6 +581,16 @@ impl SupervisorCore {
             current_task_ordinal: self
                 .current_task
                 .and_then(|index| u32::try_from(index).ok()),
+            active_worker: self
+                .active_turn
+                .as_ref()
+                .map(|active| ActiveWorkerSnapshot {
+                    task_ordinal: u32::try_from(active.task_ordinal).unwrap_or(u32::MAX),
+                    task_key: self.tasks[active.task_ordinal].spec.task_key.clone(),
+                    role: active.role,
+                    purpose: active.purpose.as_str().into(),
+                }),
+            pending_architect_action: self.pending_architect_action.clone(),
             terminal_detail: self.terminal_detail.clone(),
             tasks: self
                 .tasks
@@ -543,6 +607,10 @@ impl SupervisorCore {
                     branch: None,
                     review_round: task.review_round,
                     max_review_rounds: task.spec.max_review_rounds,
+                    clarification_rounds_used: task.clarification_rounds_used,
+                    max_clarification_rounds: task.spec.max_clarification_rounds,
+                    clarification_record_count: u32::try_from(task.clarification_records.len())
+                        .unwrap_or(u32::MAX),
                     base_revision: None,
                     head_revision: None,
                     developer_session_bound: task.developer_session.is_some(),
@@ -554,6 +622,62 @@ impl SupervisorCore {
                 })
                 .collect(),
         }
+    }
+
+    pub fn clarification_page(
+        &self,
+        task_ordinal: u32,
+        task_key: &str,
+        after_sequence: u32,
+        limit: u8,
+    ) -> Result<ClarificationPage, SupervisorError> {
+        if !(1..=MAX_CLARIFICATION_PAGE_RECORDS).contains(&limit) {
+            return Err(SupervisorError::invalid_event(
+                "clarification page limit is out of range",
+            ));
+        }
+        let task_index = usize::try_from(task_ordinal)
+            .map_err(|_| SupervisorError::invalid_identity("task ordinal is out of range"))?;
+        let task = self
+            .tasks
+            .get(task_index)
+            .ok_or_else(|| SupervisorError::invalid_identity("task ordinal is out of range"))?;
+        if task.spec.task_key != task_key {
+            return Err(SupervisorError::invalid_identity(
+                "task key does not match the requested task ordinal",
+            ));
+        }
+        let total_records = u32::try_from(task.clarification_records.len())
+            .map_err(|_| SupervisorError::overflow("clarification record count overflow"))?;
+        if after_sequence > total_records {
+            return Err(SupervisorError::invalid_event(
+                "clarification page cursor is ahead of the task record count",
+            ));
+        }
+        let records = task
+            .clarification_records
+            .iter()
+            .skip(
+                usize::try_from(after_sequence)
+                    .map_err(|_| SupervisorError::overflow("clarification cursor overflow"))?,
+            )
+            .take(usize::from(limit))
+            .cloned()
+            .collect::<Vec<_>>();
+        let next_after_sequence = records
+            .last()
+            .map(|record| record.sequence)
+            .filter(|sequence| *sequence < total_records);
+        Ok(ClarificationPage {
+            run_id: self.run_id.clone(),
+            session_version: self.version,
+            task_ordinal,
+            task_key: task_key.to_owned(),
+            total_records,
+            after_sequence,
+            records,
+            next_after_sequence,
+        })
     }
 
     /// Apply one event transactionally and return the exact ordered effects.
@@ -644,6 +768,34 @@ impl SupervisorCore {
                 &completion_token,
                 outcome,
                 final_message_path,
+            ),
+            SupervisorEvent::ClarificationSubmitted {
+                task_ordinal,
+                task_key,
+                action_sequence,
+                developer_request_path,
+                clarification_document_path,
+                human_decision_confirmed,
+                ..
+            } => self.clarification_submitted(
+                task_ordinal,
+                &task_key,
+                action_sequence,
+                &developer_request_path,
+                &clarification_document_path,
+                human_decision_confirmed,
+            ),
+            SupervisorEvent::ClarificationHumanRequired {
+                task_ordinal,
+                task_key,
+                action_sequence,
+                developer_request_path,
+                ..
+            } => self.clarification_human_required(
+                task_ordinal,
+                &task_key,
+                action_sequence,
+                &developer_request_path,
             ),
             SupervisorEvent::TurnFailed {
                 task_ordinal,
@@ -968,11 +1120,241 @@ impl SupervisorCore {
                         Some("developer turn completed; routing to review".into());
                     self.start_reviewer(task_ordinal)
                 }
+                DeveloperOutcomeStatus::ClarificationRequired => self.await_architect_action(
+                    task_ordinal,
+                    ArchitectActionReason::Clarification,
+                    final_message_path,
+                ),
+                DeveloperOutcomeStatus::Blocked => self.await_architect_action(
+                    task_ordinal,
+                    ArchitectActionReason::Blocker,
+                    final_message_path,
+                ),
             },
             RuntimeOutcome::Reviewer(reviewer) => {
                 self.handle_reviewer_verdict(task_ordinal, reviewer, final_message_path)
             }
         }
+    }
+
+    fn await_architect_action(
+        &mut self,
+        task_ordinal: usize,
+        reason: ArchitectActionReason,
+        developer_request_path: String,
+    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        if self.tasks[task_ordinal].state != TaskState::Developing {
+            return Err(SupervisorError::invalid_transition(
+                "Developer action request requires a developing task",
+            ));
+        }
+        if self.pending_architect_action.is_some() {
+            return Err(SupervisorError::invariant(
+                "a second Architect action cannot be pending",
+            ));
+        }
+        let task_record_count = self.tasks[task_ordinal].clarification_records.len();
+        let run_record_count = self
+            .tasks
+            .iter()
+            .try_fold(0usize, |total, task| {
+                total.checked_add(task.clarification_records.len())
+            })
+            .ok_or_else(|| SupervisorError::overflow("clarification record count overflow"))?;
+        if task_record_count >= MAX_CLARIFICATION_RECORDS_PER_TASK
+            || run_record_count >= MAX_CLARIFICATION_RECORDS_PER_RUN
+        {
+            self.tasks[task_ordinal].latest_developer_final_path = Some(developer_request_path);
+            return self.terminalize_current(
+                SessionState::NeedsHuman,
+                TaskState::NeedsHuman,
+                "clarification record capacity exhausted; cancel and approve a new run",
+                Vec::new(),
+            );
+        }
+        let task = &self.tasks[task_ordinal];
+        let sequence = u32::try_from(task.clarification_records.len())
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| SupervisorError::overflow("clarification sequence overflow"))?;
+        let human_decision_required =
+            task.clarification_rounds_used >= u32::from(task.spec.max_clarification_rounds);
+        let clarification_output_path = self
+            .project_root
+            .join("hcom-tasks")
+            .join(&self.run_id)
+            .join(&task.spec.task_key)
+            .join("clarification")
+            .join(format!("turn-{sequence}.md"));
+        let clarification_output_path = clarification_output_path
+            .to_str()
+            .ok_or_else(|| {
+                SupervisorError::invalid_event("clarification output path must be UTF-8")
+            })?
+            .to_owned();
+        validate_absolute_path("clarification output path", &clarification_output_path)?;
+        let published_version = self
+            .version
+            .checked_add(1)
+            .ok_or_else(|| SupervisorError::overflow("session version overflow"))?;
+        let pending = PendingArchitectActionSnapshot {
+            task_ordinal: u32::try_from(task_ordinal)
+                .map_err(|_| SupervisorError::overflow("task ordinal overflow"))?,
+            task_key: task.spec.task_key.clone(),
+            sequence,
+            reason,
+            developer_request_path: developer_request_path.clone(),
+            clarification_output_path: clarification_output_path.clone(),
+            clarification_rounds_used: task.clarification_rounds_used,
+            max_clarification_rounds: task.spec.max_clarification_rounds,
+            human_decision_required,
+            published_version,
+        };
+        let task = &mut self.tasks[task_ordinal];
+        task.latest_developer_final_path = Some(developer_request_path);
+        task.state = TaskState::AwaitingArchitectAction;
+        task.outcome_detail = Some(match reason {
+            ArchitectActionReason::Clarification => {
+                "Developer requested requirement clarification".into()
+            }
+            ArchitectActionReason::Blocker => {
+                "Developer reported an evidenced external blocker".into()
+            }
+        });
+        self.pending_architect_action = Some(pending);
+        Ok(vec![SupervisorEffect::PrepareClarificationArtifact {
+            task_ordinal,
+            task_key: task.spec.task_key.clone(),
+            sequence,
+            path: PathBuf::from(clarification_output_path),
+        }])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn clarification_submitted(
+        &mut self,
+        task_ordinal: usize,
+        task_key: &str,
+        action_sequence: u32,
+        developer_request_path: &str,
+        clarification_document_path: &str,
+        human_decision_confirmed: bool,
+    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        self.require_pending_architect_action(
+            task_ordinal,
+            task_key,
+            action_sequence,
+            developer_request_path,
+        )?;
+        let pending = self
+            .pending_architect_action
+            .as_ref()
+            .expect("pending Architect action was just validated");
+        if pending.clarification_output_path != clarification_document_path {
+            return Err(SupervisorError::invalid_identity(
+                "clarification document path does not match the pending action",
+            ));
+        }
+        validate_absolute_path("clarification document path", clarification_document_path)?;
+        if pending.human_decision_required != human_decision_confirmed {
+            return Err(SupervisorError::invalid_transition(
+                "human_decision_confirmed does not match the pending action mode",
+            ));
+        }
+
+        let reason = pending.reason;
+        let task = &mut self.tasks[task_ordinal];
+        if !human_decision_confirmed {
+            if task.clarification_rounds_used >= u32::from(task.spec.max_clarification_rounds) {
+                return Err(SupervisorError::invalid_transition(
+                    "Architect autonomous clarification budget is exhausted",
+                ));
+            }
+            task.clarification_rounds_used = task
+                .clarification_rounds_used
+                .checked_add(1)
+                .ok_or_else(|| SupervisorError::overflow("clarification round overflow"))?;
+        }
+        task.clarification_records.push(ClarificationRecord {
+            sequence: action_sequence,
+            reason,
+            developer_request_path: developer_request_path.to_owned(),
+            architect_clarification_path: clarification_document_path.to_owned(),
+            human_decision_confirmed,
+        });
+        task.state = TaskState::Developing;
+        task.outcome_detail = Some(if human_decision_confirmed {
+            "human-confirmed clarification submitted; resuming Developer".into()
+        } else {
+            "Architect clarification submitted; resuming Developer".into()
+        });
+        self.pending_architect_action = None;
+        let session = task
+            .developer_session
+            .ok_or_else(|| SupervisorError::invariant("developer session disappeared"))?;
+        self.schedule_turn(
+            task_ordinal,
+            WorkerRole::Developer,
+            RuntimeTurnPurpose::DeveloperClarificationResume,
+            session,
+        )
+    }
+
+    fn clarification_human_required(
+        &mut self,
+        task_ordinal: usize,
+        task_key: &str,
+        action_sequence: u32,
+        developer_request_path: &str,
+    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        self.require_pending_architect_action(
+            task_ordinal,
+            task_key,
+            action_sequence,
+            developer_request_path,
+        )?;
+        let pending = self
+            .pending_architect_action
+            .as_mut()
+            .expect("pending Architect action was just validated");
+        if pending.human_decision_required {
+            return Err(SupervisorError::invalid_transition(
+                "pending Architect action already requires a human decision",
+            ));
+        }
+        pending.published_version = self
+            .version
+            .checked_add(1)
+            .ok_or_else(|| SupervisorError::overflow("session version overflow"))?;
+        pending.human_decision_required = true;
+        self.tasks[task_ordinal].outcome_detail =
+            Some("Architect requested a human decision before Developer resume".into());
+        Ok(Vec::new())
+    }
+
+    fn require_pending_architect_action(
+        &self,
+        task_ordinal: usize,
+        task_key: &str,
+        action_sequence: u32,
+        developer_request_path: &str,
+    ) -> Result<(), SupervisorError> {
+        self.require_running_task(task_ordinal)?;
+        let pending = self
+            .pending_architect_action
+            .as_ref()
+            .ok_or_else(|| SupervisorError::invalid_transition("no Architect action is pending"))?;
+        if self.tasks[task_ordinal].state != TaskState::AwaitingArchitectAction
+            || usize::try_from(pending.task_ordinal).ok() != Some(task_ordinal)
+            || pending.task_key != task_key
+            || pending.sequence != action_sequence
+            || pending.developer_request_path != developer_request_path
+        {
+            return Err(SupervisorError::invalid_identity(
+                "Architect action identity does not match the pending task request",
+            ));
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1395,6 +1777,7 @@ impl SupervisorCore {
         self.pending_session_open = None;
         self.pending_turn_start = None;
         self.active_turn = None;
+        self.pending_architect_action = None;
         self.session_state = session_state;
         self.terminal_detail = Some(detail.into());
         effects.push(SupervisorEffect::FinishSession {
@@ -1410,6 +1793,7 @@ impl SupervisorCore {
         self.pending_session_open = None;
         self.pending_turn_start = None;
         self.active_turn = None;
+        self.pending_architect_action = None;
         self.used_sessions.clear();
         self.used_turns.clear();
         self.accepted_completion_tokens.clear();
@@ -1485,7 +1869,8 @@ impl SupervisorCore {
                 || self.runtime_open.is_some()
                 || self.pending_session_open.is_some()
                 || self.pending_turn_start.is_some()
-                || self.active_turn.is_some())
+                || self.active_turn.is_some()
+                || self.pending_architect_action.is_some())
         {
             return Err(SupervisorError::invariant(
                 "terminal session retains a live runtime operation",
@@ -1524,7 +1909,12 @@ impl SupervisorCore {
         if let Some(task_ordinal) = self.runtime_open
             && (self.current_task != Some(task_ordinal)
                 || self.tasks.get(task_ordinal).is_none_or(|task| {
-                    !matches!(task.state, TaskState::Developing | TaskState::Reviewing)
+                    !matches!(
+                        task.state,
+                        TaskState::Developing
+                            | TaskState::AwaitingArchitectAction
+                            | TaskState::Reviewing
+                    )
                 }))
         {
             return Err(SupervisorError::invariant(
@@ -1568,11 +1958,56 @@ impl SupervisorCore {
                 ));
             }
         }
+        let mut run_clarification_records = 0usize;
         for task in &self.tasks {
             if task.review_round > u32::from(task.spec.max_review_rounds) {
                 return Err(SupervisorError::invariant(
                     "task review round exceeds its maximum",
                 ));
+            }
+            if task.clarification_rounds_used > u32::from(task.spec.max_clarification_rounds) {
+                return Err(SupervisorError::invariant(
+                    "task clarification round exceeds its maximum",
+                ));
+            }
+            if task.clarification_records.len() > MAX_CLARIFICATION_RECORDS_PER_TASK {
+                return Err(SupervisorError::invariant(
+                    "task clarification record capacity was exceeded",
+                ));
+            }
+            run_clarification_records = run_clarification_records
+                .checked_add(task.clarification_records.len())
+                .ok_or_else(|| {
+                    SupervisorError::invariant("run clarification record count overflow")
+                })?;
+            let autonomous_records = task
+                .clarification_records
+                .iter()
+                .filter(|record| !record.human_decision_confirmed)
+                .count();
+            if usize::try_from(task.clarification_rounds_used).ok() != Some(autonomous_records) {
+                return Err(SupervisorError::invariant(
+                    "task clarification round count differs from its records",
+                ));
+            }
+            for (index, record) in task.clarification_records.iter().enumerate() {
+                let expected_sequence = u32::try_from(index)
+                    .ok()
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or_else(|| SupervisorError::invariant("clarification sequence overflow"))?;
+                if record.sequence != expected_sequence {
+                    return Err(SupervisorError::invariant(
+                        "task clarification records are not ordered and contiguous",
+                    ));
+                }
+                validate_absolute_path(
+                    "clarification developer request path",
+                    &record.developer_request_path,
+                )?;
+                validate_absolute_path(
+                    "Architect clarification path",
+                    &record.architect_clarification_path,
+                )?;
             }
             if task.state == TaskState::Reviewing
                 && (task.developer_session.is_none()
@@ -1614,6 +2049,68 @@ impl SupervisorCore {
                 return Err(SupervisorError::invariant(
                     "Reviewer session is absent from the global identity set",
                 ));
+            }
+        }
+        if run_clarification_records > MAX_CLARIFICATION_RECORDS_PER_RUN {
+            return Err(SupervisorError::invariant(
+                "run clarification record capacity was exceeded",
+            ));
+        }
+        match &self.pending_architect_action {
+            Some(pending) => {
+                let task_ordinal = usize::try_from(pending.task_ordinal).map_err(|_| {
+                    SupervisorError::invariant("pending Architect task ordinal overflow")
+                })?;
+                let task = self.tasks.get(task_ordinal).ok_or_else(|| {
+                    SupervisorError::invariant("pending Architect action task is missing")
+                })?;
+                if self.session_state != SessionState::Running
+                    || self.current_task != Some(task_ordinal)
+                    || self.runtime_open != Some(task_ordinal)
+                    || task.state != TaskState::AwaitingArchitectAction
+                    || task.spec.task_key != pending.task_key
+                    || pending.sequence
+                        != u32::try_from(task.clarification_records.len())
+                            .ok()
+                            .and_then(|value| value.checked_add(1))
+                            .ok_or_else(|| {
+                                SupervisorError::invariant(
+                                    "pending clarification sequence overflow",
+                                )
+                            })?
+                    || pending.clarification_rounds_used != task.clarification_rounds_used
+                    || pending.max_clarification_rounds != task.spec.max_clarification_rounds
+                    || pending.published_version != self.version
+                    || (!pending.human_decision_required
+                        && task.clarification_rounds_used
+                            >= u32::from(task.spec.max_clarification_rounds))
+                    || self.pending_session_open.is_some()
+                    || self.pending_turn_start.is_some()
+                    || self.active_turn.is_some()
+                {
+                    return Err(SupervisorError::invariant(
+                        "pending Architect action is not latched to an idle current task",
+                    ));
+                }
+                validate_absolute_path(
+                    "pending Developer request path",
+                    &pending.developer_request_path,
+                )?;
+                validate_absolute_path(
+                    "pending clarification output path",
+                    &pending.clarification_output_path,
+                )?;
+            }
+            None => {
+                if self
+                    .tasks
+                    .iter()
+                    .any(|task| task.state == TaskState::AwaitingArchitectAction)
+                {
+                    return Err(SupervisorError::invariant(
+                        "awaiting-Architect task has no pending action",
+                    ));
+                }
             }
         }
         let session_count = self
@@ -1767,6 +2264,7 @@ mod tests {
             design_document_paths: vec!["/project/design.md".into()],
             task_selector: key.into(),
             max_review_rounds,
+            max_clarification_rounds: 2,
         }
     }
 
@@ -1774,6 +2272,22 @@ mod tests {
         RuntimeOutcome::Developer(DeveloperOutcomeV1 {
             status: DeveloperOutcomeStatus::Ready,
         })
+    }
+
+    fn clarification_required() -> RuntimeOutcome {
+        RuntimeOutcome::Developer(DeveloperOutcomeV1 {
+            status: DeveloperOutcomeStatus::ClarificationRequired,
+        })
+    }
+
+    fn clarification_record(sequence: u32) -> ClarificationRecord {
+        ClarificationRecord {
+            sequence,
+            reason: ArchitectActionReason::Clarification,
+            developer_request_path: format!("/artifacts/developer/request-{sequence}.md"),
+            architect_clarification_path: format!("/project/clarification/turn-{sequence}.md"),
+            human_decision_confirmed: true,
+        }
     }
 
     fn runtime_failure(
@@ -2166,6 +2680,20 @@ mod tests {
         (core, active)
     }
 
+    fn awaiting_architect_core() -> SupervisorCore {
+        let (mut core, active) = active_core();
+        complete_turn(
+            &mut core,
+            active.task,
+            active.role,
+            active.session,
+            active.turn,
+            active.token,
+            clarification_required(),
+        );
+        core
+    }
+
     fn completed_core() -> SupervisorCore {
         let (mut core, developer) = active_core();
         complete_developer_ready(&mut core, developer);
@@ -2326,6 +2854,56 @@ mod tests {
                 outcome: ready(),
                 final_message_path: PathBuf::from("/artifacts/developer/final.md"),
             },
+            SupervisorEventKind::ClarificationSubmitted => {
+                let pending = core.pending_architect_action.clone().unwrap_or(
+                    PendingArchitectActionSnapshot {
+                        task_ordinal: 0,
+                        task_key: "one".into(),
+                        sequence: 1,
+                        reason: ArchitectActionReason::Clarification,
+                        developer_request_path: "/artifacts/developer/final.md".into(),
+                        clarification_output_path:
+                            "/project/hcom-tasks/run-1/one/clarification/turn-1.md".into(),
+                        clarification_rounds_used: 0,
+                        max_clarification_rounds: 2,
+                        human_decision_required: false,
+                        published_version: core.version(),
+                    },
+                );
+                SupervisorEvent::ClarificationSubmitted {
+                    expected_version: core.version(),
+                    task_ordinal: pending.task_ordinal as usize,
+                    task_key: pending.task_key,
+                    action_sequence: pending.sequence,
+                    developer_request_path: pending.developer_request_path,
+                    clarification_document_path: pending.clarification_output_path,
+                    human_decision_confirmed: pending.human_decision_required,
+                }
+            }
+            SupervisorEventKind::ClarificationHumanRequired => {
+                let pending = core.pending_architect_action.clone().unwrap_or(
+                    PendingArchitectActionSnapshot {
+                        task_ordinal: 0,
+                        task_key: "one".into(),
+                        sequence: 1,
+                        reason: ArchitectActionReason::Clarification,
+                        developer_request_path: "/artifacts/developer/final.md".into(),
+                        clarification_output_path:
+                            "/project/hcom-tasks/run-1/one/clarification/turn-1.md".into(),
+                        clarification_rounds_used: 0,
+                        max_clarification_rounds: 2,
+                        human_decision_required: false,
+                        published_version: core.version(),
+                    },
+                );
+                SupervisorEvent::ClarificationHumanRequired {
+                    expected_version: core.version(),
+                    task_ordinal: pending.task_ordinal as usize,
+                    task_key: pending.task_key,
+                    action_sequence: pending.sequence,
+                    developer_request_path: pending.developer_request_path,
+                }
+            }
             SupervisorEventKind::TurnFailed => SupervisorEvent::TurnFailed {
                 expected_version: core.version(),
                 task_ordinal: 0,
@@ -2383,6 +2961,12 @@ mod tests {
             | SupervisorEventKind::TurnFailed
             | SupervisorEventKind::Timeout => {
                 let (core, _) = active_core();
+                let event = generic_event(&core, kind);
+                (core, event)
+            }
+            SupervisorEventKind::ClarificationSubmitted
+            | SupervisorEventKind::ClarificationHumanRequired => {
+                let core = awaiting_architect_core();
                 let event = generic_event(&core, kind);
                 (core, event)
             }
@@ -2446,6 +3030,11 @@ mod tests {
                     _ => unreachable!(),
                 };
                 (core, event, kind != SupervisorEventKind::TaskRuntimeOpened)
+            }
+            TaskState::AwaitingArchitectAction => {
+                let core = awaiting_architect_core();
+                let event = generic_event(&core, kind);
+                (core, event, false)
             }
             TaskState::Reviewing => {
                 let (core, event) = match kind {
@@ -2687,8 +3276,8 @@ mod tests {
         }
 
         assert_eq!(rows, 7 * SupervisorEventKind::ALL.len());
-        assert_eq!(accepted, 23);
-        assert_eq!(rejected, 61);
+        assert_eq!(accepted, 25);
+        assert_eq!(rejected, 73);
     }
 
     #[test]
@@ -2725,6 +3314,17 @@ mod tests {
             .unwrap(),
         );
 
+        let (mut clarification, active) = active_core();
+        record(complete_turn(
+            &mut clarification,
+            active.task,
+            active.role,
+            active.session,
+            active.turn,
+            active.token,
+            clarification_required(),
+        ));
+
         assert_eq!(
             observed,
             BTreeSet::from(SupervisorEffectKind::ALL),
@@ -2739,6 +3339,7 @@ mod tests {
         let name = |state: TaskState| match state {
             TaskState::Pending => "pending",
             TaskState::Developing => "developing",
+            TaskState::AwaitingArchitectAction => "awaiting_architect_action",
             TaskState::Reviewing => "reviewing",
             TaskState::Lgtm => "lgtm",
             TaskState::ReviewExhausted => "review_exhausted",
@@ -2772,6 +3373,45 @@ mod tests {
             name(developing.tasks[0].state),
         ));
         observed_states.insert(name(developing.tasks[0].state));
+
+        let (mut clarification, active) = active_core();
+        let before = clarification.tasks[0].state;
+        complete_turn(
+            &mut clarification,
+            active.task,
+            active.role,
+            active.session,
+            active.turn,
+            active.token,
+            clarification_required(),
+        );
+        edges.insert((
+            name(before),
+            "developer_clarification",
+            name(clarification.tasks[0].state),
+        ));
+        observed_states.insert(name(clarification.tasks[0].state));
+        let pending = clarification
+            .pending_architect_action
+            .clone()
+            .expect("clarification is pending");
+        let before = clarification.tasks[0].state;
+        clarification
+            .reduce(SupervisorEvent::ClarificationSubmitted {
+                expected_version: clarification.version(),
+                task_ordinal: 0,
+                task_key: pending.task_key,
+                action_sequence: pending.sequence,
+                developer_request_path: pending.developer_request_path,
+                clarification_document_path: pending.clarification_output_path,
+                human_decision_confirmed: false,
+            })
+            .unwrap();
+        edges.insert((
+            name(before),
+            "clarification_submitted",
+            name(clarification.tasks[0].state),
+        ));
 
         let (mut blocked_core, active) = active_core();
         let before = blocked_core.tasks[0].state;
@@ -2828,6 +3468,7 @@ mod tests {
             BTreeSet::from([
                 "pending",
                 "developing",
+                "awaiting_architect_action",
                 "reviewing",
                 "lgtm",
                 "review_exhausted",
@@ -2843,6 +3484,16 @@ mod tests {
                 // Task-agnostic lane: the developer's exit routes straight to
                 // review; the supervisor inspects nothing about the work.
                 ("developing", "developer_ready", "reviewing"),
+                (
+                    "developing",
+                    "developer_clarification",
+                    "awaiting_architect_action",
+                ),
+                (
+                    "awaiting_architect_action",
+                    "clarification_submitted",
+                    "developing",
+                ),
                 ("developing", "runtime_contract_failure", "needs_human"),
                 ("reviewing", "request_changes", "developing"),
                 ("reviewing", "lgtm", "lgtm"),
@@ -2880,10 +3531,183 @@ mod tests {
     }
 
     #[test]
+    fn architect_can_escalate_early_and_only_a_confirmed_human_answer_resumes() {
+        let mut core = awaiting_architect_core();
+        let pending = core
+            .pending_architect_action
+            .clone()
+            .expect("action must be pending");
+        let before = core.clone();
+        let mut wrong_identity =
+            generic_event(&core, SupervisorEventKind::ClarificationHumanRequired);
+        let SupervisorEvent::ClarificationHumanRequired { task_key, .. } = &mut wrong_identity
+        else {
+            unreachable!()
+        };
+        *task_key = "wrong-task".into();
+        assert!(core.reduce(wrong_identity).is_err());
+        assert_eq!(core, before);
+
+        core.reduce(SupervisorEvent::ClarificationHumanRequired {
+            expected_version: core.version(),
+            task_ordinal: 0,
+            task_key: pending.task_key.clone(),
+            action_sequence: pending.sequence,
+            developer_request_path: pending.developer_request_path.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            core.pending_architect_action
+                .as_ref()
+                .unwrap()
+                .published_version,
+            core.version()
+        );
+        assert!(
+            core.pending_architect_action
+                .as_ref()
+                .unwrap()
+                .human_decision_required
+        );
+        let before = core.clone();
+        assert!(
+            core.reduce(SupervisorEvent::ClarificationSubmitted {
+                expected_version: core.version(),
+                task_ordinal: 0,
+                task_key: pending.task_key.clone(),
+                action_sequence: pending.sequence,
+                developer_request_path: pending.developer_request_path.clone(),
+                clarification_document_path: pending.clarification_output_path.clone(),
+                human_decision_confirmed: false,
+            })
+            .is_err()
+        );
+        assert_eq!(core, before);
+
+        core.reduce(SupervisorEvent::ClarificationSubmitted {
+            expected_version: core.version(),
+            task_ordinal: 0,
+            task_key: pending.task_key,
+            action_sequence: pending.sequence,
+            developer_request_path: pending.developer_request_path,
+            clarification_document_path: pending.clarification_output_path,
+            human_decision_confirmed: true,
+        })
+        .unwrap();
+        assert!(core.pending_architect_action.is_none());
+        assert_eq!(core.tasks[0].state, TaskState::Developing);
+        assert_eq!(core.tasks[0].clarification_rounds_used, 0);
+        assert!(core.tasks[0].clarification_records[0].human_decision_confirmed);
+    }
+
+    #[test]
+    fn status_snapshot_is_bounded_and_clarification_records_are_exactly_paginated() {
+        let mut core = bound_core();
+        core.tasks[0].clarification_records =
+            (1..=10).map(clarification_record).collect::<Vec<_>>();
+        core.assert_invariants().unwrap();
+
+        let snapshot = core.snapshot();
+        assert_eq!(snapshot.tasks[0].clarification_record_count, 10);
+
+        let first = core.clarification_page(0, "one", 0, 3).unwrap();
+        assert_eq!(
+            first
+                .records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(first.total_records, 10);
+        assert_eq!(first.next_after_sequence, Some(3));
+
+        let final_page = core.clarification_page(0, "one", 3, 8).unwrap();
+        assert_eq!(
+            final_page
+                .records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            [4, 5, 6, 7, 8, 9, 10]
+        );
+        assert_eq!(final_page.next_after_sequence, None);
+        assert!(core.clarification_page(0, "wrong", 0, 1).is_err());
+        assert!(core.clarification_page(0, "one", 11, 1).is_err());
+        assert!(core.clarification_page(0, "one", 0, 0).is_err());
+    }
+
+    #[test]
+    fn clarification_capacity_exhaustion_terminalizes_instead_of_latching_more_state() {
+        let (mut per_task, active) = active_core();
+        per_task.tasks[0].clarification_records =
+            (1..=u32::try_from(MAX_CLARIFICATION_RECORDS_PER_TASK).unwrap())
+                .map(clarification_record)
+                .collect();
+        per_task.assert_invariants().unwrap();
+        let effects = complete_turn(
+            &mut per_task,
+            active.task,
+            active.role,
+            active.session,
+            active.turn,
+            active.token,
+            clarification_required(),
+        );
+        assert_eq!(per_task.session_state(), SessionState::NeedsHuman);
+        assert_eq!(per_task.tasks[0].state, TaskState::NeedsHuman);
+        assert!(per_task.pending_architect_action.is_none());
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            SupervisorEffect::FinishSession {
+                state: SessionState::NeedsHuman,
+                ..
+            }
+        )));
+
+        let mut run = new_core();
+        bind(
+            &mut run,
+            (0..MAX_TASKS)
+                .map(|index| {
+                    let mut task = task(&format!("task-{index}"), "/repo", 1);
+                    task.max_clarification_rounds = 20;
+                    task
+                })
+                .collect(),
+        );
+        authorize(&mut run);
+        let active = start_first_developer(&mut run, 0, 1, 1, "run-capacity");
+        for task in &mut run.tasks {
+            task.clarification_records = (1..=20).map(clarification_record).collect();
+        }
+        assert_eq!(
+            run.tasks
+                .iter()
+                .map(|task| task.clarification_records.len())
+                .sum::<usize>(),
+            MAX_CLARIFICATION_RECORDS_PER_RUN
+        );
+        run.assert_invariants().unwrap();
+        complete_turn(
+            &mut run,
+            active.task,
+            active.role,
+            active.session,
+            active.turn,
+            active.token,
+            clarification_required(),
+        );
+        assert_eq!(run.session_state(), SessionState::NeedsHuman);
+        assert!(run.pending_architect_action.is_none());
+    }
+
+    #[test]
     fn every_task_state_by_relevant_lifecycle_event_has_an_explicit_matrix_row() {
         let task_states = [
             TaskState::Pending,
             TaskState::Developing,
+            TaskState::AwaitingArchitectAction,
             TaskState::Reviewing,
             TaskState::Lgtm,
             TaskState::ReviewExhausted,
@@ -2925,9 +3749,9 @@ mod tests {
                 }
             }
         }
-        assert_eq!(rows, 8 * 6);
+        assert_eq!(rows, 9 * 6);
         assert_eq!(accepted, 11);
-        assert_eq!(rejected, 37);
+        assert_eq!(rejected, 43);
     }
 
     #[test]
@@ -2971,6 +3795,8 @@ mod tests {
                 plan_version: Some(1),
                 plan_hash: core.plan_hash.clone(),
                 current_task_ordinal: Some(0),
+                active_worker: None,
+                pending_architect_action: None,
                 terminal_detail: Some("all ordered tasks reached a terminal review outcome".into()),
                 tasks: vec![TaskStatusSnapshot {
                     task_key: "one".into(),
@@ -2985,6 +3811,9 @@ mod tests {
                     branch: None,
                     review_round: 1,
                     max_review_rounds: 3,
+                    clarification_rounds_used: 0,
+                    max_clarification_rounds: 2,
+                    clarification_record_count: 0,
                     base_revision: None,
                     head_revision: None,
                     developer_session_bound: true,
