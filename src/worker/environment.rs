@@ -80,7 +80,9 @@ impl ParentEnvironment {
         Ok(MaterializedWorkerEnvironment { values })
     }
 
-    fn from_raw_entries(entries: impl IntoIterator<Item = (OsString, OsString)>) -> Result<Self> {
+    pub(crate) fn from_raw_entries(
+        entries: impl IntoIterator<Item = (OsString, OsString)>,
+    ) -> Result<Self> {
         let mut values = BTreeMap::new();
         for (name, value) in entries {
             if values.insert(name.clone(), value).is_some() {
@@ -91,6 +93,23 @@ impl ParentEnvironment {
             }
         }
         Ok(Self { values })
+    }
+
+    pub(crate) fn validate_claude_role(&self) -> Result<()> {
+        validate_claude_proxy_values(&self.values)?;
+        for name in [
+            CLAUDE_ADDITIONAL_DIRECTORIES_INSTRUCTIONS,
+            CLAUDE_DISABLE_BACKGROUND_TASKS,
+        ] {
+            match self.values.get(OsStr::new(name)) {
+                Some(value) if value == OsStr::new("1") => {}
+                Some(_) => {
+                    bail!("Claude role environment conflicts with required policy variable {name}")
+                }
+                None => bail!("Claude role environment is missing required policy variable {name}"),
+            }
+        }
+        Ok(())
     }
 }
 

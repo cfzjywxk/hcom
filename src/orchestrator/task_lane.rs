@@ -9,8 +9,9 @@ use super::core::{
 use super::workspace::{ProjectTasksWorkspace, TasksWorkspace};
 use super::{SessionRuntimeSources, SessionStartup, ensure_private_directory, sha256_hex};
 use crate::control_api::{SessionState, SessionStatusSnapshot, TaskDraft, TaskState, WorkerRole};
+use crate::worker::claude_exec_runtime::{ClaudeExecRuntimeConfig, ClaudeExecTaskWorkerRuntime};
 use crate::worker::environment::{
-    EnvironmentPolicy, ExecutionEnvironmentLease, MaterializedWorkerEnvironment,
+    EnvironmentPolicy, ExecutionEnvironmentLease, MaterializedWorkerEnvironment, ParentEnvironment,
 };
 use crate::worker::exec_runtime::{ExecRuntimeConfig, ExecTaskPaths, ExecTaskWorkerRuntime};
 use crate::worker::guardian::{CleanupRegistryInterlock, GuardianCleanupRegistry};
@@ -80,7 +81,7 @@ impl RuntimeFactory for ProductionRuntimeFactory {
             lease,
             artifact_root,
             run_id,
-            cleanup_registry: _,
+            cleanup_registry,
             profiles,
         } = request;
         let uses_codex = [profiles.developer.provider, profiles.reviewer.provider]
@@ -88,27 +89,56 @@ impl RuntimeFactory for ProductionRuntimeFactory {
         let uses_claude = [profiles.developer.provider, profiles.reviewer.provider]
             .contains(&RuntimeProvider::ClaudeExec);
 
+        let claude_environment = if uses_claude {
+            let parent = ParentEnvironment::from_raw_entries(environment.iter().cloned())
+                .map_err(|error| RuntimeError::invalid_contract(error.to_string()))?;
+            let materialized = parent
+                .materialize_claude()
+                .map_err(|error| RuntimeError::invalid_contract(error.to_string()))?;
+            Some(materialized_environment(&materialized))
+        } else {
+            None
+        };
         let codex_runtime = if uses_codex {
             Some(ExecTaskWorkerRuntime::open(ExecRuntimeConfig {
                 codex: PathBuf::from("codex"),
-                repository_root,
+                repository_root: repository_root.clone(),
                 paths: ExecTaskPaths {
-                    runtime: paths.runtime,
+                    runtime: paths.runtime.clone(),
                 },
-                environment,
-                lease,
-                artifact_root_path: artifact_root,
-                run_id,
-                task_id: task_key,
+                environment: environment.clone(),
+                lease: lease.clone(),
+                artifact_root_path: artifact_root.clone(),
+                run_id: run_id.clone(),
+                task_id: task_key.clone(),
             })?)
+        } else {
+            None
+        };
+        let claude_runtime = if uses_claude {
+            Some(ClaudeExecTaskWorkerRuntime::open(
+                ClaudeExecRuntimeConfig {
+                    claude: "claude".into(),
+                    guardian_executable: std::env::current_exe().map_err(|error| {
+                        RuntimeError::internal(format!(
+                            "failed to resolve the current hcom Guardian executable: {error}"
+                        ))
+                    })?,
+                    environment: claude_environment
+                        .expect("a Claude binding materializes its role environment"),
+                    lease,
+                    artifact_root_path: artifact_root,
+                    run_id,
+                    task_id: task_key,
+                    cleanup_registry,
+                },
+            )?)
         } else {
             None
         };
 
         // Preserve the exact direct Codex child for the released pure-Codex
-        // lane. Mixed bindings use the provider-neutral key router; its Claude
-        // slot remains deliberately unavailable until CLAUDE-03 supplies the
-        // native stream-json transport.
+        // lane. Any binding with Claude uses the provider-neutral key router.
         if !uses_claude {
             return Ok(Box::new(
                 codex_runtime.expect("a pure Codex binding creates the Codex runtime"),
@@ -121,10 +151,10 @@ impl RuntimeFactory for ProductionRuntimeFactory {
                 Box::new(runtime),
             )?);
         }
-        slots.push(ProviderRuntimeSlot::unavailable(
+        slots.push(ProviderRuntimeSlot::available(
             RuntimeProvider::ClaudeExec,
-            "Claude task worker runtime is not implemented; CLAUDE-03 is required",
-        ));
+            Box::new(claude_runtime.expect("a Claude binding creates the Claude runtime")),
+        )?);
         Ok(Box::new(RoleRoutedTaskWorkerRuntime::new(
             &profiles, slots,
         )?))
@@ -4365,7 +4395,7 @@ mod tests {
     }
 
     #[test]
-    fn production_claude_role_fails_closed_before_any_provider_process_exists() {
+    fn production_claude_role_requires_exact_proxy_before_any_provider_process_exists() {
         let fixture = Fixture::new();
         let mut sources = fixture.sources.clone();
         let mut profiles =
@@ -4379,7 +4409,7 @@ mod tests {
         };
         sources.set_profiles_for_test(profiles);
         let mut supervisor = TaskLaneSupervisor::open(
-            "run-unavailable-claude".into(),
+            "run-invalid-claude-proxy".into(),
             fixture.project_root.clone(),
             fixture.run_root.clone(),
             sources,
@@ -4390,7 +4420,7 @@ mod tests {
                 0,
                 "claude-exec",
                 "codex-exec",
-                vec![fixture.task("unavailable-claude", &["src"], 2)],
+                vec![fixture.task("invalid-claude-proxy", &["src"], 2)],
             )
             .unwrap();
         let error = supervisor
@@ -4398,7 +4428,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "Claude task worker runtime is not implemented; CLAUDE-03 is required"
+            "Claude proxy environment variable HTTP_PROXY does not match the required value"
         );
         let snapshot = supervisor.snapshot();
         assert_eq!(snapshot.state, SessionState::NeedsHuman);

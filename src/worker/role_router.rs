@@ -38,6 +38,7 @@ impl ProviderRuntimeSlot {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn unavailable(provider: RuntimeProvider, detail: impl Into<String>) -> Self {
         Self {
             provider,

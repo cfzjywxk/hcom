@@ -2588,6 +2588,41 @@ mod tests {
     }
 
     #[test]
+    fn bounded_cleanup_retries_after_cleanup_failed_frame() {
+        let (mut handle, peer) = protocol_handle();
+        let failed = Frame {
+            kind: FrameKind::CleanupFailed,
+            sequence: 2,
+            guardian_pid: handle.guardian.pid,
+            guardian_birth: handle.guardian.birth,
+            native_pid: 4242,
+            native_birth: 4343,
+            native_code: 0,
+            native_signal: 0,
+            disposition: 0,
+            failure_class: FailureClass::Cleanup,
+            forced_count: 1,
+        };
+        handle.accept_runtime_frame(failed).unwrap();
+        assert_eq!(handle.try_wait(), GuardianPoll::CleanupPending);
+
+        let bounded =
+            handle.terminate_and_reap(GuardianCleanupReason::NormalTeardown, Duration::ZERO);
+        assert!(matches!(
+            bounded,
+            Err(GuardianHandleFailure::CleanupPending(_))
+        ));
+        let retry = receive_frame(&peer).unwrap().unwrap();
+        assert_eq!(retry.kind, FrameKind::CleanupRequest);
+        assert_eq!(retry.sequence, 1);
+        assert_eq!(
+            GuardianCleanupReason::try_from(retry.disposition).unwrap(),
+            GuardianCleanupReason::NormalTeardown
+        );
+        stop_protocol_handle(&mut handle);
+    }
+
+    #[test]
     fn internal_parser_preserves_opaque_native_arguments() {
         let raw = OsString::from_vec(b"raw-\xff-argument".to_vec());
         let parsed = InternalArguments::parse(&[
