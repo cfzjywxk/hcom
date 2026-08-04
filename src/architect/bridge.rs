@@ -902,8 +902,8 @@ mod tests {
         CONTROL_REFUSAL_TRANSPORT, TOOL_REFUSAL_ACTION, TOOL_REFUSAL_ENVELOPE,
     };
     use crate::control_api::{
-        ActionName, ControlAction, ControlErrorCode, ControlResult, ReviewerVerdict, SessionState,
-        SessionStatusSnapshot, TaskState, TaskStatusSnapshot,
+        ActionName, ControlAction, ControlErrorCode, ControlResult, ReviewerVerdict,
+        SessionProgressEvent, SessionState, SessionStatusSnapshot, TaskState, TaskStatusSnapshot,
     };
     use std::process::{Command, Stdio};
     use std::thread::JoinHandle;
@@ -1199,6 +1199,44 @@ mod tests {
     }
 
     #[test]
+    fn progress_result_reaches_both_mcp_response_representations_without_peer_body() {
+        let response = ControlResponse::success(
+            "progress-request",
+            ControlResult::Progress {
+                run_id: "run-test".into(),
+                session_version: 8,
+                event: SessionProgressEvent::ReviewResponded {
+                    sequence: 2,
+                    task_ordinal: 0,
+                    task_key: "task-one".into(),
+                    completed_tasks: 0,
+                    total_tasks: 1,
+                    review_round: 1,
+                    max_review_rounds: 3,
+                    reviewer_verdict: ReviewerVerdict::RequestChanges,
+                    developer_final_path: "/artifacts/developer/final.md".into(),
+                    reviewer_final_message_paths: vec!["/artifacts/reviewer/final.md".into()],
+                },
+            },
+        );
+        let output = complete_tool_call(json!(17), Ok(response));
+        let structured = &output["result"]["structuredContent"];
+        assert_eq!(structured["result"]["kind"], "progress");
+        assert_eq!(
+            structured["result"]["event"]["developer_final_path"],
+            "/artifacts/developer/final.md"
+        );
+        assert_eq!(
+            structured["result"]["event"]["reviewer_final_message_paths"],
+            json!(["/artifacts/reviewer/final.md"])
+        );
+        let content: Value =
+            serde_json::from_str(output["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(content, *structured);
+        assert!(!output.to_string().contains("REVIEWER-BODY"));
+    }
+
+    #[test]
     fn session_wait_keeps_mcp_responsive_and_returns_terminal_result() {
         let fixture = BridgeTestFixture::new();
         let reviewer_path = fixture
@@ -1242,7 +1280,11 @@ mod tests {
                 "method":"tools/call",
                 "params":{
                     "name":"session_wait",
-                    "arguments":{"run_id":"run-test","after_session_version":4}
+                    "arguments":{
+                        "run_id":"run-test",
+                        "after_session_version":4,
+                        "after_progress_sequence":0
+                    }
                 }
             }),
         )
@@ -1301,7 +1343,8 @@ mod tests {
             request.action,
             ControlAction::SessionWait {
                 ref run_id,
-                after_session_version: 4
+                after_session_version: 4,
+                after_progress_sequence: 0
             } if run_id == "run-test"
         ));
     }
@@ -1341,7 +1384,11 @@ mod tests {
                 "method":"tools/call",
                 "params":{
                     "name":"session_wait",
-                    "arguments":{"run_id":"run-test","after_session_version":6}
+                    "arguments":{
+                        "run_id":"run-test",
+                        "after_session_version":6,
+                        "after_progress_sequence":0
+                    }
                 }
             }),
         )
@@ -1373,7 +1420,8 @@ mod tests {
             request.action,
             ControlAction::SessionWait {
                 ref run_id,
-                after_session_version: 6
+                after_session_version: 6,
+                after_progress_sequence: 0
             } if run_id == "run-test"
         ));
 
@@ -1440,7 +1488,11 @@ mod tests {
                     "method":"tools/call",
                     "params":{
                         "name":"session_wait",
-                        "arguments":{"run_id":"run-test","after_session_version":8}
+                        "arguments":{
+                            "run_id":"run-test",
+                            "after_session_version":8,
+                            "after_progress_sequence":0
+                        }
                     }
                 }),
             )
@@ -1472,7 +1524,8 @@ mod tests {
                 request.action,
                 ControlAction::SessionWait {
                     ref run_id,
-                    after_session_version: 8
+                    after_session_version: 8,
+                    after_progress_sequence: 0
                 } if run_id == "run-test"
             ));
         }

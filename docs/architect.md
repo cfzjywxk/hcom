@@ -212,7 +212,8 @@ session_approve_and_start({
 
 session_wait({
   run_id,
-  after_session_version
+  after_session_version,
+  after_progress_sequence
 })
 ```
 
@@ -352,23 +353,39 @@ unclassifiable Reviewer verdict moves the run to a human-visible terminal
 state. Parent exit/cancel stops the active process group. hcom never pushes,
 installs, resets, rebases, or automatically recovers after the parent exits.
 
-After dispatch, the Codex Architect calls `session_wait` with the returned
-run ID and session version. This blocking MCP subscription completes when the
-run becomes `completed`, `needs_human`, `failed`, or `canceled`, or when a
-Developer clarification/blocker action is latched. The local supervisor
-continues lifecycle monitoring and advances normal Developer-to-Reviewer and
-correction transitions without Architect model calls. Codex may display
-`Working` for the duration, but it does not sleep, poll `session_status`, or
-repeatedly infer. A wait bound to an earlier run ID is rejected and can never
-subscribe to a later run.
+After dispatch, the Codex Architect calls `session_wait` with the returned run
+ID and session version and `after_progress_sequence: 0`. This blocking MCP
+subscription completes for one retained `review_requested`,
+`review_responded`, or `task_completed` event; when the run becomes
+`completed`, `needs_human`, `failed`, or `canceled`; or when a Developer
+clarification/blocker action is latched. The local supervisor continues
+lifecycle monitoring and advances Developer-to-Reviewer and correction
+transitions without Architect model calls. For a progress result, the
+Architect displays one concise update and immediately waits again using the
+returned `session_version` and the event's `sequence`. It does not sleep, poll
+`session_status`, or repeatedly infer. A wait bound to an earlier run ID is
+rejected and can never subscribe to a later run.
+
+Every progress event identifies the task ordinal/key, completed and total task
+counts, and review round. `review_requested` carries the exact
+`developer_final_path` read by the Reviewer plus the approved task document,
+ordered design document paths, selector, and clarification-record count.
+`review_responded` carries the verdict, Developer final path, and ordered
+Reviewer final-message paths. `task_completed` separately records LGTM or
+review exhaustion with the same review evidence paths. The Architect displays
+the paths but does not read or summarize their contents merely to produce a
+progress update.
 
 Esc or MCP cancellation closes only the current wait subscription; it does not
 cancel the supervisor run. A pending Architect action records the session
 version at which it was published. While it remains unresolved, a reconnect
 from an older version immediately redelivers it; a repeated wait at or after
 that published version is rejected so it cannot spin on the same action. A
-terminal snapshot is retained in memory and likewise returns immediately if
-the run finished during the gap.
+run-local ordered event list retains progress produced between wait calls.
+Pending Architect actions take priority; after they are resolved, queued
+progress resumes at the last displayed sequence. Queued progress is drained
+before a retained terminal snapshot, so a run finishing during the gap does
+not hide its final review response or task-completion event.
 
 Task-lane polling is fail-closed at both ownership layers. The driver does not
 drop its active-turn handle until the cloned core accepts the completion
@@ -385,12 +402,12 @@ immediately re-arms `session_wait` with the returned version in the same turn.
 If the action needs a material human decision, the Architect marks it as such,
 reports the question and current repository state, and ends the turn without
 calling `session_wait`. After the human answers, it submits the exact pending
-clarification as human-confirmed and re-arms the wait. `session_status` remains
-available only for an explicit human progress query. `human_decision_confirmed`
-is an Architect attestation, like execution approval; hcom does not identify
-the physical keyboard source. Independent hard limits of 64 clarification
-records per task and 1280 per run prevent that attestation from bypassing
-control-plane resource bounds.
+clarification as human-confirmed and re-arms the wait with the last displayed
+progress sequence. `session_status` remains available only for an explicit
+human progress query. `human_decision_confirmed` is an Architect attestation,
+like execution approval; hcom does not identify the physical keyboard source.
+Independent hard limits of 64 clarification records per task and 1280 per run
+prevent that attestation from bypassing control-plane resource bounds.
 
 Mutating control requests use a bounded recent replay window of 1024 completed
 responses. A retained request ID remains payload-bound and replays its exact
@@ -408,11 +425,11 @@ Every terminal snapshot carries, for every task, its
 accumulating record vector; the Architect uses `session_clarifications_list`
 with the exact run ID and pages of at most eight to read the ordered chain. The
 Reviewer body is not copied into either the MCP compatibility text or
-`structuredContent`. After `session_wait` returns, the
-Architect reads every non-empty Reviewer path in order and uses the original
-verdict and findings for the human-facing delivery. It distinguishes `lgtm`,
-`review_exhausted`, and lifecycle failure from the typed task/session state;
-an empty list means that no Reviewer final was successfully published. The
+`structuredContent`. After a terminal `session_wait` response, the Architect
+reads every non-empty Reviewer path in order and uses the original verdict and
+findings for the human-facing delivery. It distinguishes `lgtm`,
+`review_exhausted`, and lifecycle failure from the typed task/session state; an
+empty list means that no Reviewer final was successfully published. The
 Architect does not rerun tests, perform another review, or repeat validation
 unless the human explicitly requests that extra work.
 

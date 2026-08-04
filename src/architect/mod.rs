@@ -132,23 +132,30 @@ The foreground parent owns every worker and task-local exec runtime; it keeps
 state only in memory and performs no daemon, project store, or cross-session
 recovery. Same-task corrections use the exact native Developer/Reviewer thread.
 Different tasks and different runs use fresh workers. After dispatch, the Codex
-Architect opens one blocking session_wait MCP call bound to the exact run_id.
-The foreground supervisor advances Developer and Reviewer without Architect
-model calls and completes that wait for a terminal state or a latched
-Developer clarification/blocker action. The Architect answers a defensible
-action through the exact new clarification document path and immediately
-re-arms session_wait in the same turn. When a material human decision is
-required, it ends the turn after asking the human and resumes only after the
-human answers. Normal role and correction transitions do not wake the
-Architect, and session_status is reserved for an explicit human status request.
-While the wait is pending Codex may display Working, but it is not issuing
-model turns or status polls. Interrupting the wait cancels only that
-subscription, never the run. A still-latched action is redelivered only to a
-wait from a version older than its published_version; a same-version repeated
-wait is rejected until the action is resolved. A retained terminal result
-reached during the gap remains immediately available. Status snapshots carry
-clarification counts; session_clarifications_list reads the ordered records in
-bounded pages bound to that run_id.
+Architect opens one blocking session_wait MCP call bound to the exact run_id
+and a run-local progress cursor. The foreground supervisor advances Developer
+and Reviewer without Architect model calls and completes that wait for one
+retained progress event, a terminal state, or a latched Developer
+clarification/blocker action. Progress events are emitted for each review
+request, review response, and task completion. They carry task position,
+review round, verdict/outcome where applicable, the exact Developer final path,
+and ordered Reviewer final paths where applicable; review requests also carry
+the task/design paths and selector supplied to the Reviewer. The Architect
+displays each event once, then immediately re-arms session_wait with that
+event's sequence. Worker execution continues while the update is displayed,
+and events produced during the display-to-wait gap remain queued in order.
+The Architect answers a defensible action through the exact new clarification
+document path and immediately re-arms session_wait in the same turn. When a
+material human decision is required, it ends the turn after asking the human
+and resumes only after the human answers. session_status is reserved for an
+explicit human status request. While a wait is pending Codex is not issuing
+status polls. Interrupting the wait cancels only that subscription, never the
+run. A still-latched action has priority over queued progress and is
+redelivered only to a wait from a version older than its published_version; a
+same-version repeated wait is rejected until the action is resolved. Queued
+progress is delivered before a retained terminal result. Status snapshots
+carry clarification counts; session_clarifications_list reads the ordered
+records in bounded pages bound to that run_id.
 The terminal snapshot contains each task's latest Developer final path, ordered
 final Reviewer message paths, and Reviewer verdict, never the Reviewer body.
 The Architect reads every final Reviewer file in order and delivers its

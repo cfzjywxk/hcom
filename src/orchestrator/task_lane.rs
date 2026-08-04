@@ -559,6 +559,16 @@ impl TaskLaneSupervisor {
             .map_err(|error| anyhow!(error.to_string()))
     }
 
+    pub(crate) fn progress_event_after(
+        &self,
+        run_id: &str,
+        after_sequence: u32,
+    ) -> Result<Option<crate::control_api::SessionProgressEvent>> {
+        self.core
+            .progress_event_after(run_id, after_sequence)
+            .map_err(|error| anyhow!(error.to_string()))
+    }
+
     pub(crate) fn poll_once(&mut self) -> Result<()> {
         let fallback_task_ordinal = self.active.as_ref().map(|active| active.task_ordinal);
         let result = self.poll_once_inner();

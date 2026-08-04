@@ -8,8 +8,9 @@
 use crate::control_api::{
     ActiveWorkerSnapshot, ArchitectActionReason, ClarificationPage, ClarificationRecord,
     MAX_CLARIFICATION_PAGE_RECORDS, MAX_CLARIFICATION_RECORDS_PER_RUN,
-    MAX_CLARIFICATION_RECORDS_PER_TASK, PendingArchitectActionSnapshot, SessionState,
-    SessionStatusSnapshot, TaskDraft, TaskState, TaskStatusSnapshot, WorkerRole,
+    MAX_CLARIFICATION_RECORDS_PER_TASK, MAX_PROGRESS_EVENTS_PER_RUN,
+    PendingArchitectActionSnapshot, SessionProgressEvent, SessionState, SessionStatusSnapshot,
+    TaskCompletionOutcome, TaskDraft, TaskState, TaskStatusSnapshot, WorkerRole,
 };
 use crate::worker::runtime::{
     DeveloperOutcomeStatus, ReviewerOutcomeV1, ReviewerVerdict, RuntimeFailureClass,
@@ -478,6 +479,7 @@ pub struct SupervisorCore {
     used_sessions: BTreeSet<RuntimeSessionKey>,
     used_turns: BTreeSet<RuntimeTurnKey>,
     accepted_completion_tokens: BTreeSet<String>,
+    progress_events: Vec<SessionProgressEvent>,
 }
 
 impl SupervisorCore {
@@ -522,6 +524,7 @@ impl SupervisorCore {
             used_sessions: BTreeSet::new(),
             used_turns: BTreeSet::new(),
             accepted_completion_tokens: BTreeSet::new(),
+            progress_events: Vec::new(),
         };
         core.assert_invariants()?;
         Ok(core)
@@ -719,6 +722,32 @@ impl SupervisorCore {
             records,
             next_after_sequence,
         })
+    }
+
+    pub fn progress_event_after(
+        &self,
+        run_id: &str,
+        after_sequence: u32,
+    ) -> Result<Option<SessionProgressEvent>, SupervisorError> {
+        if run_id != self.run_id {
+            return Err(SupervisorError::invalid_identity(
+                "progress cursor run id does not match the current run",
+            ));
+        }
+        let event_count = u32::try_from(self.progress_events.len())
+            .map_err(|_| SupervisorError::overflow("progress event count overflow"))?;
+        if after_sequence > event_count {
+            return Err(SupervisorError::invalid_identity(
+                "progress cursor is ahead of the current run",
+            ));
+        }
+        Ok(self
+            .progress_events
+            .get(
+                usize::try_from(after_sequence)
+                    .map_err(|_| SupervisorError::overflow("progress cursor overflow"))?,
+            )
+            .cloned())
     }
 
     /// Apply one event transactionally and return the exact ordered effects.
@@ -1159,7 +1188,9 @@ impl SupervisorCore {
                     task.state = TaskState::Reviewing;
                     task.outcome_detail =
                         Some("developer turn completed; routing to review".into());
-                    self.start_reviewer(task_ordinal)
+                    let effects = self.start_reviewer(task_ordinal)?;
+                    self.push_review_requested(task_ordinal)?;
+                    Ok(effects)
                 }
                 DeveloperOutcomeStatus::ClarificationRequired => self.await_architect_action(
                     task_ordinal,
@@ -1173,7 +1204,16 @@ impl SupervisorCore {
                 ),
             },
             RuntimeOutcome::Reviewer(reviewer) => {
-                self.handle_reviewer_verdict(task_ordinal, reviewer, final_message_path)
+                let effects =
+                    self.handle_reviewer_verdict(task_ordinal, reviewer, final_message_path)?;
+                self.push_review_responded(task_ordinal)?;
+                if matches!(
+                    self.tasks[task_ordinal].state,
+                    TaskState::Lgtm | TaskState::ReviewExhausted
+                ) {
+                    self.push_task_completed(task_ordinal)?;
+                }
+                Ok(effects)
             }
         }
     }
@@ -1667,6 +1707,152 @@ impl SupervisorCore {
         Ok(effects)
     }
 
+    fn next_progress_sequence(&self) -> Result<u32, SupervisorError> {
+        if self.progress_events.len() >= MAX_PROGRESS_EVENTS_PER_RUN {
+            return Err(SupervisorError::invariant(
+                "run progress event capacity was exceeded",
+            ));
+        }
+        u32::try_from(self.progress_events.len())
+            .ok()
+            .and_then(|sequence| sequence.checked_add(1))
+            .ok_or_else(|| SupervisorError::overflow("progress event sequence overflow"))
+    }
+
+    fn progress_task_counts(&self) -> Result<(u32, u32), SupervisorError> {
+        let completed = self
+            .tasks
+            .iter()
+            .filter(|task| matches!(task.state, TaskState::Lgtm | TaskState::ReviewExhausted))
+            .count();
+        let completed = u32::try_from(completed)
+            .map_err(|_| SupervisorError::overflow("completed task count overflow"))?;
+        let total = u32::try_from(self.tasks.len())
+            .map_err(|_| SupervisorError::overflow("total task count overflow"))?;
+        Ok((completed, total))
+    }
+
+    fn progress_task_ordinal(&self, task_ordinal: usize) -> Result<u32, SupervisorError> {
+        u32::try_from(task_ordinal)
+            .map_err(|_| SupervisorError::overflow("progress task ordinal overflow"))
+    }
+
+    fn push_review_requested(&mut self, task_ordinal: usize) -> Result<(), SupervisorError> {
+        let sequence = self.next_progress_sequence()?;
+        let (completed_tasks, total_tasks) = self.progress_task_counts()?;
+        let task_ordinal_value = self.progress_task_ordinal(task_ordinal)?;
+        let task = self
+            .tasks
+            .get(task_ordinal)
+            .ok_or_else(|| SupervisorError::invariant("review-request progress task is missing"))?;
+        let review_round = task
+            .review_round
+            .checked_add(1)
+            .ok_or_else(|| SupervisorError::overflow("review request round overflow"))?;
+        let developer_final_path = task.latest_developer_final_path.clone().ok_or_else(|| {
+            SupervisorError::invariant("review-request progress lacks a Developer final path")
+        })?;
+        let clarification_record_count =
+            u32::try_from(task.clarification_records.len()).map_err(|_| {
+                SupervisorError::overflow("review-request clarification count overflow")
+            })?;
+        self.progress_events
+            .push(SessionProgressEvent::ReviewRequested {
+                sequence,
+                task_ordinal: task_ordinal_value,
+                task_key: task.spec.task_key.clone(),
+                completed_tasks,
+                total_tasks,
+                review_round,
+                max_review_rounds: task.spec.max_review_rounds,
+                developer_final_path,
+                task_document_path: task.spec.task_document_path.clone(),
+                design_document_paths: task.spec.design_document_paths.clone(),
+                task_selector: task.spec.task_selector.clone(),
+                clarification_record_count,
+            });
+        Ok(())
+    }
+
+    fn push_review_responded(&mut self, task_ordinal: usize) -> Result<(), SupervisorError> {
+        let sequence = self.next_progress_sequence()?;
+        let (completed_tasks, total_tasks) = self.progress_task_counts()?;
+        let task_ordinal_value = self.progress_task_ordinal(task_ordinal)?;
+        let task = self.tasks.get(task_ordinal).ok_or_else(|| {
+            SupervisorError::invariant("review-response progress task is missing")
+        })?;
+        let developer_final_path = task.latest_developer_final_path.clone().ok_or_else(|| {
+            SupervisorError::invariant("review-response progress lacks a Developer final path")
+        })?;
+        let reviewer_verdict = task.latest_reviewer_verdict.ok_or_else(|| {
+            SupervisorError::invariant("review-response progress lacks a Reviewer verdict")
+        })?;
+        if task.latest_reviewer_final_paths.is_empty() {
+            return Err(SupervisorError::invariant(
+                "review-response progress lacks a Reviewer final path",
+            ));
+        }
+        self.progress_events
+            .push(SessionProgressEvent::ReviewResponded {
+                sequence,
+                task_ordinal: task_ordinal_value,
+                task_key: task.spec.task_key.clone(),
+                completed_tasks,
+                total_tasks,
+                review_round: task.review_round,
+                max_review_rounds: task.spec.max_review_rounds,
+                reviewer_verdict,
+                developer_final_path,
+                reviewer_final_message_paths: task.latest_reviewer_final_paths.clone(),
+            });
+        Ok(())
+    }
+
+    fn push_task_completed(&mut self, task_ordinal: usize) -> Result<(), SupervisorError> {
+        let sequence = self.next_progress_sequence()?;
+        let (completed_tasks, total_tasks) = self.progress_task_counts()?;
+        let task_ordinal_value = self.progress_task_ordinal(task_ordinal)?;
+        let task = self
+            .tasks
+            .get(task_ordinal)
+            .ok_or_else(|| SupervisorError::invariant("completed progress task is missing"))?;
+        let outcome = match task.state {
+            TaskState::Lgtm => TaskCompletionOutcome::Lgtm,
+            TaskState::ReviewExhausted => TaskCompletionOutcome::ReviewExhausted,
+            _ => {
+                return Err(SupervisorError::invariant(
+                    "task-completed progress requires a terminal review outcome",
+                ));
+            }
+        };
+        let developer_final_path = task.latest_developer_final_path.clone().ok_or_else(|| {
+            SupervisorError::invariant("completed progress lacks a Developer final path")
+        })?;
+        let reviewer_verdict = task.latest_reviewer_verdict.ok_or_else(|| {
+            SupervisorError::invariant("completed progress lacks a Reviewer verdict")
+        })?;
+        if task.latest_reviewer_final_paths.is_empty() {
+            return Err(SupervisorError::invariant(
+                "completed progress lacks a Reviewer final path",
+            ));
+        }
+        self.progress_events
+            .push(SessionProgressEvent::TaskCompleted {
+                sequence,
+                task_ordinal: task_ordinal_value,
+                task_key: task.spec.task_key.clone(),
+                completed_tasks,
+                total_tasks,
+                review_round: task.review_round,
+                max_review_rounds: task.spec.max_review_rounds,
+                outcome,
+                reviewer_verdict,
+                developer_final_path,
+                reviewer_final_message_paths: task.latest_reviewer_final_paths.clone(),
+            });
+        Ok(())
+    }
+
     fn schedule_session_open(
         &mut self,
         task_ordinal: usize,
@@ -1845,6 +2031,40 @@ impl SupervisorCore {
             return Err(SupervisorError::invariant(
                 "core contains more than 64 tasks",
             ));
+        }
+        if self.progress_events.len() > MAX_PROGRESS_EVENTS_PER_RUN {
+            return Err(SupervisorError::invariant(
+                "run progress event capacity was exceeded",
+            ));
+        }
+        let total_tasks = u32::try_from(self.tasks.len())
+            .map_err(|_| SupervisorError::invariant("total task count overflow"))?;
+        for (index, event) in self.progress_events.iter().enumerate() {
+            let expected_sequence = u32::try_from(index)
+                .ok()
+                .and_then(|sequence| sequence.checked_add(1))
+                .ok_or_else(|| SupervisorError::invariant("progress event sequence overflow"))?;
+            if event.sequence() != expected_sequence {
+                return Err(SupervisorError::invariant(
+                    "run progress events are not ordered and contiguous",
+                ));
+            }
+            let task_ordinal = usize::try_from(event.task_ordinal())
+                .map_err(|_| SupervisorError::invariant("progress task ordinal overflow"))?;
+            if self
+                .tasks
+                .get(task_ordinal)
+                .is_none_or(|task| task.spec.task_key != event.task_key())
+            {
+                return Err(SupervisorError::invariant(
+                    "progress event task identity is invalid",
+                ));
+            }
+            if event.total_tasks() != total_tasks || event.completed_tasks() > total_tasks {
+                return Err(SupervisorError::invariant(
+                    "progress event task counts are invalid",
+                ));
+            }
         }
         let has_plan =
             self.plan_version.is_some() || self.plan_hash.is_some() || !self.tasks.is_empty();
@@ -3921,6 +4141,112 @@ mod tests {
     }
 
     #[test]
+    fn progress_events_preserve_review_paths_rounds_and_terminal_order() {
+        let mut core = authorized_core();
+        let developer = start_first_developer(&mut core, 0, 1, 1, "developer-1");
+        complete_developer_ready(&mut core, developer);
+
+        assert_eq!(
+            core.progress_event_after("run-1", 0).unwrap(),
+            Some(SessionProgressEvent::ReviewRequested {
+                sequence: 1,
+                task_ordinal: 0,
+                task_key: "one".into(),
+                completed_tasks: 0,
+                total_tasks: 1,
+                review_round: 1,
+                max_review_rounds: 3,
+                developer_final_path: "/artifacts/developer/turn-1/native-final.partial".into(),
+                task_document_path: "/project/tasks/one.md".into(),
+                design_document_paths: vec!["/project/design.md".into()],
+                task_selector: "one".into(),
+                clarification_record_count: 0,
+            })
+        );
+        assert!(core.progress_event_after("run-1", 1).unwrap().is_none());
+
+        let reviewer = start_reviewer(&mut core, 0, 2, 2, "reviewer-1", true);
+        complete_review(&mut core, reviewer, request_changes());
+        assert_eq!(
+            core.progress_event_after("run-1", 1).unwrap(),
+            Some(SessionProgressEvent::ReviewResponded {
+                sequence: 2,
+                task_ordinal: 0,
+                task_key: "one".into(),
+                completed_tasks: 0,
+                total_tasks: 1,
+                review_round: 1,
+                max_review_rounds: 3,
+                reviewer_verdict: ReviewerVerdict::RequestChanges,
+                developer_final_path: "/artifacts/developer/turn-1/native-final.partial".into(),
+                reviewer_final_message_paths: vec![
+                    "/artifacts/reviewer/turn-2/native-final.partial".into(),
+                ],
+            })
+        );
+
+        let reviewer = correct_and_start_rereview(&mut core, 0, 3, 4, "developer-2", "reviewer-2");
+        assert_eq!(
+            core.progress_event_after("run-1", 2).unwrap(),
+            Some(SessionProgressEvent::ReviewRequested {
+                sequence: 3,
+                task_ordinal: 0,
+                task_key: "one".into(),
+                completed_tasks: 0,
+                total_tasks: 1,
+                review_round: 2,
+                max_review_rounds: 3,
+                developer_final_path: "/artifacts/developer/turn-3/native-final.partial".into(),
+                task_document_path: "/project/tasks/one.md".into(),
+                design_document_paths: vec!["/project/design.md".into()],
+                task_selector: "one".into(),
+                clarification_record_count: 0,
+            })
+        );
+
+        complete_review(&mut core, reviewer, lgtm());
+        assert_eq!(core.session_state(), SessionState::Completed);
+        assert_eq!(
+            core.progress_event_after("run-1", 3).unwrap(),
+            Some(SessionProgressEvent::ReviewResponded {
+                sequence: 4,
+                task_ordinal: 0,
+                task_key: "one".into(),
+                completed_tasks: 1,
+                total_tasks: 1,
+                review_round: 2,
+                max_review_rounds: 3,
+                reviewer_verdict: ReviewerVerdict::Lgtm,
+                developer_final_path: "/artifacts/developer/turn-3/native-final.partial".into(),
+                reviewer_final_message_paths: vec![
+                    "/artifacts/reviewer/turn-4/native-final.partial".into(),
+                ],
+            })
+        );
+        assert_eq!(
+            core.progress_event_after("run-1", 4).unwrap(),
+            Some(SessionProgressEvent::TaskCompleted {
+                sequence: 5,
+                task_ordinal: 0,
+                task_key: "one".into(),
+                completed_tasks: 1,
+                total_tasks: 1,
+                review_round: 2,
+                max_review_rounds: 3,
+                outcome: TaskCompletionOutcome::Lgtm,
+                reviewer_verdict: ReviewerVerdict::Lgtm,
+                developer_final_path: "/artifacts/developer/turn-3/native-final.partial".into(),
+                reviewer_final_message_paths: vec![
+                    "/artifacts/reviewer/turn-4/native-final.partial".into(),
+                ],
+            })
+        );
+        assert!(core.progress_event_after("run-1", 5).unwrap().is_none());
+        assert!(core.progress_event_after("run-2", 0).is_err());
+        assert!(core.progress_event_after("run-1", 6).is_err());
+    }
+
+    #[test]
     fn clarified_reviewer_round_keeps_original_then_clarification_paths() {
         let (mut core, reviewer) = active_reviewer_core(2);
         complete_turn(
@@ -4095,9 +4421,29 @@ mod tests {
             ]
         );
         assert_eq!(core.current_task(), Some(1));
+        assert!(matches!(
+            core.progress_event_after("run-1", 2).unwrap(),
+            Some(SessionProgressEvent::TaskCompleted {
+                sequence: 3,
+                task_ordinal: 0,
+                completed_tasks: 1,
+                total_tasks: 2,
+                ..
+            })
+        ));
 
         let developer = start_first_developer(&mut core, 1, 3, 3, "d2");
         complete_developer_ready(&mut core, developer);
+        assert!(matches!(
+            core.progress_event_after("run-1", 3).unwrap(),
+            Some(SessionProgressEvent::ReviewRequested {
+                sequence: 4,
+                task_ordinal: 1,
+                completed_tasks: 1,
+                total_tasks: 2,
+                ..
+            })
+        ));
         let reviewer = start_reviewer(&mut core, 1, 4, 4, "r2", true);
         complete_review(&mut core, reviewer, lgtm());
         assert_eq!(core.session_state(), SessionState::Completed);
@@ -4252,6 +4598,18 @@ mod tests {
             exhausted.reviewer_verdict,
             Some(ReviewerVerdict::RequestChanges)
         );
+        assert!(matches!(
+            core.progress_event_after("run-1", 4).unwrap(),
+            Some(SessionProgressEvent::TaskCompleted {
+                sequence: 5,
+                task_ordinal: 0,
+                completed_tasks: 1,
+                total_tasks: 2,
+                outcome: TaskCompletionOutcome::ReviewExhausted,
+                reviewer_verdict: ReviewerVerdict::RequestChanges,
+                ..
+            })
+        ));
         assert_eq!(core.current_task(), Some(1));
         start_first_developer(&mut core, 1, 3, 5, "next-developer");
         assert_eq!(core.tasks[1].state, TaskState::Developing);

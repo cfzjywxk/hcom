@@ -227,6 +227,12 @@ trait SupervisorBackend: Send {
         limit: u8,
     ) -> Result<ClarificationPage>;
 
+    fn progress_event_after(
+        &self,
+        run_id: &str,
+        after_sequence: u32,
+    ) -> Result<Option<crate::control_api::SessionProgressEvent>>;
+
     fn poll_once(&mut self) -> Result<()>;
 
     fn shutdown(&mut self) -> Result<()>;
@@ -332,6 +338,14 @@ impl SupervisorBackend for TaskLaneSupervisor {
         self.clarification_page(run_id, task_ordinal, task_key, after_sequence, limit)
     }
 
+    fn progress_event_after(
+        &self,
+        run_id: &str,
+        after_sequence: u32,
+    ) -> Result<Option<crate::control_api::SessionProgressEvent>> {
+        self.progress_event_after(run_id, after_sequence)
+    }
+
     fn poll_once(&mut self) -> Result<()> {
         self.poll_once()
     }
@@ -350,6 +364,7 @@ struct PendingSessionWait {
     stream: UnixStream,
     request_id: String,
     run_id: String,
+    after_progress_sequence: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -639,6 +654,7 @@ impl SessionSupervisorControl {
         let ControlAction::SessionWait {
             run_id,
             after_session_version,
+            after_progress_sequence,
         } = &request.action
         else {
             unreachable!("session wait handler requires a wait action")
@@ -667,15 +683,22 @@ impl SessionSupervisorControl {
                 ),
             );
         }
-        if snapshot.state.is_terminal() {
-            return write_response(
-                &mut stream,
-                &ControlResponse::success(
-                    &request.request_id,
-                    ControlResult::Session { session: snapshot },
-                ),
-            );
-        }
+        let progress_event = match self
+            .supervisor
+            .progress_event_after(run_id, *after_progress_sequence)
+        {
+            Ok(event) => event,
+            Err(_) => {
+                return write_response(
+                    &mut stream,
+                    &ControlResponse::error(
+                        &request.request_id,
+                        ControlErrorCode::Conflict,
+                        "session wait progress cursor is ahead of the current run",
+                    ),
+                );
+            }
+        };
         if let Some(pending) = snapshot.pending_architect_action.as_ref() {
             if *after_session_version < pending.published_version {
                 return write_response(
@@ -695,6 +718,28 @@ impl SessionSupervisorControl {
                 ),
             );
         }
+        if let Some(event) = progress_event {
+            return write_response(
+                &mut stream,
+                &ControlResponse::success(
+                    &request.request_id,
+                    ControlResult::Progress {
+                        run_id: snapshot.run_id,
+                        session_version: snapshot.version,
+                        event,
+                    },
+                ),
+            );
+        }
+        if snapshot.state.is_terminal() {
+            return write_response(
+                &mut stream,
+                &ControlResponse::success(
+                    &request.request_id,
+                    ControlResult::Session { session: snapshot },
+                ),
+            );
+        }
         if snapshot.state != super::SessionState::Running {
             return write_response(
                 &mut stream,
@@ -711,6 +756,7 @@ impl SessionSupervisorControl {
             stream,
             request_id: request.request_id.clone(),
             run_id: run_id.clone(),
+            after_progress_sequence: *after_progress_sequence,
         });
         Ok(())
     }
@@ -756,16 +802,50 @@ impl SessionSupervisorControl {
             let _ = write_response(&mut wait.stream, &response);
             return;
         }
-        if !snapshot.state.is_terminal() && snapshot.pending_architect_action.is_none() {
+        let progress_event = match self.pending_wait.as_ref() {
+            Some(wait) => match self
+                .supervisor
+                .progress_event_after(&wait.run_id, wait.after_progress_sequence)
+            {
+                Ok(event) => event,
+                Err(_) => {
+                    let Some(mut wait) = self.pending_wait.take() else {
+                        return;
+                    };
+                    let response = ControlResponse::error(
+                        &wait.request_id,
+                        ControlErrorCode::Conflict,
+                        "session wait progress cursor is ahead of the current run",
+                    );
+                    let _ = wait.stream.set_nonblocking(false);
+                    let _ = wait.stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT));
+                    let _ = write_response(&mut wait.stream, &response);
+                    return;
+                }
+            },
+            None => return,
+        };
+        if !snapshot.state.is_terminal()
+            && snapshot.pending_architect_action.is_none()
+            && progress_event.is_none()
+        {
             return;
         }
         let Some(mut wait) = self.pending_wait.take() else {
             return;
         };
-        let response = ControlResponse::success(
-            &wait.request_id,
-            ControlResult::Session { session: snapshot },
-        );
+        let result = if snapshot.pending_architect_action.is_some() {
+            ControlResult::Session { session: snapshot }
+        } else if let Some(event) = progress_event {
+            ControlResult::Progress {
+                run_id: snapshot.run_id,
+                session_version: snapshot.version,
+                event,
+            }
+        } else {
+            ControlResult::Session { session: snapshot }
+        };
+        let response = ControlResponse::success(&wait.request_id, result);
         let _ = wait.stream.set_nonblocking(false);
         let _ = wait.stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT));
         let _ = write_response(&mut wait.stream, &response);
@@ -1390,6 +1470,7 @@ mod tests {
     struct FakeSupervisor {
         startup: SessionStartup,
         snapshot: crate::control_api::SessionStatusSnapshot,
+        progress_events: Vec<crate::control_api::SessionProgressEvent>,
         fail_poll: bool,
     }
 
@@ -1423,6 +1504,7 @@ mod tests {
             self.snapshot.pending_architect_action = None;
             self.snapshot.terminal_detail = None;
             self.snapshot.tasks.clear();
+            self.progress_events.clear();
             self.startup.run_id.clone_from(&self.snapshot.run_id);
             Ok(())
         }
@@ -1515,6 +1597,23 @@ mod tests {
                 records: Vec::new(),
                 next_after_sequence: None,
             })
+        }
+
+        fn progress_event_after(
+            &self,
+            run_id: &str,
+            after_sequence: u32,
+        ) -> Result<Option<crate::control_api::SessionProgressEvent>> {
+            if run_id != self.snapshot.run_id {
+                bail!("fake progress run mismatch");
+            }
+            if usize::try_from(after_sequence)? > self.progress_events.len() {
+                bail!("fake progress cursor is ahead");
+            }
+            Ok(self
+                .progress_events
+                .get(usize::try_from(after_sequence)?)
+                .cloned())
         }
 
         fn poll_once(&mut self) -> Result<()> {
@@ -1649,6 +1748,7 @@ mod tests {
                     project_root,
                 },
                 snapshot,
+                progress_events: Vec::new(),
                 fail_poll: false,
             }),
             // SAFETY: geteuid has no preconditions.
@@ -1675,6 +1775,15 @@ mod tests {
     }
 
     fn wait_request(caller: CallerAuth, request_id: &str, version: u64) -> ControlRequest {
+        wait_request_after(caller, request_id, version, 0)
+    }
+
+    fn wait_request_after(
+        caller: CallerAuth,
+        request_id: &str,
+        version: u64,
+        after_progress_sequence: u32,
+    ) -> ControlRequest {
         ControlRequest {
             protocol_version: PROTOCOL_VERSION,
             request_id: request_id.into(),
@@ -1682,7 +1791,25 @@ mod tests {
             action: ControlAction::SessionWait {
                 run_id: "run-wait-test".into(),
                 after_session_version: version,
+                after_progress_sequence,
             },
+        }
+    }
+
+    fn review_requested_event() -> crate::control_api::SessionProgressEvent {
+        crate::control_api::SessionProgressEvent::ReviewRequested {
+            sequence: 1,
+            task_ordinal: 0,
+            task_key: "wait-task".into(),
+            completed_tasks: 0,
+            total_tasks: 1,
+            review_round: 1,
+            max_review_rounds: 3,
+            developer_final_path: "/artifacts/developer/native-final.partial".into(),
+            task_document_path: "/project/current_todo.md".into(),
+            design_document_paths: vec!["/project/design.md".into()],
+            task_selector: "FBTC-03".into(),
+            clarification_record_count: 0,
         }
     }
 
@@ -1739,6 +1866,152 @@ mod tests {
         };
         assert_eq!(session.state, crate::control_api::SessionState::Completed);
         assert_eq!(session.version, 11);
+    }
+
+    #[test]
+    fn session_wait_returns_retained_progress_immediately_and_by_cursor() {
+        let (mut control, caller, _) =
+            fake_wait_control(crate::control_api::SessionState::Running, 7, false);
+        let snapshot = control.supervisor.snapshot();
+        control.supervisor = Box::new(FakeSupervisor {
+            startup: control.supervisor.startup().clone(),
+            snapshot,
+            progress_events: vec![review_requested_event()],
+            fail_poll: false,
+        });
+
+        let mut client = serve_wait(
+            &mut control,
+            &wait_request_after(caller, "wait-progress", 7, 0),
+        );
+        assert!(control.pending_wait.is_none());
+        let frame = read_response_frame(&mut client).unwrap();
+        let response: ControlResponse = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(
+            response.result,
+            Some(ControlResult::Progress {
+                run_id: "run-wait-test".into(),
+                session_version: 7,
+                event: review_requested_event(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_progress_event_releases_an_already_pending_wait() {
+        let (mut control, caller, _) =
+            fake_wait_control(crate::control_api::SessionState::Running, 7, false);
+        let mut client = serve_wait(
+            &mut control,
+            &wait_request_after(caller, "wait-before-progress", 7, 0),
+        );
+        assert!(control.pending_wait.is_some());
+
+        let snapshot = control.supervisor.snapshot();
+        control.supervisor = Box::new(FakeSupervisor {
+            startup: control.supervisor.startup().clone(),
+            snapshot,
+            progress_events: vec![review_requested_event()],
+            fail_poll: false,
+        });
+        control.service_pending_wait();
+
+        assert!(control.pending_wait.is_none());
+        let frame = read_response_frame(&mut client).unwrap();
+        let response: ControlResponse = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(
+            response.result,
+            Some(ControlResult::Progress {
+                run_id: "run-wait-test".into(),
+                session_version: 7,
+                event: review_requested_event(),
+            })
+        );
+    }
+
+    #[test]
+    fn invalidated_pending_progress_cursor_returns_the_closed_conflict() {
+        let (mut control, caller, _) =
+            fake_wait_control(crate::control_api::SessionState::Running, 7, false);
+        let mut client = serve_wait(
+            &mut control,
+            &wait_request_after(caller, "wait-invalidated-progress", 7, 0),
+        );
+        control
+            .pending_wait
+            .as_mut()
+            .expect("wait must be pending")
+            .after_progress_sequence = 1;
+        control.service_pending_wait();
+
+        let frame = read_response_frame(&mut client).unwrap();
+        let response: ControlResponse = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(
+            response.error,
+            Some(crate::control_api::ControlErrorBody {
+                code: ControlErrorCode::Conflict,
+                message: "session wait progress cursor is ahead of the current run".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn pending_action_precedes_progress_and_progress_precedes_terminal() {
+        let (mut action_control, action_caller, _) =
+            fake_wait_control(crate::control_api::SessionState::Running, 9, true);
+        let snapshot = action_control.supervisor.snapshot();
+        action_control.supervisor = Box::new(FakeSupervisor {
+            startup: action_control.supervisor.startup().clone(),
+            snapshot,
+            progress_events: vec![review_requested_event()],
+            fail_poll: false,
+        });
+        let mut action_client = serve_wait(
+            &mut action_control,
+            &wait_request_after(action_caller, "wait-action-priority", 7, 0),
+        );
+        let frame = read_response_frame(&mut action_client).unwrap();
+        let response: ControlResponse = serde_json::from_slice(&frame).unwrap();
+        let Some(ControlResult::Session { session }) = response.result else {
+            panic!("pending Architect action must take priority")
+        };
+        assert!(session.pending_architect_action.is_some());
+
+        let (mut terminal_control, terminal_caller, _) =
+            fake_wait_control(crate::control_api::SessionState::Completed, 11, false);
+        let snapshot = terminal_control.supervisor.snapshot();
+        terminal_control.supervisor = Box::new(FakeSupervisor {
+            startup: terminal_control.supervisor.startup().clone(),
+            snapshot,
+            progress_events: vec![review_requested_event()],
+            fail_poll: false,
+        });
+        let mut progress_client = serve_wait(
+            &mut terminal_control,
+            &wait_request_after(
+                terminal_caller.clone(),
+                "wait-progress-before-terminal",
+                7,
+                0,
+            ),
+        );
+        let frame = read_response_frame(&mut progress_client).unwrap();
+        let response: ControlResponse = serde_json::from_slice(&frame).unwrap();
+        assert!(matches!(
+            response.result,
+            Some(ControlResult::Progress { .. })
+        ));
+
+        let mut terminal_client = serve_wait(
+            &mut terminal_control,
+            &wait_request_after(terminal_caller, "wait-terminal-after-progress", 11, 1),
+        );
+        let frame = read_response_frame(&mut terminal_client).unwrap();
+        let response: ControlResponse = serde_json::from_slice(&frame).unwrap();
+        let Some(ControlResult::Session { session }) = response.result else {
+            panic!("terminal snapshot must follow drained progress")
+        };
+        assert_eq!(session.state, crate::control_api::SessionState::Completed);
     }
 
     #[test]
@@ -1836,6 +2109,7 @@ mod tests {
         control.supervisor = Box::new(FakeSupervisor {
             startup: control.supervisor.startup().clone(),
             snapshot: control.supervisor.snapshot(),
+            progress_events: Vec::new(),
             fail_poll: true,
         });
         let mut client = serve_wait(&mut control, &wait_request(caller, "wait-poll-failure", 7));

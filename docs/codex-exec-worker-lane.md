@@ -390,12 +390,14 @@ A turn is killed after 6 hours of wall clock, monotonic and never reset by
 output. A genuinely slow turn is indistinguishable from a hung one; a wedged
 worker burns up to six hours before the watchdog fires. The foreground
 supervisor reports the resulting terminal state through the pending
-`session_wait`; a human who needs an earlier progress check can interrupt that
-wait and explicitly request `session_status` or cancellation. The same wait
-also returns for a latched Developer clarification/blocker action. An action
-survives an interrupted wait and is immediately redelivered when the reconnect
-uses a version older than the action's `published_version`; a same-version
-repeat is rejected until the action is resolved.
+`session_wait`. The same wait returns once for every review request, review
+response, and task completion, so ordinary progress no longer requires an
+interrupt and `session_status` query. It also returns for a latched Developer
+clarification/blocker action. Progress is retained under a run-local sequence
+across the short display/re-wait gap. An action survives an interrupted wait
+and is immediately redelivered when the reconnect uses a version older than
+the action's `published_version`; a same-version repeat is rejected until the
+action is resolved.
 
 The six-hour watchdog applies only to an active Developer or Reviewer turn.
 `AwaitingArchitectAction` has no timeout: it may be waiting for a human

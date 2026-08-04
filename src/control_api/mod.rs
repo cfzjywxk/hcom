@@ -18,7 +18,8 @@ pub use protocol::{
     ActionName, ActiveWorkerSnapshot, ArchitectActionReason, CallerAuth, CapabilitySnapshot,
     ClarificationPage, ClarificationRecord, ControlAction, ControlErrorBody, ControlErrorCode,
     ControlRequest, ControlResponse, ControlResult, MAX_CLARIFICATION_PAGE_RECORDS,
-    MAX_CLARIFICATION_RECORDS_PER_RUN, MAX_CLARIFICATION_RECORDS_PER_TASK, NativeSessionMode,
-    PendingArchitectActionSnapshot, ReviewerVerdict, SessionState, SessionStatusSnapshot,
-    TaskDraft, TaskState, TaskStatusSnapshot, WorkerRole,
+    MAX_CLARIFICATION_RECORDS_PER_RUN, MAX_CLARIFICATION_RECORDS_PER_TASK,
+    MAX_PROGRESS_EVENTS_PER_RUN, NativeSessionMode, PendingArchitectActionSnapshot,
+    ReviewerVerdict, SessionProgressEvent, SessionState, SessionStatusSnapshot,
+    TaskCompletionOutcome, TaskDraft, TaskState, TaskStatusSnapshot, WorkerRole,
 };

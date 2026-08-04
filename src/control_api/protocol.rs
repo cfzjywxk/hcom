@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
@@ -10,10 +10,12 @@ const MAX_ID_BYTES: usize = 128;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_TASKS: usize = 64;
 const MAX_LIST_ITEMS: usize = 256;
+const MAX_REVIEW_ROUNDS: u8 = 20;
 const MAX_CLARIFICATION_ROUNDS: u8 = 20;
 pub const MAX_CLARIFICATION_PAGE_RECORDS: u8 = 8;
 pub const MAX_CLARIFICATION_RECORDS_PER_TASK: usize = 64;
 pub const MAX_CLARIFICATION_RECORDS_PER_RUN: usize = MAX_TASKS * MAX_CLARIFICATION_ROUNDS as usize;
+pub const MAX_PROGRESS_EVENTS_PER_RUN: usize = MAX_TASKS * (MAX_REVIEW_ROUNDS as usize * 2 + 1);
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -156,6 +158,7 @@ pub enum ControlAction {
     SessionWait {
         run_id: String,
         after_session_version: u64,
+        after_progress_sequence: u32,
     },
     SessionStatus,
     SessionCancel {
@@ -352,7 +355,7 @@ impl TaskDraft {
             }
         }
         validate_single_line("task selector", &self.task_selector, 4096)?;
-        if !(1..=20).contains(&self.max_review_rounds) {
+        if !(1..=MAX_REVIEW_ROUNDS).contains(&self.max_review_rounds) {
             return Err(ProtocolValidationError::new(
                 "max_review_rounds must be between 1 and 20",
             ));
@@ -449,6 +452,105 @@ pub enum ReviewerVerdict {
     RequestChanges,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCompletionOutcome {
+    Lgtm,
+    ReviewExhausted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionProgressEvent {
+    ReviewRequested {
+        sequence: u32,
+        task_ordinal: u32,
+        task_key: String,
+        completed_tasks: u32,
+        total_tasks: u32,
+        review_round: u32,
+        max_review_rounds: u8,
+        developer_final_path: String,
+        task_document_path: String,
+        design_document_paths: Vec<String>,
+        task_selector: String,
+        clarification_record_count: u32,
+    },
+    ReviewResponded {
+        sequence: u32,
+        task_ordinal: u32,
+        task_key: String,
+        completed_tasks: u32,
+        total_tasks: u32,
+        review_round: u32,
+        max_review_rounds: u8,
+        reviewer_verdict: ReviewerVerdict,
+        developer_final_path: String,
+        reviewer_final_message_paths: Vec<String>,
+    },
+    TaskCompleted {
+        sequence: u32,
+        task_ordinal: u32,
+        task_key: String,
+        completed_tasks: u32,
+        total_tasks: u32,
+        review_round: u32,
+        max_review_rounds: u8,
+        outcome: TaskCompletionOutcome,
+        reviewer_verdict: ReviewerVerdict,
+        developer_final_path: String,
+        reviewer_final_message_paths: Vec<String>,
+    },
+}
+
+impl SessionProgressEvent {
+    pub fn sequence(&self) -> u32 {
+        match self {
+            Self::ReviewRequested { sequence, .. }
+            | Self::ReviewResponded { sequence, .. }
+            | Self::TaskCompleted { sequence, .. } => *sequence,
+        }
+    }
+
+    pub fn task_ordinal(&self) -> u32 {
+        match self {
+            Self::ReviewRequested { task_ordinal, .. }
+            | Self::ReviewResponded { task_ordinal, .. }
+            | Self::TaskCompleted { task_ordinal, .. } => *task_ordinal,
+        }
+    }
+
+    pub fn task_key(&self) -> &str {
+        match self {
+            Self::ReviewRequested { task_key, .. }
+            | Self::ReviewResponded { task_key, .. }
+            | Self::TaskCompleted { task_key, .. } => task_key,
+        }
+    }
+
+    pub fn completed_tasks(&self) -> u32 {
+        match self {
+            Self::ReviewRequested {
+                completed_tasks, ..
+            }
+            | Self::ReviewResponded {
+                completed_tasks, ..
+            }
+            | Self::TaskCompleted {
+                completed_tasks, ..
+            } => *completed_tasks,
+        }
+    }
+
+    pub fn total_tasks(&self) -> u32 {
+        match self {
+            Self::ReviewRequested { total_tasks, .. }
+            | Self::ReviewResponded { total_tasks, .. }
+            | Self::TaskCompleted { total_tasks, .. } => *total_tasks,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ControlResponse {
@@ -509,6 +611,11 @@ impl ControlResponse {
 pub enum ControlResult {
     Session {
         session: SessionStatusSnapshot,
+    },
+    Progress {
+        run_id: String,
+        session_version: u64,
+        event: SessionProgressEvent,
     },
     Plan {
         session: SessionStatusSnapshot,
@@ -940,11 +1047,49 @@ mod tests {
     }
 
     #[test]
+    fn progress_result_serializes_as_one_typed_path_bearing_event() {
+        let result = ControlResult::Progress {
+            run_id: "run-one".into(),
+            session_version: 17,
+            event: SessionProgressEvent::ReviewRequested {
+                sequence: 3,
+                task_ordinal: 2,
+                task_key: "TASK-03".into(),
+                completed_tasks: 2,
+                total_tasks: 10,
+                review_round: 2,
+                max_review_rounds: 3,
+                developer_final_path: "/run/task-03/developer/final.md".into(),
+                task_document_path: "/project/current_todo.md".into(),
+                design_document_paths: vec!["/project/current_architecture.md".into()],
+                task_selector: "TASK-03".into(),
+                clarification_record_count: 1,
+            },
+        };
+        let encoded = serde_json::to_value(&result).unwrap();
+        assert_eq!(encoded["kind"], "progress");
+        assert_eq!(encoded["event"]["kind"], "review_requested");
+        assert_eq!(encoded["event"]["sequence"], 3);
+        assert_eq!(
+            encoded["event"]["developer_final_path"],
+            "/run/task-03/developer/final.md"
+        );
+        assert_eq!(
+            encoded["event"]["task_document_path"],
+            "/project/current_todo.md"
+        );
+        assert_eq!(
+            serde_json::from_value::<ControlResult>(encoded).unwrap(),
+            result
+        );
+    }
+
+    #[test]
     fn previous_protocol_version_fails_closed() {
-        assert_eq!(PROTOCOL_VERSION, 6);
+        assert_eq!(PROTOCOL_VERSION, 7);
         let request = ControlRequest {
-            protocol_version: 5,
-            request_id: "v5-request".into(),
+            protocol_version: 6,
+            request_id: "v6-request".into(),
             caller: CallerAuth::Human {
                 process_birth: "123:456".into(),
             },
@@ -953,8 +1098,8 @@ mod tests {
         assert!(request.validate().is_err());
 
         let response = ControlResponse {
-            protocol_version: 5,
-            request_id: "v5-response".into(),
+            protocol_version: 6,
+            request_id: "v6-response".into(),
             ok: false,
             result: None,
             error: Some(ControlErrorBody {

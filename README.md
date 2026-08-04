@@ -188,21 +188,23 @@ hcom commands inside it use private per-run state so the live retained hcom
 store is not addressed through the normal CLI.
 
 After dispatch, the Codex Architect makes a blocking `session_wait` call bound
-to the exact current run ID.
-The foreground supervisor advances Developer and Reviewer without Architect
-model calls and returns for a terminal state or a latched Developer
-clarification/blocker action; normal role transitions do not wake it. A
-defensible clarification is submitted through its exact artifact path and the
-wait is immediately re-armed. A material human decision ends the Architect
-turn until the human answers. The UI may remain `Working` while the call is
-pending, but no timer or status polling is involved. Esc cancels only the wait
-subscription, not the run. A pending action records its `published_version`:
-an older-version reconnect re-delivers it, while a same-version repeat is
-rejected until the action is resolved. Terminal results reached during a gap
-remain immediately available. `session_status` is for an explicit human
-progress query only and carries clarification counts, not the accumulating
-record list; `session_clarifications_list` reads records for the exact run in
-pages of at most eight.
+to the exact current run ID and a run-local progress cursor. The foreground
+supervisor advances Developer and Reviewer without Architect model calls and
+returns one retained review-request, review-response, or task-completion event,
+a latched Developer clarification/blocker action, or a terminal state. The
+Architect displays each progress event and immediately re-arms the wait with
+that event's sequence; worker execution continues and events produced during
+the gap remain queued in order. A defensible clarification is submitted
+through its exact artifact path and the wait is likewise immediately re-armed.
+A material human decision ends the Architect turn until the human answers. No
+timer or status polling is involved. Esc cancels only the wait subscription,
+not the run. A pending action takes priority over queued progress and records
+its `published_version`: an older-version reconnect re-delivers it, while a
+same-version repeat is rejected until the action is resolved. Queued progress
+is delivered before a retained terminal result. `session_status` is for an
+explicit human progress query only and carries clarification counts, not the
+accumulating record list; `session_clarifications_list` reads records for the
+exact run in pages of at most eight.
 
 A terminal run remains immutable but does not end the foreground Architect.
 After delivering all Reviewer and clarification evidence, a later human

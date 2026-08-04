@@ -135,10 +135,19 @@ Developer clarification/blocker requests also route only through durable
 paths. Each accepted clarification becomes ordered task runtime evidence and
 is supplied by path to every later Developer and Reviewer turn; it does not
 change the approved plan hash. `session_wait` is bound to the exact current run
-ID and returns for a latched action or a terminal state. Each action has a
-`published_version`: an interrupted client can recover it by waiting from an
-older version in that run, while a repeated wait at the published version is
-rejected until the action is resolved. Status snapshots carry only each task's
+ID and a run-local progress sequence. It returns one retained review-request,
+review-response, or task-completion event, a latched action, or a terminal
+state. Review-request events carry the exact Developer final path read by the
+Reviewer plus the approved task/design paths and selector. Review-response and
+task-completion events carry the exact Developer path and ordered Reviewer
+final paths; no peer body is copied into the event. The Architect displays each
+event once and re-waits with its sequence. Events created between waits are
+retained, and queued progress is delivered before terminal.
+
+Each action has a `published_version`: an interrupted client can recover it by
+waiting from an older version in that run, while a repeated wait at the
+published version is rejected until the action is resolved. A pending action
+takes priority over queued progress. Status snapshots carry only each task's
 clarification count; the ordered records are available through run-bound pages
 of at most eight. The runtime enforces 64 records per task and 1280 per run
 independently of whether an answer is Architect-derived or human-confirmed. At
@@ -183,6 +192,7 @@ separately, and only the foreground parent exit releases the lease.
 | native worker argv/config | `worker::exec_runtime::tests::happy_developer_turn_completes_and_captures_thread_id`, `reviewer_registers_the_external_repository_as_a_native_workspace_root` |
 | byte-exact native environment with no additions | `orchestrator::task_lane::tests::complete_parent_environment_is_preserved_byte_for_byte` |
 | path-only peer and terminal handoff | `orchestrator::task_lane::tests::request_changes_round_routes_only_ordered_durable_paths`, `architect::bridge::tests::session_wait_keeps_mcp_responsive_and_returns_terminal_result` |
+| retained progress paths and wait priority | `orchestrator::core::tests::progress_events_preserve_review_paths_rounds_and_terminal_order`, `control_api::supervisor::tests::a_progress_event_releases_an_already_pending_wait`, `control_api::supervisor::tests::pending_action_precedes_progress_and_progress_precedes_terminal`, `architect::bridge::tests::progress_result_reaches_both_mcp_response_representations_without_peer_body` |
 | sequential immutable runs in one Architect | `orchestrator::core::tests::terminal_core_creates_a_fresh_run_without_mutating_terminal_evidence`, `orchestrator::task_lane::tests::one_foreground_supervisor_runs_two_immutable_runs_with_fresh_workers`, `control_api::supervisor::tests::terminal_run_begin_creates_a_new_run_and_old_wait_identity_is_rejected` |
 | project ownership survives run transition | `orchestrator::task_lane::tests::one_foreground_supervisor_runs_two_immutable_runs_with_fresh_workers`, `orchestrator::workspace::tests::a_second_process_cannot_open_the_project_workspace_while_it_is_locked` |
 | bounded clarification control plane | `orchestrator::core::tests::status_snapshot_is_bounded_and_clarification_records_are_exactly_paginated`, `control_api::codec::tests::maximum_clarification_page_stays_within_the_control_response_frame`, `orchestrator::core::tests::clarification_capacity_exhaustion_terminalizes_instead_of_latching_more_state` |
