@@ -23,25 +23,25 @@ const MAX_RUN_FILE_BYTES: usize = 256 * 1024;
 const MAX_CLARIFICATION_FILE_BYTES: usize = 256 * 1024;
 const MAX_DECISION_LINE_BYTES: usize = 4096;
 
-/// The per-run workspace under `<project>/hcom-tasks/<run-id>/`, holding the
-/// exclusive whole-workspace lock for the lifetime of the run.
+/// The project-wide `<project>/hcom-tasks/` owner for one foreground Architect.
+///
+/// The lock is acquired on the first approved run and deliberately survives
+/// every later sequential run. It is released only when the foreground
+/// supervisor is dropped.
 #[derive(Debug)]
-pub struct TasksWorkspace {
+pub struct ProjectTasksWorkspace {
     root: PathBuf,
-    run_dir: PathBuf,
-    run_id: String,
     _lock: File,
 }
 
-impl TasksWorkspace {
-    /// Open (creating if needed) the project workspace and claim a fresh run
-    /// directory. Fails closed on foreign directories, unsafe permissions,
-    /// and concurrent runs in the same project.
-    pub fn open(project_root: &Path, run_id: &str) -> Result<Self> {
+impl ProjectTasksWorkspace {
+    /// Open (creating if needed) the project workspace and hold its exclusive
+    /// lock. Fails closed on foreign directories, unsafe permissions, and a
+    /// competing foreground Architect in the same project.
+    pub fn open(project_root: &Path) -> Result<Self> {
         if !project_root.is_absolute() {
             bail!("tasks workspace requires an absolute project root");
         }
-        validate_run_id(run_id)?;
         let root = project_root.join(WORKSPACE_DIR_NAME);
 
         match fs::symlink_metadata(&root) {
@@ -86,8 +86,7 @@ impl TasksWorkspace {
         // O_CLOEXEC is load-bearing, not hygiene: every worker is fork+exec'd
         // from this process and would otherwise inherit this descriptor. The
         // flock lives on the open file description, so an inherited copy keeps
-        // the lock held for as long as any worker survives — including after
-        // this run exits.
+        // the lock held after the foreground supervisor exits.
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -103,7 +102,7 @@ impl TasksWorkspace {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
                 bail!(
-                    "another hcom arch run already holds {}/{LOCK_FILE} for this project",
+                    "another hcom arch session already holds {}/{LOCK_FILE} for this project",
                     root.display()
                 );
             }
@@ -111,28 +110,50 @@ impl TasksWorkspace {
                 .with_context(|| format!("failed to lock {}/{LOCK_FILE}", root.display()));
         }
 
-        let run_dir = root.join(run_id);
+        Ok(Self { root, _lock: lock })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Claim one fresh per-run evidence directory without releasing or
+    /// reacquiring the project-wide lock.
+    pub fn claim_run(&self, run_id: &str) -> Result<TasksWorkspace> {
+        validate_run_id(run_id)?;
+        let run_dir = self.root.join(run_id);
         fs::create_dir(&run_dir)
             .with_context(|| format!("failed to create run directory {}", run_dir.display()))?;
         fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700))
             .with_context(|| format!("failed to set mode on {}", run_dir.display()))?;
 
         // Atomic `latest` update: build a fresh symlink and rename it over.
-        let tmp = root.join(LATEST_TMP);
+        let tmp = self.root.join(LATEST_TMP);
         let _ = fs::remove_file(&tmp);
         symlink(run_id, &tmp)
-            .with_context(|| format!("failed to stage latest link in {}", root.display()))?;
-        fs::rename(&tmp, root.join(LATEST_LINK))
-            .with_context(|| format!("failed to publish latest link in {}", root.display()))?;
+            .with_context(|| format!("failed to stage latest link in {}", self.root.display()))?;
+        fs::rename(&tmp, self.root.join(LATEST_LINK))
+            .with_context(|| format!("failed to publish latest link in {}", self.root.display()))?;
 
-        Ok(Self {
-            root,
+        Ok(TasksWorkspace {
+            root: self.root.clone(),
             run_dir,
             run_id: run_id.to_string(),
-            _lock: lock,
         })
     }
+}
 
+/// One run's durable evidence directory under
+/// `<project>/hcom-tasks/<run-id>/`. The project lock is owned separately by
+/// [`ProjectTasksWorkspace`].
+#[derive(Debug)]
+pub struct TasksWorkspace {
+    root: PathBuf,
+    run_dir: PathBuf,
+    run_id: String,
+}
+
+impl TasksWorkspace {
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -340,6 +361,8 @@ fn write_exclusive_file(path: &Path, contents: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
 
     /// A fixture directory that is never recycled during the run.
     ///
@@ -358,11 +381,17 @@ mod tests {
         project
     }
 
+    fn open_run(project: &Path, run_id: &str) -> (ProjectTasksWorkspace, TasksWorkspace) {
+        let owner = ProjectTasksWorkspace::open(project).unwrap();
+        let run = owner.claim_run(run_id).unwrap();
+        (owner, run)
+    }
+
     #[test]
     fn fresh_workspace_is_created_with_marker_gitignore_and_latest() {
         const TEST_NAME: &str = "fresh_workspace_is_created_with_marker_gitignore_and_latest";
         let project = test_project(TEST_NAME);
-        let workspace = TasksWorkspace::open(&project, "run-1").unwrap();
+        let (_owner, workspace) = open_run(&project, "run-1");
         let root = &project.join(WORKSPACE_DIR_NAME);
         assert!(root.join(MARKER_FILE).is_file());
         assert_eq!(
@@ -392,7 +421,7 @@ mod tests {
         const TEST_NAME: &str =
             "clarification_paths_are_unique_and_documents_are_bounded_plain_utf8_files";
         let project = test_project(TEST_NAME);
-        let workspace = TasksWorkspace::open(&project, "run-1").unwrap();
+        let (_owner, workspace) = open_run(&project, "run-1");
         assert!(workspace.prepare_clarification_path("..", 1).is_err());
 
         let first = workspace.prepare_clarification_path("task-one", 1).unwrap();
@@ -433,7 +462,7 @@ mod tests {
         const TEST_NAME: &str = "foreign_directory_without_marker_is_refused";
         let project = test_project(TEST_NAME);
         fs::create_dir(project.join(WORKSPACE_DIR_NAME)).unwrap();
-        let error = TasksWorkspace::open(&project, "run-1").unwrap_err();
+        let error = ProjectTasksWorkspace::open(&project).unwrap_err();
         assert!(error.to_string().contains("ownership marker"), "{error}");
     }
 
@@ -442,49 +471,50 @@ mod tests {
     fn world_writable_root_is_refused() {
         const TEST_NAME: &str = "world_writable_root_is_refused";
         let project = test_project(TEST_NAME);
-        drop(TasksWorkspace::open(&project, "run-1").unwrap());
+        drop(ProjectTasksWorkspace::open(&project).unwrap());
         let root = &project.join(WORKSPACE_DIR_NAME);
         fs::set_permissions(root, fs::Permissions::from_mode(0o707)).unwrap();
-        let error = TasksWorkspace::open(&project, "run-2").unwrap_err();
+        let error = ProjectTasksWorkspace::open(&project).unwrap_err();
         assert!(error.to_string().contains("world-writable"), "{error}");
     }
 
-    /// Mutual exclusion is a cross-process property (two `hcom arch` runs in
-    /// one project), so it is asserted against a real second process. Testing
-    /// it inside this process would instead measure same-process flock
-    /// aliasing: `/tmp` recycles inodes fast enough that a sibling test
-    /// thread's not-yet-closed lock file can land on the inode this test just
-    /// created.
+    /// Mutual exclusion is a cross-process property, so the holder lives in a
+    /// helper process. Keeping the lock out of this multi-threaded test process
+    /// also avoids the fork-before-exec descriptor inheritance window when the
+    /// release assertion runs beside unrelated process-spawning tests.
     #[test]
     #[serial]
-    fn a_second_process_cannot_open_the_workspace_while_it_is_locked() {
+    fn a_second_process_cannot_open_the_project_workspace_while_it_is_locked() {
         const TEST_NAME: &str = "a_second_process_cannot_open_the_workspace_while_it_is_locked";
         let project = test_project(TEST_NAME);
-        let workspace = TasksWorkspace::open(&project, "run-1").unwrap();
-        let lock_path = workspace.root().join(LOCK_FILE);
+        let bootstrap = ProjectTasksWorkspace::open(&project).unwrap();
+        let lock_path = bootstrap.root().join(LOCK_FILE);
+        drop(bootstrap);
 
-        let held = std::process::Command::new("/usr/bin/flock")
-            .args(["--nonblock", "--exclusive"])
+        let mut holder = Command::new("/usr/bin/flock")
+            .arg("--exclusive")
             .arg(&lock_path)
-            .args(["true"])
-            .status()
-            .expect("run flock(1)");
+            .args(["/bin/sh", "-c", "printf 'ready\\n'; read _ || true"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("start external workspace lock holder");
+        let mut ready = String::new();
+        BufReader::new(holder.stdout.take().expect("holder stdout"))
+            .read_line(&mut ready)
+            .expect("read holder ready marker");
+        assert_eq!(ready, "ready\n");
+
+        let held = ProjectTasksWorkspace::open(&project).unwrap_err();
         assert!(
-            !held.success(),
-            "a second process acquired the lock while this run holds it"
+            held.to_string().contains("already holds"),
+            "the foreground process acquired a project lock held by another process: {held}"
         );
 
-        drop(workspace);
-        let free = std::process::Command::new("/usr/bin/flock")
-            .args(["--nonblock", "--exclusive"])
-            .arg(&lock_path)
-            .args(["true"])
-            .status()
-            .expect("run flock(1)");
-        assert!(
-            free.success(),
-            "the lock was not released when the workspace was dropped"
-        );
+        drop(holder.stdin.take());
+        assert!(holder.wait().expect("wait for lock holder").success());
+        let released = ProjectTasksWorkspace::open(&project).unwrap();
+        assert_eq!(released.root(), project.join(WORKSPACE_DIR_NAME));
     }
 
     #[test]
@@ -492,8 +522,8 @@ mod tests {
     fn opening_a_second_run_while_one_is_live_is_refused() {
         const TEST_NAME: &str = "opening_a_second_run_while_one_is_live_is_refused";
         let project = test_project(TEST_NAME);
-        let first = TasksWorkspace::open(&project, "run-1").unwrap();
-        let error = TasksWorkspace::open(&project, "run-2").unwrap_err();
+        let first = ProjectTasksWorkspace::open(&project).unwrap();
+        let error = ProjectTasksWorkspace::open(&project).unwrap_err();
         assert!(error.to_string().contains("already holds"), "{error}");
         drop(first);
     }
@@ -502,7 +532,7 @@ mod tests {
     fn run_files_are_exclusive_and_decisions_append_single_lines() {
         const TEST_NAME: &str = "run_files_are_exclusive_and_decisions_append_single_lines";
         let project = test_project(TEST_NAME);
-        let workspace = TasksWorkspace::open(&project, "run-1").unwrap();
+        let (_owner, workspace) = open_run(&project, "run-1");
         workspace.write_run_file("plan.md", b"# plan\n").unwrap();
         assert!(workspace.write_run_file("plan.md", b"again").is_err());
         assert!(workspace.write_run_file("../escape", b"x").is_err());
@@ -524,8 +554,9 @@ mod tests {
     fn invalid_run_ids_are_refused() {
         const TEST_NAME: &str = "invalid_run_ids_are_refused";
         let project = test_project(TEST_NAME);
+        let owner = ProjectTasksWorkspace::open(&project).unwrap();
         for bad in ["", "UPPER", "has/slash", "a b", &"x".repeat(65)] {
-            assert!(TasksWorkspace::open(&project, bad).is_err(), "{bad}");
+            assert!(owner.claim_run(bad).is_err(), "{bad}");
         }
     }
 }

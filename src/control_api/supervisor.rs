@@ -171,6 +171,12 @@ struct SessionSupervisorControl {
 trait SupervisorBackend: Send {
     fn startup(&self) -> &SessionStartup;
 
+    fn begin_next_run(
+        &mut self,
+        expected_session_version: u64,
+        terminal_run_id: &str,
+    ) -> Result<()>;
+
     fn replace_plan(
         &mut self,
         expected_session_version: u64,
@@ -214,6 +220,7 @@ trait SupervisorBackend: Send {
 
     fn clarification_page(
         &self,
+        run_id: &str,
         task_ordinal: u32,
         task_key: &str,
         after_sequence: u32,
@@ -228,6 +235,14 @@ trait SupervisorBackend: Send {
 impl SupervisorBackend for TaskLaneSupervisor {
     fn startup(&self) -> &SessionStartup {
         self.startup()
+    }
+
+    fn begin_next_run(
+        &mut self,
+        expected_session_version: u64,
+        terminal_run_id: &str,
+    ) -> Result<()> {
+        self.begin_next_run(expected_session_version, terminal_run_id)
     }
 
     fn replace_plan(
@@ -308,12 +323,13 @@ impl SupervisorBackend for TaskLaneSupervisor {
 
     fn clarification_page(
         &self,
+        run_id: &str,
         task_ordinal: u32,
         task_key: &str,
         after_sequence: u32,
         limit: u8,
     ) -> Result<ClarificationPage> {
-        self.clarification_page(task_ordinal, task_key, after_sequence, limit)
+        self.clarification_page(run_id, task_ordinal, task_key, after_sequence, limit)
     }
 
     fn poll_once(&mut self) -> Result<()> {
@@ -333,6 +349,7 @@ struct RequestRecord {
 struct PendingSessionWait {
     stream: UnixStream,
     request_id: String,
+    run_id: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -620,12 +637,26 @@ impl SessionSupervisorControl {
             );
         }
         let ControlAction::SessionWait {
+            run_id,
             after_session_version,
         } = &request.action
         else {
             unreachable!("session wait handler requires a wait action")
         };
         let snapshot = self.supervisor.snapshot();
+        if *run_id != snapshot.run_id {
+            return write_response(
+                &mut stream,
+                &ControlResponse::error(
+                    &request.request_id,
+                    ControlErrorCode::Conflict,
+                    format!(
+                        "session wait run identity does not match the current run; current run_id is {}",
+                        snapshot.run_id
+                    ),
+                ),
+            );
+        }
         if *after_session_version > snapshot.version {
             return write_response(
                 &mut stream,
@@ -679,6 +710,7 @@ impl SessionSupervisorControl {
         self.pending_wait = Some(PendingSessionWait {
             stream,
             request_id: request.request_id.clone(),
+            run_id: run_id.clone(),
         });
         Ok(())
     }
@@ -703,6 +735,27 @@ impl SessionSupervisorControl {
             return;
         }
         let snapshot = self.supervisor.snapshot();
+        if self
+            .pending_wait
+            .as_ref()
+            .is_some_and(|wait| wait.run_id != snapshot.run_id)
+        {
+            let Some(mut wait) = self.pending_wait.take() else {
+                return;
+            };
+            let response = ControlResponse::error(
+                &wait.request_id,
+                ControlErrorCode::Conflict,
+                format!(
+                    "session wait belonged to an earlier run; current run_id is {}",
+                    snapshot.run_id
+                ),
+            );
+            let _ = wait.stream.set_nonblocking(false);
+            let _ = wait.stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT));
+            let _ = write_response(&mut wait.stream, &response);
+            return;
+        }
         if !snapshot.state.is_terminal() && snapshot.pending_architect_action.is_none() {
             return;
         }
@@ -766,6 +819,19 @@ impl SessionSupervisorControl {
             &request.action,
             ControlAction::SessionStatus | ControlAction::SessionClarificationsList { .. }
         ) {
+            if let ControlAction::SessionClarificationsList { run_id, .. } = &request.action {
+                let snapshot = self.supervisor.snapshot();
+                if *run_id != snapshot.run_id {
+                    return ControlResponse::error(
+                        &request.request_id,
+                        ControlErrorCode::Conflict,
+                        format!(
+                            "clarification page run identity does not match the current run; current run_id is {}",
+                            snapshot.run_id
+                        ),
+                    );
+                }
+            }
             return match self.dispatch_action(&request.action) {
                 Ok(result) => ControlResponse::success(&request.request_id, result),
                 Err(_) => {
@@ -858,6 +924,16 @@ impl SessionSupervisorControl {
 
     fn dispatch_action(&mut self, action: &ControlAction) -> Result<ControlResult> {
         match action {
+            ControlAction::SessionRunBegin {
+                expected_session_version,
+                terminal_run_id,
+            } => {
+                self.supervisor
+                    .begin_next_run(*expected_session_version, terminal_run_id)?;
+                Ok(ControlResult::Session {
+                    session: self.supervisor.snapshot(),
+                })
+            }
             ControlAction::SessionPlanReplace {
                 expected_session_version,
                 developer_adapter,
@@ -933,12 +1009,14 @@ impl SessionSupervisorControl {
                 })
             }
             ControlAction::SessionClarificationsList {
+                run_id,
                 task_ordinal,
                 task_key,
                 after_sequence,
                 limit,
             } => Ok(ControlResult::Clarifications {
                 page: self.supervisor.clarification_page(
+                    run_id,
                     *task_ordinal,
                     task_key,
                     *after_sequence,
@@ -1320,6 +1398,35 @@ mod tests {
             &self.startup
         }
 
+        fn begin_next_run(
+            &mut self,
+            expected_session_version: u64,
+            terminal_run_id: &str,
+        ) -> Result<()> {
+            if self.snapshot.version != expected_session_version
+                || self.snapshot.run_id != terminal_run_id
+                || !self.snapshot.state.is_terminal()
+            {
+                bail!("fake next-run gate failed");
+            }
+            self.snapshot.version = self
+                .snapshot
+                .version
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("fake session version overflow"))?;
+            self.snapshot.run_id = "run-fake-next".into();
+            self.snapshot.state = crate::control_api::SessionState::AwaitingPlan;
+            self.snapshot.plan_version = None;
+            self.snapshot.plan_hash = None;
+            self.snapshot.current_task_ordinal = None;
+            self.snapshot.active_worker = None;
+            self.snapshot.pending_architect_action = None;
+            self.snapshot.terminal_detail = None;
+            self.snapshot.tasks.clear();
+            self.startup.run_id.clone_from(&self.snapshot.run_id);
+            Ok(())
+        }
+
         fn replace_plan(
             &mut self,
             _expected_session_version: u64,
@@ -1383,11 +1490,15 @@ mod tests {
 
         fn clarification_page(
             &self,
+            run_id: &str,
             task_ordinal: u32,
             task_key: &str,
             after_sequence: u32,
             _limit: u8,
         ) -> Result<ClarificationPage> {
+            if run_id != self.snapshot.run_id {
+                bail!("fake clarification run mismatch");
+            }
             let task = self
                 .snapshot
                 .tasks
@@ -1569,6 +1680,7 @@ mod tests {
             request_id: request_id.into(),
             caller,
             action: ControlAction::SessionWait {
+                run_id: "run-wait-test".into(),
                 after_session_version: version,
             },
         }
@@ -1627,6 +1739,94 @@ mod tests {
         };
         assert_eq!(session.state, crate::control_api::SessionState::Completed);
         assert_eq!(session.version, 11);
+    }
+
+    #[test]
+    fn terminal_run_begin_creates_a_new_run_and_old_wait_identity_is_rejected() {
+        let (mut control, caller, peer) =
+            fake_wait_control(crate::control_api::SessionState::Completed, 11, false);
+        let begin = ControlRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: "begin-next-run".into(),
+            caller: caller.clone(),
+            action: ControlAction::SessionRunBegin {
+                expected_session_version: 11,
+                terminal_run_id: "run-wait-test".into(),
+            },
+        };
+        let first = control.handle_request(peer, &begin);
+        assert!(first.ok);
+        let Some(ControlResult::Session { session }) = first.result.as_ref() else {
+            panic!("run begin must return the new session snapshot")
+        };
+        assert_eq!(session.run_id, "run-fake-next");
+        assert_eq!(session.version, 12);
+        assert_eq!(
+            session.state,
+            crate::control_api::SessionState::AwaitingPlan
+        );
+        assert!(session.tasks.is_empty());
+        assert_eq!(control.supervisor.startup().run_id, "run-fake-next");
+        assert_eq!(
+            control.handle_request(peer, &begin),
+            first,
+            "a retained begin request must replay its exact new-run response"
+        );
+
+        let stale_retry = ControlRequest {
+            request_id: "begin-next-run-stale-retry".into(),
+            ..begin.clone()
+        };
+        let rejected = control.handle_request(peer, &stale_retry);
+        assert_eq!(
+            rejected.error.map(|error| error.code),
+            Some(ControlErrorCode::Conflict)
+        );
+        assert_eq!(control.supervisor.snapshot().run_id, "run-fake-next");
+        assert_eq!(control.supervisor.snapshot().version, 12);
+
+        let mut stale_wait =
+            serve_wait(&mut control, &wait_request(caller, "wait-from-old-run", 11));
+        let frame = read_response_frame(&mut stale_wait).unwrap();
+        let response: ControlResponse = serde_json::from_slice(&frame).unwrap();
+        let error = response.error.expect("stale wait must return an error");
+        assert_eq!(error.code, ControlErrorCode::Conflict);
+        assert!(error.message.contains("current run_id is run-fake-next"));
+        assert!(control.pending_wait.is_none());
+    }
+
+    #[test]
+    fn next_run_releases_an_unserviced_terminal_wait_from_the_old_run() {
+        let (mut control, caller, peer) =
+            fake_wait_control(crate::control_api::SessionState::Running, 7, false);
+        let mut old_wait = serve_wait(
+            &mut control,
+            &wait_request(caller.clone(), "old-run-pending-wait", 7),
+        );
+        assert!(control.pending_wait.is_some());
+        control.supervisor.cancel(7, "old run completed").unwrap();
+
+        let begin = ControlRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: "begin-before-old-wait-service".into(),
+            caller,
+            action: ControlAction::SessionRunBegin {
+                expected_session_version: 8,
+                terminal_run_id: "run-wait-test".into(),
+            },
+        };
+        assert!(control.handle_request(peer, &begin).ok);
+        assert_eq!(control.supervisor.snapshot().run_id, "run-fake-next");
+        control.service_pending_wait();
+        assert!(control.pending_wait.is_none());
+
+        let frame = read_response_frame(&mut old_wait).unwrap();
+        let response: ControlResponse = serde_json::from_slice(&frame).unwrap();
+        let error = response
+            .error
+            .expect("old pending wait must return an error");
+        assert_eq!(error.code, ControlErrorCode::Conflict);
+        assert!(error.message.contains("current run_id is run-fake-next"));
     }
 
     #[test]
@@ -1768,8 +1968,9 @@ mod tests {
         let request = ControlRequest {
             protocol_version: PROTOCOL_VERSION,
             request_id: "clarification-page".into(),
-            caller,
+            caller: caller.clone(),
             action: ControlAction::SessionClarificationsList {
+                run_id: "run-wait-test".into(),
                 task_ordinal: 0,
                 task_key: "wait-task".into(),
                 after_sequence: 0,
@@ -1787,6 +1988,31 @@ mod tests {
         assert_eq!(page.task_key, "wait-task");
         assert_eq!(page.total_records, 0);
         assert!(page.records.is_empty());
+        assert!(control.requests.is_empty());
+
+        let wrong_run = ControlRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: "clarification-page-wrong-run".into(),
+            caller,
+            action: ControlAction::SessionClarificationsList {
+                run_id: "run-older".into(),
+                task_ordinal: 0,
+                task_key: "wait-task".into(),
+                after_sequence: 0,
+                limit: 8,
+            },
+        };
+        let (mut client, server) = UnixStream::pair().unwrap();
+        write_request_frame(&mut client, &serde_json::to_vec(&wrong_run).unwrap()).unwrap();
+        control.serve_stream(server).unwrap();
+        let response: ControlResponse =
+            serde_json::from_slice(&read_response_frame(&mut client).unwrap()).unwrap();
+        let error = response
+            .error
+            .expect("wrong-run clarification list must return an error");
+        assert_eq!(error.code, ControlErrorCode::Conflict);
+        assert!(error.message.contains("current run_id is run-wait-test"));
+        assert!(!error.message.contains("task or cursor"));
         assert!(control.requests.is_empty());
     }
 

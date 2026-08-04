@@ -134,17 +134,29 @@ metadata but never the Reviewer body.
 Developer clarification/blocker requests also route only through durable
 paths. Each accepted clarification becomes ordered task runtime evidence and
 is supplied by path to every later Developer and Reviewer turn; it does not
-change the approved plan hash. `session_wait` returns for a latched action or a
-terminal state. Each action has a `published_version`: an interrupted client
-can recover it by waiting from an older version, while a repeated wait at the
-published version is rejected until the action is resolved. Status snapshots
-carry only each task's clarification count; the ordered records are available
-through pages of at most eight. The runtime enforces 64 records per task and
-1280 per run independently of whether an answer is Architect-derived or
-human-confirmed. At terminal return, the Architect reads every non-empty final
-Reviewer file in order and delivers the original verdict and findings. It
-distinguishes LGTM, `review_exhausted`, and lifecycle failure and does not rerun
-tests, review, or validation unless the human explicitly asks.
+change the approved plan hash. `session_wait` is bound to the exact current run
+ID and returns for a latched action or a terminal state. Each action has a
+`published_version`: an interrupted client can recover it by waiting from an
+older version in that run, while a repeated wait at the published version is
+rejected until the action is resolved. Status snapshots carry only each task's
+clarification count; the ordered records are available through run-bound pages
+of at most eight. The runtime enforces 64 records per task and 1280 per run
+independently of whether an answer is Architect-derived or human-confirmed. At
+terminal return, the Architect reads every non-empty final Reviewer file in
+order and delivers the original verdict and findings. It distinguishes LGTM,
+`review_exhausted`, and lifecycle failure and does not rerun tests, review, or
+validation unless the human explicitly asks.
+
+The terminal run stays immutable. After its evidence handoff, a later human
+request may use `session_run_begin` to allocate a new run ID under the same
+foreground Architect. The new run resets task and logical worker identity but
+keeps a monotonically increasing session version and the frozen
+project/profile binding. Its plan hash is run-bound, and it still needs a fresh
+plan plus explicit approval before any worker starts.
+The first approved run acquires the project `hcom-tasks` ownership lock. That
+project lease remains held by the foreground supervisor across every terminal
+run and `session_run_begin`; per-run evidence directories are claimed
+separately, and only the foreground parent exit releases the lease.
 
 ## Test map
 
@@ -156,6 +168,8 @@ tests, review, or validation unless the human explicitly asks.
 | native worker argv/config | `worker::exec_runtime::tests::happy_developer_turn_completes_and_captures_thread_id`, `reviewer_registers_the_external_repository_as_a_native_workspace_root` |
 | byte-exact native environment with no additions | `orchestrator::task_lane::tests::complete_parent_environment_is_preserved_byte_for_byte` |
 | path-only peer and terminal handoff | `orchestrator::task_lane::tests::request_changes_round_routes_only_ordered_durable_paths`, `architect::bridge::tests::session_wait_keeps_mcp_responsive_and_returns_terminal_result` |
+| sequential immutable runs in one Architect | `orchestrator::core::tests::terminal_core_creates_a_fresh_run_without_mutating_terminal_evidence`, `orchestrator::task_lane::tests::one_foreground_supervisor_runs_two_immutable_runs_with_fresh_workers`, `control_api::supervisor::tests::terminal_run_begin_creates_a_new_run_and_old_wait_identity_is_rejected` |
+| project ownership survives run transition | `orchestrator::task_lane::tests::one_foreground_supervisor_runs_two_immutable_runs_with_fresh_workers`, `orchestrator::workspace::tests::a_second_process_cannot_open_the_project_workspace_while_it_is_locked` |
 | bounded clarification control plane | `orchestrator::core::tests::status_snapshot_is_bounded_and_clarification_records_are_exactly_paginated`, `control_api::codec::tests::maximum_clarification_page_stays_within_the_control_response_frame`, `orchestrator::core::tests::clarification_capacity_exhaustion_terminalizes_instead_of_latching_more_state` |
 | clarification artifact failure closes the run | `orchestrator::task_lane::tests::preexisting_clarification_artifact_terminalizes_instead_of_wedging_the_run` |
 | real CLI assumptions | `scripts/codex-exec-contract-smokes` |

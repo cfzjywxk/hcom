@@ -39,6 +39,7 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 const MAX_BWRAP_INFO_BYTES: usize = 4096;
 const MAX_INHERITED_CREDENTIAL_SOCKETS: usize = 8;
@@ -111,7 +112,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         Vec::new()
     };
     let control_paths = ControlPaths::new(&run_root)?;
-    let run_id = format!("run-{}", random_hex(16)?);
+    let run_id = format!("run-{}", Uuid::new_v4().simple());
     let runtime_sources = SessionRuntimeSources::capture(
         native_environment.parent_environment.clone(),
         loaded.profiles.clone(),

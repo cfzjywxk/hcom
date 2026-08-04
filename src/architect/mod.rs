@@ -82,7 +82,7 @@ plan revision/hash and confirmation bit, not OS-level keyboard provenance.
 
 Only typed profile fields are accepted; arbitrary native argv is not. The
 effective sanitized profiles and their SHA-256 hash are printed at startup and
-used for that foreground run.
+frozen for every sequential run in that foreground Architect invocation.
 
 No prompt argument, stdin payload, terminal injection, or automatic first turn
 is used. The human owns every architect terminal input. The Architect has a
@@ -113,7 +113,8 @@ installs, resets, rebases, merges, or applies changes.
 The foreground parent owns every worker and task-local exec runtime; it keeps
 state only in memory and performs no daemon, project store, or cross-session
 recovery. Same-task corrections use the exact native Developer/Reviewer thread.
-After dispatch, the Codex Architect opens one blocking session_wait MCP call.
+Different tasks and different runs use fresh workers. After dispatch, the Codex
+Architect opens one blocking session_wait MCP call bound to the exact run_id.
 The foreground supervisor advances Developer and Reviewer without Architect
 model calls and completes that wait for a terminal state or a latched
 Developer clarification/blocker action. The Architect answers a defensible
@@ -129,13 +130,18 @@ wait from a version older than its published_version; a same-version repeated
 wait is rejected until the action is resolved. A retained terminal result
 reached during the gap remains immediately available. Status snapshots carry
 clarification counts; session_clarifications_list reads the ordered records in
-bounded pages.
+bounded pages bound to that run_id.
 The terminal snapshot contains each task's latest Developer final path, ordered
 final Reviewer message paths, and Reviewer verdict, never the Reviewer body.
 The Architect reads every final Reviewer file in order and delivers its
 original verdict and findings, distinguishing LGTM, review exhaustion, and
 lifecycle failure. It does not rerun tests, review, or validation unless the
-human explicitly requests that work.
+human explicitly requests that work. A terminal run remains immutable but does
+not end the foreground Architect. After completing that evidence handoff, a
+later human request can call session_run_begin with the exact terminal run_id
+and version to create a fresh empty run under the same parent. The new run gets
+a new run_id, monotonically advances the session version, resets run-local
+task/worker identity, and still requires a separately bound and approved plan.
 
 See docs/architect.md for the complete TOML schema and examples."#
 }

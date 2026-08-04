@@ -181,7 +181,8 @@ that plan; there is no host-path allowlist. The Codex Architect has the native
 same-user host view; hcom commands inside it use private per-run state so the
 live retained hcom store is not addressed through the normal CLI.
 
-After dispatch, the Codex Architect makes a blocking `session_wait` call.
+After dispatch, the Codex Architect makes a blocking `session_wait` call bound
+to the exact current run ID.
 The foreground supervisor advances Developer and Reviewer without Architect
 model calls and returns for a terminal state or a latched Developer
 clarification/blocker action; normal role transitions do not wake it. A
@@ -194,8 +195,22 @@ an older-version reconnect re-delivers it, while a same-version repeat is
 rejected until the action is resolved. Terminal results reached during a gap
 remain immediately available. `session_status` is for an explicit human
 progress query only and carries clarification counts, not the accumulating
-record list; `session_clarifications_list` reads records in pages of at most
-eight.
+record list; `session_clarifications_list` reads records for the exact run in
+pages of at most eight.
+
+A terminal run remains immutable but does not end the foreground Architect.
+After delivering all Reviewer and clarification evidence, a later human
+request can use `session_run_begin` with that terminal run ID and version to
+create a fresh empty run in the same Architect process. The new run has a new
+run ID, fresh Developer/Reviewer sessions and a separately bound and approved
+plan; the cross-run session version remains monotonic so delayed old mutations
+cannot match it. No new terminal, daemon, or cross-parent recovery is involved.
+Once the first approved run acquires the project `hcom-tasks/.lock`, the
+foreground supervisor retains that ownership lease across terminal handoff and
+`session_run_begin`; only the per-run evidence handle changes. A later approve
+claims its fresh run directory under the existing lease, so a newer hcom
+session cannot displace the live foreground Architect between runs. The lease
+is released when that foreground parent exits.
 
 ---
 

@@ -1242,7 +1242,7 @@ mod tests {
                 "method":"tools/call",
                 "params":{
                     "name":"session_wait",
-                    "arguments":{"after_session_version":4}
+                    "arguments":{"run_id":"run-test","after_session_version":4}
                 }
             }),
         )
@@ -1300,8 +1300,9 @@ mod tests {
         assert!(matches!(
             request.action,
             ControlAction::SessionWait {
+                ref run_id,
                 after_session_version: 4
-            }
+            } if run_id == "run-test"
         ));
     }
 
@@ -1340,7 +1341,7 @@ mod tests {
                 "method":"tools/call",
                 "params":{
                     "name":"session_wait",
-                    "arguments":{"after_session_version":6}
+                    "arguments":{"run_id":"run-test","after_session_version":6}
                 }
             }),
         )
@@ -1371,8 +1372,9 @@ mod tests {
         assert!(matches!(
             request.action,
             ControlAction::SessionWait {
+                ref run_id,
                 after_session_version: 6
-            }
+            } if run_id == "run-test"
         ));
 
         write_json_line(
@@ -1438,7 +1440,7 @@ mod tests {
                     "method":"tools/call",
                     "params":{
                         "name":"session_wait",
-                        "arguments":{"after_session_version":8}
+                        "arguments":{"run_id":"run-test","after_session_version":8}
                     }
                 }),
             )
@@ -1469,8 +1471,9 @@ mod tests {
             assert!(matches!(
                 request.action,
                 ControlAction::SessionWait {
+                    ref run_id,
                     after_session_version: 8
-                }
+                } if run_id == "run-test"
             ));
         }
     }

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
@@ -71,6 +71,7 @@ impl CallerAuth {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionName {
+    SessionRunBegin,
     SessionPlanReplace,
     SessionApproveAndStart,
     SessionClarificationSubmit,
@@ -82,7 +83,8 @@ pub enum ActionName {
 }
 
 impl ActionName {
-    pub const ARCHITECT: [Self; 8] = [
+    pub const ARCHITECT: [Self; 9] = [
+        Self::SessionRunBegin,
         Self::SessionPlanReplace,
         Self::SessionApproveAndStart,
         Self::SessionClarificationSubmit,
@@ -92,10 +94,11 @@ impl ActionName {
         Self::SessionStatus,
         Self::SessionCancel,
     ];
-    pub const ALL: [Self; 8] = Self::ARCHITECT;
+    pub const ALL: [Self; 9] = Self::ARCHITECT;
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::SessionRunBegin => "session_run_begin",
             Self::SessionPlanReplace => "session_plan_replace",
             Self::SessionApproveAndStart => "session_approve_and_start",
             Self::SessionClarificationSubmit => "session_clarification_submit",
@@ -111,6 +114,10 @@ impl ActionName {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlAction {
+    SessionRunBegin {
+        expected_session_version: u64,
+        terminal_run_id: String,
+    },
     SessionPlanReplace {
         expected_session_version: u64,
         developer_adapter: String,
@@ -140,12 +147,14 @@ pub enum ControlAction {
         developer_request_path: String,
     },
     SessionClarificationsList {
+        run_id: String,
         task_ordinal: u32,
         task_key: String,
         after_sequence: u32,
         limit: u8,
     },
     SessionWait {
+        run_id: String,
         after_session_version: u64,
     },
     SessionStatus,
@@ -158,6 +167,7 @@ pub enum ControlAction {
 impl ControlAction {
     pub fn name(&self) -> ActionName {
         match self {
+            Self::SessionRunBegin { .. } => ActionName::SessionRunBegin,
             Self::SessionPlanReplace { .. } => ActionName::SessionPlanReplace,
             Self::SessionApproveAndStart { .. } => ActionName::SessionApproveAndStart,
             Self::SessionClarificationSubmit { .. } => ActionName::SessionClarificationSubmit,
@@ -177,6 +187,9 @@ impl ControlAction {
 
     fn validate(&self) -> Result<(), ProtocolValidationError> {
         match self {
+            Self::SessionRunBegin {
+                terminal_run_id, ..
+            } => validate_id("terminal_run_id", terminal_run_id),
             Self::SessionPlanReplace {
                 developer_adapter,
                 reviewer_adapter,
@@ -237,8 +250,12 @@ impl ControlAction {
                 validate_document_path("developer request path", developer_request_path)
             }
             Self::SessionClarificationsList {
-                task_key, limit, ..
+                run_id,
+                task_key,
+                limit,
+                ..
             } => {
+                validate_id("run_id", run_id)?;
                 validate_id("task_key", task_key)?;
                 if !(1..=MAX_CLARIFICATION_PAGE_RECORDS).contains(limit) {
                     return Err(ProtocolValidationError::new(
@@ -247,7 +264,8 @@ impl ControlAction {
                 }
                 Ok(())
             }
-            Self::SessionWait { .. } | Self::SessionStatus => Ok(()),
+            Self::SessionWait { run_id, .. } => validate_id("run_id", run_id),
+            Self::SessionStatus => Ok(()),
             Self::SessionCancel { reason, .. } => {
                 validate_free_text("cancel reason", reason, 4096, false)
             }
@@ -856,6 +874,24 @@ mod tests {
     }
 
     #[test]
+    fn next_run_requires_an_exact_terminal_run_identity() {
+        let action = ControlAction::SessionRunBegin {
+            expected_session_version: 9,
+            terminal_run_id: "run-completed".into(),
+        };
+        assert!(action.validate().is_ok());
+        let mut invalid = action;
+        let ControlAction::SessionRunBegin {
+            terminal_run_id, ..
+        } = &mut invalid
+        else {
+            unreachable!()
+        };
+        terminal_run_id.push('\n');
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
     fn clarification_actions_require_exact_bounded_identity_fields() {
         let submit = ControlAction::SessionClarificationSubmit {
             expected_session_version: 8,
@@ -888,6 +924,7 @@ mod tests {
         assert!(require_human.validate().is_ok());
 
         let page = ControlAction::SessionClarificationsList {
+            run_id: "run-one".into(),
             task_ordinal: 0,
             task_key: "task-one".into(),
             after_sequence: 0,
@@ -904,10 +941,10 @@ mod tests {
 
     #[test]
     fn previous_protocol_version_fails_closed() {
-        assert_eq!(PROTOCOL_VERSION, 5);
+        assert_eq!(PROTOCOL_VERSION, 6);
         let request = ControlRequest {
-            protocol_version: 4,
-            request_id: "v4-request".into(),
+            protocol_version: 5,
+            request_id: "v5-request".into(),
             caller: CallerAuth::Human {
                 process_birth: "123:456".into(),
             },
@@ -916,8 +953,8 @@ mod tests {
         assert!(request.validate().is_err());
 
         let response = ControlResponse {
-            protocol_version: 4,
-            request_id: "v4-response".into(),
+            protocol_version: 5,
+            request_id: "v5-response".into(),
             ok: false,
             result: None,
             error: Some(ControlErrorBody {
@@ -937,6 +974,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "session_run_begin",
                 "session_plan_replace",
                 "session_approve_and_start",
                 "session_clarification_submit",

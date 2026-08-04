@@ -1,13 +1,16 @@
 # Architect and in-session task workers
 
 `hcom arch` starts one blank foreground Codex or Claude Architect plus a
-session-local, in-memory task supervisor. After the human authorizes a typed
-ordered plan, the parent starts fresh no-TTY Codex Developer and Reviewer
-sessions for each task. Same-task correction/re-review resumes the exact
-original role session; a later task starts fresh sessions.
+foreground-local, in-memory task supervisor. One foreground Architect may
+execute multiple sequential runs. After the human authorizes a typed ordered
+plan, the parent starts fresh no-TTY Codex Developer and Reviewer sessions for
+each task. Same-task correction/re-review resumes the exact original role
+session; a later task or later run starts fresh sessions.
 
 There is no daemon, Project Store, cross-Architect recovery, final apply, push,
-or install. Parent exit stops the workers and loses the in-memory run state.
+or install. Parent exit stops the workers and loses the current in-memory
+control state. Each terminal run and its durable artifacts remain immutable;
+starting another run does not revive or modify it.
 
 ## Start
 
@@ -111,7 +114,7 @@ second path before development or review.
 Profiles live in `$HCOM_DIR/config.toml`; without `HCOM_DIR`, the path is
 `~/.hcom/config.toml`. The parent reads and validates it once before starting
 the Architect. It prints the effective profiles and a SHA-256 profile hash;
-editing the file later does not change a running session.
+editing the file later does not change any run in that foreground invocation.
 
 Built-in defaults are:
 
@@ -206,6 +209,11 @@ session_approve_and_start({
   plan_hash,
   approval_confirmed: true
 })
+
+session_wait({
+  run_id,
+  after_session_version
+})
 ```
 
 The supervisor validates the exact session version, plan version/hash, frozen
@@ -233,6 +241,28 @@ file-only route:
 No peer body, redacted summary, or inline/file alternative enters these
 prompts. Same-task correction and re-review resume the exact respective role
 session.
+
+After a run reaches a terminal state, the Architect first completes its
+Reviewer and clarification evidence handoff. If the human later requests more
+delegated work, the same foreground Architect creates a new empty run:
+
+```text
+session_run_begin({
+  expected_session_version: <terminal version>,
+  terminal_run_id: <terminal run_id>
+})
+```
+
+This does not bind a plan, approve execution, or start a worker. It returns a
+new `run_id` in `awaiting_plan`; plan versioning restarts for that run, while
+the session version continues monotonically across the foreground invocation.
+The plan hash includes the new run identity. The old run remains unchanged
+under its original `<project>/hcom-tasks/<run-id>/` directory.
+After the first approved run opens `hcom-tasks`, its project-wide ownership
+lock stays with the foreground supervisor through every terminal handoff and
+run transition. `session_run_begin` drops only the old per-run evidence handle;
+the next approval claims a new run directory without releasing or reacquiring
+the project lock. The lock is released only when the foreground parent exits.
 
 ## Worker process and filesystem behavior
 
@@ -297,12 +327,14 @@ state. Parent exit/cancel stops the active process group. hcom never pushes,
 installs, resets, rebases, or automatically recovers after the parent exits.
 
 After dispatch, the Codex Architect calls `session_wait` with the returned
-session version. This blocking MCP subscription completes when the run becomes
-`completed`, `needs_human`, `failed`, or `canceled`, or when a Developer
-clarification/blocker action is latched. The local supervisor continues
-lifecycle monitoring and advances normal Developer-to-Reviewer and correction
-transitions without Architect model calls. Codex may display `Working` for the
-duration, but it does not sleep, poll `session_status`, or repeatedly infer.
+run ID and session version. This blocking MCP subscription completes when the
+run becomes `completed`, `needs_human`, `failed`, or `canceled`, or when a
+Developer clarification/blocker action is latched. The local supervisor
+continues lifecycle monitoring and advances normal Developer-to-Reviewer and
+correction transitions without Architect model calls. Codex may display
+`Working` for the duration, but it does not sleep, poll `session_status`, or
+repeatedly infer. A wait bound to an earlier run ID is rejected and can never
+subscribe to a later run.
 
 Esc or MCP cancellation closes only the current wait subscription; it does not
 cancel the supervisor run. A pending Architect action records the session
@@ -348,15 +380,23 @@ Every terminal snapshot carries, for every task, its
 `latest_developer_final_path`, ordered `final_reviewer_message_paths`, and
 `reviewer_verdict`. It carries `clarification_record_count` rather than the
 accumulating record vector; the Architect uses `session_clarifications_list`
-with pages of at most eight to read the ordered chain. The Reviewer body is not
-copied into either the MCP compatibility text or `structuredContent`. After
-`session_wait` returns, the
+with the exact run ID and pages of at most eight to read the ordered chain. The
+Reviewer body is not copied into either the MCP compatibility text or
+`structuredContent`. After `session_wait` returns, the
 Architect reads every non-empty Reviewer path in order and uses the original
 verdict and findings for the human-facing delivery. It distinguishes `lgtm`,
 `review_exhausted`, and lifecycle failure from the typed task/session state;
 an empty list means that no Reviewer final was successfully published. The
 Architect does not rerun tests, perform another review, or repeat validation
 unless the human explicitly requests that extra work.
+
+The Architect must finish clarification pagination before
+`session_run_begin`: the old files remain durable, but the in-memory
+clarification control target moves to the new run. Beginning the next run
+resets logical Developer/Reviewer session and turn counters, allocates a new
+artifact namespace, and retains the same captured parent environment and
+frozen role profiles. It does not require a new terminal or a new native
+Architect process.
 
 ## Verification
 

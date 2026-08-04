@@ -6,7 +6,7 @@
 use super::core::{
     DriverFailure, DriverFailureClass, SupervisorCore, SupervisorEffect, SupervisorEvent,
 };
-use super::workspace::TasksWorkspace;
+use super::workspace::{ProjectTasksWorkspace, TasksWorkspace};
 use super::{SessionRuntimeSources, SessionStartup, ensure_private_directory, sha256_hex};
 use crate::control_api::{SessionState, SessionStatusSnapshot, TaskDraft, TaskState, WorkerRole};
 use crate::worker::environment::{
@@ -177,6 +177,7 @@ pub(crate) struct TaskLaneSupervisor {
     active: Option<ActiveTurn>,
     next_session: u64,
     next_turn: u64,
+    project_tasks_workspace: Option<ProjectTasksWorkspace>,
     tasks_workspace: Option<TasksWorkspace>,
 }
 
@@ -241,12 +242,55 @@ impl TaskLaneSupervisor {
             active: None,
             next_session: 1,
             next_turn: 1,
+            project_tasks_workspace: None,
             tasks_workspace: None,
         })
     }
 
     pub(crate) fn startup(&self) -> &SessionStartup {
         &self.startup
+    }
+
+    pub(crate) fn begin_next_run(
+        &mut self,
+        expected_session_version: u64,
+        terminal_run_id: &str,
+    ) -> Result<()> {
+        let run_id = format!("run-{}", Uuid::new_v4().simple());
+        self.begin_next_run_with_id(expected_session_version, terminal_run_id, run_id)
+    }
+
+    fn begin_next_run_with_id(
+        &mut self,
+        expected_session_version: u64,
+        terminal_run_id: &str,
+        run_id: String,
+    ) -> Result<()> {
+        if expected_session_version != self.core.version() {
+            bail!("session version is stale");
+        }
+        if terminal_run_id != self.core.run_id() {
+            bail!("terminal run identity is stale");
+        }
+        if !self.core.session_state().is_terminal() {
+            bail!("a new run requires a terminal current run");
+        }
+        if self.task_runtime.is_some() || self.active.is_some() {
+            bail!("terminal run retained a live task runtime");
+        }
+        crate::worker::validation::validate_opaque_id("run id", &run_id)?;
+
+        let next_core = self
+            .core
+            .next_run(run_id.clone())
+            .map_err(|error| anyhow!(error.to_string()))?;
+        self.startup.run_id = run_id;
+        self.epoch = format!("exec-supervisor-{}", Uuid::new_v4());
+        self.core = next_core;
+        self.next_session = 1;
+        self.next_turn = 1;
+        self.tasks_workspace = None;
+        Ok(())
     }
 
     pub(crate) fn replace_plan(
@@ -349,9 +393,23 @@ impl TaskLaneSupervisor {
         self.execute_effects(effects)
     }
 
-    fn stage_tasks_workspace(&self, plan_version: u64, plan_hash: &str) -> Result<TasksWorkspace> {
-        let workspace = TasksWorkspace::open(&self.startup.project_root, &self.startup.run_id)
-            .context("failed to open the hcom-tasks workspace")?;
+    fn stage_tasks_workspace(
+        &mut self,
+        plan_version: u64,
+        plan_hash: &str,
+    ) -> Result<TasksWorkspace> {
+        if self.project_tasks_workspace.is_none() {
+            self.project_tasks_workspace = Some(
+                ProjectTasksWorkspace::open(&self.startup.project_root)
+                    .context("failed to open the hcom-tasks workspace")?,
+            );
+        }
+        let workspace = self
+            .project_tasks_workspace
+            .as_ref()
+            .expect("project tasks workspace was opened above")
+            .claim_run(&self.startup.run_id)
+            .context("failed to claim the hcom-tasks run workspace")?;
         workspace.write_run_file(
             "plan.md",
             self.render_plan(plan_version, plan_hash).as_bytes(),
@@ -490,13 +548,14 @@ impl TaskLaneSupervisor {
 
     pub(crate) fn clarification_page(
         &self,
+        run_id: &str,
         task_ordinal: u32,
         task_key: &str,
         after_sequence: u32,
         limit: u8,
     ) -> Result<crate::control_api::ClarificationPage> {
         self.core
-            .clarification_page(task_ordinal, task_key, after_sequence, limit)
+            .clarification_page(run_id, task_ordinal, task_key, after_sequence, limit)
             .map_err(|error| anyhow!(error.to_string()))
     }
 
@@ -2303,6 +2362,174 @@ mod tests {
     }
 
     #[test]
+    fn one_foreground_supervisor_runs_two_immutable_runs_with_fresh_workers() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let scripts = vec![
+            task_script(
+                "first",
+                vec![
+                    FakeTurnScript::new(
+                        WorkerRole::Developer,
+                        RuntimeTurnPurpose::InitialDevelopment,
+                        [ready("first implemented")],
+                    ),
+                    FakeTurnScript::new(
+                        WorkerRole::Reviewer,
+                        RuntimeTurnPurpose::InitialReview,
+                        [lgtm("first sound")],
+                    ),
+                ],
+                vec![
+                    Mutation::Commit {
+                        path: "src/first.txt",
+                        contents: "first\n",
+                    },
+                    Mutation::None,
+                ],
+            ),
+            task_script(
+                "second",
+                vec![
+                    FakeTurnScript::new(
+                        WorkerRole::Developer,
+                        RuntimeTurnPurpose::InitialDevelopment,
+                        [ready("second implemented")],
+                    ),
+                    FakeTurnScript::new(
+                        WorkerRole::Reviewer,
+                        RuntimeTurnPurpose::InitialReview,
+                        [lgtm("second sound")],
+                    ),
+                ],
+                vec![
+                    Mutation::Commit {
+                        path: "src/second.txt",
+                        contents: "second\n",
+                    },
+                    Mutation::None,
+                ],
+            ),
+        ];
+        let mut supervisor = fixture.supervisor(scripts, Arc::clone(&audit));
+
+        start(&mut supervisor, vec![fixture.task("first", &["src"], 3)]);
+        let first_terminal = drive_terminal(&mut supervisor);
+        let first_run_id = first_terminal.run_id.clone();
+        let first_plan_path = fixture
+            .project_root
+            .join("hcom-tasks")
+            .join(&first_run_id)
+            .join("plan.md");
+        let first_plan = fs::read(&first_plan_path).unwrap();
+
+        supervisor
+            .begin_next_run_with_id(
+                first_terminal.version,
+                &first_run_id,
+                "run-driver-next".into(),
+            )
+            .unwrap();
+        let awaiting_plan = supervisor.snapshot();
+        assert_eq!(awaiting_plan.run_id, "run-driver-next");
+        assert_eq!(supervisor.startup().run_id, "run-driver-next");
+        assert_eq!(awaiting_plan.version, first_terminal.version + 1);
+        assert_eq!(awaiting_plan.state, SessionState::AwaitingPlan);
+        assert!(awaiting_plan.tasks.is_empty());
+        assert_eq!(awaiting_plan.plan_version, None);
+        assert_eq!(awaiting_plan.plan_hash, None);
+        assert_eq!(fs::read(&first_plan_path).unwrap(), first_plan);
+        assert!(
+            supervisor.project_tasks_workspace.is_some(),
+            "the foreground Architect must retain the project lease between runs"
+        );
+        assert!(
+            supervisor.tasks_workspace.is_none(),
+            "the terminal run handle must not become the next run handle"
+        );
+        let competing_session = ProjectTasksWorkspace::open(&fixture.project_root).unwrap_err();
+        assert!(
+            competing_session.to_string().contains("already holds"),
+            "a competing hcom session was not rejected between sequential runs: {competing_session}"
+        );
+        let competing_owner = Command::new("/usr/bin/flock")
+            .args(["--nonblock", "--exclusive"])
+            .arg(fixture.project_root.join("hcom-tasks/.lock"))
+            .arg("true")
+            .status()
+            .expect("probe the project workspace lease from another process");
+        assert!(
+            !competing_owner.success(),
+            "another process acquired the project workspace between sequential runs"
+        );
+
+        let before_rejected_restart = supervisor.snapshot();
+        assert!(
+            supervisor
+                .begin_next_run_with_id(
+                    before_rejected_restart.version,
+                    "run-driver-next",
+                    "run-too-early".into(),
+                )
+                .is_err()
+        );
+        assert_eq!(supervisor.snapshot(), before_rejected_restart);
+        assert!(
+            supervisor
+                .replace_plan(
+                    first_terminal.version,
+                    CODEX_TASK_WORKER_ADAPTER,
+                    CODEX_TASK_WORKER_ADAPTER,
+                    vec![fixture.task("stale", &["src"], 3)],
+                )
+                .is_err(),
+            "the previous run's terminal version must not match the new run"
+        );
+
+        let second_task = fixture.task("second", &["src"], 3);
+        let (plan_version, plan_hash) = supervisor
+            .replace_plan(
+                awaiting_plan.version,
+                CODEX_TASK_WORKER_ADAPTER,
+                CODEX_TASK_WORKER_ADAPTER,
+                vec![second_task],
+            )
+            .unwrap();
+        let awaiting_approval = supervisor.snapshot();
+        supervisor
+            .approve_and_start(awaiting_approval.version, plan_version, &plan_hash, true)
+            .unwrap();
+        let second_terminal = drive_terminal(&mut supervisor);
+        assert_eq!(second_terminal.run_id, "run-driver-next");
+        assert_eq!(second_terminal.state, SessionState::Completed);
+        assert!(second_terminal.version > first_terminal.version);
+        assert_eq!(fs::read(&first_plan_path).unwrap(), first_plan);
+        assert!(
+            fixture
+                .project_root
+                .join("hcom-tasks/run-driver-next/plan.md")
+                .is_file()
+        );
+
+        let audit = audit.lock().unwrap();
+        assert_eq!(audit.opens, ["first", "second"]);
+        assert_eq!(audit.shutdowns, ["first", "second"]);
+        assert_eq!(
+            audit
+                .sessions
+                .iter()
+                .map(|(task, role, key)| (task.as_str(), *role, *key))
+                .collect::<Vec<_>>(),
+            [
+                ("first", WorkerRole::Developer, 1),
+                ("first", WorkerRole::Reviewer, 2),
+                ("second", WorkerRole::Developer, 1),
+                ("second", WorkerRole::Reviewer, 2),
+            ]
+        );
+    }
+
+    #[test]
     fn correction_and_rereview_reuse_each_exact_role_session() {
         let fixture = Fixture::new();
         let audit = Arc::new(Mutex::new(Audit::default()));
@@ -3846,6 +4073,39 @@ mod tests {
     }
 
     #[test]
+    fn run_claim_failure_keeps_the_project_lease_until_foreground_drop() {
+        let fixture = Fixture::new();
+        let owner = ProjectTasksWorkspace::open(&fixture.project_root).unwrap();
+        let stale_run = owner.claim_run("run-driver-test").unwrap();
+        drop(stale_run);
+        drop(owner);
+
+        let mut supervisor = fixture.supervisor(Vec::new(), Arc::new(Mutex::new(Audit::default())));
+        let task = fixture.task("run-claim-failure", &["src"], 2);
+        let (plan_version, plan_hash) = supervisor
+            .replace_plan(
+                0,
+                CODEX_TASK_WORKER_ADAPTER,
+                CODEX_TASK_WORKER_ADAPTER,
+                vec![task],
+            )
+            .unwrap();
+        let error = supervisor
+            .approve_and_start(1, plan_version, &plan_hash, true)
+            .unwrap_err();
+        assert!(error.to_string().contains("claim the hcom-tasks run"));
+        assert_eq!(supervisor.snapshot().state, SessionState::NeedsHuman);
+        assert!(supervisor.project_tasks_workspace.is_some());
+        assert!(supervisor.tasks_workspace.is_none());
+
+        let competing_session = ProjectTasksWorkspace::open(&fixture.project_root).unwrap_err();
+        assert!(
+            competing_session.to_string().contains("already holds"),
+            "a failed per-run claim released the foreground project lease: {competing_session}"
+        );
+    }
+
+    #[test]
     fn successful_task_transition_is_not_committed_when_runtime_cleanup_fails() {
         let fixture = Fixture::new();
         let audit = Arc::new(Mutex::new(Audit::default()));
@@ -3987,7 +4247,9 @@ mod tests {
         assert_eq!(task.review_round, 1);
         assert_eq!(task.clarification_rounds_used, 1);
         assert_eq!(task.clarification_record_count, 1);
-        let clarification_page = supervisor.clarification_page(0, "clarify", 0, 8).unwrap();
+        let clarification_page = supervisor
+            .clarification_page(&terminal.run_id, 0, "clarify", 0, 8)
+            .unwrap();
         assert_eq!(clarification_page.records.len(), 1);
         assert_eq!(
             clarification_page.records[0].architect_clarification_path,
@@ -4240,7 +4502,7 @@ mod tests {
         assert_eq!(task.clarification_rounds_used, 1);
         assert_eq!(task.clarification_record_count, 2);
         let clarification_page = supervisor
-            .clarification_page(0, "human-answer", 0, 8)
+            .clarification_page(&terminal.run_id, 0, "human-answer", 0, 8)
             .unwrap();
         assert!(!clarification_page.records[0].human_decision_confirmed);
         assert!(clarification_page.records[1].human_decision_confirmed);

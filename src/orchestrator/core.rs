@@ -486,6 +486,15 @@ impl SupervisorCore {
         project_root: PathBuf,
         profile_hash: String,
     ) -> Result<Self, SupervisorError> {
+        Self::new_at_version(run_id, project_root, profile_hash, 0)
+    }
+
+    fn new_at_version(
+        run_id: String,
+        project_root: PathBuf,
+        profile_hash: String,
+        version: u64,
+    ) -> Result<Self, SupervisorError> {
         validate_identifier("run id", &run_id)?;
         let project_text = project_root
             .to_str()
@@ -497,7 +506,7 @@ impl SupervisorCore {
             project_root,
             profile_hash,
             session_state: SessionState::AwaitingPlan,
-            version: 0,
+            version,
             next_plan_version: 1,
             plan_version: None,
             plan_hash: None,
@@ -516,6 +525,31 @@ impl SupervisorCore {
         };
         core.assert_invariants()?;
         Ok(core)
+    }
+
+    /// Create the next immutable run for the same foreground Architect.
+    ///
+    /// The completed core is left untouched. The new core keeps the project
+    /// and frozen worker profile binding, resets all run-local task/session
+    /// state, and advances the session version so delayed mutations from an
+    /// earlier run cannot match the new one.
+    pub fn next_run(&self, run_id: String) -> Result<Self, SupervisorError> {
+        self.assert_invariants()?;
+        if !self.session_state.is_terminal() {
+            return Err(SupervisorError::invalid_transition(
+                "a new run requires a terminal current run",
+            ));
+        }
+        let version = self
+            .version
+            .checked_add(1)
+            .ok_or_else(|| SupervisorError::overflow("session version overflow"))?;
+        Self::new_at_version(
+            run_id,
+            self.project_root.clone(),
+            self.profile_hash.clone(),
+            version,
+        )
     }
 
     /// Compatibility constructor retained from P0 for source-level seam tests.
@@ -562,7 +596,8 @@ impl SupervisorCore {
 
     pub fn expected_plan_hash(&self, plan_version: u64, tasks: &[TaskDraft]) -> String {
         canonical_hash(&(
-            "hcom-codex-exec-session-plan-v3",
+            "hcom-codex-exec-session-plan-v4",
+            &self.run_id,
             plan_version,
             &self.project_root,
             &self.profile_hash,
@@ -626,11 +661,17 @@ impl SupervisorCore {
 
     pub fn clarification_page(
         &self,
+        run_id: &str,
         task_ordinal: u32,
         task_key: &str,
         after_sequence: u32,
         limit: u8,
     ) -> Result<ClarificationPage, SupervisorError> {
+        if run_id != self.run_id {
+            return Err(SupervisorError::invalid_identity(
+                "run id does not match the current run",
+            ));
+        }
         if !(1..=MAX_CLARIFICATION_PAGE_RECORDS).contains(&limit) {
             return Err(SupervisorError::invalid_event(
                 "clarification page limit is out of range",
@@ -3152,6 +3193,44 @@ mod tests {
     }
 
     #[test]
+    fn terminal_core_creates_a_fresh_run_without_mutating_terminal_evidence() {
+        let terminal = completed_core();
+        let before = terminal.clone();
+        let next = terminal.next_run("run-next".into()).unwrap();
+
+        assert_eq!(terminal, before);
+        assert_eq!(next.run_id(), "run-next");
+        assert_eq!(next.project_root(), terminal.project_root());
+        assert_eq!(next.profile_hash(), terminal.profile_hash());
+        assert_eq!(next.version(), terminal.version() + 1);
+        assert_eq!(next.session_state(), SessionState::AwaitingPlan);
+        assert!(next.tasks().is_empty());
+        assert_eq!(next.plan_version(), None);
+        assert_eq!(next.plan_hash(), None);
+        assert_eq!(next.current_task(), None);
+        assert!(next.snapshot().terminal_detail.is_none());
+
+        let nonterminal = new_core();
+        let error = nonterminal.next_run("run-too-early".into()).unwrap_err();
+        assert_eq!(error.code, SupervisorErrorCode::InvalidTransition);
+    }
+
+    #[test]
+    fn plan_hash_is_bound_to_the_exact_run() {
+        let tasks = vec![task("one", "/repo", 2)];
+        let first =
+            SupervisorCore::new("run-one".into(), PathBuf::from("/project"), "0".repeat(64))
+                .unwrap();
+        let second =
+            SupervisorCore::new("run-two".into(), PathBuf::from("/project"), "0".repeat(64))
+                .unwrap();
+        assert_ne!(
+            first.expected_plan_hash(1, &tasks),
+            second.expected_plan_hash(1, &tasks)
+        );
+    }
+
+    #[test]
     fn provider_transport_types_do_not_leak_into_the_core_source() {
         let source = include_str!("core.rs");
         let implementation = source
@@ -3610,7 +3689,7 @@ mod tests {
         let snapshot = core.snapshot();
         assert_eq!(snapshot.tasks[0].clarification_record_count, 10);
 
-        let first = core.clarification_page(0, "one", 0, 3).unwrap();
+        let first = core.clarification_page("run-1", 0, "one", 0, 3).unwrap();
         assert_eq!(
             first
                 .records
@@ -3622,7 +3701,7 @@ mod tests {
         assert_eq!(first.total_records, 10);
         assert_eq!(first.next_after_sequence, Some(3));
 
-        let final_page = core.clarification_page(0, "one", 3, 8).unwrap();
+        let final_page = core.clarification_page("run-1", 0, "one", 3, 8).unwrap();
         assert_eq!(
             final_page
                 .records
@@ -3632,9 +3711,13 @@ mod tests {
             [4, 5, 6, 7, 8, 9, 10]
         );
         assert_eq!(final_page.next_after_sequence, None);
-        assert!(core.clarification_page(0, "wrong", 0, 1).is_err());
-        assert!(core.clarification_page(0, "one", 11, 1).is_err());
-        assert!(core.clarification_page(0, "one", 0, 0).is_err());
+        assert!(
+            core.clarification_page("run-wrong", 0, "one", 0, 1)
+                .is_err()
+        );
+        assert!(core.clarification_page("run-1", 0, "wrong", 0, 1).is_err());
+        assert!(core.clarification_page("run-1", 0, "one", 11, 1).is_err());
+        assert!(core.clarification_page("run-1", 0, "one", 0, 0).is_err());
     }
 
     #[test]
