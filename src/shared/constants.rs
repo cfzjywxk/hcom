@@ -7,7 +7,39 @@ use super::ansi::{
     BG_BLUE, BG_GRAY, BG_GREEN, BG_RED, BG_YELLOW, FG_BLUE, FG_GRAY, FG_GREEN, FG_RED, FG_YELLOW,
 };
 
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// SemVer used by package metadata and machine-facing protocols.
+pub const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Format a SemVer release for human-facing hcom output.
+///
+/// The fork's patch segment is displayed with at least two digits while the
+/// package and machine-facing version remains valid SemVer.
+pub fn format_human_version(machine_version: &str) -> String {
+    let Some((major, rest)) = machine_version.split_once('.') else {
+        return machine_version.to_string();
+    };
+    let Some((minor, patch_and_suffix)) = rest.split_once('.') else {
+        return machine_version.to_string();
+    };
+    let patch_digits = patch_and_suffix
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    if patch_digits == 0 {
+        return machine_version.to_string();
+    }
+    let (patch, suffix) = patch_and_suffix.split_at(patch_digits);
+    let Ok(patch) = patch.parse::<u64>() else {
+        return machine_version.to_string();
+    };
+
+    format!("{major}.{minor}.{patch:02}{suffix}")
+}
+
+/// Current human-visible hcom version.
+pub fn human_version() -> String {
+    format_human_version(PACKAGE_VERSION)
+}
 
 /// CLI sender identity (the human operator).
 pub const SENDER: &str = "bigboss";
@@ -137,6 +169,25 @@ pub fn status_bg(status: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn human_version_pads_only_short_patch_segments() {
+        assert_eq!(format_human_version("1.0.1"), "1.0.01");
+        assert_eq!(format_human_version("1.0.9"), "1.0.09");
+        assert_eq!(format_human_version("1.0.10"), "1.0.10");
+        assert_eq!(format_human_version("1.0.100"), "1.0.100");
+        assert_eq!(
+            format_human_version("1.0.1-alpha+build"),
+            "1.0.01-alpha+build"
+        );
+        assert_eq!(format_human_version("invalid"), "invalid");
+    }
+
+    #[test]
+    fn package_and_human_versions_have_distinct_representations() {
+        assert_eq!(PACKAGE_VERSION, "1.0.1");
+        assert_eq!(human_version(), "1.0.01");
+    }
 
     #[test]
     fn test_mention_pattern_basic() {

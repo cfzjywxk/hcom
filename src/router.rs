@@ -50,15 +50,6 @@ fn is_launch_tool(name: &str) -> bool {
     matches!(name, "f" | "r") || name.parse::<Tool>().is_ok_and(|tool| tool.spec().released)
 }
 
-fn action_allows_update_notice(action: &Action) -> bool {
-    match action {
-        Action::Command { cmd, .. } => cmd != "update",
-        Action::Launch { .. } | Action::Version | Action::Help => true,
-        Action::Architect { .. } => false,
-        _ => false,
-    }
-}
-
 fn maybe_external_send_name_hint(
     cmd: &str,
     explicit_name: Option<&str>,
@@ -513,17 +504,12 @@ pub fn dispatch() -> anyhow::Result<()> {
     // Skip dev_root re-exec for `config dev_root` so a stale pointer can't
     // trap the user — the invoked binary owns its own dev_root setting. The
     // The session-task architect lane is also independent of retained v24 state.
-    if !is_config_dev_root_invocation(argv) && !matches!(&action, Action::Architect { .. }) {
-        maybe_reexec_dev_root();
-    }
-
-    // Check for updates on ordinary CLI commands (not hooks/pty/relay-worker —
-    // those need to be fast, silent, and free of unowned background children).
-    // `hcom update` handles its own output.
-    if action_allows_update_notice(&action)
-        && let Some(notice) = crate::update::get_update_notice()
+    let is_update = matches!(&action, Action::Command { cmd, .. } if cmd == "update");
+    if !is_config_dev_root_invocation(argv)
+        && !matches!(&action, Action::Architect { .. })
+        && !is_update
     {
-        eprintln!("{notice}");
+        maybe_reexec_dev_root();
     }
 
     match action {
@@ -642,7 +628,7 @@ pub fn dispatch() -> anyhow::Result<()> {
             std::process::exit(1);
         }
         Action::Version => {
-            println!("hcom {}", env!("CARGO_PKG_VERSION"));
+            println!("hcom {}", crate::shared::human_version());
         }
         Action::Help => {
             crate::commands::help::print_help();
@@ -742,6 +728,21 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         }
         v
     };
+
+    // The fork-owned update refusal must not open retained state, resolve
+    // identity, deliver messages, or delegate to an installer path.
+    if cmd == "update" {
+        use clap::Parser;
+        return match crate::commands::update::UpdateArgs::try_parse_from(
+            std::iter::once(cmd.to_string()).chain(cmd_argv),
+        ) {
+            Ok(args) => crate::commands::update::cmd_update(&args),
+            Err(error) => {
+                error.print().ok();
+                if error.use_stderr() { 1 } else { 0 }
+            }
+        };
+    }
 
     // "relay daemon" subcommand doesn't need DB or identity context
     if cmd == "relay" && cmd_argv.first().map(|s| s.as_str()) == Some("daemon") {
@@ -920,12 +921,6 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         "run" => clap_dispatch!(crate::commands::run::RunArgs, cmd, &cmd_argv, |args| {
             crate::commands::run::cmd_run(&db, &args, Some(&ctx))
         }),
-        "update" => clap_dispatch!(
-            crate::commands::update::UpdateArgs,
-            cmd,
-            &cmd_argv,
-            |args| crate::commands::update::cmd_update(&db, &args, Some(&ctx))
-        ),
         _ => {
             // Should never happen — only matched commands reach here
             eprintln!("Error: Unknown native command '{cmd}'");
@@ -1042,16 +1037,6 @@ mod tests {
     fn no_args_runs_tui() {
         let action = resolve_action(&[]);
         assert_eq!(action, Action::Tui);
-    }
-
-    #[test]
-    fn update_command_does_not_spawn_an_update_notice() {
-        assert!(!action_allows_update_notice(&resolve_action(&sv(&[
-            "update"
-        ]))));
-        assert!(action_allows_update_notice(&resolve_action(&sv(&[
-            "status"
-        ]))));
     }
 
     #[test]

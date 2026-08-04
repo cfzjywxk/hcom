@@ -31,6 +31,7 @@ pub use constants::{
     // Functions
     extract_mentions,
     format_pane_title,
+    human_version,
     status_bg,
     status_fg,
     status_icon,

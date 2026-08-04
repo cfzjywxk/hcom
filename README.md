@@ -1,8 +1,7 @@
 # hcom
 
-[![CI](https://github.com/aannoo/hcom/actions/workflows/ci.yml/badge.svg)](https://github.com/aannoo/hcom/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/aannoo/hcom)](https://github.com/aannoo/hcom/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/aannoo/hcom/blob/main/LICENSE)
+[![CI](https://github.com/cfzjywxk/hcom/actions/workflows/ci.yml/badge.svg)](https://github.com/cfzjywxk/hcom/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/cfzjywxk/hcom/blob/master/LICENSE)
 
 > **Hook your coding agents together**
 
@@ -19,32 +18,16 @@ https://github.com/user-attachments/assets/1ce23ed9-f529-4be0-8124-816aa4c2fd43
 ## Install
 
 ```bash
-brew install aannoo/hcom/hcom
+git clone https://github.com/cfzjywxk/hcom.git
+cd hcom
+cargo build --release --locked
+./target/release/hcom --version
 ```
 
-<details><summary>Other install options</summary>
-
-```bash
-# Shell installer for macOS, Linux, Android (Termux), and WSL
-curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
-```
-
-```powershell
-# PowerShell installer for Windows
-irm https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.ps1 | iex
-```
-
-```bash
-# With PyPI
-uv tool install hcom  # or: pip install hcom
-```
-
-```bash
-# Update any existing install to latest hcom version
-hcom update
-```
-
-</details>
+This fork does not follow upstream releases. The retained `hcom update`,
+`hcom update --check`, and `hcom update --go` forms report that upstream
+updates are disabled and return a nonzero status; build the selected fork
+revision instead.
 
 ---
 
@@ -426,7 +409,7 @@ hcom send -b @luna -- hey           # one-off message to an agent
 hcom list                           # show all active agents
 hcom term [name]                    # view/inject into an agent's PTY screen
 hcom events --wait <filters>         # Block until match for scripting
-hcom update                         # update hcom version
+hcom update                         # report disabled upstream updates (nonzero)
 ```
 
 `hcom run docs --cli` for all commands.
@@ -525,7 +508,7 @@ Custom scripts: drop `*.sh` or `*.py` into `~/.hcom/scripts/` — auto-discovere
 ```bash
 # Prerequisites: Rust 1.88+
 
-git clone https://github.com/aannoo/hcom.git
+git clone https://github.com/cfzjywxk/hcom.git
 cd hcom
 cargo build
 cargo test

@@ -9,23 +9,19 @@ cargo-dist-version = "0.31.0"
 ci = "github"
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-linux-android", "aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl", "x86_64-apple-darwin", "x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
-# The installers to generate for each app
-installers = ["shell", "powershell", "homebrew"]
+# The fork publishes installers only through its own GitHub release.
+installers = ["shell", "powershell"]
 # Use .tar.gz on Unix so curl-installed users on minimal Linux systems
 # don't need a separate `xz` executable just to unpack releases.
 unix-archive = ".tar.gz"
 # Local artifacts jobs to run in CI
 local-artifacts-jobs = ["./build-wheels"]
-# Publish jobs to run in CI
-publish-jobs = ["homebrew", "./publish-pypi"]
+# External package-manager publication is disabled for this fork.
+publish-jobs = []
 # Post-announce jobs to run after the release is published
 post-announce-jobs = ["./post-announce-compare-link"]
 # Extra setup steps to run before dist builds
 github-build-setup = "../build-setup.yml"
-# Custom permissions for reusable workflow jobs
-github-custom-job-permissions = { "publish-pypi" = { id-token = "write", contents = "write" } }
-# A GitHub repo to push Homebrew formulas to
-tap = "aannoo/homebrew-hcom"
 # Whether dist should create a Github Release or use an existing draft
 create-release = true
 # Path that installers should place binaries in

@@ -1,18 +1,7 @@
 #!/bin/sh
 set -eu
 
-NEW_URL="https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh"
-
-cat <<EOF
-install.sh has moved and this compatibility shim will be removed in a future release.
-Please update your command to:
-
-  curl -fsSL $NEW_URL | sh
-
-Running the new installer now...
-EOF
-
-SHIM_TMP=$(mktemp)
-curl -fsSL "$NEW_URL" -o "$SHIM_TMP"
-sh "$SHIM_TMP"
-rm -f "$SHIM_TMP"
+printf >&2 '%s\n' \
+  'Error: the upstream installer is disabled for this fork.' \
+  'Build a selected fork revision with `cargo build --release --locked`.'
+exit 1

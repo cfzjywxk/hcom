@@ -648,20 +648,17 @@ const STATUS_HELP: &[HelpEntry] = &[
 ];
 
 const UPDATE_HELP: &[HelpEntry] = &[
-    ("update", "Check for and apply updates"),
+    ("update", "Report that upstream updates are disabled"),
     (
         "update --check",
-        "Only check — print status without applying",
+        "Report disabled upstream updates (returns nonzero)",
+    ),
+    (
+        "update --go",
+        "Report disabled upstream updates (returns nonzero)",
     ),
     ("", ""),
-    (
-        "",
-        "Detects install method and runs the right update command:",
-    ),
-    ("", "  brew install    → brew upgrade hcom"),
-    ("", "  uv tool install → uv tool upgrade hcom"),
-    ("", "  pip install     → pip install -U hcom"),
-    ("", "  curl installer  → re-run hcom-installer.sh"),
+    ("", "This fork never fetches or installs upstream releases."),
 ];
 
 const HOOKS_HELP: &[HelpEntry] = &[
@@ -984,8 +981,8 @@ Commands:\n\
   hooks        Add or remove hooks\n\
   status       Installation and diagnostics\n\
   term         View/inject into agent PTY screens\n\
-  update       Check and apply updates",
-        env!("CARGO_PKG_VERSION"),
+  update       Report disabled upstream updates",
+        crate::shared::human_version(),
     )
 }
 
@@ -1192,9 +1189,7 @@ mod tests {
 
     #[test]
     fn help_text_contains_version() {
-        // Capture what print_help would output by checking the format string
-        let version = env!("CARGO_PKG_VERSION");
-        assert!(!version.is_empty());
+        assert!(get_help_text().starts_with("hcom (hook-comms) v1.0.01 "));
     }
 
     #[test]

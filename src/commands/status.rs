@@ -260,14 +260,12 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
 
     if json_mode {
         let log_summary = crate::log::get_log_summary(1.0);
-        // Call get_update_info once to avoid inconsistent state (it has side effects)
-        let update_info = crate::update::get_update_info();
         let mut result = json!({
             "version": {
-                "current": env!("CARGO_PKG_VERSION"),
-                "latest": update_info.as_ref().map(|(v, _)| v.clone()),
-                "update_available": update_info.is_some(),
-                "update_cmd": update_info.as_ref().map(|(_, c)| *c),
+                "current": crate::shared::human_version(),
+                "latest": null,
+                "update_available": false,
+                "update_cmd": null,
             },
             "hcom_dir": hcom_dir.to_string_lossy(),
             "hcom_dir_override": hcom_dir_override,
@@ -335,7 +333,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
     }
 
     // Pretty output
-    println!("hcom {}", env!("CARGO_PKG_VERSION"));
+    println!("hcom {}", crate::shared::human_version());
     println!();
 
     // Directory

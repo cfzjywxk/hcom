@@ -11,7 +11,10 @@ description: >
 AI agents running in separate terminals are isolated. hcom connects them via hooks and a shared database so they can message, watch, and spawn each other in real-time.
 
 ```bash
-curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
+git clone https://github.com/cfzjywxk/hcom.git
+cd hcom
+cargo build --release --locked
+export PATH="$PWD/target/release:$PATH"
 hcom claude       # or: hcom gemini, hcom codex, hcom opencode, hcom kilo, hcom pi, hcom omp, hcom agy, hcom cursor-agent, hcom kimi, hcom copilot
 hcom              # TUI dashboard
 ```
@@ -72,16 +75,14 @@ the explicit opt-in.
 
 if the user invokes this skill without arguments:
 
-1. run `hcom status` — if "command not found", install first:
-   ```bash
-   curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
-   ```
+1. run `hcom status` — if "command not found", use a build from the selected
+   fork revision; do not run an upstream installer or `hcom update`
 2. run `hcom hooks add` to install hooks for all detected tools
 3. restart the AI tool for hooks to activate
 
 | status output | meaning | action |
 |---------------|---------|--------|
-| command not found | not installed | install via `brew install aannoo/hcom/hcom`, the curl installer above, or `pip install hcom` |
+| command not found | not installed | build the selected fork revision with `cargo build --release --locked` |
 | `[~] claude` | tool exists, hooks not installed | `hcom hooks add` then restart |
 | `[✓] claude` | hooks installed | ready |
 | `[✗] claude` | tool not found | install the AI tool first |
@@ -198,4 +199,4 @@ hcom --help              # all commands
 hcom <command> --help    # command details
 ```
 
-github: https://github.com/aannoo/hcom
+github: https://github.com/cfzjywxk/hcom

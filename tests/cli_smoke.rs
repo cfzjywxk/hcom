@@ -408,6 +408,174 @@ fn top_level_help_preserves_retained_commands_and_omits_stale_commands() {
 }
 
 #[test]
+fn fork_version_help_and_status_use_human_visible_version() {
+    let h = Hcom::new();
+
+    let (code, stdout, stderr) = h.run(["--version"]);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "hcom 1.0.01\n");
+    assert!(stderr.is_empty(), "stderr={stderr}");
+
+    let (code, stdout, stderr) = h.run(["--help"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(
+        stdout.starts_with("hcom (hook-comms) v1.0.01 "),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("update       Report disabled upstream updates"),
+        "stdout={stdout}"
+    );
+    assert!(stderr.is_empty(), "stderr={stderr}");
+
+    let (code, stdout, stderr) = h.run(["status"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout.lines().next(), Some("hcom 1.0.01"));
+    assert!(stderr.is_empty(), "stderr={stderr}");
+
+    let (code, stdout, stderr) = h.run(["status", "--json"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stderr.is_empty(), "stderr={stderr}");
+    let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(status["version"]["current"], "1.0.01");
+    assert!(status["version"]["latest"].is_null());
+    assert_eq!(status["version"]["update_available"], false);
+    assert!(status["version"]["update_cmd"].is_null());
+}
+
+#[test]
+fn retained_update_forms_refuse_upstream_updates() {
+    let h = Hcom::new();
+    let db_path = h.path().join("hcom.db");
+    let expected =
+        "Error: upstream updates are disabled for this fork; use a fork-owned source checkout.\n";
+
+    assert!(!db_path.exists());
+    for argv in [
+        vec!["update"],
+        vec!["update", "--check"],
+        vec!["update", "--go"],
+    ] {
+        let (code, stdout, stderr) = h.run(argv.clone());
+        assert_ne!(code, 0, "argv={argv:?}");
+        assert!(stdout.is_empty(), "argv={argv:?} stdout={stdout}");
+        assert_eq!(stderr, expected, "argv={argv:?}");
+    }
+    assert!(
+        !db_path.exists(),
+        "the fail-closed update command must not initialize retained state"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_version_status_and_update_ignore_cache_and_update_executables() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let h = Hcom::new();
+    let flags = h.path().join(".tmp/flags");
+    std::fs::create_dir_all(&flags).unwrap();
+    let update_cache = flags.join("update_check");
+    let cache_contents = b"999.999.999\n";
+    std::fs::write(&update_cache, cache_contents).unwrap();
+
+    let sentinel_bin = h.root_path().join("update-sentinels");
+    let sentinel_log = h.root_path().join("update-sentinel.log");
+    std::fs::create_dir(&sentinel_bin).unwrap();
+    for name in [
+        "git",
+        "curl",
+        "sh",
+        "powershell",
+        "pwsh",
+        "brew",
+        "uv",
+        "pip",
+        "pip3",
+        "python",
+        "python3",
+        "hcom-installer.sh",
+    ] {
+        let path = sentinel_bin.join(name);
+        std::fs::write(
+            &path,
+            b"#!/bin/sh\nprintf '%s\\n' \"$0\" >> \"$HCOM_SENTINEL_LOG\"\nexit 97\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let run = |argv: &[&str]| {
+        h.cmd()
+            .env("PATH", &sentinel_bin)
+            .env("HCOM_SENTINEL_LOG", &sentinel_log)
+            .args(argv)
+            .output()
+            .unwrap_or_else(|error| panic!("run hcom {argv:?}: {error}"))
+    };
+
+    for argv in [
+        &["--version"][..],
+        &["--help"][..],
+        &["status"][..],
+        &["status", "--json"][..],
+        &["update"][..],
+        &["update", "--check"][..],
+        &["update", "--go"][..],
+    ] {
+        let output = run(argv);
+        if argv.first() == Some(&"update") {
+            assert!(!output.status.success(), "argv={argv:?}");
+        } else {
+            assert!(output.status.success(), "argv={argv:?}");
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stdout.contains("999.999.999"), "argv={argv:?}");
+        assert!(!stderr.contains("999.999.999"), "argv={argv:?}");
+    }
+
+    assert!(
+        !sentinel_log.exists(),
+        "an update executable was invoked: {}",
+        std::fs::read_to_string(&sentinel_log).unwrap_or_default()
+    );
+
+    let stale_dev_root = h.root_path().join("stale-dev-root");
+    let stale_hcom = stale_dev_root.join("target/debug/hcom");
+    std::fs::create_dir_all(stale_hcom.parent().unwrap()).unwrap();
+    std::fs::write(
+        &stale_hcom,
+        b"#!/bin/sh\nprintf '%s\\n' \"$0\" >> \"$HCOM_SENTINEL_LOG\"\nexit 97\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&stale_hcom, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for argv in [
+        &["update"][..],
+        &["update", "--check"][..],
+        &["update", "--go"][..],
+    ] {
+        let output = h
+            .cmd()
+            .env("HCOM_DEV_ROOT", &stale_dev_root)
+            .env("HCOM_SENTINEL_LOG", &sentinel_log)
+            .args(argv)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "argv={argv:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("upstream updates are disabled"),
+            "argv={argv:?}"
+        );
+    }
+    assert!(
+        !sentinel_log.exists(),
+        "update delegated to a stale dev-root binary"
+    );
+    assert_eq!(std::fs::read(&update_cache).unwrap(), cache_contents);
+}
+
+#[test]
 fn stale_top_level_commands_are_unknown_without_opening_v24_state() {
     let h = Hcom::new();
     let db_path = h.path().join("hcom.db");
