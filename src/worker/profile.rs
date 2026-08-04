@@ -12,8 +12,7 @@ pub const CODEX_ARCHITECT_ADAPTER: &str = "codex";
 pub const CLAUDE_ARCHITECT_ADAPTER: &str = "claude";
 
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
-const DEFAULT_CLAUDE_DEVELOPER_MODEL: &str = "claude-opus-5";
-const DEFAULT_CLAUDE_ARCHITECT_MODEL: &str = "opus";
+const DEFAULT_CLAUDE_MODEL: &str = "opus";
 const DEFAULT_DEVELOPER_REASONING: &str = "xhigh";
 const DEFAULT_ARCHITECT_REASONING: &str = "xhigh";
 
@@ -155,7 +154,7 @@ pub struct ClaudeInvocationProfile {
 impl ClaudeInvocationProfile {
     pub fn architect_default() -> Self {
         Self {
-            model: DEFAULT_CLAUDE_ARCHITECT_MODEL.into(),
+            model: DEFAULT_CLAUDE_MODEL.into(),
             effort: DEFAULT_ARCHITECT_REASONING.into(),
             dangerously_skip_permissions: true,
         }
@@ -163,7 +162,7 @@ impl ClaudeInvocationProfile {
 
     pub fn developer_default() -> Self {
         Self {
-            model: DEFAULT_CLAUDE_DEVELOPER_MODEL.into(),
+            model: DEFAULT_CLAUDE_MODEL.into(),
             effort: DEFAULT_DEVELOPER_REASONING.into(),
             dangerously_skip_permissions: true,
         }
@@ -372,14 +371,11 @@ impl SessionInvocationProfiles {
         }
     }
 
-    /// Built-in profiles for the Codex exec worker task-runtime lane.
+    /// Built-in profiles for the provider-routed task-runtime lane.
     ///
-    /// This is intentionally separate from [`Self::for_architect`] while the
-    /// released CLI worker path is retained. Production selects this resolver
-    /// only when the exec worker integration phase is enabled.
+    /// The foreground Architect adapter is selected independently from the
+    /// default Codex Developer + Claude Reviewer worker pair.
     pub fn for_task_lane(adapter: ArchitectAdapter) -> Result<Self> {
-        // Both `hcom arch codex` and `hcom arch claude` keep their own
-        // foreground Architect adapter but share one Codex-only worker lane.
         let architect = match adapter {
             ArchitectAdapter::Codex => ArchitectInvocationProfile::Codex {
                 profile: CodexInvocationProfile::architect_default(),
@@ -393,8 +389,8 @@ impl SessionInvocationProfiles {
             developer: DeveloperInvocationProfile::Codex {
                 profile: CodexInvocationProfile::developer_default(),
             },
-            reviewer: ReviewerInvocationProfile::Codex {
-                profile: CodexInvocationProfile::reviewer_default(),
+            reviewer: ReviewerInvocationProfile::Claude {
+                profile: ClaudeInvocationProfile::reviewer_default(),
             },
         })
     }
@@ -520,15 +516,25 @@ mod tests {
     }
 
     #[test]
-    fn codex_exec_worker_lane_defaults_both_workers_to_exact_codex_profiles() {
+    fn all_three_claude_roles_share_the_production_default() {
+        let architect = ClaudeInvocationProfile::architect_default();
+        let developer = ClaudeInvocationProfile::developer_default();
+        let reviewer = ClaudeInvocationProfile::reviewer_default();
+        for profile in [&architect, &developer, &reviewer] {
+            assert_eq!(profile.model, "opus");
+            assert_eq!(profile.effort, "xhigh");
+            assert!(profile.dangerously_skip_permissions);
+        }
+        assert_eq!(architect, developer);
+        assert_eq!(developer, reviewer);
+    }
+
+    #[test]
+    fn task_lane_defaults_to_codex_developer_and_claude_reviewer() {
         let profiles = SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Codex).unwrap();
         profiles.validate().unwrap();
         assert_eq!(profiles.developer_adapter_name(), CODEX_DEVELOPER_ADAPTER);
-        assert_eq!(profiles.reviewer_adapter_name(), CODEX_REVIEWER_ADAPTER);
-        assert_eq!(
-            profiles.developer.codex().unwrap(),
-            profiles.reviewer.codex().unwrap()
-        );
+        assert_eq!(profiles.reviewer_adapter_name(), CLAUDE_REVIEWER_ADAPTER);
         assert_eq!(
             profiles.developer.codex().unwrap(),
             &CodexInvocationProfile {
@@ -538,8 +544,15 @@ mod tests {
                 approval_policy: CodexApprovalPolicy::Never,
             }
         );
-        // A Claude Architect keeps its own foreground adapter but binds the
-        // same Codex-only worker lane.
+        assert_eq!(
+            profiles.reviewer.claude().unwrap(),
+            &ClaudeInvocationProfile {
+                model: "opus".into(),
+                effort: "xhigh".into(),
+                dangerously_skip_permissions: true,
+            }
+        );
+        // A Claude Architect changes only the foreground role.
         let claude = SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Claude).unwrap();
         claude.validate().unwrap();
         assert!(matches!(
@@ -547,10 +560,14 @@ mod tests {
             ArchitectInvocationProfile::Claude { .. }
         ));
         assert_eq!(claude.developer_adapter_name(), CODEX_DEVELOPER_ADAPTER);
-        assert_eq!(claude.reviewer_adapter_name(), CODEX_REVIEWER_ADAPTER);
+        assert_eq!(claude.reviewer_adapter_name(), CLAUDE_REVIEWER_ADAPTER);
         assert_eq!(
             claude.developer.codex().unwrap(),
             profiles.developer.codex().unwrap()
+        );
+        assert_eq!(
+            claude.reviewer.claude().unwrap(),
+            profiles.reviewer.claude().unwrap()
         );
     }
 

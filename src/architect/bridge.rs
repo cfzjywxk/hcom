@@ -20,7 +20,7 @@ use crate::worker::profile::{
     CODEX_REVIEWER_ADAPTER,
 };
 use crate::worker::runtime::{CLAUDE_TASK_WORKER_ADAPTER, CODEX_TASK_WORKER_ADAPTER};
-use crate::worker::validation::validate_opaque_id;
+use crate::worker::validation::{validate_opaque_id, validate_sha256};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -68,6 +68,7 @@ pub(super) struct BridgeConfiguration {
     pub control_socket_path: PathBuf,
     pub relay_executable: ExecutableIdentity,
     pub relay_runtime_scope_hash: String,
+    pub session_binding_hash: String,
     pub architect_adapter: String,
     pub architect_additional_directories: Vec<PathBuf>,
     pub developer_adapter: String,
@@ -246,6 +247,10 @@ fn validate_bridge_configuration(configuration: &BridgeConfiguration) -> Result<
         bail!("architect relay runtime scope drifted before bridge start");
     }
     configuration.relay_executable.revalidate()?;
+    validate_sha256(
+        "architect bridge session binding hash",
+        &configuration.session_binding_hash,
+    )?;
     let architect_adapter = ArchitectAdapter::parse(&configuration.architect_adapter)?;
     if architect_adapter == ArchitectAdapter::Codex
         && !configuration.architect_additional_directories.is_empty()
@@ -963,6 +968,7 @@ mod tests {
                     control_socket_path: root.join("control.sock"),
                     relay_executable: executable,
                     relay_runtime_scope_hash: relay_runtime_scope_hash(&root).unwrap(),
+                    session_binding_hash: "a".repeat(64),
                     architect_adapter: "codex".into(),
                     architect_additional_directories: Vec::new(),
                     developer_adapter: "codex-developer".into(),
@@ -973,10 +979,17 @@ mod tests {
     }
 
     #[test]
-    fn bridge_accepts_all_routed_worker_pairs_without_mixing_runtime_families() {
-        for developer in [CODEX_TASK_WORKER_ADAPTER, CLAUDE_TASK_WORKER_ADAPTER] {
-            for reviewer in [CODEX_TASK_WORKER_ADAPTER, CLAUDE_TASK_WORKER_ADAPTER] {
-                validate_worker_adapter_binding(developer, reviewer).unwrap();
+    fn bridge_binds_both_architects_to_all_four_routed_worker_pairs() {
+        let fixture = BridgeTestFixture::new();
+        for architect in ["codex", "claude"] {
+            for developer in [CODEX_TASK_WORKER_ADAPTER, CLAUDE_TASK_WORKER_ADAPTER] {
+                for reviewer in [CODEX_TASK_WORKER_ADAPTER, CLAUDE_TASK_WORKER_ADAPTER] {
+                    let mut configuration = fixture.configuration.clone();
+                    configuration.architect_adapter = architect.into();
+                    configuration.developer_adapter = developer.into();
+                    configuration.reviewer_adapter = reviewer.into();
+                    validate_bridge_configuration(&configuration).unwrap();
+                }
             }
         }
         validate_worker_adapter_binding(CODEX_DEVELOPER_ADAPTER, CLAUDE_REVIEWER_ADAPTER).unwrap();
@@ -1101,6 +1114,7 @@ mod tests {
             control_socket_path: root.join("control.sock"),
             relay_executable: executable,
             relay_runtime_scope_hash: "unused-by-authorization".into(),
+            session_binding_hash: "a".repeat(64),
             architect_adapter: "codex".into(),
             architect_additional_directories: Vec::new(),
             developer_adapter: "codex-developer".into(),
@@ -1858,6 +1872,7 @@ mod tests {
             control_socket_path: run_root.join("control.sock"),
             relay_executable: executable,
             relay_runtime_scope_hash: relay_runtime_scope_hash(&relay_root).unwrap(),
+            session_binding_hash: "a".repeat(64),
             architect_adapter: "codex".into(),
             architect_additional_directories: Vec::new(),
             developer_adapter: "codex-developer".into(),
@@ -1869,6 +1884,10 @@ mod tests {
         alternate_roles.developer_adapter = CLAUDE_DEVELOPER_ADAPTER.into();
         alternate_roles.reviewer_adapter = CODEX_REVIEWER_ADAPTER.into();
         validate_bridge_configuration(&alternate_roles).unwrap();
+
+        let mut invalid_binding_hash = configuration.clone();
+        invalid_binding_hash.session_binding_hash = "not-a-sha256".into();
+        assert!(validate_bridge_configuration(&invalid_binding_hash).is_err());
 
         let mut drifted = configuration.clone();
         drifted.control_socket_path = root.join("other.sock");

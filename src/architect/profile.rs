@@ -216,10 +216,10 @@ pub(super) fn load_task_lane_profiles(
 fn load_invocation_profiles_with_defaults(
     path: &Path,
     architect_adapter: ArchitectAdapter,
-    codex_exec_worker_lane: bool,
+    provider_routed_worker_lane: bool,
 ) -> Result<LoadedInvocationProfiles> {
     let defaults = || {
-        if codex_exec_worker_lane {
+        if provider_routed_worker_lane {
             SessionInvocationProfiles::for_task_lane(architect_adapter)
         } else {
             Ok(SessionInvocationProfiles::for_architect(architect_adapter))
@@ -311,7 +311,7 @@ fn load_invocation_profiles_with_defaults(
         }
     }
     profiles.validate()?;
-    if codex_exec_worker_lane {
+    if provider_routed_worker_lane {
         crate::worker::runtime::TaskWorkerProfiles::from_session_profiles(&profiles)
             .map_err(|error| anyhow::anyhow!(error.detail))?;
     }
@@ -325,7 +325,10 @@ fn load_invocation_profiles_with_defaults(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::profile::{CODEX_DEVELOPER_ADAPTER, CODEX_REVIEWER_ADAPTER};
+    use crate::worker::profile::{
+        CLAUDE_DEVELOPER_ADAPTER, CLAUDE_REVIEWER_ADAPTER, CODEX_DEVELOPER_ADAPTER,
+        CODEX_REVIEWER_ADAPTER,
+    };
     use std::os::unix::fs::PermissionsExt;
 
     fn write_config(contents: &str) -> (tempfile::TempDir, PathBuf) {
@@ -350,24 +353,26 @@ mod tests {
         for profile in [
             loaded.profiles.architect.codex().unwrap(),
             loaded.profiles.developer.codex().unwrap(),
-            loaded.profiles.reviewer.codex().unwrap(),
         ] {
             assert_eq!(profile.model, "gpt-5.6-sol");
             assert_eq!(profile.reasoning_effort, "xhigh");
         }
-        // Workers are Codex-only in this lane, for both roles.
         assert_eq!(
             loaded.profiles.developer_adapter_name(),
             CODEX_DEVELOPER_ADAPTER
         );
         assert_eq!(
             loaded.profiles.reviewer_adapter_name(),
-            CODEX_REVIEWER_ADAPTER
+            CLAUDE_REVIEWER_ADAPTER
         );
+        let reviewer = loaded.profiles.reviewer.claude().unwrap();
+        assert_eq!(reviewer.model, "opus");
+        assert_eq!(reviewer.effort, "xhigh");
+        assert!(reviewer.dangerously_skip_permissions);
     }
 
     #[test]
-    fn claude_architect_keeps_its_adapter_but_gets_codex_workers() {
+    fn claude_architect_changes_only_the_foreground_default() {
         let temp = tempfile::tempdir().unwrap();
         let loaded =
             load_task_lane_profiles(&temp.path().join("missing.toml"), ArchitectAdapter::Claude)
@@ -381,12 +386,13 @@ mod tests {
         );
         assert_eq!(
             loaded.profiles.reviewer_adapter_name(),
-            CODEX_REVIEWER_ADAPTER
+            CLAUDE_REVIEWER_ADAPTER
         );
+        assert_eq!(loaded.profiles.reviewer.claude().unwrap().model, "opus");
     }
 
     #[test]
-    fn task_lane_resolver_uses_codex_reviewer_when_config_is_absent() {
+    fn task_lane_resolver_locks_the_mixed_default_when_config_is_absent() {
         let temp = tempfile::tempdir().unwrap();
         let loaded =
             load_task_lane_profiles(&temp.path().join("missing.toml"), ArchitectAdapter::Codex)
@@ -397,12 +403,9 @@ mod tests {
         );
         assert_eq!(
             loaded.profiles.reviewer_adapter_name(),
-            CODEX_REVIEWER_ADAPTER
+            CLAUDE_REVIEWER_ADAPTER
         );
-        assert_eq!(
-            loaded.profiles.developer.codex().unwrap(),
-            loaded.profiles.reviewer.codex().unwrap()
-        );
+        assert_eq!(loaded.profiles.reviewer.claude().unwrap().model, "opus");
     }
 
     #[test]
@@ -490,13 +493,94 @@ effort = "medium"
             loaded.profiles.developer.codex().unwrap().reasoning_effort,
             "xhigh"
         );
+        let reviewer = loaded.profiles.reviewer.claude().unwrap();
+        assert_eq!(reviewer.model, "opus");
+        assert_eq!(reviewer.effort, "medium");
+        assert!(reviewer.dangerously_skip_permissions);
+    }
+
+    #[test]
+    fn adapter_switches_merge_partial_overrides_onto_the_selected_role_defaults() {
+        let (_temp, path) = write_config(
+            r#"
+[architect.developer]
+adapter = "claude"
+effort = "medium"
+
+[architect.reviewer]
+adapter = "codex"
+reasoning_effort = "high"
+"#,
+        );
+        let loaded = load_task_lane_profiles(&path, ArchitectAdapter::Codex).unwrap();
+        let developer = loaded.profiles.developer.claude().unwrap();
+        assert_eq!(developer.model, "opus");
+        assert_eq!(developer.effort, "medium");
+        assert!(developer.dangerously_skip_permissions);
         let reviewer = loaded.profiles.reviewer.codex().unwrap();
         assert_eq!(reviewer.model, "gpt-5.6-sol");
-        assert_eq!(reviewer.reasoning_effort, "medium");
-        assert_eq!(
-            reviewer.sandbox,
-            CodexInvocationProfile::reviewer_default().sandbox
-        );
+        assert_eq!(reviewer.reasoning_effort, "high");
+        assert_eq!(reviewer.sandbox, CodexSandbox::DangerFullAccess);
+        assert_eq!(reviewer.approval_policy, CodexApprovalPolicy::Never);
+    }
+
+    #[test]
+    fn both_architects_bind_all_four_worker_pairs_exactly() {
+        use crate::worker::runtime::{RuntimeProvider, TaskWorkerProfiles};
+
+        for architect in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
+            for developer in [ConfiguredAdapter::Codex, ConfiguredAdapter::Claude] {
+                for reviewer in [ConfiguredAdapter::Codex, ConfiguredAdapter::Claude] {
+                    let developer_name = match developer {
+                        ConfiguredAdapter::Codex => "codex",
+                        ConfiguredAdapter::Claude => "claude",
+                    };
+                    let reviewer_name = match reviewer {
+                        ConfiguredAdapter::Codex => "codex",
+                        ConfiguredAdapter::Claude => "claude",
+                    };
+                    let config = format!(
+                        "[architect.developer]\nadapter = \"{developer_name}\"\n\n\
+                         [architect.reviewer]\nadapter = \"{reviewer_name}\"\n"
+                    );
+                    let (_temp, path) = write_config(&config);
+                    let loaded = load_task_lane_profiles(&path, architect).unwrap();
+                    assert_eq!(loaded.profiles.architect.adapter(), architect);
+                    assert_eq!(
+                        loaded.profiles.developer_adapter_name(),
+                        match developer {
+                            ConfiguredAdapter::Codex => CODEX_DEVELOPER_ADAPTER,
+                            ConfiguredAdapter::Claude => CLAUDE_DEVELOPER_ADAPTER,
+                        }
+                    );
+                    assert_eq!(
+                        loaded.profiles.reviewer_adapter_name(),
+                        match reviewer {
+                            ConfiguredAdapter::Codex => CODEX_REVIEWER_ADAPTER,
+                            ConfiguredAdapter::Claude => CLAUDE_REVIEWER_ADAPTER,
+                        }
+                    );
+                    let runtime =
+                        TaskWorkerProfiles::from_session_profiles(&loaded.profiles).unwrap();
+                    assert_eq!(
+                        runtime.developer.provider,
+                        match developer {
+                            ConfiguredAdapter::Codex => RuntimeProvider::CodexExec,
+                            ConfiguredAdapter::Claude => RuntimeProvider::ClaudeExec,
+                        }
+                    );
+                    assert_eq!(
+                        runtime.reviewer.provider,
+                        match reviewer {
+                            ConfiguredAdapter::Codex => RuntimeProvider::CodexExec,
+                            ConfiguredAdapter::Claude => RuntimeProvider::ClaudeExec,
+                        }
+                    );
+                    assert_eq!(loaded.profiles.canonical_hash().len(), 64);
+                    assert_eq!(runtime.canonical_hash().len(), 64);
+                }
+            }
+        }
     }
 
     #[test]
@@ -547,6 +631,7 @@ ask_for_approval = "never"
             );
         }
     }
+
     #[test]
     fn config_can_select_the_closed_codex_reviewer_profile() {
         let (_temp, path) = write_config(

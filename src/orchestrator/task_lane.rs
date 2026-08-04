@@ -1,4 +1,4 @@
-//! Effect driver for the `hcom arch codex` Codex exec worker task lane.
+//! Effect driver for the provider-routed `hcom arch` task worker lane.
 //!
 //! The driver is the only owner of Git, filesystem, environment, and runtime
 //! I/O. Scheduling decisions remain in [`SupervisorCore`].
@@ -15,7 +15,7 @@ use crate::worker::environment::{
 };
 use crate::worker::exec_runtime::{ExecRuntimeConfig, ExecTaskPaths, ExecTaskWorkerRuntime};
 use crate::worker::guardian::{CleanupRegistryInterlock, GuardianCleanupRegistry};
-use crate::worker::profile::ArchitectAdapter;
+use crate::worker::profile::{ArchitectAdapter, SessionInvocationProfiles};
 use crate::worker::role_router::{ProviderRuntimeSlot, RoleRoutedTaskWorkerRuntime};
 use crate::worker::runtime::{
     OutcomeContract, RoleSessionSpec, RuntimeContractIdentity, RuntimeError, RuntimeErrorCode,
@@ -50,6 +50,21 @@ impl ProductionRuntimeFactory {
     fn new() -> Self {
         Self
     }
+}
+
+fn session_binding_hash(
+    session_profiles: &SessionInvocationProfiles,
+    worker_profiles: &TaskWorkerProfiles,
+    contract: &RuntimeContractIdentity,
+    architect_additional_directories: &[PathBuf],
+) -> Result<String> {
+    Ok(sha256_hex(&serde_json::to_vec(&(
+        "hcom-provider-routed-session-binding-v1",
+        session_profiles.canonical_hash(),
+        worker_profiles.canonical_hash(),
+        contract.canonical_hash(),
+        architect_additional_directories,
+    ))?))
 }
 
 impl RuntimeFactory for ProductionRuntimeFactory {
@@ -292,24 +307,24 @@ impl TaskLaneSupervisor {
         let session_profiles = sources
             .profiles
             .clone()
-            .ok_or_else(|| anyhow!("the Codex exec worker lane requires loaded profiles"))?;
+            .ok_or_else(|| anyhow!("the provider-routed worker lane requires loaded profiles"))?;
         let profiles = TaskWorkerProfiles::from_session_profiles(&session_profiles)
             .map_err(|error| anyhow!(error.detail))?;
         profiles.validate().map_err(|error| anyhow!(error.detail))?;
         let contract = factory.contract(&profiles);
         contract.validate().map_err(|error| anyhow!(error.detail))?;
-        let profile_hash = sha256_hex(&serde_json::to_vec(&(
-            "hcom-codex-exec-session-binding-v2",
-            session_profiles.canonical_hash(),
-            profiles.canonical_hash(),
-            contract.canonical_hash(),
+        let binding_hash = session_binding_hash(
+            &session_profiles,
+            &profiles,
+            &contract,
             &sources.architect_additional_directories,
-        ))?);
+        )?;
         let startup = SessionStartup {
             run_id: run_id.clone(),
             project_root: project_root.clone(),
+            session_binding_hash: binding_hash.clone(),
         };
-        let core = SupervisorCore::new(run_id, project_root, profile_hash)
+        let core = SupervisorCore::new(run_id, project_root, binding_hash)
             .map_err(|error| anyhow!(error.to_string()))?;
         let developer_adapter = profiles.developer.provider.as_str().into();
         let reviewer_adapter = profiles.reviewer.provider.as_str().into();
@@ -389,7 +404,7 @@ impl TaskLaneSupervisor {
     ) -> Result<(u64, String)> {
         if developer_adapter != self.developer_adapter || reviewer_adapter != self.reviewer_adapter
         {
-            bail!("task plan adapters differ from the Codex exec worker session binding");
+            bail!("task plan adapters differ from the provider-routed worker session binding");
         }
         if expected_session_version != self.core.version() {
             bail!("session version is stale");
@@ -1525,8 +1540,8 @@ mod tests {
     use crate::worker::environment::ParentEnvironment;
     use crate::worker::fake_runtime::{FakeTaskWorkerRuntime, FakeTurnScript};
     use crate::worker::profile::{
-        ArchitectAdapter, ClaudeInvocationProfile, DeveloperInvocationProfile,
-        ReviewerInvocationProfile, SessionInvocationProfiles,
+        ArchitectAdapter, ClaudeInvocationProfile, CodexInvocationProfile,
+        DeveloperInvocationProfile, ReviewerInvocationProfile, SessionInvocationProfiles,
     };
     use crate::worker::runtime::{
         CODEX_TASK_WORKER_ADAPTER, DeveloperOutcomeStatus, DeveloperOutcomeV1, ReviewerOutcomeV1,
@@ -1536,6 +1551,52 @@ mod tests {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::process::Command;
     use std::sync::{Arc, Mutex};
+
+    fn pure_codex_profiles(adapter: ArchitectAdapter) -> SessionInvocationProfiles {
+        let mut profiles = SessionInvocationProfiles::for_task_lane(adapter).unwrap();
+        profiles.reviewer = ReviewerInvocationProfile::Codex {
+            profile: CodexInvocationProfile::reviewer_default(),
+        };
+        profiles
+    }
+
+    fn binding_hash(profiles: &SessionInvocationProfiles, roots: &[PathBuf]) -> String {
+        let workers = TaskWorkerProfiles::from_session_profiles(profiles).unwrap();
+        let contract = workers.contract_identity();
+        session_binding_hash(profiles, &workers, &contract, roots).unwrap()
+    }
+
+    #[test]
+    fn session_binding_hash_covers_all_three_profiles_contracts_and_ordered_roots() {
+        let base = SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Codex).unwrap();
+        let base_hash = binding_hash(&base, &[]);
+
+        let mut architect = base.clone();
+        architect.architect = crate::worker::profile::ArchitectInvocationProfile::Codex {
+            profile: crate::worker::profile::CodexInvocationProfile {
+                model: "architect-override".into(),
+                ..crate::worker::profile::CodexInvocationProfile::architect_default()
+            },
+        };
+        assert_ne!(base_hash, binding_hash(&architect, &[]));
+
+        let mut developer = base.clone();
+        developer.developer = DeveloperInvocationProfile::Claude {
+            profile: ClaudeInvocationProfile::developer_default(),
+        };
+        assert_ne!(base_hash, binding_hash(&developer, &[]));
+
+        let mut reviewer = base.clone();
+        reviewer.reviewer = ReviewerInvocationProfile::Codex {
+            profile: CodexInvocationProfile::reviewer_default(),
+        };
+        assert_ne!(base_hash, binding_hash(&reviewer, &[]));
+
+        let roots = [PathBuf::from("/source/one"), PathBuf::from("/source/two")];
+        assert_ne!(base_hash, binding_hash(&base, &roots));
+        let reversed = [roots[1].clone(), roots[0].clone()];
+        assert_ne!(binding_hash(&base, &roots), binding_hash(&base, &reversed));
+    }
 
     #[test]
     fn role_contract_separates_local_candidate_commits_from_release_authority() {
@@ -1795,8 +1856,7 @@ mod tests {
             let repository = fs::canonicalize(repository).unwrap();
 
             let mut sources = SessionRuntimeSources::fake(&toolchain);
-            sources.profiles =
-                Some(SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Codex).unwrap());
+            sources.profiles = Some(pure_codex_profiles(ArchitectAdapter::Codex));
             sources.parent_environment = ParentEnvironment::from_os(vec![
                 (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
                 (
@@ -4233,8 +4293,7 @@ mod tests {
     #[test]
     fn claude_architect_requires_external_repository_roots_to_be_predeclared() {
         let mut fixture = Fixture::new();
-        fixture.sources.profiles =
-            Some(SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Claude).unwrap());
+        fixture.sources.profiles = Some(pure_codex_profiles(ArchitectAdapter::Claude));
         let task = fixture.task("external-root", &["src"], 2);
 
         let mut rejected = fixture.supervisor(Vec::new(), Arc::new(Mutex::new(Audit::default())));
@@ -4406,6 +4465,9 @@ mod tests {
                 effort: "medium".into(),
                 dangerously_skip_permissions: true,
             },
+        };
+        profiles.reviewer = ReviewerInvocationProfile::Codex {
+            profile: CodexInvocationProfile::reviewer_default(),
         };
         sources.set_profiles_for_test(profiles);
         let mut supervisor = TaskLaneSupervisor::open(

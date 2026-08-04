@@ -40,7 +40,7 @@ pub fn help_text() -> &'static str {
 Launch one blank, foreground Codex or Claude architect with capability-bound
 in-memory session-task tools. The invocation's exact current directory is the
 Architect's project context and does not need to be a Git repository. Every
-task carries an exact canonical source directory; exec worker role threads use
+task carries an exact canonical source directory; task worker role sessions use
 the project directory as native cwd and receive that directory through
 --add-dir when it is distinct.
 
@@ -51,8 +51,9 @@ Profile configuration is read once from $HCOM_DIR/config.toml (default:
   [architect.reviewer]   fresh per-task reviewer profile
 
 Each table is a partial override: omitted fields keep the built-in role
-default. Codex accepts reasoning_effort or its effort alias. Worker adapter
-defaults to codex.
+default. Codex accepts reasoning_effort or its effort alias. Developer and
+Reviewer adapters are selected independently; their defaults are codex and
+claude respectively.
 
 Architect CLI overrides (higher priority than TOML):
   --model <model>
@@ -65,11 +66,11 @@ Architect CLI overrides (higher priority than TOML):
 
 Built-in Architect defaults are Codex gpt-5.6-sol/xhigh with
 danger-full-access/never, or Claude opus/xhigh with
-dangerously-skip-permissions. Both entrypoints share one worker lane: a fresh
-codex-exec process per turn. Developer and Reviewer both
-default to Codex gpt-5.6-sol/xhigh with danger-full-access/never. Explicit
-worker tables must also select Codex with danger-full-access/never; Claude
-workers are unsupported and fail closed.
+dangerously-skip-permissions. Both entrypoints share one provider-routed worker
+lane. Developer defaults to Codex gpt-5.6-sol/xhigh with
+danger-full-access/never; Reviewer defaults to Claude opus/xhigh with
+dangerously-skip-permissions. Either worker role can explicitly select codex
+or claude. An unavailable selected adapter fails closed without fallback.
 
 The capability-bound session-control MCP tools do not add a second native
 approval prompt. For Codex, hcom adds one exact task-control MCP config leaf.
@@ -90,24 +91,30 @@ by itself authorize starting the delegated loop. hcom validates the typed plan
 revision/hash and confirmation bit, not OS-level keyboard provenance.
 
 Only typed profile fields are accepted; arbitrary native argv is not. The
-effective sanitized profiles and their SHA-256 hash are printed at startup and
-frozen for every sequential run in that foreground Architect invocation.
+effective sanitized profiles, their SHA-256 hash, and the exact session binding
+hash are printed at startup and frozen for every sequential run in that
+foreground Architect invocation. The private task-control protocol remains v7:
+its plan hash binds that exact session profile/runtime contract, and the closed
+bridge bootstrap carries the same binding hash. A mismatched hcom and
+hcom-architect-mcp pair fails closed rather than weakening the binding.
 
 No prompt argument, stdin payload, terminal injection, or automatic first turn
 is used. The human owns every architect terminal input. The Architect has a
 path-preserving whole-host read-write view for project plans, current_todo, and
-coordination records. Codex and Claude Architects, and every Codex exec worker,
-inherit the complete parent environment, real HOME and native config/auth/cache/
-session state, plus the ordinary same-user host view. hcom does not replace any
-parent environment variable, including HCOM_DIR. Claude adds only
+coordination records. Codex and Claude Architects, and every Codex or Claude
+task worker, inherit the complete parent environment, real HOME and native
+config/auth/cache/session state, plus the ordinary same-user host view. hcom
+does not replace any parent environment variable, including HCOM_DIR. Claude
+adds only
 CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1 and
 CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1, refusing conflicting parent values.
 Native shell_environment_policy decides what model-started commands inherit.
 hcom does not inspect or freeze native Architect session storage. Every Claude
 launch requires unique exact http_proxy/https_proxy/HTTP_PROXY/HTTPS_PROXY
 entries set to http://127.0.0.1:7890 before any Claude executable starts, and
-runs through the Linux descendant Guardian. Claude task workers remain
-unsupported in this implementation phase.
+runs through the Linux per-invocation descendant Guardian. That Guardian uses
+PR_SET_CHILD_SUBREAPER while live; external service-manager resources and
+unexpected Guardian death remain outside its cleanup guarantee.
 
 Each authorized task binds the exact canonical source directory, absolute task
 document path, ordered absolute design document paths, and task selector

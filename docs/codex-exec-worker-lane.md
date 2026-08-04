@@ -1,7 +1,10 @@
-# Codex exec worker lane
+# Codex exec worker provider
 
-The task worker lane hcom actually runs: one native `codex exec` process per
-turn, no protocol conversation, and a supervisor that never judges the work.
+The Codex provider inside hcom's task worker lane: one native `codex exec`
+process per selected Codex turn, no protocol conversation, and a supervisor
+that never judges the work. Developer and Reviewer adapters are independent;
+the built-in pair is Codex Developer + Claude Reviewer, while an explicit
+Codex/Codex override retains this provider for both roles.
 
 ## The two rules
 

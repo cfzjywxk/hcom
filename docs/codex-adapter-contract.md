@@ -1,9 +1,10 @@
 # Codex Architect adapter maintenance contract
 
 This is the maintainer contract for the native Codex blank Architect started
-by `hcom arch codex`. Background Developer and Reviewer turns use the native
-Codex exec lane documented in
-[codex-exec-worker-lane.md](codex-exec-worker-lane.md). Existing tagged
+by `hcom arch codex`. A background role configured for Codex uses the native
+Codex exec provider documented in
+[codex-exec-worker-lane.md](codex-exec-worker-lane.md); a Claude role is routed
+to its independent native provider. Existing tagged
 interactive hcom products are independent and must not be routed through this
 session lane.
 
@@ -18,7 +19,7 @@ filesystem.
 
 The deliberate exceptions are:
 
-- the built-in Codex Architect, Developer, and Reviewer model/effort defaults
+- any selected Codex Architect, Developer, or Reviewer model/effort defaults
   are `gpt-5.6-sol` and `xhigh`, passed explicitly rather than inherited from
   user config;
 - typed sandbox/approval values are also explicit;
@@ -93,10 +94,12 @@ its first task-control call.
 
 ## Background Codex workers
 
-Both `hcom arch codex` and `hcom arch claude` currently bind the same
-Codex-only exec worker runtime. A configured Claude Developer or Reviewer is
-rejected before the Architect starts. The foreground Architect adapter does
-not change the worker adapter.
+Both `hcom arch codex` and `hcom arch claude` bind one provider-routed worker
+lane. The foreground Architect adapter does not change the independently
+configured worker adapters. The default pair is Codex Developer + Claude
+Reviewer; explicitly selecting Codex Reviewer restores the original pure
+Codex/Codex behavior. A selected unavailable provider fails closed without
+fallback.
 
 The exec lane:
 
@@ -186,7 +189,7 @@ separately, and only the foreground parent exit releases the lease.
 
 | Contract | Regression |
 |---|---|
-| defaults are explicit | `architect::profile::tests::missing_file_uses_reviewed_defaults`, `worker::profile::tests::codex_exec_worker_lane_defaults_both_workers_to_exact_codex_profiles` |
+| defaults are explicit | `architect::profile::tests::missing_file_uses_reviewed_defaults`, `worker::profile::tests::task_lane_defaults_to_codex_developer_and_claude_reviewer` |
 | no prompt or input injection | `architect::launch::tests::native_profile_has_no_prompt_or_secret_transport`, `blank_codex_launch_keeps_input_empty_and_preserves_native_host_semantics` |
 | native config plus one MCP leaf | `architect::launch::tests::codex_control_server_is_an_additive_cli_overlay_not_a_private_config` |
 | native worker argv/config | `worker::exec_runtime::tests::happy_developer_turn_completes_and_captures_thread_id`, `reviewer_registers_the_external_repository_as_a_native_workspace_root` |

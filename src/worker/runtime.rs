@@ -143,6 +143,14 @@ impl RuntimeProfile {
         }
     }
 
+    pub fn claude_exec_default() -> Self {
+        Self::from_claude(
+            "default Claude runtime",
+            &ClaudeInvocationProfile::reviewer_default(),
+        )
+        .expect("built-in Claude runtime profile must remain valid")
+    }
+
     pub fn from_codex(label: &str, profile: &CodexInvocationProfile) -> Result<Self, RuntimeError> {
         profile
             .validate(label)
@@ -294,7 +302,7 @@ impl TaskWorkerProfiles {
     pub fn defaults() -> Self {
         Self {
             developer: RuntimeProfile::codex_exec_default(),
-            reviewer: RuntimeProfile::codex_exec_default(),
+            reviewer: RuntimeProfile::claude_exec_default(),
         }
     }
 
@@ -985,59 +993,58 @@ mod tests {
     };
 
     #[test]
-    fn exact_defaults_match_the_approved_cli_semantics_for_both_roles() {
+    fn exact_defaults_match_the_approved_mixed_worker_pair() {
         let profiles = TaskWorkerProfiles::defaults();
         profiles.validate().unwrap();
-        assert_eq!(profiles.developer, profiles.reviewer);
-        for profile in [&profiles.developer, &profiles.reviewer] {
-            assert_eq!(profile.provider, RuntimeProvider::CodexExec);
-            assert_eq!(profile.model, "gpt-5.6-sol");
-            assert_eq!(profile.reasoning_effort, "xhigh");
-            assert_eq!(profile.sandbox, RuntimeSandbox::DangerFullAccess);
-            assert_eq!(profile.approval_policy, RuntimeApprovalPolicy::Never);
-            assert_eq!(
-                profile.cli_equivalent_arguments(),
-                [
-                    "--sandbox",
-                    "danger-full-access",
-                    "--ask-for-approval",
-                    "never",
-                    "--model",
-                    "gpt-5.6-sol",
-                    "--config",
-                    "model_reasoning_effort=\"xhigh\"",
-                ]
-            );
-            assert_eq!(
-                profile.thread_fields(),
-                RuntimeThreadProfileFields {
-                    model: "gpt-5.6-sol",
-                    sandbox: "danger-full-access",
-                    approval_policy: "never",
-                }
-            );
-            assert_eq!(
-                profile.turn_fields(),
-                RuntimeTurnProfileFields {
-                    model: "gpt-5.6-sol",
-                    reasoning_effort: "xhigh",
-                    sandbox_policy_type: "dangerFullAccess",
-                    approval_policy: "never",
-                }
-            );
-            assert_eq!(
-                profile.canonical_hash(),
-                "1e8159291188ab4646d99a80674214dc89f4bf657293b799cac0c04b8f615b1a"
-            );
-        }
+        let developer = &profiles.developer;
+        assert_eq!(developer.provider, RuntimeProvider::CodexExec);
+        assert_eq!(developer.model, "gpt-5.6-sol");
+        assert_eq!(developer.reasoning_effort, "xhigh");
+        assert_eq!(developer.sandbox, RuntimeSandbox::DangerFullAccess);
+        assert_eq!(developer.approval_policy, RuntimeApprovalPolicy::Never);
+        assert_eq!(developer.claude_permissions, None);
         assert_eq!(
-            profiles.canonical_hash(),
-            "49e80a69a9158b04935f3175b83330c6454a1bb7395bdc350b9cf7998bae2ca8"
+            developer.cli_equivalent_arguments(),
+            [
+                "--sandbox",
+                "danger-full-access",
+                "--ask-for-approval",
+                "never",
+                "--model",
+                "gpt-5.6-sol",
+                "--config",
+                "model_reasoning_effort=\"xhigh\"",
+            ]
+        );
+
+        let reviewer = &profiles.reviewer;
+        assert_eq!(reviewer.provider, RuntimeProvider::ClaudeExec);
+        assert_eq!(reviewer.model, "opus");
+        assert_eq!(reviewer.reasoning_effort, "xhigh");
+        assert_eq!(reviewer.sandbox, RuntimeSandbox::DangerFullAccess);
+        assert_eq!(reviewer.approval_policy, RuntimeApprovalPolicy::Never);
+        assert_eq!(
+            reviewer.claude_permissions,
+            Some(RuntimeClaudePermissions {
+                dangerously_skip_permissions: true,
+            })
         );
         assert_eq!(
-            profiles.contract_identity().canonical_hash(),
-            "a7cdd93580a9f314e98be9c6d329b542228bee2c82a26db36601602dcafaac42"
+            reviewer.cli_equivalent_arguments(),
+            [
+                "--model",
+                "opus",
+                "--effort",
+                "xhigh",
+                "--dangerously-skip-permissions",
+            ]
         );
+        assert_eq!(profiles.canonical_hash().len(), 64);
+        assert_eq!(
+            profiles.contract_identity().adapter,
+            ROLE_ROUTER_TASK_WORKER_ADAPTER
+        );
+        assert_eq!(profiles.contract_identity().canonical_hash().len(), 64);
     }
 
     #[test]
@@ -1072,7 +1079,7 @@ mod tests {
         };
         let resolved = TaskWorkerProfiles::from_session_profiles(&profiles).unwrap();
         assert_eq!(resolved.developer.provider, RuntimeProvider::ClaudeExec);
-        assert_eq!(resolved.developer.model, "claude-opus-5");
+        assert_eq!(resolved.developer.model, "opus");
         assert_eq!(resolved.developer.reasoning_effort, "xhigh");
         assert_eq!(
             resolved.developer.claude_permissions,

@@ -517,7 +517,7 @@ mod tests {
                 available_slot(RuntimeProvider::CodexExec, Vec::new()),
                 ProviderRuntimeSlot::unavailable(
                     RuntimeProvider::ClaudeExec,
-                    "Claude task worker runtime is not implemented; CLAUDE-03 is required",
+                    "selected Claude task worker executable is unavailable",
                 ),
             ],
         )
@@ -531,7 +531,7 @@ mod tests {
         assert_eq!(error.code, RuntimeErrorCode::Unsupported);
         assert_eq!(
             error.detail,
-            "Claude task worker runtime is not implemented; CLAUDE-03 is required"
+            "selected Claude task worker executable is unavailable"
         );
     }
 

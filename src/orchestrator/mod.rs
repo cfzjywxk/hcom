@@ -19,6 +19,9 @@ use std::path::{Path, PathBuf};
 pub(crate) struct SessionStartup {
     pub(crate) run_id: String,
     pub(crate) project_root: PathBuf,
+    /// Exact frozen Architect/worker profile, runtime-contract, and
+    /// additional-directory binding used by every plan in this session.
+    pub(crate) session_binding_hash: String,
 }
 
 #[derive(Clone)]

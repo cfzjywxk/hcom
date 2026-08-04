@@ -78,10 +78,10 @@ hcom
 ## Foreground architect
 
 `hcom arch` runs one blank interactive Codex or Claude architect and an
-in-memory, ordered task supervisor. Each approved task gets fresh no-TUI Codex
-Developer and Reviewer sessions. Both entrypoints currently use the same
-native `codex exec` worker lane; same-task review changes resume those exact
-native threads, while a configured Claude Developer or Reviewer fails closed.
+in-memory, ordered task supervisor. Each approved task gets fresh no-TUI
+Developer and Reviewer sessions routed independently to native Codex or Claude
+workers. The built-in pair is Codex Developer + Claude Reviewer; same-task
+review changes resume the exact native session for that role.
 Execution approval for this standard lane includes one signed-off local
 candidate commit per task. Review corrections amend that same commit; LGTM
 applies to the final exact candidate range, so there is no extra post-LGTM
@@ -97,13 +97,15 @@ hcom arch codex
 # or: hcom arch claude
 ```
 
-The Codex Architect, Developer, and Reviewer all default to `gpt-5.6-sol`
-with `xhigh` reasoning, `danger-full-access`, and approval policy `never`.
-These values are explicit and therefore do not inherit model/effort defaults
-from native Codex config. `hcom arch claude` uses a native Claude `opus`/`xhigh`
-foreground Architect and the same Codex worker defaults. The capability-bound
-session-control MCP server is additive, so all other native MCP servers remain
-available. A human request that
+Codex roles default to `gpt-5.6-sol` with `xhigh` reasoning,
+`danger-full-access`, and approval policy `never`. Claude roles default to
+`opus`/`xhigh` with `dangerously-skip-permissions`. These values are explicit
+and therefore do not inherit model/effort defaults from native configuration.
+`hcom arch codex` selects a Codex foreground Architect; `hcom arch claude`
+selects a Claude foreground Architect. Both retain the Codex Developer +
+Claude Reviewer worker default unless their role tables override it. The
+capability-bound session-control MCP server is additive, so all other native
+MCP servers remain available. A human request that
 explicitly says to follow or execute a named existing detailed plan,
 specification, or `current_todo` authorizes the Architect to derive the typed
 plan and start it in the same turn. So does a request to plan or define the
@@ -118,10 +120,10 @@ not by itself authorize starting it. The supervisor validates the exact plan
 version/hash and required confirmation bit, but does not independently attest
 an OS-level human keystroke.
 
-The Codex Architect and workers use the launching terminal's real
+Codex Architects and workers use the launching terminal's real
 HOME/CODEX_HOME and native Codex config, authentication, trust, AGENTS.md,
 rules, hooks, skills, plugins, MCP servers, feature flags, custom providers,
-caches, and session history. The Claude Architect likewise uses the real
+caches, and session history. Claude Architects and workers likewise use the real
 HOME/CLAUDE_CONFIG_DIR and native settings, authentication, instructions,
 hooks, skills, MCP servers, provider, and managed policy. Both foreground
 Architects are selected as bare programs from inherited `PATH`; hcom does not
@@ -133,24 +135,28 @@ Claude launch additionally requires all four inherited `http_proxy`,
 `http://127.0.0.1:7890`. It adds only
 `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` and
 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`, then runs the native process through
-the descendant Guardian. Conflicting pin values fail closed.
+the Linux per-invocation subreaper Guardian. Its cleanup guarantee covers owned
+descendants while the Guardian remains live, not external service-manager
+resources or unexpected Guardian death. Conflicting pin values fail closed.
 
 The exact current directory is the Architect's project context and does not
 need to be a Git repository. The Architect can read and write project plans,
 `current_todo`, design notes, and discussion records, then binds each
 authorized task to its actual source repository; that may be elsewhere or
-nested under the project. Codex workers keep the project cwd and receive the
+nested under the project. Task workers keep the project cwd and receive the
 task repository as `--add-dir` when distinct. Their prompts explicitly require
 reading applicable project and source AGENTS.md/AGENTS.override.md plus nested
 instructions; hcom passes paths and does not parse those files. Architect,
-Developer, and Reviewer model/effort/permission profiles are typed TOML
+Developer, and Reviewer adapter/model/effort/permission profiles are typed TOML
 settings in `$HCOM_DIR/config.toml` (normally `~/.hcom/config.toml`) and are
 merged independently onto the built-in role defaults, then frozen when the
-command starts. A table may override only model or effort; omitted fields keep
-their defaults. The Reviewer has the same native host view as a manually
-launched Codex session; source non-mutation is a role contract, not an OS
-read-only mount. See [the Architect user guide](docs/architect.md) for the
-profile schema, parent-terminal inheritance, and exact-session invariants.
+command starts. A worker table may select `adapter = "codex"` or
+`adapter = "claude"`; omitted fields keep the selected role defaults. An
+unavailable selected adapter fails closed without fallback. The Reviewer has
+the same native host view as its directly launched provider; source
+non-mutation is a role contract, not an OS read-only mount. See [the Architect
+user guide](docs/architect.md) for the profile schema, parent-terminal
+inheritance, and exact-session invariants.
 
 The Architect and every session task worker inherit the complete environment
 of the process that started `hcom arch`, captured once without a name

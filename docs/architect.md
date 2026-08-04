@@ -3,9 +3,10 @@
 `hcom arch` starts one blank foreground Codex or Claude Architect plus a
 foreground-local, in-memory task supervisor. One foreground Architect may
 execute multiple sequential runs. After the human authorizes a typed ordered
-plan, the parent starts fresh no-TTY Codex Developer and Reviewer sessions for
-each task. Same-task correction/re-review resumes the exact original role
-session; a later task or later run starts fresh sessions.
+plan, the parent starts fresh no-TTY Developer and Reviewer sessions through
+independently selected Codex or Claude adapters for each task. Same-task
+correction/re-review resumes the exact original native role session; a later
+task or later run starts fresh sessions.
 
 There is no daemon, Project Store, cross-Architect recovery, final apply, push,
 or install. Parent exit stops the workers and loses the current in-memory
@@ -32,20 +33,22 @@ as a directory. It may be `/home/user/src/hcom` while the project is
 hcom passes this source path to both roles; it does not infer it from plan
 markdown or search the filesystem for a repository.
 
-Both public entrypoints currently use the same native Codex exec worker lane:
+Both public entrypoints use the same provider-routed worker lane. The command
+selects only the foreground Architect; worker tables remain independent:
 
-- `hcom arch codex`: Codex foreground Architect, Codex Developer, Codex
-  Reviewer.
-- `hcom arch claude`: Claude foreground Architect, Codex Developer, Codex
-  Reviewer.
+- `hcom arch codex`: Codex foreground Architect, Codex Developer, Claude
+  Reviewer by default.
+- `hcom arch claude`: Claude foreground Architect, Codex Developer, Claude
+  Reviewer by default.
 
-Configuring a Claude Developer or Reviewer fails before the Architect starts.
-Claude worker support is not part of this lane.
+Either worker role may explicitly select Codex or Claude. An unavailable
+selected adapter fails closed; hcom never silently falls back to another
+provider.
 
 ## Native Architect projection
 
-The foreground Architect and Codex workers behave like directly launched
-native CLI sessions:
+The foreground Architect and all workers behave like directly launched native
+CLI sessions:
 
 - complete parent OS environment;
 - real HOME and native config directory;
@@ -65,8 +68,8 @@ The intentional exceptions are small:
 - Codex Architect/Developer/Reviewer built-in model and effort are passed
   explicitly as `gpt-5.6-sol` and `xhigh`, so those two defaults do not come
   from native config;
-- Claude Architect built-in model and effort are passed explicitly as `opus`
-  and `xhigh`;
+- every Claude role's built-in model and effort are passed explicitly as
+  `opus` and `xhigh`;
 - typed sandbox/approval or Claude permission values are explicit;
 - the Architect receives one additive hcom task-control MCP binding in addition
   to native MCP servers;
@@ -80,20 +83,26 @@ The intentional exceptions are small:
 - workers start from the complete parent environment; native Codex
   `shell_environment_policy` controls what model-started tool commands receive.
 
-The Codex Architect is a direct child process. The Claude Architect is launched
-through the Linux descendant Guardian in `ForegroundArchitect` mode while
-retaining the same terminal fds and human input ownership. There is no
+The Codex Architect is a direct child process. Every Claude role is launched
+through a Linux per-invocation `PR_SET_CHILD_SUBREAPER` Guardian; the Claude
+Architect uses `ForegroundArchitect` mode while retaining the same terminal
+fds and human input ownership, and workers use `HeadlessWorker` mode. Guardian
+cleanup covers owned descendants while the Guardian remains live; external
+service-manager resources and unexpected Guardian death are outside that
+guarantee. There is no
 bubblewrap, mount/user/PID namespace, private environment reconstruction, or
 HOME/auth/session-store preflight. hcom records the native PID for its
 task-control relay; neither relay nor lifecycle ownership changes the native
-process's host capabilities. Claude task workers remain unsupported in this
-implementation phase.
+process's host capabilities.
 
 ## Project and source instructions
 
-The primary project is the Codex cwd, so native global/project instruction
-discovery applies normally. When `repository_root` differs, hcom passes
-`--add-dir <repository_root>` to both Developer and Reviewer.
+The primary project is every worker's native cwd, so provider-global and
+project instruction discovery applies normally. When `repository_root`
+differs, hcom passes `--add-dir <repository_root>` to both Developer and
+Reviewer. Claude workers also receive
+`CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1`, so external-source
+`CLAUDE.md` instructions load alongside project instructions.
 
 For a Claude Architect, external task repositories must be declared before
 launch with repeatable `hcom arch claude --add-dir <canonical-absolute-root>`.
@@ -104,9 +113,10 @@ plan approval. This is an instruction-loading contract, not a filesystem
 allowlist, and hcom neither infers roots from task documents nor restarts the
 Architect.
 
-A secondary `--add-dir` root is not the primary Codex instruction-discovery
-chain. Therefore every task prompt explicitly tells both roles to inspect and
-follow applicable AGENTS.md, AGENTS.override.md, and nested instructions in:
+A secondary `--add-dir` root is not every provider's primary instruction
+discovery chain. Therefore every task prompt explicitly tells both roles to
+inspect and follow applicable AGENTS.md, AGENTS.override.md, and nested
+instructions in:
 
 1. the project directory; and
 2. the task repository and every path they touch.
@@ -129,15 +139,16 @@ second path before development or review.
 
 Profiles live in `$HCOM_DIR/config.toml`; without `HCOM_DIR`, the path is
 `~/.hcom/config.toml`. The parent reads and validates it once before starting
-the Architect. It prints the effective profiles and a SHA-256 profile hash;
-editing the file later does not change any run in that foreground invocation.
+the Architect. It prints the effective profiles, their SHA-256 invocation
+profile hash, and the exact session binding hash; editing the file later does
+not change any run in that foreground invocation.
 
 Built-in defaults are:
 
 | Command | Architect | Developer | Reviewer |
 |---|---|---|---|
-| `hcom arch codex` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` |
-| `hcom arch claude` | Claude `opus`, `xhigh`, skip permissions | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` |
+| `hcom arch codex` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Claude `opus`, `xhigh`, skip permissions |
+| `hcom arch claude` | Claude `opus`, `xhigh`, skip permissions | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Claude `opus`, `xhigh`, skip permissions |
 
 Every table is a partial override. Omitted fields retain that role's built-in
 default, so overriding only model/effort is sufficient:
@@ -147,19 +158,27 @@ default, so overriding only model/effort is sufficient:
 model = "architect-model-override"
 
 [architect.developer]
-model = "developer-model-override"
-effort = "high" # alias for reasoning_effort
+adapter = "claude"
+model = "opus"
+effort = "high"
+dangerously_skip_permissions = true
 
 [architect.reviewer]
+adapter = "codex"
+model = "reviewer-model-override"
 reasoning_effort = "xhigh"
+sandbox = "danger-full-access"
+ask_for_approval = "never"
 ```
 
-`adapter` is optional in worker tables and defaults to the current Codex role.
-The current exec worker lane rejects `adapter = "claude"` and, if explicitly
-set, requires `sandbox = "danger-full-access"` and
-`ask_for_approval = "never"` because workers have no human approval channel.
-Codex accepts either `reasoning_effort` or the shorter `effort` alias, but not
-both in one table.
+`adapter` is optional in worker tables. Developer defaults to `codex`; Reviewer
+defaults to `claude`. Setting an adapter switches that table to the selected
+role's complete built-in default before applying its remaining partial
+overrides. Codex workers require `sandbox = "danger-full-access"` and
+`ask_for_approval = "never"` because they have no human approval channel.
+Claude accepts `effort` and `dangerously_skip_permissions`; Codex accepts
+either `reasoning_effort` or the shorter `effort` alias, but not both in one
+table. Provider-specific fields in the wrong adapter table fail closed.
 
 For a Claude foreground Architect:
 
@@ -183,7 +202,20 @@ built-in defaults < $HCOM_DIR/config.toml < explicit Architect CLI options
 
 The production Codex defaults remain `gpt-5.6-sol`/`xhigh`. Model-backed
 contract and E2E tests deliberately default to the cheaper
-`gpt-5.3-codex-spark`/`medium` pair.
+`gpt-5.3-codex-spark`/`medium` pair. Production Claude defaults remain
+`opus`/`xhigh`, but every model-backed Claude test must explicitly use
+`haiku`/`medium`; ordinary source tests use fake executables and never call a
+provider.
+
+At startup hcom prints all three effective role profiles, the invocation
+profile hash, the exact session binding hash, the Guardian platform boundary,
+and the additional-directory instruction policy. The session binding hash
+includes the exact Architect/worker profiles, worker runtime contracts, and
+ordered Claude Architect `--add-dir` roots; the approved plan hash binds it.
+The bridge bootstrap carries the same hash under a closed schema. This profile
+and bridge addition does not change private task-control protocol v7. An old or
+mismatched `hcom`/`hcom-architect-mcp` pair rejects the bootstrap or protocol
+version instead of falling back to weaker/default profiles.
 
 ## Session identity
 

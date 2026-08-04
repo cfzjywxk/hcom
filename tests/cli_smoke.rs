@@ -413,13 +413,13 @@ fn fork_version_help_and_status_use_human_visible_version() {
 
     let (code, stdout, stderr) = h.run(["--version"]);
     assert_eq!(code, 0);
-    assert_eq!(stdout, "hcom 1.0.07\n");
+    assert_eq!(stdout, "hcom 1.0.08\n");
     assert!(stderr.is_empty(), "stderr={stderr}");
 
     let (code, stdout, stderr) = h.run(["--help"]);
     assert_eq!(code, 0, "stderr={stderr}");
     assert!(
-        stdout.starts_with("hcom (hook-comms) v1.0.07 "),
+        stdout.starts_with("hcom (hook-comms) v1.0.08 "),
         "stdout={stdout}"
     );
     assert!(
@@ -430,14 +430,14 @@ fn fork_version_help_and_status_use_human_visible_version() {
 
     let (code, stdout, stderr) = h.run(["status"]);
     assert_eq!(code, 0, "stderr={stderr}");
-    assert_eq!(stdout.lines().next(), Some("hcom 1.0.07"));
+    assert_eq!(stdout.lines().next(), Some("hcom 1.0.08"));
     assert!(stderr.is_empty(), "stderr={stderr}");
 
     let (code, stdout, stderr) = h.run(["status", "--json"]);
     assert_eq!(code, 0, "stderr={stderr}");
     assert!(stderr.is_empty(), "stderr={stderr}");
     let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(status["version"]["current"], "1.0.07");
+    assert_eq!(status["version"]["current"], "1.0.08");
     assert!(status["version"]["latest"].is_null());
     assert_eq!(status["version"]["update_available"], false);
     assert!(status["version"]["update_cmd"].is_null());
@@ -659,27 +659,16 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     assert!(!stdout.contains("hcom architect"), "stdout={stdout}");
     assert!(stdout.contains("gpt-5.6-sol/xhigh"), "stdout={stdout}");
     assert!(stdout.contains("Claude opus/xhigh"), "stdout={stdout}");
+    assert!(stdout.contains("provider-routed worker"), "stdout={stdout}");
+    let normalized_stdout = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        stdout.contains("codex-exec process per turn"),
-        "stdout={stdout}"
-    );
-    assert!(
-        stdout.contains(
-            "Developer and Reviewer both\n\
-             default to Codex gpt-5.6-sol/xhigh with danger-full-access/never"
+        normalized_stdout.contains(
+            "Developer defaults to Codex gpt-5.6-sol/xhigh with danger-full-access/never; Reviewer defaults to Claude opus/xhigh with dangerously-skip-permissions"
+        ) && normalized_stdout.contains(
+            "An unavailable selected adapter fails closed without fallback"
         ),
         "stdout={stdout}"
     );
-    // Both entrypoints bind the one Codex-only worker lane.
-    assert!(
-        stdout.contains("Claude\nworkers are unsupported and fail closed."),
-        "stdout={stdout}"
-    );
-    assert!(
-        stdout.contains("Both entrypoints share one worker lane"),
-        "stdout={stdout}"
-    );
-    let normalized_stdout = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
         normalized_stdout.contains(
             "Each table is a partial override: omitted fields keep the built-in role default"
@@ -694,13 +683,15 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     );
     assert!(
         normalized_stdout.contains(
-            "Codex and Claude Architects, and every Codex exec worker, inherit the complete parent environment"
+            "Codex and Claude Architects, and every Codex or Claude task worker, inherit the complete parent environment"
         ) && normalized_stdout.contains(
             "hcom does not replace any parent environment variable, including HCOM_DIR"
         ) && normalized_stdout.contains(
             "Claude adds only CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1"
         ) && normalized_stdout.contains(
             "hcom does not inspect or freeze native Architect session storage"
+        ) && normalized_stdout.contains(
+            "Linux per-invocation descendant Guardian"
         ),
         "stdout={stdout}"
     );

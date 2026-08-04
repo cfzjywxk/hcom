@@ -1391,11 +1391,23 @@ mod tests {
     use super::*;
     use crate::control_api::codec::{read_response_frame, write_request_frame};
     use crate::control_api::protocol::PROTOCOL_VERSION;
-    use crate::worker::profile::{ArchitectAdapter, SessionInvocationProfiles};
+    use crate::worker::profile::{
+        ArchitectAdapter, CodexInvocationProfile, ReviewerInvocationProfile,
+        SessionInvocationProfiles,
+    };
     use std::collections::BTreeSet;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     use std::time::Instant;
+
+    fn pure_codex_profiles() -> SessionInvocationProfiles {
+        let mut profiles =
+            SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Codex).unwrap();
+        profiles.reviewer = ReviewerInvocationProfile::Codex {
+            profile: CodexInvocationProfile::reviewer_default(),
+        };
+        profiles
+    }
 
     struct Fixture {
         _temp: tempfile::TempDir,
@@ -1433,12 +1445,7 @@ mod tests {
             );
             let mut sources = SessionRuntimeSources::fake(&toolchain);
             // The lane only opens against the profiles loaded for this run.
-            sources.set_profiles_for_test(
-                crate::worker::profile::SessionInvocationProfiles::for_task_lane(
-                    crate::worker::profile::ArchitectAdapter::Codex,
-                )
-                .unwrap(),
-            );
+            sources.set_profiles_for_test(pure_codex_profiles());
             Self {
                 _temp: temp,
                 paths: ControlPaths::new(&run).unwrap(),
@@ -1746,6 +1753,7 @@ mod tests {
                 startup: SessionStartup {
                     run_id: "run-wait-test".into(),
                     project_root,
+                    session_binding_hash: "d".repeat(64),
                 },
                 snapshot,
                 progress_events: Vec::new(),
@@ -2327,9 +2335,7 @@ mod tests {
     #[test]
     fn task_lane_backend_uses_the_same_private_control_endpoint_contract() {
         let mut fixture = Fixture::new();
-        fixture.sources.set_profiles_for_test(
-            SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Codex).unwrap(),
-        );
+        fixture.sources.set_profiles_for_test(pure_codex_profiles());
         let control_socket = fixture.paths.socket_path();
         let registration_socket = fixture.paths.registration_socket_path();
         {

@@ -599,7 +599,7 @@ impl SupervisorCore {
 
     pub fn expected_plan_hash(&self, plan_version: u64, tasks: &[TaskDraft]) -> String {
         canonical_hash(&(
-            "hcom-codex-exec-session-plan-v4",
+            "hcom-provider-routed-session-plan-v1",
             &self.run_id,
             plan_version,
             &self.project_root,
@@ -3443,6 +3443,21 @@ mod tests {
                 .unwrap();
         let second =
             SupervisorCore::new("run-two".into(), PathBuf::from("/project"), "0".repeat(64))
+                .unwrap();
+        assert_ne!(
+            first.expected_plan_hash(1, &tasks),
+            second.expected_plan_hash(1, &tasks)
+        );
+    }
+
+    #[test]
+    fn plan_hash_is_bound_to_the_exact_session_profile() {
+        let tasks = vec![task("one", "/repo", 2)];
+        let first =
+            SupervisorCore::new("run-one".into(), PathBuf::from("/project"), "0".repeat(64))
+                .unwrap();
+        let second =
+            SupervisorCore::new("run-one".into(), PathBuf::from("/project"), "1".repeat(64))
                 .unwrap();
         assert_ne!(
             first.expected_plan_hash(1, &tasks),

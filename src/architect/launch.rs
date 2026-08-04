@@ -161,6 +161,11 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
             }
         )?;
         writeln!(stdout, "profile hash: {}", loaded.profiles.canonical_hash())?;
+        writeln!(
+            stdout,
+            "session binding hash: {}",
+            startup.session_binding_hash
+        )?;
         write_profile_summary(&mut stdout, &loaded.profiles)?;
         if loaded.profiles.uses_claude() {
             write_claude_startup_summary(
@@ -265,6 +270,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         control_socket_path: control_paths.socket_path(),
         relay_executable: tools.component.clone(),
         relay_runtime_scope_hash: relay_scope_hash.clone(),
+        session_binding_hash: startup.session_binding_hash.clone(),
         architect_adapter: architect_adapter.contract_name().into(),
         architect_additional_directories: architect_additional_directories.clone(),
         developer_adapter: developer_adapter.into(),
@@ -574,6 +580,14 @@ fn write_claude_startup_summary(
     writeln!(
         output,
         "claude environment policy: {CLAUDE_ADDITIONAL_DIRECTORIES_INSTRUCTIONS}=1; {CLAUDE_DISABLE_BACKGROUND_TASKS}=1"
+    )?;
+    writeln!(
+        output,
+        "claude additional-directory instructions: external task repositories use native --add-dir with {CLAUDE_ADDITIONAL_DIRECTORIES_INSTRUCTIONS}=1; this is not a filesystem allowlist"
+    )?;
+    writeln!(
+        output,
+        "claude lifecycle backend: Linux per-invocation PR_SET_CHILD_SUBREAPER Guardian"
     )?;
     writeln!(output, "claude lifecycle: {GUARDIAN_LIFECYCLE_BOUNDARY}")?;
     if architect_adapter == ArchitectAdapter::Claude {
@@ -1583,50 +1597,83 @@ mod tests {
     }
 
     #[test]
-    fn both_public_entrypoints_keep_the_current_codex_only_worker_defaults() {
+    fn both_public_entrypoints_use_the_mixed_worker_default() {
         for adapter in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
             let profiles = SessionInvocationProfiles::for_task_lane(adapter).unwrap();
             assert_eq!(
                 worker_adapter_bindings(adapter, &profiles).unwrap(),
-                ("codex-exec", "codex-exec")
+                ("codex-exec", "claude-exec")
             );
         }
     }
 
     #[test]
-    fn worker_adapter_bindings_follow_each_role_provider_independently() {
-        for developer_claude in [false, true] {
-            for reviewer_claude in [false, true] {
-                let mut profiles =
-                    SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Codex).unwrap();
-                if developer_claude {
-                    profiles.developer = DeveloperInvocationProfile::Claude {
-                        profile: crate::worker::profile::ClaudeInvocationProfile::developer_default(
-                        ),
+    fn both_architects_bind_each_worker_provider_independently() {
+        for architect_adapter in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
+            for developer_claude in [false, true] {
+                for reviewer_claude in [false, true] {
+                    let mut profiles =
+                        SessionInvocationProfiles::for_task_lane(architect_adapter).unwrap();
+                    profiles.developer = if developer_claude {
+                        DeveloperInvocationProfile::Claude {
+                            profile:
+                                crate::worker::profile::ClaudeInvocationProfile::developer_default(),
+                        }
+                    } else {
+                        DeveloperInvocationProfile::Codex {
+                            profile: CodexInvocationProfile::developer_default(),
+                        }
                     };
-                }
-                if reviewer_claude {
-                    profiles.reviewer = ReviewerInvocationProfile::Claude {
-                        profile: crate::worker::profile::ClaudeInvocationProfile::reviewer_default(
-                        ),
+                    profiles.reviewer = if reviewer_claude {
+                        ReviewerInvocationProfile::Claude {
+                            profile:
+                                crate::worker::profile::ClaudeInvocationProfile::reviewer_default(),
+                        }
+                    } else {
+                        ReviewerInvocationProfile::Codex {
+                            profile: CodexInvocationProfile::reviewer_default(),
+                        }
                     };
+                    assert_eq!(profiles.architect.adapter(), architect_adapter);
+                    assert_eq!(
+                        worker_adapter_bindings(architect_adapter, &profiles).unwrap(),
+                        (
+                            if developer_claude {
+                                "claude-exec"
+                            } else {
+                                "codex-exec"
+                            },
+                            if reviewer_claude {
+                                "claude-exec"
+                            } else {
+                                "codex-exec"
+                            },
+                        )
+                    );
                 }
-                assert_eq!(
-                    worker_adapter_bindings(ArchitectAdapter::Codex, &profiles).unwrap(),
-                    (
-                        if developer_claude {
-                            "claude-exec"
-                        } else {
-                            "codex-exec"
-                        },
-                        if reviewer_claude {
-                            "claude-exec"
-                        } else {
-                            "codex-exec"
-                        },
-                    )
-                );
             }
         }
+    }
+
+    #[test]
+    fn startup_summary_displays_all_roles_and_claude_platform_policy() {
+        let profiles = SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Codex).unwrap();
+        let mut output = Vec::new();
+        write_profile_summary(&mut output, &profiles).unwrap();
+        write_claude_startup_summary(&mut output, ArchitectAdapter::Codex, &[]).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(
+            "architect profile: codex model=gpt-5.6-sol reasoning=xhigh sandbox=danger-full-access approval=never"
+        ));
+        assert!(output.contains(
+            "developer profile: codex model=gpt-5.6-sol reasoning=xhigh sandbox=danger-full-access approval=never"
+        ));
+        assert!(output.contains(
+            "reviewer profile: claude model=opus effort=xhigh dangerously_skip_permissions=true"
+        ));
+        assert!(output.contains("Linux per-invocation PR_SET_CHILD_SUBREAPER Guardian"));
+        assert!(output.contains("external task repositories use native --add-dir"));
+        assert!(output.contains("not a filesystem allowlist"));
+        assert!(output.contains(GUARDIAN_LIFECYCLE_BOUNDARY));
     }
 }
