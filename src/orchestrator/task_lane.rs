@@ -12,15 +12,14 @@ use crate::control_api::{SessionState, SessionStatusSnapshot, TaskDraft, TaskSta
 use crate::worker::environment::{
     EnvironmentPolicy, ExecutionEnvironmentLease, MaterializedWorkerEnvironment,
 };
-use crate::worker::exec_runtime::{
-    ExecRuntimeConfig, ExecTaskPaths, ExecTaskWorkerRuntime, codex_exec_contract_identity,
-};
+use crate::worker::exec_runtime::{ExecRuntimeConfig, ExecTaskPaths, ExecTaskWorkerRuntime};
 use crate::worker::guardian::{CleanupRegistryInterlock, GuardianCleanupRegistry};
 use crate::worker::profile::ArchitectAdapter;
+use crate::worker::role_router::{ProviderRuntimeSlot, RoleRoutedTaskWorkerRuntime};
 use crate::worker::runtime::{
-    CODEX_TASK_WORKER_ADAPTER, OutcomeContract, RoleSessionSpec, RuntimeContractIdentity,
-    RuntimeError, RuntimeErrorCode, RuntimeFailureClass, RuntimeProfile, RuntimeSessionKey,
-    RuntimeTurnKey, RuntimeTurnPoll, RuntimeTurnPurpose, RuntimeTurnSpec, SanitizedRuntimeFailure,
+    OutcomeContract, RoleSessionSpec, RuntimeContractIdentity, RuntimeError, RuntimeErrorCode,
+    RuntimeFailureClass, RuntimeProfile, RuntimeProvider, RuntimeSessionKey, RuntimeTurnKey,
+    RuntimeTurnPoll, RuntimeTurnPurpose, RuntimeTurnSpec, SanitizedRuntimeFailure,
     TaskWorkerProfiles, TaskWorkerRuntime,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -36,7 +35,7 @@ use uuid::Uuid;
 const TURN_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 
 trait RuntimeFactory: Send {
-    fn contract(&self) -> RuntimeContractIdentity;
+    fn contract(&self, profiles: &TaskWorkerProfiles) -> RuntimeContractIdentity;
 
     fn open(
         &mut self,
@@ -53,8 +52,8 @@ impl ProductionRuntimeFactory {
 }
 
 impl RuntimeFactory for ProductionRuntimeFactory {
-    fn contract(&self) -> RuntimeContractIdentity {
-        codex_exec_contract_identity()
+    fn contract(&self, profiles: &TaskWorkerProfiles) -> RuntimeContractIdentity {
+        profiles.contract_identity()
     }
 
     fn open(
@@ -72,19 +71,63 @@ impl RuntimeFactory for ProductionRuntimeFactory {
         }
         crate::worker::validation::validate_opaque_id("task runtime key", &request.task_key)
             .map_err(|_| RuntimeError::invalid_contract("task runtime key was invalid"))?;
-        let runtime = ExecTaskWorkerRuntime::open(ExecRuntimeConfig {
-            codex: PathBuf::from("codex"),
-            repository_root: request.repository_root,
-            paths: ExecTaskPaths {
-                runtime: request.paths.runtime,
-            },
-            environment: request.environment,
-            lease: request.lease,
-            artifact_root_path: request.artifact_root,
-            run_id: request.run_id,
-            task_id: request.task_key,
-        })?;
-        Ok(Box::new(runtime))
+        let RuntimeOpenRequest {
+            task_ordinal: _,
+            task_key,
+            repository_root,
+            paths,
+            environment,
+            lease,
+            artifact_root,
+            run_id,
+            cleanup_registry: _,
+            profiles,
+        } = request;
+        let uses_codex = [profiles.developer.provider, profiles.reviewer.provider]
+            .contains(&RuntimeProvider::CodexExec);
+        let uses_claude = [profiles.developer.provider, profiles.reviewer.provider]
+            .contains(&RuntimeProvider::ClaudeExec);
+
+        let codex_runtime = if uses_codex {
+            Some(ExecTaskWorkerRuntime::open(ExecRuntimeConfig {
+                codex: PathBuf::from("codex"),
+                repository_root,
+                paths: ExecTaskPaths {
+                    runtime: paths.runtime,
+                },
+                environment,
+                lease,
+                artifact_root_path: artifact_root,
+                run_id,
+                task_id: task_key,
+            })?)
+        } else {
+            None
+        };
+
+        // Preserve the exact direct Codex child for the released pure-Codex
+        // lane. Mixed bindings use the provider-neutral key router; its Claude
+        // slot remains deliberately unavailable until CLAUDE-03 supplies the
+        // native stream-json transport.
+        if !uses_claude {
+            return Ok(Box::new(
+                codex_runtime.expect("a pure Codex binding creates the Codex runtime"),
+            ));
+        }
+        let mut slots = Vec::new();
+        if let Some(runtime) = codex_runtime {
+            slots.push(ProviderRuntimeSlot::available(
+                RuntimeProvider::CodexExec,
+                Box::new(runtime),
+            )?);
+        }
+        slots.push(ProviderRuntimeSlot::unavailable(
+            RuntimeProvider::ClaudeExec,
+            "Claude task worker runtime is not implemented; CLAUDE-03 is required",
+        ));
+        Ok(Box::new(RoleRoutedTaskWorkerRuntime::new(
+            &profiles, slots,
+        )?))
     }
 }
 
@@ -98,6 +141,7 @@ struct RuntimeOpenRequest {
     artifact_root: PathBuf,
     run_id: String,
     cleanup_registry: GuardianCleanupRegistry,
+    profiles: TaskWorkerProfiles,
 }
 
 struct RuntimeOpenFailure {
@@ -222,7 +266,7 @@ impl TaskLaneSupervisor {
         let profiles = TaskWorkerProfiles::from_session_profiles(&session_profiles)
             .map_err(|error| anyhow!(error.detail))?;
         profiles.validate().map_err(|error| anyhow!(error.detail))?;
-        let contract = factory.contract();
+        let contract = factory.contract(&profiles);
         contract.validate().map_err(|error| anyhow!(error.detail))?;
         let profile_hash = sha256_hex(&serde_json::to_vec(&(
             "hcom-codex-exec-session-binding-v2",
@@ -237,6 +281,8 @@ impl TaskLaneSupervisor {
         };
         let core = SupervisorCore::new(run_id, project_root, profile_hash)
             .map_err(|error| anyhow!(error.to_string()))?;
+        let developer_adapter = profiles.developer.provider.as_str().into();
+        let reviewer_adapter = profiles.reviewer.provider.as_str().into();
         Ok(Self {
             startup,
             epoch: format!("exec-supervisor-{}", Uuid::new_v4()),
@@ -244,8 +290,8 @@ impl TaskLaneSupervisor {
             run_root,
             sources,
             profiles,
-            developer_adapter: CODEX_TASK_WORKER_ADAPTER.into(),
-            reviewer_adapter: CODEX_TASK_WORKER_ADAPTER.into(),
+            developer_adapter,
+            reviewer_adapter,
             factory,
             task_runtime: None,
             active: None,
@@ -934,11 +980,12 @@ impl TaskLaneSupervisor {
                 })?,
             run_id: self.startup.run_id.clone(),
             cleanup_registry: self.cleanup_registry.clone(),
+            profiles: self.profiles.clone(),
         };
         let runtime = self.factory.open(request).map_err(|error| {
             RuntimeOpenFailure::new(DriverFailureClass::Runtime, anyhow!(error.detail))
         })?;
-        if runtime.contract() != &self.factory.contract() {
+        if runtime.contract() != &self.factory.contract(&self.profiles) {
             return Err(RuntimeOpenFailure::new(
                 DriverFailureClass::Contract,
                 anyhow!("opened task runtime differs from the frozen runtime contract"),
@@ -1448,12 +1495,12 @@ mod tests {
     use crate::worker::environment::ParentEnvironment;
     use crate::worker::fake_runtime::{FakeTaskWorkerRuntime, FakeTurnScript};
     use crate::worker::profile::{
-        ArchitectAdapter, DeveloperInvocationProfile, ReviewerInvocationProfile,
-        SessionInvocationProfiles,
+        ArchitectAdapter, ClaudeInvocationProfile, DeveloperInvocationProfile,
+        ReviewerInvocationProfile, SessionInvocationProfiles,
     };
     use crate::worker::runtime::{
-        DeveloperOutcomeStatus, DeveloperOutcomeV1, ReviewerOutcomeV1, ReviewerVerdict,
-        RuntimeOutcome, RuntimeTelemetry,
+        CODEX_TASK_WORKER_ADAPTER, DeveloperOutcomeStatus, DeveloperOutcomeV1, ReviewerOutcomeV1,
+        ReviewerVerdict, RuntimeOutcome, RuntimeTelemetry,
     };
     use std::collections::BTreeSet;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -1562,7 +1609,7 @@ mod tests {
     }
 
     impl RuntimeFactory for ScriptedFactory {
-        fn contract(&self) -> RuntimeContractIdentity {
+        fn contract(&self, _profiles: &TaskWorkerProfiles) -> RuntimeContractIdentity {
             RuntimeContractIdentity::codex_exec()
         }
 
@@ -1676,7 +1723,7 @@ mod tests {
     struct FailingFactory;
 
     impl RuntimeFactory for FailingFactory {
-        fn contract(&self) -> RuntimeContractIdentity {
+        fn contract(&self, _profiles: &TaskWorkerProfiles) -> RuntimeContractIdentity {
             RuntimeContractIdentity::codex_exec()
         }
 
@@ -1849,6 +1896,7 @@ mod tests {
             ArchitectAdapter, CodexInvocationProfile, DeveloperInvocationProfile,
             ReviewerInvocationProfile, SessionInvocationProfiles,
         };
+        use crate::worker::runtime::CODEX_TASK_WORKER_ADAPTER;
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
@@ -4313,6 +4361,51 @@ mod tests {
                 .read_dir()
                 .unwrap()
                 .any(|entry| entry.is_ok())
+        );
+    }
+
+    #[test]
+    fn production_claude_role_fails_closed_before_any_provider_process_exists() {
+        let fixture = Fixture::new();
+        let mut sources = fixture.sources.clone();
+        let mut profiles =
+            SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Codex).unwrap();
+        profiles.developer = DeveloperInvocationProfile::Claude {
+            profile: ClaudeInvocationProfile {
+                model: "haiku".into(),
+                effort: "medium".into(),
+                dangerously_skip_permissions: true,
+            },
+        };
+        sources.set_profiles_for_test(profiles);
+        let mut supervisor = TaskLaneSupervisor::open(
+            "run-unavailable-claude".into(),
+            fixture.project_root.clone(),
+            fixture.run_root.clone(),
+            sources,
+        )
+        .unwrap();
+        let (plan_version, plan_hash) = supervisor
+            .replace_plan(
+                0,
+                "claude-exec",
+                "codex-exec",
+                vec![fixture.task("unavailable-claude", &["src"], 2)],
+            )
+            .unwrap();
+        let error = supervisor
+            .approve_and_start(1, plan_version, &plan_hash, true)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Claude task worker runtime is not implemented; CLAUDE-03 is required"
+        );
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, SessionState::NeedsHuman);
+        assert!(snapshot.active_worker.is_none());
+        assert_eq!(
+            snapshot.terminal_detail.as_deref(),
+            Some("task worker runtime operation failed")
         );
     }
 

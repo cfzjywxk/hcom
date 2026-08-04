@@ -23,7 +23,7 @@ use crate::worker::profile::{
     ArchitectAdapter, ArchitectInvocationProfile, CodexApprovalPolicy, CodexSandbox,
     DeveloperInvocationProfile, ReviewerInvocationProfile, SessionInvocationProfiles,
 };
-use crate::worker::runtime::CODEX_TASK_WORKER_ADAPTER;
+use crate::worker::runtime::TaskWorkerProfiles;
 use crate::worker::{ExecutableIdentity, ParentEnvironment};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -92,8 +92,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         std::iter::once("hcom arch".to_owned()).chain(argv.iter().skip(1).cloned()),
     )?;
     let architect_adapter = ArchitectAdapter::parse(&args.adapter)?;
-    // Both public entrypoints bind the same Codex-only task worker lane; a
-    // configured Claude developer or reviewer fails closed inside the loader.
+    // Both public entrypoints share the same provider-routed task worker lane.
     let mut loaded = match config_path {
         Some(path) => load_task_lane_profiles(path, architect_adapter)?,
         None => LoadedInvocationProfiles {
@@ -104,7 +103,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
     };
     apply_architect_cli_overrides(&args, &mut loaded.profiles)?;
     let (developer_adapter, reviewer_adapter) =
-        worker_adapter_bindings(architect_adapter, &loaded.profiles);
+        worker_adapter_bindings(architect_adapter, &loaded.profiles)?;
     validate_foreground_terminal()?;
     let parent_environment = ParentEnvironment::capture_current()?;
     let claude_environment = loaded
@@ -170,10 +169,17 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
                 &architect_additional_directories,
             )?;
         }
-        writeln!(
-            stdout,
-            "worker runtime: codex-exec (one native process per turn)"
-        )?;
+        if developer_adapter == "codex-exec" && reviewer_adapter == "codex-exec" {
+            writeln!(
+                stdout,
+                "worker runtime: codex-exec (one native process per turn)"
+            )?;
+        } else {
+            writeln!(
+                stdout,
+                "worker runtime: role-router (one native provider process per turn; unavailable providers fail closed)"
+            )?;
+        }
         writeln!(
             stdout,
             "task repositories: discovered from project documentation and bound only after explicit execution authorization; each developer commits directly there"
@@ -619,10 +625,15 @@ fn validate_additional_directories(
 fn worker_adapter_bindings(
     architect_adapter: ArchitectAdapter,
     profiles: &SessionInvocationProfiles,
-) -> (&'static str, &'static str) {
-    // Adapter-independent: the worker lane is Codex-only for both entrypoints.
-    let _ = (architect_adapter, profiles);
-    (CODEX_TASK_WORKER_ADAPTER, CODEX_TASK_WORKER_ADAPTER)
+) -> Result<(&'static str, &'static str)> {
+    // Worker routes are independent of the foreground Architect provider.
+    let _ = architect_adapter;
+    let profiles = TaskWorkerProfiles::from_session_profiles(profiles)
+        .map_err(|error| anyhow::anyhow!(error.detail))?;
+    Ok((
+        profiles.developer.provider.as_str(),
+        profiles.reviewer.provider.as_str(),
+    ))
 }
 
 fn validate_foreground_terminal() -> Result<()> {
@@ -1572,13 +1583,50 @@ mod tests {
     }
 
     #[test]
-    fn both_public_entrypoints_keep_the_current_codex_only_worker_lane() {
+    fn both_public_entrypoints_keep_the_current_codex_only_worker_defaults() {
         for adapter in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
             let profiles = SessionInvocationProfiles::for_task_lane(adapter).unwrap();
             assert_eq!(
-                worker_adapter_bindings(adapter, &profiles),
-                (CODEX_TASK_WORKER_ADAPTER, CODEX_TASK_WORKER_ADAPTER)
+                worker_adapter_bindings(adapter, &profiles).unwrap(),
+                ("codex-exec", "codex-exec")
             );
+        }
+    }
+
+    #[test]
+    fn worker_adapter_bindings_follow_each_role_provider_independently() {
+        for developer_claude in [false, true] {
+            for reviewer_claude in [false, true] {
+                let mut profiles =
+                    SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Codex).unwrap();
+                if developer_claude {
+                    profiles.developer = DeveloperInvocationProfile::Claude {
+                        profile: crate::worker::profile::ClaudeInvocationProfile::developer_default(
+                        ),
+                    };
+                }
+                if reviewer_claude {
+                    profiles.reviewer = ReviewerInvocationProfile::Claude {
+                        profile: crate::worker::profile::ClaudeInvocationProfile::reviewer_default(
+                        ),
+                    };
+                }
+                assert_eq!(
+                    worker_adapter_bindings(ArchitectAdapter::Codex, &profiles).unwrap(),
+                    (
+                        if developer_claude {
+                            "claude-exec"
+                        } else {
+                            "codex-exec"
+                        },
+                        if reviewer_claude {
+                            "claude-exec"
+                        } else {
+                            "codex-exec"
+                        },
+                    )
+                );
+            }
         }
     }
 }

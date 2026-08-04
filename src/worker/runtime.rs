@@ -7,8 +7,8 @@
 pub use crate::control_api::ReviewerVerdict;
 use crate::control_api::WorkerRole;
 use crate::worker::profile::{
-    CodexApprovalPolicy, CodexInvocationProfile, CodexSandbox, DeveloperInvocationProfile,
-    ReviewerInvocationProfile, SessionInvocationProfiles,
+    ClaudeInvocationProfile, CodexApprovalPolicy, CodexInvocationProfile, CodexSandbox,
+    DeveloperInvocationProfile, ReviewerInvocationProfile, SessionInvocationProfiles,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,6 +18,8 @@ use std::time::Duration;
 use thiserror::Error;
 
 pub const CODEX_TASK_WORKER_ADAPTER: &str = "codex-exec";
+pub const CLAUDE_TASK_WORKER_ADAPTER: &str = "claude-exec";
+pub const ROLE_ROUTER_TASK_WORKER_ADAPTER: &str = "role-router";
 
 pub const MAX_RUNTIME_KEY_BYTES: usize = 128;
 pub const MAX_RUNTIME_PROMPT_BYTES: usize = 256 * 1024;
@@ -34,17 +36,19 @@ const MAX_PATH_BYTES: usize = 4096;
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeProvider {
     CodexExec,
+    ClaudeExec,
 }
 
 impl RuntimeProvider {
     pub fn parse(value: &str) -> Result<Self, RuntimeError> {
         match value {
             "codex-exec" => Ok(Self::CodexExec),
+            "claude-exec" => Ok(Self::ClaudeExec),
             "codex" | "claude" => Err(RuntimeError::unsupported(format!(
-                "{value} CLI workers are unsupported in the Codex exec worker lane"
+                "{value} is a profile adapter name, not a task runtime provider"
             ))),
             _ => Err(RuntimeError::unsupported(format!(
-                "unknown worker runtime provider {value:?}; expected codex-exec"
+                "unknown worker runtime provider {value:?}; expected codex-exec or claude-exec"
             ))),
         }
     }
@@ -52,6 +56,14 @@ impl RuntimeProvider {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CodexExec => "codex-exec",
+            Self::ClaudeExec => "claude-exec",
+        }
+    }
+
+    pub fn contract_identity(self) -> RuntimeContractIdentity {
+        match self {
+            Self::CodexExec => RuntimeContractIdentity::codex_exec(),
+            Self::ClaudeExec => RuntimeContractIdentity::claude_exec(),
         }
     }
 }
@@ -76,6 +88,12 @@ pub enum RuntimeApprovalPolicy {
     Never,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeClaudePermissions {
+    pub dangerously_skip_permissions: bool,
+}
+
 impl RuntimeApprovalPolicy {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -92,6 +110,10 @@ pub struct RuntimeProfile {
     pub reasoning_effort: String,
     pub sandbox: RuntimeSandbox,
     pub approval_policy: RuntimeApprovalPolicy,
+    /// Claude's native permission flag has no Codex equivalent. Omitting this
+    /// field keeps the established Codex profile serialization and hash exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_permissions: Option<RuntimeClaudePermissions>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +139,7 @@ impl RuntimeProfile {
             reasoning_effort: DEFAULT_REASONING_EFFORT.into(),
             sandbox: RuntimeSandbox::DangerFullAccess,
             approval_policy: RuntimeApprovalPolicy::Never,
+            claude_permissions: None,
         }
     }
 
@@ -140,18 +163,65 @@ impl RuntimeProfile {
             reasoning_effort: profile.reasoning_effort.clone(),
             sandbox: RuntimeSandbox::DangerFullAccess,
             approval_policy: RuntimeApprovalPolicy::Never,
+            claude_permissions: None,
+        })
+    }
+
+    pub fn from_claude(
+        label: &str,
+        profile: &ClaudeInvocationProfile,
+    ) -> Result<Self, RuntimeError> {
+        profile
+            .validate(label)
+            .map_err(|error| RuntimeError::invalid_profile(error.to_string()))?;
+        Ok(Self {
+            provider: RuntimeProvider::ClaudeExec,
+            model: profile.model.clone(),
+            reasoning_effort: profile.effort.clone(),
+            // These fields preserve the closed RuntimeProfile shape for the
+            // existing Codex child. Claude transport reads only its explicit
+            // native permission field when CLAUDE-03 supplies that child.
+            sandbox: RuntimeSandbox::DangerFullAccess,
+            approval_policy: RuntimeApprovalPolicy::Never,
+            claude_permissions: Some(RuntimeClaudePermissions {
+                dangerously_skip_permissions: profile.dangerously_skip_permissions,
+            }),
         })
     }
 
     pub fn validate(&self, label: &str) -> Result<(), RuntimeError> {
         validate_model(label, &self.model)?;
-        if !matches!(
-            self.reasoning_effort.as_str(),
-            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-        ) {
-            return Err(RuntimeError::invalid_profile(format!(
-                "{label} reasoning_effort must be one of none, minimal, low, medium, high, xhigh, or max"
-            )));
+        match self.provider {
+            RuntimeProvider::CodexExec => {
+                if self.claude_permissions.is_some() {
+                    return Err(RuntimeError::invalid_profile(format!(
+                        "{label} Codex profile cannot carry Claude permissions"
+                    )));
+                }
+                if !matches!(
+                    self.reasoning_effort.as_str(),
+                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                ) {
+                    return Err(RuntimeError::invalid_profile(format!(
+                        "{label} reasoning_effort must be one of none, minimal, low, medium, high, xhigh, or max"
+                    )));
+                }
+            }
+            RuntimeProvider::ClaudeExec => {
+                if self.claude_permissions.is_none() {
+                    return Err(RuntimeError::invalid_profile(format!(
+                        "{label} Claude profile must bind its native permission mode"
+                    )));
+                }
+                if !matches!(
+                    self.reasoning_effort.as_str(),
+                    "low" | "medium" | "high" | "xhigh" | "max"
+                ) {
+                    return Err(RuntimeError::invalid_profile(format!(
+                        "{label} effort must be one of low, medium, high, xhigh, or max"
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -159,16 +229,34 @@ impl RuntimeProfile {
     /// The native CLI options whose semantics the exec invocation must
     /// preserve. This is diagnostic/test evidence, never a process argv.
     pub fn cli_equivalent_arguments(&self) -> Vec<String> {
-        vec![
-            "--sandbox".into(),
-            self.sandbox.as_str().into(),
-            "--ask-for-approval".into(),
-            self.approval_policy.as_str().into(),
-            "--model".into(),
-            self.model.clone(),
-            "--config".into(),
-            format!("model_reasoning_effort=\"{}\"", self.reasoning_effort),
-        ]
+        match self.provider {
+            RuntimeProvider::CodexExec => vec![
+                "--sandbox".into(),
+                self.sandbox.as_str().into(),
+                "--ask-for-approval".into(),
+                self.approval_policy.as_str().into(),
+                "--model".into(),
+                self.model.clone(),
+                "--config".into(),
+                format!("model_reasoning_effort=\"{}\"", self.reasoning_effort),
+            ],
+            RuntimeProvider::ClaudeExec => {
+                let mut arguments = vec![
+                    "--model".into(),
+                    self.model.clone(),
+                    "--effort".into(),
+                    self.reasoning_effort.clone(),
+                ];
+                if self
+                    .claude_permissions
+                    .as_ref()
+                    .is_some_and(|permissions| permissions.dangerously_skip_permissions)
+                {
+                    arguments.push("--dangerously-skip-permissions".into());
+                }
+                arguments
+            }
+        }
     }
 
     pub fn canonical_hash(&self) -> String {
@@ -217,20 +305,16 @@ impl TaskWorkerProfiles {
             DeveloperInvocationProfile::Codex { profile } => {
                 RuntimeProfile::from_codex("Codex developer", profile)?
             }
-            DeveloperInvocationProfile::Claude { .. } => {
-                return Err(RuntimeError::unsupported(
-                    "Claude developer is unsupported in the Codex exec worker runtime lane",
-                ));
+            DeveloperInvocationProfile::Claude { profile } => {
+                RuntimeProfile::from_claude("Claude developer", profile)?
             }
         };
         let reviewer = match &profiles.reviewer {
             ReviewerInvocationProfile::Codex { profile } => {
                 RuntimeProfile::from_codex("Codex reviewer", profile)?
             }
-            ReviewerInvocationProfile::Claude { .. } => {
-                return Err(RuntimeError::unsupported(
-                    "Claude reviewer is unsupported in the Codex exec worker runtime lane",
-                ));
+            ReviewerInvocationProfile::Claude { profile } => {
+                RuntimeProfile::from_claude("Claude reviewer", profile)?
             }
         };
         Ok(Self {
@@ -240,12 +324,23 @@ impl TaskWorkerProfiles {
     }
 
     pub fn validate(&self) -> Result<(), RuntimeError> {
-        self.developer.validate("Codex developer")?;
-        self.reviewer.validate("Codex reviewer")
+        self.developer.validate("developer runtime profile")?;
+        self.reviewer.validate("reviewer runtime profile")
     }
 
     pub fn canonical_hash(&self) -> String {
         canonical_hash(&("hcom-exec-worker-profiles-v1", self))
+    }
+
+    pub fn provider(&self, role: WorkerRole) -> RuntimeProvider {
+        match role {
+            WorkerRole::Developer => self.developer.provider,
+            WorkerRole::Reviewer => self.reviewer.provider,
+        }
+    }
+
+    pub fn contract_identity(&self) -> RuntimeContractIdentity {
+        RuntimeContractIdentity::for_role_providers(self.developer.provider, self.reviewer.provider)
     }
 }
 
@@ -266,6 +361,43 @@ impl RuntimeContractIdentity {
             vec![
                 "stdout.thread.started.thread_id".into(),
                 "output-last-message".into(),
+            ],
+        )
+    }
+
+    pub fn claude_exec() -> Self {
+        Self::new(
+            CLAUDE_TASK_WORKER_ADAPTER,
+            vec!["-p".into(), "--resume".into()],
+            vec![
+                "stream-json.system.init.session_id".into(),
+                "stream-json.result.session_id".into(),
+                "stream-json.result.result".into(),
+            ],
+        )
+    }
+
+    pub fn for_role_providers(developer: RuntimeProvider, reviewer: RuntimeProvider) -> Self {
+        let developer_contract = developer.contract_identity();
+        let reviewer_contract = reviewer.contract_identity();
+        if developer == reviewer {
+            return developer_contract;
+        }
+        Self::new(
+            ROLE_ROUTER_TASK_WORKER_ADAPTER,
+            vec![
+                format!("developer={}", developer.as_str()),
+                format!("reviewer={}", reviewer.as_str()),
+            ],
+            vec![
+                format!(
+                    "developer.contract_sha256={}",
+                    developer_contract.contract_sha256
+                ),
+                format!(
+                    "reviewer.contract_sha256={}",
+                    reviewer_contract.contract_sha256
+                ),
             ],
         )
     }
@@ -893,11 +1025,23 @@ mod tests {
                     approval_policy: "never",
                 }
             );
+            assert_eq!(
+                profile.canonical_hash(),
+                "1e8159291188ab4646d99a80674214dc89f4bf657293b799cac0c04b8f615b1a"
+            );
         }
+        assert_eq!(
+            profiles.canonical_hash(),
+            "49e80a69a9158b04935f3175b83330c6454a1bb7395bdc350b9cf7998bae2ca8"
+        );
+        assert_eq!(
+            profiles.contract_identity().canonical_hash(),
+            "a7cdd93580a9f314e98be9c6d329b542228bee2c82a26db36601602dcafaac42"
+        );
     }
 
     #[test]
-    fn explicit_codex_overrides_are_preserved_and_invalid_combinations_are_rejected() {
+    fn explicit_role_profiles_preserve_each_selected_provider() {
         let mut profiles = SessionInvocationProfiles {
             developer: DeveloperInvocationProfile::Codex {
                 profile: CodexInvocationProfile {
@@ -926,12 +1070,21 @@ mod tests {
         profiles.developer = DeveloperInvocationProfile::Claude {
             profile: ClaudeInvocationProfile::developer_default(),
         };
-        let error = TaskWorkerProfiles::from_session_profiles(&profiles).unwrap_err();
-        assert_eq!(error.code, RuntimeErrorCode::Unsupported);
+        let resolved = TaskWorkerProfiles::from_session_profiles(&profiles).unwrap();
+        assert_eq!(resolved.developer.provider, RuntimeProvider::ClaudeExec);
+        assert_eq!(resolved.developer.model, "claude-opus-5");
+        assert_eq!(resolved.developer.reasoning_effort, "xhigh");
         assert_eq!(
-            error.detail,
-            "Claude developer is unsupported in the Codex exec worker runtime lane"
+            resolved.developer.claude_permissions,
+            Some(RuntimeClaudePermissions {
+                dangerously_skip_permissions: true,
+            })
         );
+        assert_eq!(resolved.reviewer.provider, RuntimeProvider::CodexExec);
+
+        profiles.developer = DeveloperInvocationProfile::Codex {
+            profile: CodexInvocationProfile::developer_default(),
+        };
 
         for invalid in [
             CodexInvocationProfile {
@@ -962,6 +1115,10 @@ mod tests {
             RuntimeProvider::parse("codex-exec").unwrap(),
             RuntimeProvider::CodexExec
         );
+        assert_eq!(
+            RuntimeProvider::parse("claude-exec").unwrap(),
+            RuntimeProvider::ClaudeExec
+        );
         for unsupported in ["codex", "claude", "future"] {
             assert_eq!(
                 RuntimeProvider::parse(unsupported).unwrap_err().code,
@@ -985,6 +1142,31 @@ mod tests {
         );
         assert_eq!(identity.selected_methods, ["exec", "exec resume"]);
         assert_eq!(identity.canonical_hash().len(), 64);
+        let claude = RuntimeContractIdentity::claude_exec();
+        claude.validate().unwrap();
+        assert_eq!(claude.adapter, CLAUDE_TASK_WORKER_ADAPTER);
+        assert_eq!(
+            RuntimeContractIdentity::for_role_providers(
+                RuntimeProvider::CodexExec,
+                RuntimeProvider::CodexExec,
+            ),
+            identity
+        );
+        assert_eq!(
+            RuntimeContractIdentity::for_role_providers(
+                RuntimeProvider::ClaudeExec,
+                RuntimeProvider::ClaudeExec,
+            ),
+            claude
+        );
+        assert_eq!(
+            RuntimeContractIdentity::for_role_providers(
+                RuntimeProvider::CodexExec,
+                RuntimeProvider::ClaudeExec,
+            )
+            .adapter,
+            ROLE_ROUTER_TASK_WORKER_ADAPTER
+        );
         assert!(serde_json::from_str::<OutcomeContract>(r#""developer_v2""#).is_err());
     }
 

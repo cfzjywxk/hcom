@@ -14,9 +14,9 @@ use super::environment::{ExecutionEnvironmentLease, SecretRedactor};
 use super::process::{ProcessGroupBinding, configure_worker_child};
 use super::runtime::{
     DeveloperOutcomeStatus, DeveloperOutcomeV1, ReviewerOutcomeV1, ReviewerVerdict,
-    RoleSessionSpec, RuntimeContractIdentity, RuntimeError, RuntimeOutcome, RuntimeSessionKey,
-    RuntimeTelemetry, RuntimeTurnKey, RuntimeTurnPoll, RuntimeTurnSpec, SanitizedRuntimeFailure,
-    TaskWorkerRuntime,
+    RoleSessionSpec, RuntimeContractIdentity, RuntimeError, RuntimeOutcome, RuntimeProvider,
+    RuntimeSessionKey, RuntimeTelemetry, RuntimeTurnKey, RuntimeTurnPoll, RuntimeTurnSpec,
+    SanitizedRuntimeFailure, TaskWorkerRuntime,
 };
 use super::verdict::{Verdict, VerdictClassification, classify_verdict};
 use crate::artifact::{ArtifactAttempt, ArtifactKind, ArtifactRoot, ArtifactScope};
@@ -631,6 +631,11 @@ impl TaskWorkerRuntime for ExecTaskWorkerRuntime {
             return Err(RuntimeError::invalid_transition("runtime is shut down"));
         }
         spec.validate()?;
+        if spec.profile.provider != RuntimeProvider::CodexExec {
+            return Err(RuntimeError::invalid_profile(
+                "Codex exec session requires a codex-exec runtime profile",
+            ));
+        }
         self.next_session += 1;
         let key = RuntimeSessionKey::from_counter(self.next_session)?;
         self.sessions.insert(
@@ -657,6 +662,11 @@ impl TaskWorkerRuntime for ExecTaskWorkerRuntime {
             return Err(RuntimeError::invalid_transition("runtime is shut down"));
         }
         spec.validate()?;
+        if spec.profile.provider != RuntimeProvider::CodexExec {
+            return Err(RuntimeError::invalid_profile(
+                "Codex exec turn requires a codex-exec runtime profile",
+            ));
+        }
         if self.active_turn.is_some() {
             return Err(RuntimeError::invalid_transition(
                 "another exec turn is still running",

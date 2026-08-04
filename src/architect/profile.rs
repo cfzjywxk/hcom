@@ -205,7 +205,7 @@ fn apply_reviewer_override(
     Ok(())
 }
 
-/// Resolver for the production Codex exec worker task-runtime lane.
+/// Resolver for the production provider-routed task-runtime lane.
 pub(super) fn load_task_lane_profiles(
     path: &Path,
     architect_adapter: ArchitectAdapter,
@@ -406,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn task_lane_resolver_rejects_explicit_claude_without_fallback() {
+    fn task_lane_resolver_accepts_explicit_claude_without_changing_other_role() {
         let (_temp, path) = write_config(
             r#"
 [architect.reviewer]
@@ -416,13 +416,22 @@ effort = "xhigh"
 dangerously_skip_permissions = true
 "#,
         );
-        let error = match load_task_lane_profiles(&path, ArchitectAdapter::Codex) {
-            Ok(_) => panic!("explicit Claude reviewer was accepted"),
-            Err(error) => error,
-        };
+        let loaded = load_task_lane_profiles(&path, ArchitectAdapter::Codex).unwrap();
         assert_eq!(
-            error.to_string(),
-            "Claude reviewer is unsupported in the Codex exec worker runtime lane"
+            loaded.profiles.developer_adapter_name(),
+            CODEX_DEVELOPER_ADAPTER
+        );
+        assert!(loaded.profiles.reviewer.claude().is_some());
+        let runtime =
+            crate::worker::runtime::TaskWorkerProfiles::from_session_profiles(&loaded.profiles)
+                .unwrap();
+        assert_eq!(
+            runtime.developer.provider,
+            crate::worker::runtime::RuntimeProvider::CodexExec
+        );
+        assert_eq!(
+            runtime.reviewer.provider,
+            crate::worker::runtime::RuntimeProvider::ClaudeExec
         );
     }
 

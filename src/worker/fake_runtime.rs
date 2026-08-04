@@ -72,8 +72,15 @@ pub struct FakeTaskWorkerRuntime {
 
 impl FakeTaskWorkerRuntime {
     pub fn new(scripts: impl IntoIterator<Item = FakeTurnScript>) -> Self {
+        Self::with_contract(RuntimeContractIdentity::codex_exec(), scripts)
+    }
+
+    pub fn with_contract(
+        contract: RuntimeContractIdentity,
+        scripts: impl IntoIterator<Item = FakeTurnScript>,
+    ) -> Self {
         Self {
-            contract: RuntimeContractIdentity::codex_exec(),
+            contract,
             scripts: scripts.into_iter().collect(),
             sessions: BTreeMap::new(),
             active: BTreeMap::new(),

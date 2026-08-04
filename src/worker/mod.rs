@@ -19,6 +19,7 @@ pub mod profile;
 pub mod result;
 #[cfg(target_os = "linux")]
 pub mod reviewer;
+pub(crate) mod role_router;
 pub mod runtime;
 #[cfg(target_os = "linux")]
 pub(crate) mod sandbox;
@@ -42,11 +43,12 @@ pub use process::{
 };
 pub use runtime::{
     DeveloperOutcomeStatus, DeveloperOutcomeV1, OutcomeContract, ReviewerOutcomeV1,
-    ReviewerVerdict, RoleSessionSpec, RuntimeApprovalPolicy, RuntimeContractIdentity, RuntimeError,
-    RuntimeFailureClass, RuntimeOutcome, RuntimeProfile, RuntimeProvider, RuntimeSandbox,
-    RuntimeSessionKey, RuntimeTelemetry, RuntimeThreadProfileFields, RuntimeTurnKey,
-    RuntimeTurnPoll, RuntimeTurnProfileFields, RuntimeTurnPurpose, RuntimeTurnSpec,
-    SanitizedRuntimeFailure, TaskWorkerProfiles, TaskWorkerRuntime,
+    ReviewerVerdict, RoleSessionSpec, RuntimeApprovalPolicy, RuntimeClaudePermissions,
+    RuntimeContractIdentity, RuntimeError, RuntimeFailureClass, RuntimeOutcome, RuntimeProfile,
+    RuntimeProvider, RuntimeSandbox, RuntimeSessionKey, RuntimeTelemetry,
+    RuntimeThreadProfileFields, RuntimeTurnKey, RuntimeTurnPoll, RuntimeTurnProfileFields,
+    RuntimeTurnPurpose, RuntimeTurnSpec, SanitizedRuntimeFailure, TaskWorkerProfiles,
+    TaskWorkerRuntime,
 };
 
 /// Unit tests create temporary executables while other test threads are
