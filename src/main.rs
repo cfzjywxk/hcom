@@ -43,6 +43,19 @@ use std::panic;
 use std::str::FromStr;
 
 fn main() -> Result<()> {
+    // The Claude lifecycle Guardian is a private same-binary entry. Dispatch it
+    // before config, logging, dev-root re-exec, or CLI parsing so it cannot
+    // acquire unrelated application state or write diagnostics into the native
+    // child's inherited stdout/stderr streams.
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(exit_code) =
+            hcom::worker::guardian::run_internal_entry(std::env::args_os().skip(1))
+        {
+            std::process::exit(exit_code);
+        }
+    }
+
     // Initialize global config from environment variables
     config::Config::init();
 

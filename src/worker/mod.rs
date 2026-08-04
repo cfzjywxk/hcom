@@ -12,6 +12,8 @@ pub mod exec_runtime;
 pub mod fake;
 pub mod fake_runtime;
 #[cfg(target_os = "linux")]
+pub mod guardian;
+#[cfg(target_os = "linux")]
 pub mod process;
 pub mod profile;
 pub mod result;

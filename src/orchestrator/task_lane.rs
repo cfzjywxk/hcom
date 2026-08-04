@@ -15,6 +15,7 @@ use crate::worker::environment::{
 use crate::worker::exec_runtime::{
     ExecRuntimeConfig, ExecTaskPaths, ExecTaskWorkerRuntime, codex_exec_contract_identity,
 };
+use crate::worker::guardian::{CleanupRegistryInterlock, GuardianCleanupRegistry};
 use crate::worker::runtime::{
     CODEX_TASK_WORKER_ADAPTER, OutcomeContract, RoleSessionSpec, RuntimeContractIdentity,
     RuntimeError, RuntimeErrorCode, RuntimeFailureClass, RuntimeProfile, RuntimeSessionKey,
@@ -59,6 +60,10 @@ impl RuntimeFactory for ProductionRuntimeFactory {
         &mut self,
         request: RuntimeOpenRequest,
     ) -> Result<Box<dyn TaskWorkerRuntime>, RuntimeError> {
+        request
+            .cleanup_registry
+            .ensure_available()
+            .map_err(|error| RuntimeError::internal(error.to_string()))?;
         if request.task_ordinal >= 64 {
             return Err(RuntimeError::invalid_contract(
                 "task runtime ordinal exceeds the session bound",
@@ -91,6 +96,7 @@ struct RuntimeOpenRequest {
     lease: ExecutionEnvironmentLease,
     artifact_root: PathBuf,
     run_id: String,
+    cleanup_registry: GuardianCleanupRegistry,
 }
 
 struct RuntimeOpenFailure {
@@ -179,6 +185,7 @@ pub(crate) struct TaskLaneSupervisor {
     next_turn: u64,
     project_tasks_workspace: Option<ProjectTasksWorkspace>,
     tasks_workspace: Option<TasksWorkspace>,
+    cleanup_registry: GuardianCleanupRegistry,
 }
 
 impl TaskLaneSupervisor {
@@ -244,6 +251,7 @@ impl TaskLaneSupervisor {
             next_turn: 1,
             project_tasks_workspace: None,
             tasks_workspace: None,
+            cleanup_registry: GuardianCleanupRegistry::default(),
         })
     }
 
@@ -278,6 +286,7 @@ impl TaskLaneSupervisor {
         if self.task_runtime.is_some() || self.active.is_some() {
             bail!("terminal run retained a live task runtime");
         }
+        self.cleanup_registry.ensure_available()?;
         crate::worker::validation::validate_opaque_id("run id", &run_id)?;
 
         let next_core = self
@@ -357,6 +366,7 @@ impl TaskLaneSupervisor {
         if !approval_confirmed {
             bail!("run start requires explicit human execution authorization");
         }
+        self.cleanup_registry.ensure_available()?;
         let effects = self
             .core
             .reduce(SupervisorEvent::ExecutionAuthorized {
@@ -570,6 +580,7 @@ impl TaskLaneSupervisor {
     }
 
     pub(crate) fn poll_once(&mut self) -> Result<()> {
+        let _ = self.cleanup_registry.retry_pending();
         let fallback_task_ordinal = self.active.as_ref().map(|active| active.task_ordinal);
         let result = self.poll_once_inner();
         if result.is_ok() || self.core.session_state().is_terminal() {
@@ -662,7 +673,15 @@ impl TaskLaneSupervisor {
             self.execute_effects(effects)?;
         }
         self.close_runtime_best_effort();
-        Ok(())
+        match self.cleanup_registry.cleanup_for(Duration::from_secs(3)) {
+            CleanupRegistryInterlock::Ready => Ok(()),
+            CleanupRegistryInterlock::Pending { claims } => {
+                bail!("Claude lifecycle cleanup remains pending for {claims} Guardian claim(s)")
+            }
+            CleanupRegistryInterlock::Poisoned { detail } => {
+                bail!("Claude lifecycle ownership lost: {detail}")
+            }
+        }
     }
 
     fn execute_effects(&mut self, initial: Vec<SupervisorEffect>) -> Result<()> {
@@ -834,6 +853,9 @@ impl TaskLaneSupervisor {
         &mut self,
         task_ordinal: usize,
     ) -> Result<(), RuntimeOpenFailure> {
+        self.cleanup_registry
+            .ensure_available()
+            .map_err(|error| RuntimeOpenFailure::new(DriverFailureClass::Cleanup, error))?;
         if self.task_runtime.is_some() || self.active.is_some() {
             return Err(RuntimeOpenFailure::new(
                 DriverFailureClass::Contract,
@@ -878,6 +900,7 @@ impl TaskLaneSupervisor {
                     )
                 })?,
             run_id: self.startup.run_id.clone(),
+            cleanup_registry: self.cleanup_registry.clone(),
         };
         let runtime = self.factory.open(request).map_err(|error| {
             RuntimeOpenFailure::new(DriverFailureClass::Runtime, anyhow!(error.detail))
@@ -902,6 +925,7 @@ impl TaskLaneSupervisor {
         task_ordinal: usize,
         role: WorkerRole,
     ) -> Result<RuntimeSessionKey> {
+        self.cleanup_registry.ensure_available()?;
         let task = self
             .core
             .tasks()
@@ -946,6 +970,7 @@ impl TaskLaneSupervisor {
         if self.active.is_some() {
             bail!("a second exec worker turn cannot start");
         }
+        self.cleanup_registry.ensure_available()?;
         let task = self
             .core
             .tasks()
@@ -2597,6 +2622,100 @@ mod tests {
                 ("second", WorkerRole::Reviewer, 2),
             ]
         );
+    }
+
+    #[test]
+    fn pending_guardian_cleanup_blocks_next_run_until_completion() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script(
+            "first",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("implemented")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [lgtm("sound")],
+                ),
+            ],
+            vec![
+                Mutation::Commit {
+                    path: "src/first.txt",
+                    contents: "first\n",
+                },
+                Mutation::None,
+            ],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], audit);
+        start(&mut supervisor, vec![fixture.task("first", &["src"], 2)]);
+        let terminal = drive_terminal(&mut supervisor);
+        supervisor.cleanup_registry.inject_pending_for_test();
+
+        let before = supervisor.snapshot();
+        let error = supervisor
+            .begin_next_run_with_id(
+                terminal.version,
+                &terminal.run_id,
+                "run-cleanup-blocked".into(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("cleanup is pending"));
+        assert_eq!(supervisor.snapshot(), before);
+
+        supervisor.cleanup_registry.complete_pending_for_test();
+        supervisor
+            .begin_next_run_with_id(
+                terminal.version,
+                &terminal.run_id,
+                "run-cleanup-released".into(),
+            )
+            .unwrap();
+        assert_eq!(supervisor.snapshot().state, SessionState::AwaitingPlan);
+    }
+
+    #[test]
+    fn lost_guardian_ownership_permanently_poisons_sequential_runs() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = task_script(
+            "poison",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("implemented")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [lgtm("sound")],
+                ),
+            ],
+            vec![
+                Mutation::Commit {
+                    path: "src/poison.txt",
+                    contents: "poison\n",
+                },
+                Mutation::None,
+            ],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], audit);
+        start(&mut supervisor, vec![fixture.task("poison", &["src"], 2)]);
+        let terminal = drive_terminal(&mut supervisor);
+        supervisor
+            .cleanup_registry
+            .poison_for_test("protocol identity lost");
+
+        let error = supervisor
+            .begin_next_run_with_id(terminal.version, &terminal.run_id, "run-poisoned".into())
+            .unwrap_err();
+        assert!(error.to_string().contains("ownership lost"));
+        assert_eq!(supervisor.snapshot(), terminal);
+        assert!(supervisor.cleanup_registry.ensure_available().is_err());
     }
 
     #[test]
