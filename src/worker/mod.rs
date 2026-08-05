@@ -52,7 +52,7 @@ pub use runtime::{
     RuntimeProvider, RuntimeSandbox, RuntimeSessionKey, RuntimeTelemetry,
     RuntimeThreadProfileFields, RuntimeTurnKey, RuntimeTurnPoll, RuntimeTurnProfileFields,
     RuntimeTurnPurpose, RuntimeTurnSpec, SanitizedRuntimeFailure, TaskWorkerProfiles,
-    TaskWorkerRuntime,
+    TaskWorkerRuntime, WorkerLane,
 };
 
 /// Unit tests create temporary executables while other test threads are

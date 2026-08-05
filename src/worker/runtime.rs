@@ -32,6 +32,42 @@ const DEFAULT_REASONING_EFFORT: &str = "xhigh";
 const MAX_TASK_KEY_BYTES: usize = 128;
 const MAX_PATH_BYTES: usize = 4096;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WorkerLane {
+    Developer,
+    Reviewer(ReviewerId),
+}
+
+impl WorkerLane {
+    pub fn released_for_role(role: WorkerRole) -> Self {
+        match role {
+            WorkerRole::Developer => Self::Developer,
+            WorkerRole::Reviewer => Self::Reviewer(ReviewerId::Reviewer1),
+        }
+    }
+
+    pub fn role(self) -> WorkerRole {
+        match self {
+            Self::Developer => WorkerRole::Developer,
+            Self::Reviewer(_) => WorkerRole::Reviewer,
+        }
+    }
+
+    pub fn reviewer_id(self) -> Option<ReviewerId> {
+        match self {
+            Self::Developer => None,
+            Self::Reviewer(reviewer_id) => Some(reviewer_id),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Developer => "developer",
+            Self::Reviewer(reviewer_id) => reviewer_id.as_str(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeProvider {
@@ -382,11 +418,34 @@ impl TaskWorkerProfiles {
             .profile
     }
 
-    pub fn profile(&self, role: WorkerRole) -> &RuntimeProfile {
-        match role {
-            WorkerRole::Developer => &self.developer,
-            WorkerRole::Reviewer => self.reviewer1(),
+    pub fn lanes(&self) -> impl Iterator<Item = WorkerLane> + '_ {
+        std::iter::once(WorkerLane::Developer).chain(
+            self.reviewers
+                .iter()
+                .map(|binding| WorkerLane::Reviewer(binding.reviewer_id)),
+        )
+    }
+
+    pub fn profile_for_lane(&self, lane: WorkerLane) -> Result<&RuntimeProfile, RuntimeError> {
+        match lane {
+            WorkerLane::Developer => Ok(&self.developer),
+            WorkerLane::Reviewer(reviewer_id) => self
+                .reviewers
+                .iter()
+                .find(|binding| binding.reviewer_id == reviewer_id)
+                .map(|binding| &binding.profile)
+                .ok_or_else(|| {
+                    RuntimeError::invalid_identity(format!(
+                        "{} is not bound in the frozen reviewer collection",
+                        reviewer_id.as_str()
+                    ))
+                }),
         }
+    }
+
+    pub fn profile(&self, role: WorkerRole) -> &RuntimeProfile {
+        self.profile_for_lane(WorkerLane::released_for_role(role))
+            .expect("validated released task worker profiles bind the requested role lane")
     }
 
     pub fn provider(&self, role: WorkerRole) -> RuntimeProvider {
@@ -1103,8 +1162,28 @@ mod tests {
         profiles.validate().unwrap();
         assert_eq!(profiles.reviewers.len(), 1);
         assert_eq!(profiles.reviewers[0].reviewer_id, ReviewerId::Reviewer1);
+        assert_eq!(
+            profiles.lanes().collect::<Vec<_>>(),
+            [
+                WorkerLane::Developer,
+                WorkerLane::Reviewer(ReviewerId::Reviewer1)
+            ]
+        );
         assert_eq!(profiles.profile(WorkerRole::Developer), &profiles.developer);
         assert_eq!(profiles.profile(WorkerRole::Reviewer), profiles.reviewer1());
+        assert_eq!(
+            profiles
+                .profile_for_lane(WorkerLane::Reviewer(ReviewerId::Reviewer1))
+                .unwrap(),
+            profiles.reviewer1()
+        );
+        assert_eq!(
+            profiles
+                .profile_for_lane(WorkerLane::Reviewer(ReviewerId::Reviewer2))
+                .unwrap_err()
+                .code,
+            RuntimeErrorCode::InvalidIdentity
+        );
 
         let mut wrong_identity = profiles.clone();
         wrong_identity.reviewers[0].reviewer_id = ReviewerId::Reviewer2;

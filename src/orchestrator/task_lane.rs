@@ -16,12 +16,12 @@ use crate::worker::environment::{
 use crate::worker::exec_runtime::{ExecRuntimeConfig, ExecTaskPaths, ExecTaskWorkerRuntime};
 use crate::worker::guardian::{CleanupRegistryInterlock, GuardianCleanupRegistry};
 use crate::worker::profile::{ArchitectAdapter, SessionInvocationProfiles};
-use crate::worker::role_router::{ProviderRuntimeSlot, RoleRoutedTaskWorkerRuntime};
+use crate::worker::role_router::{LaneRuntimeSlot, LaneTaskWorkerRuntime, TaskRuntimeBundle};
 use crate::worker::runtime::{
     OutcomeContract, RoleSessionSpec, RuntimeContractIdentity, RuntimeError, RuntimeErrorCode,
     RuntimeFailureClass, RuntimeProfile, RuntimeProvider, RuntimeSessionKey, RuntimeTurnKey,
     RuntimeTurnPoll, RuntimeTurnPurpose, RuntimeTurnSpec, SanitizedRuntimeFailure,
-    TaskWorkerProfiles, TaskWorkerRuntime,
+    TaskWorkerProfiles, WorkerLane,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::{BTreeMap, VecDeque};
@@ -41,7 +41,7 @@ trait RuntimeFactory: Send {
     fn open(
         &mut self,
         request: RuntimeOpenRequest,
-    ) -> Result<Box<dyn TaskWorkerRuntime>, RuntimeError>;
+    ) -> Result<Box<dyn LaneTaskWorkerRuntime>, RuntimeError>;
 }
 
 struct ProductionRuntimeFactory;
@@ -75,7 +75,7 @@ impl RuntimeFactory for ProductionRuntimeFactory {
     fn open(
         &mut self,
         request: RuntimeOpenRequest,
-    ) -> Result<Box<dyn TaskWorkerRuntime>, RuntimeError> {
+    ) -> Result<Box<dyn LaneTaskWorkerRuntime>, RuntimeError> {
         request
             .cleanup_registry
             .ensure_available()
@@ -100,16 +100,11 @@ impl RuntimeFactory for ProductionRuntimeFactory {
             profiles,
             guardian_executable,
         } = request;
-        let mut providers = std::iter::once(profiles.developer.provider).chain(
+        let uses_claude = profiles.lanes().any(|lane| {
             profiles
-                .reviewers
-                .iter()
-                .map(|binding| binding.profile.provider),
-        );
-        let uses_codex = providers
-            .clone()
-            .any(|provider| provider == RuntimeProvider::CodexExec);
-        let uses_claude = providers.any(|provider| provider == RuntimeProvider::ClaudeExec);
+                .profile_for_lane(lane)
+                .is_ok_and(|profile| profile.provider == RuntimeProvider::ClaudeExec)
+        });
 
         let claude_environment = if uses_claude {
             let parent = ParentEnvironment::from_raw_entries(environment.iter().cloned())
@@ -121,61 +116,44 @@ impl RuntimeFactory for ProductionRuntimeFactory {
         } else {
             None
         };
-        let codex_runtime = if uses_codex {
-            Some(ExecTaskWorkerRuntime::open(ExecRuntimeConfig {
-                codex: PathBuf::from("codex"),
-                repository_root: repository_root.clone(),
-                paths: ExecTaskPaths {
-                    runtime: paths.runtime.clone(),
-                },
-                environment: environment.clone(),
-                lease: lease.clone(),
-                artifact_root_path: artifact_root.clone(),
-                run_id: run_id.clone(),
-                task_id: task_key.clone(),
-            })?)
-        } else {
-            None
-        };
-        let claude_runtime = if uses_claude {
-            Some(ClaudeExecTaskWorkerRuntime::open(
-                ClaudeExecRuntimeConfig {
-                    claude: "claude".into(),
-                    guardian_executable,
-                    environment: claude_environment
-                        .expect("a Claude binding materializes its role environment"),
-                    lease,
-                    artifact_root_path: artifact_root,
-                    run_id,
-                    task_id: task_key,
-                    cleanup_registry,
-                },
-            )?)
-        } else {
-            None
-        };
-
-        // Preserve the exact direct Codex child for the released pure-Codex
-        // lane. Any binding with Claude uses the provider-neutral key router.
-        if !uses_claude {
-            return Ok(Box::new(
-                codex_runtime.expect("a pure Codex binding creates the Codex runtime"),
-            ));
-        }
         let mut slots = Vec::new();
-        if let Some(runtime) = codex_runtime {
-            slots.push(ProviderRuntimeSlot::available(
-                RuntimeProvider::CodexExec,
-                Box::new(runtime),
-            )?);
+        for lane in profiles.lanes() {
+            let profile = profiles.profile_for_lane(lane)?;
+            let runtime: Box<dyn crate::worker::runtime::TaskWorkerRuntime> = match profile.provider
+            {
+                RuntimeProvider::CodexExec => {
+                    Box::new(ExecTaskWorkerRuntime::open(ExecRuntimeConfig {
+                        codex: PathBuf::from("codex"),
+                        repository_root: repository_root.clone(),
+                        paths: ExecTaskPaths {
+                            runtime: paths.runtime_for(lane)?.to_path_buf(),
+                        },
+                        environment: environment.clone(),
+                        lease: lease.clone(),
+                        artifact_root_path: artifact_root.clone(),
+                        run_id: run_id.clone(),
+                        task_id: task_key.clone(),
+                    })?)
+                }
+                RuntimeProvider::ClaudeExec => Box::new(ClaudeExecTaskWorkerRuntime::open(
+                    ClaudeExecRuntimeConfig {
+                        claude: "claude".into(),
+                        guardian_executable: guardian_executable.clone(),
+                        environment: claude_environment
+                            .as_ref()
+                            .expect("a Claude binding materializes its role environment")
+                            .clone(),
+                        lease: lease.clone(),
+                        artifact_root_path: artifact_root.clone(),
+                        run_id: run_id.clone(),
+                        task_id: task_key.clone(),
+                        cleanup_registry: cleanup_registry.clone(),
+                    },
+                )?),
+            };
+            slots.push(LaneRuntimeSlot::available(lane, runtime)?);
         }
-        slots.push(ProviderRuntimeSlot::available(
-            RuntimeProvider::ClaudeExec,
-            Box::new(claude_runtime.expect("a Claude binding creates the Claude runtime")),
-        )?);
-        Ok(Box::new(RoleRoutedTaskWorkerRuntime::new(
-            &profiles, slots,
-        )?))
+        Ok(Box::new(TaskRuntimeBundle::new(&profiles, slots)?))
     }
 }
 
@@ -208,7 +186,7 @@ impl RuntimeOpenFailure {
 }
 
 struct TaskRuntimePaths {
-    runtime: PathBuf,
+    runtimes: BTreeMap<WorkerLane, PathBuf>,
 }
 
 impl TaskRuntimePaths {
@@ -217,6 +195,7 @@ impl TaskRuntimePaths {
         task_ordinal: usize,
         task_key: &str,
         _repository_root: &Path,
+        lanes: impl IntoIterator<Item = WorkerLane>,
     ) -> Result<(TempDir, Self)> {
         let workers = run_root.join("exec-workers");
         ensure_private_directory(&workers)?;
@@ -226,37 +205,63 @@ impl TaskRuntimePaths {
             .tempdir_in(&workers)
             .context("failed to create task-private exec worker root")?;
         let root_path = fs::canonicalize(root.path())?;
-        let paths = Self {
-            runtime: root_path.join("run"),
-        };
-        fs::create_dir(&paths.runtime).with_context(|| {
+        let runtime_root = root_path.join("run");
+        fs::create_dir(&runtime_root).with_context(|| {
             format!(
-                "failed to create task-private exec worker directory {}",
-                paths.runtime.display()
+                "failed to create task-private exec worker root {}",
+                runtime_root.display()
             )
         })?;
-        fs::set_permissions(&paths.runtime, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700))?;
+        let mut runtimes = BTreeMap::new();
+        for lane in lanes {
+            let runtime = runtime_root.join(lane.as_str());
+            fs::create_dir(&runtime).with_context(|| {
+                format!(
+                    "failed to create {} task-private worker directory {}",
+                    lane.as_str(),
+                    runtime.display()
+                )
+            })?;
+            fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))?;
+            if runtimes.insert(lane, runtime).is_some() {
+                bail!("task-private worker runtime lane was duplicated");
+            }
+        }
+        let paths = Self { runtimes };
         Ok((root, paths))
+    }
+
+    fn runtime_for(&self, lane: WorkerLane) -> Result<&Path, RuntimeError> {
+        self.runtimes
+            .get(&lane)
+            .map(PathBuf::as_path)
+            .ok_or_else(|| {
+                RuntimeError::invalid_contract(format!(
+                    "{} task runtime path is missing",
+                    lane.as_str()
+                ))
+            })
     }
 }
 
 struct OpenTaskRuntime {
     task_ordinal: usize,
     _root: TempDir,
-    runtime: Box<dyn TaskWorkerRuntime>,
+    runtime: Box<dyn LaneTaskWorkerRuntime>,
     sessions: BTreeMap<RuntimeSessionKey, LocalSession>,
 }
 
 #[derive(Clone, Copy)]
 struct LocalSession {
-    role: WorkerRole,
+    lane: WorkerLane,
     key: RuntimeSessionKey,
 }
 
 #[derive(Clone)]
 struct ActiveTurn {
     task_ordinal: usize,
-    role: WorkerRole,
+    lane: WorkerLane,
     logical_session: RuntimeSessionKey,
     logical_turn: RuntimeTurnKey,
     local_turn: RuntimeTurnKey,
@@ -733,10 +738,21 @@ impl TaskLaneSupervisor {
             .active
             .clone()
             .ok_or_else(|| anyhow!("active exec worker turn disappeared"))?;
-        let poll = {
+        let polled = {
             let task_runtime = self.require_task_runtime_mut(active.task_ordinal)?;
-            task_runtime.runtime.poll_turn(active.local_turn)
+            task_runtime
+                .runtime
+                .poll_turn(active.lane, active.local_turn)
         };
+        let poll = polled.and_then(|polled| {
+            if polled.lane != active.lane || polled.turn != active.local_turn {
+                return Err(RuntimeError::invalid_identity(
+                    "task runtime returned a poll for another lane or turn",
+                ));
+            }
+            Ok(polled.poll)
+        });
+        let role = active.lane.role();
         let event = match poll {
             Ok(RuntimeTurnPoll::Pending { .. }) => return Ok(()),
             Ok(RuntimeTurnPoll::Completed {
@@ -746,7 +762,7 @@ impl TaskLaneSupervisor {
             }) => SupervisorEvent::TurnCompleted {
                 expected_version: self.core.version(),
                 task_ordinal: active.task_ordinal,
-                role: active.role,
+                role,
                 session: active.logical_session,
                 turn: active.logical_turn,
                 completion_token: active.completion_token.clone(),
@@ -756,7 +772,7 @@ impl TaskLaneSupervisor {
             Ok(RuntimeTurnPoll::Failed { failure, .. }) => SupervisorEvent::TurnFailed {
                 expected_version: self.core.version(),
                 task_ordinal: active.task_ordinal,
-                role: active.role,
+                role,
                 session: active.logical_session,
                 turn: active.logical_turn,
                 completion_token: active.completion_token.clone(),
@@ -765,7 +781,7 @@ impl TaskLaneSupervisor {
             Err(error) => SupervisorEvent::TurnFailed {
                 expected_version: self.core.version(),
                 task_ordinal: active.task_ordinal,
-                role: active.role,
+                role,
                 session: active.logical_session,
                 turn: active.logical_turn,
                 completion_token: active.completion_token.clone(),
@@ -1002,6 +1018,7 @@ impl TaskLaneSupervisor {
             task_ordinal,
             &task.spec.task_key,
             &repository_root,
+            self.profiles.lanes(),
         )
         .map_err(|error| RuntimeOpenFailure::new(DriverFailureClass::Environment, error))?;
         let environment = self
@@ -1064,25 +1081,29 @@ impl TaskLaneSupervisor {
         let task_key = task.spec.task_key.clone();
         let repository_root = PathBuf::from(&task.spec.repository_root);
         let project_root = self.startup.project_root.clone();
+        let lane = WorkerLane::released_for_role(role);
         let profile = self.profile(role).clone();
         let instructions = role_instructions(role).to_owned();
         let local = self
             .require_task_runtime_mut(task_ordinal)?
             .runtime
-            .open_session(RoleSessionSpec {
-                role,
-                task_key,
-                cwd: project_root,
-                task_repository: repository_root,
-                profile,
-                developer_instructions: instructions,
-            })
+            .open_session(
+                lane,
+                RoleSessionSpec {
+                    role,
+                    task_key,
+                    cwd: project_root,
+                    task_repository: repository_root,
+                    profile,
+                    developer_instructions: instructions,
+                },
+            )
             .map_err(|error| anyhow!(error.detail))?;
         let logical = self.allocate_session_key()?;
         let runtime = self.require_task_runtime_mut(task_ordinal)?;
         if runtime
             .sessions
-            .insert(logical, LocalSession { role, key: local })
+            .insert(logical, LocalSession { lane, key: local })
             .is_some()
         {
             bail!("logical exec worker role session key collided");
@@ -1110,20 +1131,22 @@ impl TaskLaneSupervisor {
         let repository_root = PathBuf::from(&task.spec.repository_root);
         let prompt = self.build_turn_prompt(task_ordinal, role, purpose)?;
         let profile = self.profile(role).clone();
+        let lane = WorkerLane::released_for_role(role);
         let local_session = self
             .require_task_runtime_mut(task_ordinal)?
             .sessions
             .get(&logical_session)
             .copied()
             .ok_or_else(|| anyhow!("logical exec worker role session is not bound"))?;
-        if local_session.role != role {
-            bail!("logical exec worker session belongs to the wrong role");
+        if local_session.lane != lane {
+            bail!("logical exec worker session belongs to the wrong lane");
         }
         let project_root = self.startup.project_root.clone();
         let local_turn = self
             .require_task_runtime_mut(task_ordinal)?
             .runtime
             .start_turn(
+                lane,
                 local_session.key,
                 RuntimeTurnSpec {
                     role,
@@ -1145,7 +1168,7 @@ impl TaskLaneSupervisor {
         let completion_token = format!("exec-turn-{}", Uuid::new_v4());
         self.active = Some(ActiveTurn {
             task_ordinal,
-            role,
+            lane,
             logical_session,
             logical_turn,
             local_turn,
@@ -1168,7 +1191,7 @@ impl TaskLaneSupervisor {
             return;
         }
         if let Some(runtime) = self.task_runtime.as_mut()
-            && let Err(error) = runtime.runtime.cancel_turn(active.local_turn)
+            && let Err(error) = runtime.runtime.cancel_turn(active.lane, active.local_turn)
         {
             // Cancellation that could not confirm the worker died is evidence,
             // not something to swallow: the run is ending either way, so
@@ -1429,7 +1452,7 @@ fn runtime_error_failure(error: RuntimeError) -> Result<SanitizedRuntimeFailure>
 
 fn clone_runtime_paths(paths: &TaskRuntimePaths) -> TaskRuntimePaths {
     TaskRuntimePaths {
-        runtime: paths.runtime.clone(),
+        runtimes: paths.runtimes.clone(),
     }
 }
 
@@ -1547,7 +1570,7 @@ mod tests {
     };
     use crate::worker::runtime::{
         CODEX_TASK_WORKER_ADAPTER, DeveloperOutcomeStatus, DeveloperOutcomeV1, ReviewerOutcomeV1,
-        ReviewerVerdict, RuntimeOutcome, RuntimeTelemetry,
+        ReviewerVerdict, RuntimeOutcome, RuntimeTelemetry, TaskWorkerRuntime,
     };
     use std::collections::BTreeSet;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -1709,7 +1732,7 @@ mod tests {
         fn open(
             &mut self,
             request: RuntimeOpenRequest,
-        ) -> Result<Box<dyn TaskWorkerRuntime>, RuntimeError> {
+        ) -> Result<Box<dyn LaneTaskWorkerRuntime>, RuntimeError> {
             let script = self.scripts.pop_front().ok_or_else(|| {
                 RuntimeError::invalid_transition("scripted runtime factory is exhausted")
             })?;
@@ -1727,6 +1750,8 @@ mod tests {
                 task_key: request.task_key,
                 repository: request.repository_root,
                 inner: FakeTaskWorkerRuntime::new(script.turns),
+                sessions: BTreeMap::new(),
+                turns: BTreeMap::new(),
                 mutations: script.mutations,
                 shutdown_failure: script.shutdown_failure,
                 audit: Arc::clone(&self.audit),
@@ -1738,23 +1763,32 @@ mod tests {
         task_key: String,
         repository: PathBuf,
         inner: FakeTaskWorkerRuntime,
+        sessions: BTreeMap<RuntimeSessionKey, WorkerLane>,
+        turns: BTreeMap<RuntimeTurnKey, WorkerLane>,
         mutations: VecDeque<Mutation>,
         shutdown_failure: bool,
         audit: Arc<Mutex<Audit>>,
     }
 
-    impl TaskWorkerRuntime for ScriptedRuntime {
+    impl LaneTaskWorkerRuntime for ScriptedRuntime {
         fn contract(&self) -> &RuntimeContractIdentity {
             self.inner.contract()
         }
 
         fn open_session(
             &mut self,
+            lane: WorkerLane,
             spec: RoleSessionSpec,
         ) -> Result<RuntimeSessionKey, RuntimeError> {
+            if lane.role() != spec.role {
+                return Err(RuntimeError::invalid_identity(
+                    "scripted session lane differs from its role",
+                ));
+            }
             let role = spec.role;
             let profile = spec.profile.clone();
             let session = self.inner.open_session(spec)?;
+            self.sessions.insert(session, lane);
             let mut audit = self.audit.lock().unwrap();
             audit
                 .sessions
@@ -1765,13 +1799,20 @@ mod tests {
 
         fn start_turn(
             &mut self,
+            lane: WorkerLane,
             session: RuntimeSessionKey,
             spec: RuntimeTurnSpec,
         ) -> Result<RuntimeTurnKey, RuntimeError> {
+            if self.sessions.get(&session) != Some(&lane) || lane.role() != spec.role {
+                return Err(RuntimeError::invalid_identity(
+                    "scripted turn differs from its lane-scoped session",
+                ));
+            }
             let role = spec.role;
             let purpose = spec.purpose;
             let prompt = spec.prompt.clone();
             let turn = self.inner.start_turn(session, spec)?;
+            self.turns.insert(turn, lane);
             let mut audit = self.audit.lock().unwrap();
             audit
                 .turns
@@ -1781,20 +1822,61 @@ mod tests {
             Ok(turn)
         }
 
-        fn poll_turn(&mut self, turn: RuntimeTurnKey) -> Result<RuntimeTurnPoll, RuntimeError> {
+        fn poll_turn(
+            &mut self,
+            lane: WorkerLane,
+            turn: RuntimeTurnKey,
+        ) -> Result<crate::worker::role_router::LaneRuntimeTurnPoll, RuntimeError> {
+            if self.turns.get(&turn) != Some(&lane) {
+                return Err(RuntimeError::invalid_identity(
+                    "scripted poll differs from its lane-scoped turn",
+                ));
+            }
             let poll = self.inner.poll_turn(turn)?;
             if poll.is_terminal() {
+                self.turns.remove(&turn);
                 let mutation = self.mutations.pop_front().ok_or_else(|| {
                     RuntimeError::internal("scripted runtime mutation inventory disappeared")
                 })?;
                 apply_mutation(&self.repository, mutation)
                     .map_err(|_| RuntimeError::internal("scripted Git mutation failed"))?;
             }
-            Ok(poll)
+            Ok(crate::worker::role_router::LaneRuntimeTurnPoll { lane, turn, poll })
         }
 
-        fn cancel_turn(&mut self, turn: RuntimeTurnKey) -> Result<(), RuntimeError> {
-            self.inner.cancel_turn(turn)
+        fn cancel_turn(
+            &mut self,
+            lane: WorkerLane,
+            turn: RuntimeTurnKey,
+        ) -> Result<(), RuntimeError> {
+            if self.turns.get(&turn) != Some(&lane) {
+                return Err(RuntimeError::invalid_identity(
+                    "scripted cancel differs from its lane-scoped turn",
+                ));
+            }
+            self.inner.cancel_turn(turn)?;
+            self.turns.remove(&turn);
+            Ok(())
+        }
+
+        fn cancel_all(&mut self) -> Result<(), RuntimeError> {
+            let turns = self
+                .turns
+                .iter()
+                .map(|(turn, lane)| (*lane, *turn))
+                .collect::<Vec<_>>();
+            let mut first_error = None;
+            for (lane, turn) in turns {
+                if let Err(error) = self.cancel_turn(lane, turn)
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            Ok(())
         }
 
         fn shutdown(&mut self) -> Result<(), RuntimeError> {
@@ -1823,7 +1905,7 @@ mod tests {
         fn open(
             &mut self,
             _request: RuntimeOpenRequest,
-        ) -> Result<Box<dyn TaskWorkerRuntime>, RuntimeError> {
+        ) -> Result<Box<dyn LaneTaskWorkerRuntime>, RuntimeError> {
             Err(RuntimeError::internal("runtime-factory-secret-sentinel"))
         }
     }
@@ -2670,17 +2752,24 @@ mod tests {
     }
 
     #[test]
-    fn task_runtime_only_creates_its_raw_transport_directory() {
+    fn task_runtime_creates_private_transport_directories_per_released_lane() {
         let fixture = Fixture::new();
+        let lanes = [
+            WorkerLane::Developer,
+            WorkerLane::released_for_role(WorkerRole::Reviewer),
+        ];
         let (root, paths) =
-            TaskRuntimePaths::create(&fixture.run_root, 0, "config", &fixture.repository).unwrap();
+            TaskRuntimePaths::create(&fixture.run_root, 0, "config", &fixture.repository, lanes)
+                .unwrap();
         let mut children = fs::read_dir(root.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
         children.sort();
         assert_eq!(children, [OsString::from("run")]);
-        assert!(paths.runtime.is_dir());
+        for lane in lanes {
+            assert!(paths.runtime_for(lane).unwrap().is_dir());
+        }
     }
 
     #[test]
