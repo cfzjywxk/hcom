@@ -181,7 +181,7 @@ trait SupervisorBackend: Send {
         &mut self,
         expected_session_version: u64,
         developer_adapter: &str,
-        reviewer_adapter: &str,
+        reviewer_adapters: &[crate::control_api::ReviewerAdapterBinding],
         tasks: Vec<crate::control_api::TaskDraft>,
     ) -> Result<(u64, String)>;
 
@@ -255,13 +255,13 @@ impl SupervisorBackend for TaskLaneSupervisor {
         &mut self,
         expected_session_version: u64,
         developer_adapter: &str,
-        reviewer_adapter: &str,
+        reviewer_adapters: &[crate::control_api::ReviewerAdapterBinding],
         tasks: Vec<crate::control_api::TaskDraft>,
     ) -> Result<(u64, String)> {
         self.replace_plan(
             expected_session_version,
             developer_adapter,
-            reviewer_adapter,
+            reviewer_adapters,
             tasks,
         )
     }
@@ -1017,13 +1017,13 @@ impl SessionSupervisorControl {
             ControlAction::SessionPlanReplace {
                 expected_session_version,
                 developer_adapter,
-                reviewer_adapter,
+                reviewer_adapters,
                 tasks,
             } => {
                 let (plan_version, plan_hash) = self.supervisor.replace_plan(
                     *expected_session_version,
                     developer_adapter,
-                    reviewer_adapter,
+                    reviewer_adapters,
                     tasks.clone(),
                 )?;
                 Ok(ControlResult::Plan {
@@ -1520,7 +1520,7 @@ mod tests {
             &mut self,
             _expected_session_version: u64,
             _developer_adapter: &str,
-            _reviewer_adapter: &str,
+            _reviewer_adapters: &[crate::control_api::ReviewerAdapterBinding],
             _tasks: Vec<crate::control_api::TaskDraft>,
         ) -> Result<(u64, String)> {
             bail!("unused fake replace_plan")

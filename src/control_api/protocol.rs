@@ -141,7 +141,7 @@ pub enum ControlAction {
     SessionPlanReplace {
         expected_session_version: u64,
         developer_adapter: String,
-        reviewer_adapter: String,
+        reviewer_adapters: Vec<ReviewerAdapterBinding>,
         tasks: Vec<TaskDraft>,
     },
     SessionApproveAndStart {
@@ -213,12 +213,12 @@ impl ControlAction {
             } => validate_id("terminal_run_id", terminal_run_id),
             Self::SessionPlanReplace {
                 developer_adapter,
-                reviewer_adapter,
+                reviewer_adapters,
                 tasks,
                 ..
             } => {
                 validate_single_line("developer_adapter", developer_adapter, 64)?;
-                validate_single_line("reviewer_adapter", reviewer_adapter, 64)?;
+                validate_reviewer_adapter_bindings(reviewer_adapters)?;
                 validate_tasks(tasks)
             }
             Self::SessionApproveAndStart {
@@ -299,6 +299,13 @@ impl ControlAction {
 pub enum WorkerRole {
     Developer,
     Reviewer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewerAdapterBinding {
+    pub reviewer_id: ReviewerId,
+    pub adapter: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -819,6 +826,23 @@ fn validate_tasks(tasks: &[TaskDraft]) -> Result<(), ProtocolValidationError> {
     Ok(())
 }
 
+fn validate_reviewer_adapter_bindings(
+    bindings: &[ReviewerAdapterBinding],
+) -> Result<(), ProtocolValidationError> {
+    if bindings.len() != REVIEWER_COUNT
+        || bindings[0].reviewer_id != ReviewerId::Reviewer1
+        || bindings[1].reviewer_id != ReviewerId::Reviewer2
+    {
+        return Err(ProtocolValidationError::new(
+            "reviewer_adapters must contain ordered Reviewer1 and Reviewer2 bindings",
+        ));
+    }
+    for binding in bindings {
+        validate_single_line("reviewer adapter", &binding.adapter, 64)?;
+    }
+    Ok(())
+}
+
 fn validate_id(label: &str, value: &str) -> Result<(), ProtocolValidationError> {
     if value.is_empty()
         || value.len() > MAX_ID_BYTES
@@ -950,10 +974,29 @@ mod tests {
         let valid = ControlAction::SessionPlanReplace {
             expected_session_version: 0,
             developer_adapter: "codex-developer".into(),
-            reviewer_adapter: "codex-reviewer".into(),
+            reviewer_adapters: vec![
+                ReviewerAdapterBinding {
+                    reviewer_id: ReviewerId::Reviewer1,
+                    adapter: "codex-reviewer".into(),
+                },
+                ReviewerAdapterBinding {
+                    reviewer_id: ReviewerId::Reviewer2,
+                    adapter: "claude-reviewer-2.1.220".into(),
+                },
+            ],
             tasks: vec![task("one"), task("two")],
         };
         assert!(valid.validate().is_ok());
+
+        let mut wrong_reviewer_order = valid.clone();
+        let ControlAction::SessionPlanReplace {
+            reviewer_adapters, ..
+        } = &mut wrong_reviewer_order
+        else {
+            unreachable!()
+        };
+        reviewer_adapters.swap(0, 1);
+        assert!(wrong_reviewer_order.validate().is_err());
 
         let mut duplicate = valid.clone();
         let ControlAction::SessionPlanReplace { tasks, .. } = &mut duplicate else {

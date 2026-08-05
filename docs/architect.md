@@ -258,7 +258,10 @@ content:
 session_plan_replace({
   expected_session_version,
   developer_adapter,
-  reviewer_adapter,
+  reviewer_adapters: [
+    { reviewer_id: "reviewer1", adapter: reviewer1_adapter },
+    { reviewer_id: "reviewer2", adapter: reviewer2_adapter }
+  ],
   tasks: [{
     task_key,
     title,
@@ -556,12 +559,16 @@ Real model-backed tests are opt-in and use disposable paths:
 ```bash
 scripts/codex-exec-contract-smokes
 cargo test --lib real_exec -- --ignored --nocapture --test-threads=1
+scripts/dual-review-e2e strict-generation
 ```
 
 They must never reuse, focus, type into, signal, or close an existing user
 window/tab/pane. A real blank Architect TUI smoke requires a newly authorized
 disposable terminal because automated submission of its first prompt would
 violate user input ownership.
+The protocol-v8 dual-review runner is separately authorized, serial, and
+Haiku/medium-only for Claude; its definitions are present but have not been run.
+The released protocol-v7 10/10 result is not v8 dual-review evidence.
 
 Implementation details and test mappings:
 

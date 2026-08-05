@@ -9,7 +9,8 @@ use super::core::{
 use super::workspace::{ProjectTasksWorkspace, TasksWorkspace};
 use super::{SessionRuntimeSources, SessionStartup, ensure_private_directory, sha256_hex};
 use crate::control_api::{
-    ReviewerBindingSnapshot, SessionState, SessionStatusSnapshot, TaskDraft, TaskState, WorkerRole,
+    ReviewerAdapterBinding, ReviewerBindingSnapshot, SessionState, SessionStatusSnapshot,
+    TaskDraft, TaskState, WorkerRole,
 };
 use crate::worker::claude_exec_runtime::{ClaudeExecRuntimeConfig, ClaudeExecTaskWorkerRuntime};
 use crate::worker::environment::{
@@ -281,7 +282,7 @@ pub(crate) struct TaskLaneSupervisor {
     sources: SessionRuntimeSources,
     profiles: TaskWorkerProfiles,
     developer_adapter: String,
-    reviewer_adapter: String,
+    reviewer_adapters: Vec<ReviewerAdapterBinding>,
     factory: Box<dyn RuntimeFactory>,
     task_runtime: Option<OpenTaskRuntime>,
     active: BTreeMap<WorkerLane, ActiveTurn>,
@@ -357,7 +358,14 @@ impl TaskLaneSupervisor {
         )
         .map_err(|error| anyhow!(error.to_string()))?;
         let developer_adapter = profiles.developer.provider.as_str().into();
-        let reviewer_adapter = profiles.reviewer1().provider.as_str().into();
+        let reviewer_adapters = profiles
+            .reviewers
+            .iter()
+            .map(|binding| ReviewerAdapterBinding {
+                reviewer_id: binding.reviewer_id,
+                adapter: binding.profile.provider.as_str().into(),
+            })
+            .collect();
         Ok(Self {
             startup,
             epoch: format!("exec-supervisor-{}", Uuid::new_v4()),
@@ -366,7 +374,7 @@ impl TaskLaneSupervisor {
             sources,
             profiles,
             developer_adapter,
-            reviewer_adapter,
+            reviewer_adapters,
             factory,
             task_runtime: None,
             active: BTreeMap::new(),
@@ -429,10 +437,11 @@ impl TaskLaneSupervisor {
         &mut self,
         expected_session_version: u64,
         developer_adapter: &str,
-        reviewer_adapter: &str,
+        reviewer_adapters: &[ReviewerAdapterBinding],
         tasks: Vec<TaskDraft>,
     ) -> Result<(u64, String)> {
-        if developer_adapter != self.developer_adapter || reviewer_adapter != self.reviewer_adapter
+        if developer_adapter != self.developer_adapter
+            || reviewer_adapters != self.reviewer_adapters
         {
             bail!("task plan adapters differ from the provider-routed worker session binding");
         }
@@ -1673,6 +1682,23 @@ mod tests {
         profiles
     }
 
+    fn reviewer_adapter_bindings(reviewer1: &str, reviewer2: &str) -> Vec<ReviewerAdapterBinding> {
+        vec![
+            ReviewerAdapterBinding {
+                reviewer_id: ReviewerId::Reviewer1,
+                adapter: reviewer1.into(),
+            },
+            ReviewerAdapterBinding {
+                reviewer_id: ReviewerId::Reviewer2,
+                adapter: reviewer2.into(),
+            },
+        ]
+    }
+
+    fn pure_codex_reviewer_adapters() -> Vec<ReviewerAdapterBinding> {
+        reviewer_adapter_bindings(CODEX_TASK_WORKER_ADAPTER, CODEX_TASK_WORKER_ADAPTER)
+    }
+
     fn reviewer_paths(task: &crate::control_api::TaskStatusSnapshot) -> Vec<String> {
         task.reviewers
             .iter()
@@ -2235,7 +2261,7 @@ mod tests {
             run_root: PathBuf,
             sources: SessionRuntimeSources,
             developer_adapter: String,
-            reviewer_adapter: String,
+            reviewer_adapters: Vec<ReviewerAdapterBinding>,
         }
 
         impl RealFixture {
@@ -2245,6 +2271,7 @@ mod tests {
                     ArchitectAdapter::Codex,
                     RuntimeProvider::CodexExec,
                     RuntimeProvider::CodexExec,
+                    RuntimeProvider::CodexExec,
                 )
             }
 
@@ -2252,9 +2279,10 @@ mod tests {
                 label: &str,
                 architect: ArchitectAdapter,
                 developer: RuntimeProvider,
-                reviewer: RuntimeProvider,
+                reviewer1: RuntimeProvider,
+                reviewer2: RuntimeProvider,
             ) -> Self {
-                let claude_gate = [developer, reviewer]
+                let claude_gate = [developer, reviewer1, reviewer2]
                     .contains(&RuntimeProvider::ClaudeExec)
                     .then(|| ClaudeModelTestGate::capture().unwrap());
                 let temp = tempfile::Builder::new()
@@ -2307,7 +2335,7 @@ mod tests {
                         profile: cheap_claude.clone(),
                     },
                 };
-                *profiles.reviewer1_mut() = match reviewer {
+                *profiles.reviewer1_mut() = match reviewer1 {
                     RuntimeProvider::CodexExec => ReviewerInvocationProfile::Codex {
                         profile: cheap_codex.clone(),
                     },
@@ -2315,7 +2343,7 @@ mod tests {
                         profile: cheap_claude.clone(),
                     },
                 };
-                *profiles.reviewer2_mut() = match reviewer {
+                *profiles.reviewer2_mut() = match reviewer2 {
                     RuntimeProvider::CodexExec => ReviewerInvocationProfile::Codex {
                         profile: cheap_codex,
                     },
@@ -2360,7 +2388,10 @@ mod tests {
                     run_root,
                     sources,
                     developer_adapter: developer.as_str().into(),
-                    reviewer_adapter: reviewer.as_str().into(),
+                    reviewer_adapters: super::reviewer_adapter_bindings(
+                        reviewer1.as_str(),
+                        reviewer2.as_str(),
+                    ),
                 }
             }
 
@@ -2485,7 +2516,7 @@ mod tests {
 
             pub(crate) fn start(&self, supervisor: &mut TaskLaneSupervisor, tasks: Vec<TaskDraft>) {
                 let (plan_version, plan_hash) = supervisor
-                    .replace_plan(0, &self.developer_adapter, &self.reviewer_adapter, tasks)
+                    .replace_plan(0, &self.developer_adapter, &self.reviewer_adapters, tasks)
                     .unwrap();
                 supervisor
                     .approve_and_start(1, plan_version, &plan_hash, true)
@@ -2815,7 +2846,7 @@ mod tests {
             .replace_plan(
                 0,
                 CODEX_TASK_WORKER_ADAPTER,
-                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_reviewer_adapters(),
                 tasks,
             )
             .unwrap();
@@ -3194,7 +3225,7 @@ mod tests {
                 .replace_plan(
                     first_terminal.version,
                     CODEX_TASK_WORKER_ADAPTER,
-                    CODEX_TASK_WORKER_ADAPTER,
+                    &pure_codex_reviewer_adapters(),
                     vec![fixture.task("stale", &["src"], 3)],
                 )
                 .is_err(),
@@ -3206,7 +3237,7 @@ mod tests {
             .replace_plan(
                 awaiting_plan.version,
                 CODEX_TASK_WORKER_ADAPTER,
-                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_reviewer_adapters(),
                 vec![second_task],
             )
             .unwrap();
@@ -3529,6 +3560,81 @@ mod tests {
             .collect();
         assert_eq!(developer_turns.len(), 1);
         assert_eq!(audit.shutdowns, ["contract-terminal"]);
+    }
+
+    #[test]
+    fn reviewer_failure_preserves_peer_evidence_cancels_join_and_never_respawns() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = TaskScript {
+            task_key: "reviewer-failure".into(),
+            turns: vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("committed")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [lgtm("reviewer1 evidence")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [failed_retryable()],
+                ),
+            ],
+            mutations: VecDeque::from([
+                Mutation::Commit {
+                    path: "src/task.txt",
+                    contents: "committed\n",
+                },
+                Mutation::None,
+                Mutation::None,
+            ]),
+            shutdown_failure: false,
+        };
+        let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
+        start(
+            &mut supervisor,
+            vec![fixture.task("reviewer-failure", &["src"], 3)],
+        );
+        let snapshot = drive_terminal(&mut supervisor);
+        assert_eq!(snapshot.state, SessionState::NeedsHuman);
+        assert_eq!(snapshot.tasks[0].state, TaskState::NeedsHuman);
+        assert_eq!(snapshot.tasks[0].review_round, 0);
+        assert_eq!(snapshot.tasks[0].review_generation, 1);
+        assert_eq!(
+            snapshot.tasks[0].reviewers[0].current_verdict,
+            Some(ReviewerVerdict::Lgtm)
+        );
+        assert_eq!(snapshot.tasks[0].reviewers[1].current_verdict, None);
+        assert_eq!(
+            snapshot.tasks[0].reviewers[0]
+                .current_final_message_paths
+                .len(),
+            1
+        );
+
+        let audit = audit.lock().unwrap();
+        assert_eq!(
+            audit
+                .turns
+                .iter()
+                .filter(|(_, role, _, _)| *role == WorkerRole::Reviewer)
+                .count(),
+            2,
+            "retryable Reviewer failure must not spawn a replacement lane"
+        );
+        assert!(
+            audit
+                .turns
+                .iter()
+                .all(|(_, role, purpose, _)| *role != WorkerRole::Developer
+                    || *purpose != RuntimeTurnPurpose::DeveloperCorrection)
+        );
+        assert_eq!(audit.shutdowns, ["reviewer-failure"]);
     }
 
     #[test]
@@ -4720,7 +4826,7 @@ mod tests {
                 .replace_plan(
                     0,
                     CODEX_TASK_WORKER_ADAPTER,
-                    CODEX_TASK_WORKER_ADAPTER,
+                    &pure_codex_reviewer_adapters(),
                     vec![fixture.task("binds", &["src"], 2)],
                 )
                 .expect("an untidy checkout must still bind");
@@ -4737,7 +4843,7 @@ mod tests {
             .replace_plan(
                 0,
                 CODEX_TASK_WORKER_ADAPTER,
-                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_reviewer_adapters(),
                 vec![task],
             )
             .expect("a subdirectory is a valid task source directory");
@@ -4759,7 +4865,7 @@ mod tests {
                 .replace_plan(
                     0,
                     CODEX_TASK_WORKER_ADAPTER,
-                    CODEX_TASK_WORKER_ADAPTER,
+                    &pure_codex_reviewer_adapters(),
                     vec![task],
                 )
                 .is_err()
@@ -4778,7 +4884,7 @@ mod tests {
             .replace_plan(
                 0,
                 CODEX_TASK_WORKER_ADAPTER,
-                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_reviewer_adapters(),
                 vec![task.clone()],
             )
             .unwrap_err()
@@ -4795,7 +4901,7 @@ mod tests {
             .replace_plan(
                 0,
                 CODEX_TASK_WORKER_ADAPTER,
-                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_reviewer_adapters(),
                 vec![task],
             )
             .unwrap();
@@ -4811,7 +4917,7 @@ mod tests {
             .replace_plan(
                 0,
                 CODEX_TASK_WORKER_ADAPTER,
-                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_reviewer_adapters(),
                 vec![local_task],
             )
             .unwrap();
@@ -4839,7 +4945,7 @@ mod tests {
             .replace_plan(
                 0,
                 CODEX_TASK_WORKER_ADAPTER,
-                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_reviewer_adapters(),
                 vec![retained_task.clone()],
             )
             .unwrap();
@@ -4859,7 +4965,7 @@ mod tests {
                 .replace_plan(
                     before.version,
                     CODEX_TASK_WORKER_ADAPTER,
-                    CODEX_TASK_WORKER_ADAPTER,
+                    &pure_codex_reviewer_adapters(),
                     vec![rejected_task],
                 )
                 .is_err()
@@ -4873,7 +4979,7 @@ mod tests {
             .replace_plan(
                 0,
                 CODEX_TASK_WORKER_ADAPTER,
-                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_reviewer_adapters(),
                 vec![retained_task],
             )
             .expect("task source directories are not locked");
@@ -4882,6 +4988,49 @@ mod tests {
             .approve_and_start(before.version, plan_version, &plan_hash, true)
             .unwrap();
         assert_eq!(supervisor.snapshot().state, SessionState::Running);
+    }
+
+    #[test]
+    fn plan_acknowledgement_binds_both_ordered_reviewer_adapters() {
+        let fixture = Fixture::new();
+        let mut supervisor = fixture.supervisor(Vec::new(), Arc::new(Mutex::new(Audit::default())));
+        let task = fixture.task("adapter-bundle", &["src"], 2);
+
+        let wrong_reviewer2 = reviewer_adapter_bindings(CODEX_TASK_WORKER_ADAPTER, "claude-exec");
+        assert!(
+            supervisor
+                .replace_plan(
+                    0,
+                    CODEX_TASK_WORKER_ADAPTER,
+                    &wrong_reviewer2,
+                    vec![task.clone()],
+                )
+                .is_err(),
+            "Reviewer2 must not be carried only through an implicit session hash"
+        );
+
+        let mut wrong_order = pure_codex_reviewer_adapters();
+        wrong_order.swap(0, 1);
+        assert!(
+            supervisor
+                .replace_plan(
+                    0,
+                    CODEX_TASK_WORKER_ADAPTER,
+                    &wrong_order,
+                    vec![task.clone()],
+                )
+                .is_err()
+        );
+
+        supervisor
+            .replace_plan(
+                0,
+                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_reviewer_adapters(),
+                vec![task],
+            )
+            .unwrap();
+        assert_eq!(supervisor.snapshot().state, SessionState::AwaitingApproval);
     }
 
     #[test]
@@ -4900,7 +5049,7 @@ mod tests {
             .replace_plan(
                 0,
                 CODEX_TASK_WORKER_ADAPTER,
-                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_reviewer_adapters(),
                 vec![task],
             )
             .unwrap();
@@ -4958,7 +5107,7 @@ mod tests {
             .replace_plan(
                 0,
                 "claude-exec",
-                "codex-exec",
+                &reviewer_adapter_bindings("codex-exec", "claude-exec"),
                 vec![fixture.task("invalid-claude-proxy", &["src"], 2)],
             )
             .unwrap();
@@ -4990,7 +5139,7 @@ mod tests {
             .replace_plan(
                 0,
                 CODEX_TASK_WORKER_ADAPTER,
-                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_reviewer_adapters(),
                 vec![task],
             )
             .unwrap();
@@ -5025,7 +5174,7 @@ mod tests {
             .replace_plan(
                 0,
                 CODEX_TASK_WORKER_ADAPTER,
-                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_reviewer_adapters(),
                 vec![task],
             )
             .unwrap();
@@ -5592,7 +5741,13 @@ mod real_exec_tests {
         developer: RuntimeProvider,
         reviewer: RuntimeProvider,
     ) -> RealFixture {
-        RealFixture::new_with_workers(label, ArchitectAdapter::Codex, developer, reviewer)
+        RealFixture::new_with_workers(
+            label,
+            ArchitectAdapter::Codex,
+            developer,
+            reviewer,
+            reviewer,
+        )
     }
 
     fn process_birth(pid: u32) -> Option<u64> {
@@ -5672,6 +5827,39 @@ if {foreground_hang}:
         )
         .unwrap();
         (helper, identity)
+    }
+
+    fn write_dual_review_overlap_helper(fixture: &RealFixture) -> (PathBuf, PathBuf) {
+        let helper = fixture.project_root.join("dual-review-overlap.py");
+        let markers = fixture.project_root.join("dual-review-overlap");
+        std::fs::create_dir(&markers).unwrap();
+        std::fs::write(
+            &helper,
+            r#"#!/usr/bin/python3
+import pathlib
+import sys
+import time
+
+root = pathlib.Path(sys.argv[1])
+reviewer = sys.argv[2]
+generation = sys.argv[3]
+if reviewer not in {"reviewer1", "reviewer2"}:
+    raise SystemExit("reviewer identity must be reviewer1 or reviewer2")
+if generation not in {"1", "2"}:
+    raise SystemExit("review generation must be 1 or 2")
+marker = root / f"generation-{generation}-{reviewer}"
+marker.write_text("started\n", encoding="ascii")
+peer = "reviewer2" if reviewer == "reviewer1" else "reviewer1"
+peer_marker = root / f"generation-{generation}-{peer}"
+deadline = time.monotonic() + 120
+while not peer_marker.exists():
+    if time.monotonic() >= deadline:
+        raise SystemExit("peer Reviewer did not overlap this turn")
+    time.sleep(0.05)
+"#,
+        )
+        .unwrap();
+        (helper, markers)
     }
 
     #[test]
@@ -5980,6 +6168,232 @@ if {foreground_hang}:
         assert!(developer.len() >= 2 && developer.windows(2).all(|ids| ids[0] == ids[1]));
         assert!(reviewer.len() >= 2 && reviewer.windows(2).all(|ids| ids[0] == ids[1]));
         assert_ne!(developer[0], reviewer[0]);
+        assert!(fixture.stray_worker_pids().is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires explicit Haiku/medium profile, exact Claude proxy, native Codex and Claude CLIs, auth, and network"]
+    fn real_dual_review_mixed_provider_strict_generation_and_overlap() {
+        let fixture = RealFixture::new_with_workers(
+            "dual-review-mixed-strict",
+            ArchitectAdapter::Codex,
+            RuntimeProvider::CodexExec,
+            RuntimeProvider::CodexExec,
+            RuntimeProvider::ClaudeExec,
+        );
+        let (overlap_helper, overlap_markers) = write_dual_review_overlap_helper(&fixture);
+        let mut supervisor = fixture.supervisor();
+        let task = fixture.task(
+            "dual-review-strict",
+            "Concurrent strict-generation mixed-provider review",
+            &format!(
+                "This is a controlled dual-review E2E. Follow the contract for your current \
+                 hcom turn purpose exactly.\n\n\
+                 InitialDevelopment: create calc.py with add(a, b) returning a + b. Create \
+                 exactly one signed-off task commit containing calc.py. Deliberately omit \
+                 test_calc.py and disclose that omission.\n\n\
+                 Every Reviewer turn: before deciding a verdict, run `python3 '{}' '{}' \
+                 <your exact reviewer identity> <the exact review generation from your prompt>`. \
+                 Use reviewer1 or reviewer2 and generation 1 or 2 exactly. The command must \
+                 finish successfully; it proves both Reviewer processes overlap.\n\n\
+                 InitialReview: Reviewer1 must return VERDICT: LGTM after the overlap probe. \
+                 Reviewer2 must return VERDICT: REQUEST_CHANGES and require test_calc.py to \
+                 assert add(2, 3) == 5. Do not infer or read the peer response.\n\n\
+                 DeveloperCorrection: read and synthesize both ordered Reviewer responses, add \
+                 test_calc.py with that assertion, run `python3 -B test_calc.py`, and amend the \
+                 existing signed-off task commit.\n\n\
+                 ReviewerRereview: run the generation-2 overlap probe, independently run \
+                 `python3 -B test_calc.py`, and return VERDICT: LGTM only if it passes and the \
+                 exact candidate remains one signed-off commit. Do not push.",
+                overlap_helper.display(),
+                overlap_markers.display(),
+            ),
+            3,
+        );
+        let snapshot = fixture.run(&mut supervisor, vec![task]);
+        assert_eq!(snapshot.state, SessionState::Completed);
+        assert_eq!(snapshot.tasks[0].state, TaskState::Lgtm);
+        assert_eq!(snapshot.tasks[0].review_round, 2);
+        assert_eq!(snapshot.tasks[0].review_generation, 2);
+        assert!(snapshot.tasks[0].reviewers.iter().all(|reviewer| {
+            reviewer.current_generation == Some(2)
+                && reviewer.current_verdict == Some(ReviewerVerdict::Lgtm)
+        }));
+        for generation in [1, 2] {
+            for reviewer in ["reviewer1", "reviewer2"] {
+                assert!(
+                    overlap_markers
+                        .join(format!("generation-{generation}-{reviewer}"))
+                        .is_file(),
+                    "missing overlap evidence for generation {generation} {reviewer}"
+                );
+            }
+        }
+        let reviewer1 = fixture.native_session_ids("dual-review-strict", "reviewer/reviewer1");
+        let reviewer2 = fixture.native_session_ids("dual-review-strict", "reviewer/reviewer2");
+        assert!(reviewer1.len() >= 2 && reviewer1.windows(2).all(|ids| ids[0] == ids[1]));
+        assert!(reviewer2.len() >= 2 && reviewer2.windows(2).all(|ids| ids[0] == ids[1]));
+        assert_ne!(reviewer1[0], reviewer2[0]);
+        assert!(fixture.stray_worker_pids().is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires explicit Haiku/medium profile, exact Claude proxy, native Codex and Claude CLIs, auth, and network"]
+    fn real_dual_review_mixed_provider_round_one_exhaustion_advances() {
+        let fixture = RealFixture::new_with_workers(
+            "dual-review-mixed-exhaustion",
+            ArchitectAdapter::Codex,
+            RuntimeProvider::CodexExec,
+            RuntimeProvider::CodexExec,
+            RuntimeProvider::ClaudeExec,
+        );
+        let mut supervisor = fixture.supervisor();
+        let tasks = vec![
+            fixture.task(
+                "dual-exhausted",
+                "Dual review round-one exhaustion",
+                "InitialDevelopment: create incomplete.py containing value = 1 in exactly one \
+                 signed-off task commit and deliberately omit required_test.py.\n\n\
+                 InitialReview: both Reviewer1 and Reviewer2 must independently return \
+                 VERDICT: REQUEST_CHANGES because required_test.py is absent. The synchronized \
+                 review budget is one, so no Developer correction may start. Do not push.",
+                1,
+            ),
+            fixture.task(
+                "after-dual-exhaustion",
+                "Advance after dual review exhaustion",
+                "Create recovered.txt containing exactly RECOVERED followed by a newline in one \
+                 signed-off task commit. Both Reviewers return VERDICT: LGTM only when the exact \
+                 content and sign-off are correct. Do not push.",
+                2,
+            ),
+        ];
+        let snapshot = fixture.run(&mut supervisor, tasks);
+        assert_eq!(snapshot.state, SessionState::Completed);
+        assert_eq!(snapshot.tasks[0].state, TaskState::ReviewExhausted);
+        assert_eq!(snapshot.tasks[0].review_round, 1);
+        assert_eq!(snapshot.tasks[0].review_generation, 1);
+        assert!(
+            snapshot.tasks[0].reviewers.iter().all(|reviewer| {
+                reviewer.current_verdict == Some(ReviewerVerdict::RequestChanges)
+            })
+        );
+        assert_eq!(snapshot.tasks[1].state, TaskState::Lgtm);
+        assert!(fixture.stray_worker_pids().is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires explicit Haiku/medium profile, exact Claude proxy, native Codex and Claude CLIs, auth, and network"]
+    fn real_dual_review_claude_reviewer_exit_cancels_codex_peer_without_residuals() {
+        let fixture = RealFixture::new_with_workers(
+            "dual-review-reviewer-exit",
+            ArchitectAdapter::Codex,
+            RuntimeProvider::CodexExec,
+            RuntimeProvider::CodexExec,
+            RuntimeProvider::ClaudeExec,
+        );
+        let mut supervisor = fixture.supervisor();
+        let task = fixture.task(
+            "dual-reviewer-exit",
+            "Mixed-provider Reviewer abnormal exit",
+            "InitialDevelopment: create candidate.py containing ready = True in exactly one \
+             signed-off task commit.\n\n\
+             InitialReview: both Reviewers must first use the Bash tool to run `sleep 300`; do \
+             not return a verdict before it exits. This is a controlled abnormal-exit probe. \
+             Do not push.",
+            2,
+        );
+        fixture.start(&mut supervisor, vec![task]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let claude_reviewer = loop {
+            supervisor.poll_once().unwrap();
+            let reviewing = supervisor.snapshot();
+            if reviewing.active_workers.len() == 2
+                && reviewing
+                    .active_workers
+                    .iter()
+                    .all(|worker| worker.worker_lane.role() == WorkerRole::Reviewer)
+            {
+                let workers = fixture.live_claude_worker_pids();
+                if workers.len() == 1 {
+                    break workers[0];
+                }
+                assert!(
+                    workers.is_empty(),
+                    "selected multiple fixture-owned Claude workers: {workers:?}"
+                );
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dual Reviewer processes did not become concurrently active"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(claude_reviewer as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+        let snapshot = fixture.drive(&mut supervisor);
+        assert_eq!(snapshot.state, SessionState::NeedsHuman);
+        assert_eq!(snapshot.tasks[0].state, TaskState::NeedsHuman);
+        assert_eq!(snapshot.tasks[0].review_round, 0);
+        assert_eq!(snapshot.tasks[0].review_generation, 1);
+        assert!(fixture.stray_worker_pids().is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires explicit Haiku/medium profile, exact Claude proxy, native Codex and Claude CLIs, auth, and network"]
+    fn real_dual_review_parent_stop_cleans_both_reviewer_trees() {
+        let fixture = RealFixture::new_with_workers(
+            "dual-review-parent-stop",
+            ArchitectAdapter::Codex,
+            RuntimeProvider::CodexExec,
+            RuntimeProvider::CodexExec,
+            RuntimeProvider::ClaudeExec,
+        );
+        let mut supervisor = fixture.supervisor();
+        let task = fixture.task(
+            "dual-parent-stop",
+            "Dual Reviewer foreground-parent stop",
+            "InitialDevelopment: create candidate.py containing ready = True in exactly one \
+             signed-off task commit.\n\n\
+             InitialReview: both Reviewers must first use the Bash tool to run `sleep 300`; do \
+             not return a verdict before it exits. This is a controlled foreground-parent stop \
+             probe. Do not push.",
+            2,
+        );
+        fixture.start(&mut supervisor, vec![task]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            supervisor.poll_once().unwrap();
+            let reviewing = supervisor.snapshot();
+            if reviewing.active_workers.len() == 2
+                && reviewing
+                    .active_workers
+                    .iter()
+                    .all(|worker| worker.worker_lane.role() == WorkerRole::Reviewer)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dual Reviewer processes did not become concurrently active"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        supervisor.shutdown().unwrap();
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, SessionState::Canceled);
+        assert_eq!(
+            snapshot.terminal_detail.as_deref(),
+            Some("foreground Architect parent stopped")
+        );
+        assert_eq!(snapshot.tasks[0].review_round, 0);
+        assert_eq!(snapshot.tasks[0].review_generation, 1);
         assert!(fixture.stray_worker_pids().is_empty());
     }
 

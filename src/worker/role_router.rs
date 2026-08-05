@@ -692,6 +692,87 @@ mod tests {
     }
 
     #[test]
+    fn same_provider_reviewers_own_independent_concurrent_runtime_slots() {
+        let profiles = profiles(RuntimeProvider::CodexExec, RuntimeProvider::CodexExec);
+        let reviewer_script = FakeTurnScript::new(
+            WorkerRole::Reviewer,
+            RuntimeTurnPurpose::InitialReview,
+            [
+                RuntimeTurnPoll::Pending {
+                    telemetry: RuntimeTelemetry::default(),
+                },
+                completed(WorkerRole::Reviewer),
+            ],
+        );
+        let mut runtime = bundle(&profiles, Vec::new(), vec![reviewer_script]);
+        let reviewer1 = runtime
+            .open_session(
+                REVIEWER1,
+                session_spec(WorkerRole::Reviewer, profiles.reviewer1().clone()),
+            )
+            .unwrap();
+        let reviewer2 = runtime
+            .open_session(
+                REVIEWER2,
+                session_spec(WorkerRole::Reviewer, profiles.reviewer2().clone()),
+            )
+            .unwrap();
+        let turn1 = runtime
+            .start_turn(
+                REVIEWER1,
+                reviewer1,
+                turn_spec(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    profiles.reviewer1().clone(),
+                ),
+            )
+            .unwrap();
+        let turn2 = runtime
+            .start_turn(
+                REVIEWER2,
+                reviewer2,
+                turn_spec(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    profiles.reviewer2().clone(),
+                ),
+            )
+            .unwrap();
+        assert_ne!(reviewer1, reviewer2);
+        assert_ne!(turn1, turn2);
+        assert!(
+            !runtime
+                .poll_turn(REVIEWER2, turn2)
+                .unwrap()
+                .poll
+                .is_terminal()
+        );
+        assert!(
+            !runtime
+                .poll_turn(REVIEWER1, turn1)
+                .unwrap()
+                .poll
+                .is_terminal()
+        );
+        assert!(
+            runtime
+                .poll_turn(REVIEWER1, turn1)
+                .unwrap()
+                .poll
+                .is_terminal()
+        );
+        assert!(
+            runtime
+                .poll_turn(REVIEWER2, turn2)
+                .unwrap()
+                .poll
+                .is_terminal()
+        );
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
     fn session_turn_poll_and_cancel_are_exactly_lane_scoped() {
         let profiles = profiles(RuntimeProvider::CodexExec, RuntimeProvider::ClaudeExec);
         let mut runtime = bundle(

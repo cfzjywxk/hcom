@@ -4864,6 +4864,99 @@ mod tests {
     }
 
     #[test]
+    fn both_completion_orders_cover_all_four_verdict_pairs_and_join_once() {
+        for reviewer1_verdict in [ReviewerVerdict::Lgtm, ReviewerVerdict::RequestChanges] {
+            for reviewer2_verdict in [ReviewerVerdict::Lgtm, ReviewerVerdict::RequestChanges] {
+                for reviewer2_first in [false, true] {
+                    let (mut core, _) = active_reviewer_core(3);
+                    let reviewer1_lane = WorkerLane::Reviewer(ReviewerId::Reviewer1);
+                    let reviewer2_lane = WorkerLane::Reviewer(ReviewerId::Reviewer2);
+                    let reviewer1 = core.active_turns[&reviewer1_lane].clone();
+                    let reviewer2 = core.active_turns[&reviewer2_lane].clone();
+                    let outcome = |verdict| match verdict {
+                        ReviewerVerdict::Lgtm => lgtm(),
+                        ReviewerVerdict::RequestChanges => request_changes(),
+                    };
+                    let (first, first_verdict, second, second_verdict) = if reviewer2_first {
+                        (reviewer2, reviewer2_verdict, reviewer1, reviewer1_verdict)
+                    } else {
+                        (reviewer1, reviewer1_verdict, reviewer2, reviewer2_verdict)
+                    };
+
+                    assert_eq!(
+                        complete_lane_turn(
+                            &mut core,
+                            first.task_ordinal,
+                            first.lane,
+                            first.session,
+                            first.turn,
+                            &first.completion_token,
+                            outcome(first_verdict),
+                        ),
+                        vec![SupervisorEffect::PublishStatus]
+                    );
+                    assert_eq!(core.tasks[0].state, TaskState::Reviewing);
+                    assert_eq!(core.tasks[0].review_round, 0);
+                    assert_eq!(core.tasks[0].review_generation, 1);
+                    assert!(!core.active_turns.contains_key(&WorkerLane::Developer));
+                    assert!(
+                        !core
+                            .pending_turn_starts
+                            .contains_key(&WorkerLane::Developer)
+                    );
+
+                    let effects = complete_lane_turn(
+                        &mut core,
+                        second.task_ordinal,
+                        second.lane,
+                        second.session,
+                        second.turn,
+                        &second.completion_token,
+                        outcome(second_verdict),
+                    );
+                    assert_eq!(core.tasks[0].review_round, 1);
+                    assert_eq!(core.tasks[0].review_generation, 1);
+                    assert_eq!(
+                        core.tasks[0].reviewer_results[&ReviewerId::Reviewer1].verdict,
+                        reviewer1_verdict
+                    );
+                    assert_eq!(
+                        core.tasks[0].reviewer_results[&ReviewerId::Reviewer2].verdict,
+                        reviewer2_verdict
+                    );
+
+                    if reviewer1_verdict == ReviewerVerdict::Lgtm
+                        && reviewer2_verdict == ReviewerVerdict::Lgtm
+                    {
+                        assert_eq!(core.tasks[0].state, TaskState::Lgtm);
+                        assert_eq!(core.session_state(), SessionState::Completed);
+                    } else {
+                        assert_eq!(core.tasks[0].state, TaskState::Developing);
+                        assert_eq!(
+                            effects
+                                .iter()
+                                .filter(|effect| {
+                                    matches!(
+                                        effect,
+                                        SupervisorEffect::StartTurn {
+                                            lane: WorkerLane::Developer,
+                                            purpose: RuntimeTurnPurpose::DeveloperCorrection,
+                                            ..
+                                        }
+                                    )
+                                })
+                                .count(),
+                            1,
+                            "one joined generation must start one Developer correction"
+                        );
+                    }
+                    core.assert_invariants().unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
     fn reviewer_open_and_start_acknowledgements_can_interleave_by_lane() {
         let mut core = authorized_core();
         let developer = start_first_developer(&mut core, 0, 1, 1, "developer");
@@ -5114,6 +5207,15 @@ mod tests {
                 )],
             }),
         );
+        assert_eq!(core.tasks[0].review_round, 0);
+        assert_eq!(
+            core.progress_events
+                .iter()
+                .filter(|event| matches!(event, SessionProgressEvent::ReviewResponded { .. }))
+                .count(),
+            1,
+            "verdict clarification must remain one logical Reviewer response"
+        );
         let peer_lane = WorkerLane::Reviewer(ReviewerId::Reviewer2);
         let peer = core.active_turns[&peer_lane].clone();
         complete_lane_turn(
@@ -5138,6 +5240,19 @@ mod tests {
         assert_eq!(
             joined_reviewer_verdict(task),
             Some(ReviewerVerdict::RequestChanges)
+        );
+        assert_eq!(task.review_round, 1);
+        assert_eq!(
+            task.reviewers[0].current_final_message_paths.len(),
+            2,
+            "one logical Reviewer response may contain at most original plus clarification"
+        );
+        assert_eq!(
+            core.progress_events
+                .iter()
+                .filter(|event| matches!(event, SessionProgressEvent::ReviewResponded { .. }))
+                .count(),
+            2
         );
     }
 
@@ -5392,6 +5507,16 @@ mod tests {
             "d2",
             ready(),
         );
+        assert_eq!(core.tasks[0].review_round, 1);
+        assert_eq!(core.tasks[0].review_generation, 2);
+        assert!(
+            core.tasks[0].reviewer_results.is_empty(),
+            "a Developer amendment must invalidate both prior verdicts before rereview"
+        );
+        assert!(core.tasks[0].latest_reviewer_final_paths.is_empty());
+        assert!(reviewer_ids().into_iter().all(|reviewer_id| {
+            core.tasks[0].historical_reviewer_final_paths[&reviewer_id].len() == 1
+        }));
         let rereviewer = start_reviewer(&mut core, 0, 2, 4, "r2", false);
         complete_review(&mut core, rereviewer, lgtm());
 
@@ -5406,6 +5531,11 @@ mod tests {
             core.tasks[0].reviewer_sessions[&ReviewerId::Reviewer1].counter(),
             2,
             "Reviewer re-review must use the first logical session"
+        );
+        assert_eq!(
+            core.tasks[0].reviewer_sessions[&ReviewerId::Reviewer2].counter(),
+            10_002,
+            "Reviewer2 re-review must use its own first logical session"
         );
         let task = &core.snapshot().tasks[0];
         assert_eq!(
@@ -5888,6 +6018,128 @@ mod tests {
     }
 
     #[test]
+    fn dual_reviewer_completion_cancel_timeout_and_parent_stop_races_close_both_lanes() {
+        let (mut completion_first, reviewer1) = active_reviewer_core(3);
+        complete_lane_turn(
+            &mut completion_first,
+            reviewer1.task,
+            reviewer1.lane,
+            reviewer1.session,
+            reviewer1.turn,
+            reviewer1.token,
+            lgtm(),
+        );
+        completion_first
+            .reduce(SupervisorEvent::CancelRequested {
+                expected_version: completion_first.version(),
+                reason: "cancel after first Reviewer response".into(),
+            })
+            .unwrap();
+        let snapshot = completion_first.snapshot();
+        assert_eq!(snapshot.state, SessionState::Canceled);
+        assert_eq!(snapshot.tasks[0].review_round, 0);
+        assert_eq!(snapshot.tasks[0].review_generation, 1);
+        assert_eq!(
+            snapshot.tasks[0].reviewers[0].current_verdict,
+            Some(ReviewerVerdict::Lgtm)
+        );
+        assert_eq!(snapshot.tasks[0].reviewers[1].current_verdict, None);
+
+        let (mut cancel_first, reviewer1) = active_reviewer_core(3);
+        let reviewer2 =
+            cancel_first.active_turns[&WorkerLane::Reviewer(ReviewerId::Reviewer2)].clone();
+        let effects = cancel_first
+            .reduce(SupervisorEvent::CancelRequested {
+                expected_version: cancel_first.version(),
+                reason: "cancel both Reviewers".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, SupervisorEffect::InterruptTurn { .. }))
+                .count(),
+            2
+        );
+        for (lane, active) in [
+            (
+                WorkerLane::Reviewer(ReviewerId::Reviewer1),
+                (
+                    reviewer1.session,
+                    reviewer1.turn,
+                    reviewer1.token.to_owned(),
+                ),
+            ),
+            (
+                WorkerLane::Reviewer(ReviewerId::Reviewer2),
+                (
+                    reviewer2.session,
+                    reviewer2.turn,
+                    reviewer2.completion_token,
+                ),
+            ),
+        ] {
+            assert!(
+                cancel_first
+                    .reduce(SupervisorEvent::TurnCompleted {
+                        expected_version: cancel_first.version(),
+                        task_ordinal: 0,
+                        lane,
+                        review_generation: Some(1),
+                        session: active.0,
+                        turn: active.1,
+                        completion_token: active.2,
+                        outcome: lgtm(),
+                        final_message_path: PathBuf::from("/artifacts/reviewer/late.md"),
+                    })
+                    .is_err()
+            );
+        }
+
+        let (mut timed_out, _) = active_reviewer_core(3);
+        let reviewer2 =
+            timed_out.active_turns[&WorkerLane::Reviewer(ReviewerId::Reviewer2)].clone();
+        let effects = timed_out
+            .reduce(SupervisorEvent::Timeout {
+                expected_version: timed_out.version(),
+                task_ordinal: reviewer2.task_ordinal,
+                lane: reviewer2.lane,
+                review_generation: reviewer2.review_generation,
+                session: reviewer2.session,
+                turn: reviewer2.turn,
+                completion_token: reviewer2.completion_token,
+            })
+            .unwrap();
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, SupervisorEffect::InterruptTurn { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(timed_out.session_state(), SessionState::NeedsHuman);
+        assert_eq!(timed_out.tasks[0].review_round, 0);
+        assert_eq!(timed_out.tasks[0].review_generation, 1);
+
+        let (mut parent_stopping, _) = active_reviewer_core(3);
+        let effects = parent_stopping
+            .reduce(SupervisorEvent::ParentStopping {
+                expected_version: parent_stopping.version(),
+            })
+            .unwrap();
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, SupervisorEffect::InterruptTurn { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(parent_stopping.session_state(), SessionState::Canceled);
+        assert_eq!(parent_stopping.tasks[0].review_round, 0);
+        assert_eq!(parent_stopping.tasks[0].review_generation, 1);
+    }
+
+    #[test]
     fn plan_task_count_review_round_and_status_ordinal_bounds_are_exact() {
         assert_eq!(
             plan_result(Vec::new()).unwrap_err().code,
@@ -5919,7 +6171,14 @@ mod tests {
             SupervisorErrorCode::InvalidPlan
         );
 
-        for (rounds, accepted) in [(0, false), (1, true), (20, true), (21, false)] {
+        for (rounds, accepted) in [
+            (0, false),
+            (1, true),
+            (3, true),
+            (5, true),
+            (20, true),
+            (21, false),
+        ] {
             assert_eq!(
                 plan_result(vec![task("rounds", "/repo", rounds)]).is_ok(),
                 accepted,

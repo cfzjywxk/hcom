@@ -1,0 +1,82 @@
+#!/bin/bash
+# Serial, explicit opt-in runner for bounded v8 dual-Reviewer model E2E.
+#
+# Usage:
+#   CLAUDE_TEST_MODEL=haiku CLAUDE_TEST_EFFORT=medium \
+#     scripts/dual-review-e2e <strict-generation|exhaustion|reviewer-exit|parent-stop|all>
+#
+# The runner never sets or repairs proxy variables. Each Claude-enabled test
+# validates the raw inherited four-variable proxy contract before any provider
+# executable discovery or spawn.
+set -euo pipefail
+
+if [ "${CLAUDE_TEST_MODEL-}" != "haiku" ]; then
+  printf 'CLAUDE_TEST_MODEL must be explicitly set to haiku\n' >&2
+  exit 64
+fi
+if [ "${CLAUDE_TEST_EFFORT-}" != "medium" ]; then
+  printf 'CLAUDE_TEST_EFFORT must be explicitly set to medium\n' >&2
+  exit 64
+fi
+
+scenario=${1-}
+if [ -z "$scenario" ]; then
+  printf '%s\n' \
+    'usage: scripts/dual-review-e2e <strict-generation|exhaustion|reviewer-exit|parent-stop|all>' \
+    >&2
+  exit 64
+fi
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+cd "$repo_root"
+
+cargo build --quiet --locked --bin hcom
+target_dir=${CARGO_TARGET_DIR:-target}
+case "$target_dir" in
+  /*) ;;
+  *) target_dir="$repo_root/$target_dir" ;;
+esac
+real_hcom=$(readlink -f -- "$target_dir/debug/hcom")
+if [ ! -x "$real_hcom" ]; then
+  printf 'fresh hcom Guardian binary is missing: %s\n' "$real_hcom" >&2
+  exit 1
+fi
+
+run_test() {
+  local name=$1
+  HCOM_REAL_E2E_HCOM_BIN="$real_hcom" \
+  cargo test --locked --lib "$name" -- \
+    --ignored --nocapture --test-threads=1
+}
+
+run_scenario() {
+  case "$1" in
+    strict-generation)
+      run_test real_dual_review_mixed_provider_strict_generation_and_overlap
+      ;;
+    exhaustion)
+      run_test real_dual_review_mixed_provider_round_one_exhaustion_advances
+      ;;
+    reviewer-exit)
+      run_test real_dual_review_claude_reviewer_exit_cancels_codex_peer_without_residuals
+      ;;
+    parent-stop)
+      run_test real_dual_review_parent_stop_cleans_both_reviewer_trees
+      ;;
+    *)
+      printf 'unknown dual-review E2E scenario: %s\n' "$1" >&2
+      exit 64
+      ;;
+  esac
+}
+
+if [ "$scenario" = "all" ]; then
+  for selected in strict-generation exhaustion reviewer-exit parent-stop
+  do
+    printf '\n== dual-review E2E: %s ==\n' "$selected"
+    run_scenario "$selected"
+  done
+else
+  run_scenario "$scenario"
+fi

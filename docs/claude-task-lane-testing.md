@@ -7,9 +7,9 @@ No test launches the interactive Architect TUI.
 The named task-lane scenarios below are the released protocol-v7
 single-Reviewer evidence. They do not constitute protocol-v8 concurrent
 dual-review acceptance, and the former 10/10 result must not be reported as
-v8 evidence. The explicit v8 dual-review E2E definitions are added by the
-separate aggregate test task; until those scenarios are defined and separately
-authorized to run, real-model v8 dual-review E2E is **NOT RUN**.
+v8 evidence. The explicit v8 dual-review E2E definitions are listed below,
+but they have not been authorized or executed: real-model v8 dual-review E2E
+is **NOT RUN**.
 
 ## Mandatory caller environment
 
@@ -87,6 +87,37 @@ These historical real scenarios cover all four released-v7
 Developer/Reviewer pairs. Current deterministic tests cover the v8
 Architect/Developer/Reviewer1/Reviewer2 profile matrix without making provider
 calls. Real scenarios add model evidence only where native behavior matters.
+
+## Protocol-v8 concurrent dual-review scenarios
+
+Run one separately authorized scenario at a time:
+
+```bash
+scripts/dual-review-e2e strict-generation
+scripts/dual-review-e2e exhaustion
+scripts/dual-review-e2e reviewer-exit
+scripts/dual-review-e2e parent-stop
+```
+
+`all` runs those four scenarios serially. Every scenario uses a Codex
+Developer, Codex Reviewer1, and Claude Reviewer2. The strict-generation
+scenario uses a two-party filesystem barrier in each generation to prove both
+native Reviewer turns overlap. Generation 1 produces one LGTM and one
+REQUEST_CHANGES, the Developer reads both ordered responses and amends the
+single signed-off commit, and both Reviewer sessions exact-resume before
+generation 2 can finish with dual LGTM. The exhaustion scenario proves a
+synchronized `max_review_rounds=1` rejection advances to the next task. The
+reviewer-exit scenario kills only the fixture-owned Claude Reviewer2 and
+requires peer cancellation, `needs_human`, zero consumed review rounds, and no
+residual process. The parent-stop scenario stops the foreground supervisor only
+after both native Reviewer trees are active, then requires both trees to be
+cleaned with a canceled, zero-round result.
+
+The runner enforces explicit `haiku`/`medium`, never sets or repairs the proxy,
+and uses `--test-threads=1`. Codex roles use the existing
+`gpt-5.3-codex-spark`/`medium` test profile. It never invokes Opus or launches
+an interactive TUI. Defining these ignored tests does not authorize running
+them, a TUI, push, install, or release.
 
 Set `HCOM_REAL_E2E_KEEP=1` to retain a failed disposable fixture and print its
 path. The default removes fixtures automatically after completion. Process

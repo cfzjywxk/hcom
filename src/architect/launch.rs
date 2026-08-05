@@ -3,13 +3,13 @@ use super::bridge::{
     relay_runtime_scope_hash, sha256_hex,
 };
 use super::profile::{LoadedInvocationProfiles, load_task_lane_profiles};
-use crate::control_api::ActionName;
 use crate::control_api::peer::{process_birth_identity, process_owns_foreground_tty};
 use crate::control_api::protocol::PROTOCOL_VERSION;
 use crate::control_api::registration::{
     RegistrationAction, RegistrationCaller, RegistrationClient,
 };
 use crate::control_api::supervisor::{ControlPaths, SessionSupervisorEndpoint};
+use crate::control_api::{ActionName, ReviewerAdapterBinding};
 use crate::orchestrator::SessionRuntimeSources;
 use crate::worker::environment::{
     CLAUDE_ADDITIONAL_DIRECTORIES_INSTRUCTIONS, CLAUDE_DISABLE_BACKGROUND_TASKS,
@@ -103,7 +103,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         },
     };
     apply_architect_cli_overrides(&args, &mut loaded.profiles)?;
-    let (developer_adapter, reviewer_adapter) =
+    let (developer_adapter, reviewer_adapters) =
         worker_adapter_bindings(architect_adapter, &loaded.profiles)?;
     validate_foreground_terminal()?;
     let parent_environment = ParentEnvironment::capture_current()?;
@@ -269,7 +269,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         architect_adapter: architect_adapter.contract_name().into(),
         architect_additional_directories: architect_additional_directories.clone(),
         developer_adapter: developer_adapter.into(),
-        reviewer_adapter: reviewer_adapter.into(),
+        reviewer_adapters,
     };
     if let Err(error) = configure_bridge(&mut bridge.bootstrap, configuration) {
         terminate_child(&mut bridge.child);
@@ -654,14 +654,21 @@ fn validate_additional_directories(
 fn worker_adapter_bindings(
     architect_adapter: ArchitectAdapter,
     profiles: &SessionInvocationProfiles,
-) -> Result<(&'static str, &'static str)> {
+) -> Result<(&'static str, Vec<ReviewerAdapterBinding>)> {
     // Worker routes are independent of the foreground Architect provider.
     let _ = architect_adapter;
     let profiles = TaskWorkerProfiles::from_session_profiles(profiles)
         .map_err(|error| anyhow::anyhow!(error.detail))?;
     Ok((
         profiles.developer.provider.as_str(),
-        profiles.reviewer1().provider.as_str(),
+        profiles
+            .reviewers
+            .iter()
+            .map(|binding| ReviewerAdapterBinding {
+                reviewer_id: binding.reviewer_id,
+                adapter: binding.profile.provider.as_str().into(),
+            })
+            .collect(),
     ))
 }
 
@@ -1617,54 +1624,93 @@ mod tests {
             let profiles = SessionInvocationProfiles::for_task_lane(adapter).unwrap();
             assert_eq!(
                 worker_adapter_bindings(adapter, &profiles).unwrap(),
-                ("codex-exec", "codex-exec")
+                (
+                    "codex-exec",
+                    vec![
+                        ReviewerAdapterBinding {
+                            reviewer_id: crate::worker::profile::ReviewerId::Reviewer1,
+                            adapter: "codex-exec".into(),
+                        },
+                        ReviewerAdapterBinding {
+                            reviewer_id: crate::worker::profile::ReviewerId::Reviewer2,
+                            adapter: "claude-exec".into(),
+                        },
+                    ],
+                )
             );
         }
     }
 
     #[test]
-    fn both_architects_bind_each_worker_provider_independently() {
+    fn both_architects_bind_all_sixteen_worker_provider_combinations() {
         for architect_adapter in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
             for developer_claude in [false, true] {
-                for reviewer_claude in [false, true] {
-                    let mut profiles =
-                        SessionInvocationProfiles::for_task_lane(architect_adapter).unwrap();
-                    profiles.developer = if developer_claude {
-                        DeveloperInvocationProfile::Claude {
+                for reviewer1_claude in [false, true] {
+                    for reviewer2_claude in [false, true] {
+                        let mut profiles =
+                            SessionInvocationProfiles::for_task_lane(architect_adapter).unwrap();
+                        profiles.developer = if developer_claude {
+                            DeveloperInvocationProfile::Claude {
                             profile:
                                 crate::worker::profile::ClaudeInvocationProfile::developer_default(),
                         }
-                    } else {
-                        DeveloperInvocationProfile::Codex {
-                            profile: CodexInvocationProfile::developer_default(),
-                        }
-                    };
-                    *profiles.reviewer1_mut() = if reviewer_claude {
-                        ReviewerInvocationProfile::Claude {
+                        } else {
+                            DeveloperInvocationProfile::Codex {
+                                profile: CodexInvocationProfile::developer_default(),
+                            }
+                        };
+                        *profiles.reviewer1_mut() = if reviewer1_claude {
+                            ReviewerInvocationProfile::Claude {
                             profile:
                                 crate::worker::profile::ClaudeInvocationProfile::reviewer_default(),
                         }
-                    } else {
-                        ReviewerInvocationProfile::Codex {
-                            profile: CodexInvocationProfile::reviewer_default(),
+                        } else {
+                            ReviewerInvocationProfile::Codex {
+                                profile: CodexInvocationProfile::reviewer_default(),
+                            }
+                        };
+                        *profiles.reviewer2_mut() = if reviewer2_claude {
+                            ReviewerInvocationProfile::Claude {
+                            profile:
+                                crate::worker::profile::ClaudeInvocationProfile::reviewer_default(),
                         }
-                    };
-                    assert_eq!(profiles.architect.adapter(), architect_adapter);
-                    assert_eq!(
-                        worker_adapter_bindings(architect_adapter, &profiles).unwrap(),
-                        (
-                            if developer_claude {
-                                "claude-exec"
-                            } else {
-                                "codex-exec"
-                            },
-                            if reviewer_claude {
-                                "claude-exec"
-                            } else {
-                                "codex-exec"
-                            },
-                        )
-                    );
+                        } else {
+                            ReviewerInvocationProfile::Codex {
+                                profile: CodexInvocationProfile::reviewer_default(),
+                            }
+                        };
+                        assert_eq!(profiles.architect.adapter(), architect_adapter);
+                        assert_eq!(
+                            worker_adapter_bindings(architect_adapter, &profiles).unwrap(),
+                            (
+                                if developer_claude {
+                                    "claude-exec"
+                                } else {
+                                    "codex-exec"
+                                },
+                                vec![
+                                    ReviewerAdapterBinding {
+                                        reviewer_id: crate::worker::profile::ReviewerId::Reviewer1,
+                                        adapter: if reviewer1_claude {
+                                            "claude-exec"
+                                        } else {
+                                            "codex-exec"
+                                        }
+                                        .into(),
+                                    },
+                                    ReviewerAdapterBinding {
+                                        reviewer_id: crate::worker::profile::ReviewerId::Reviewer2,
+                                        adapter: if reviewer2_claude {
+                                            "claude-exec"
+                                        } else {
+                                            "codex-exec"
+                                        }
+                                        .into(),
+                                    },
+                                ],
+                            )
+                        );
+                    }
                 }
             }
         }

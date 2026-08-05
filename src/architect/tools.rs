@@ -1,4 +1,4 @@
-use crate::control_api::{ActionName, ControlAction};
+use crate::control_api::{ActionName, ControlAction, ReviewerAdapterBinding};
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
@@ -80,14 +80,17 @@ local reviewed commit and the absence of any separately authorized push or \
 install; do not ask whether to retain or revert it merely because commit was \
 not separately authorized, and do not create another post-LGTM commit.";
 
-pub(crate) fn tool_definitions(developer_adapter: &str, reviewer_adapter: &str) -> Vec<Value> {
+pub(crate) fn tool_definitions(
+    developer_adapter: &str,
+    reviewer_adapters: &[ReviewerAdapterBinding],
+) -> Vec<Value> {
     ActionName::ARCHITECT
         .into_iter()
         .map(|action| {
             json!({
                 "name": action.as_str(),
                 "description": tool_description(action),
-                "inputSchema": action_schema(action, developer_adapter, reviewer_adapter),
+                "inputSchema": action_schema(action, developer_adapter, reviewer_adapters),
             })
         })
         .collect()
@@ -97,7 +100,7 @@ pub(crate) fn control_action(
     name: &str,
     arguments: Value,
     developer_adapter: &str,
-    reviewer_adapter: &str,
+    reviewer_adapters: &[ReviewerAdapterBinding],
 ) -> Result<ControlAction> {
     let action = ActionName::ARCHITECT
         .into_iter()
@@ -115,10 +118,10 @@ pub(crate) fn control_action(
         .context("architect tool arguments failed protocol validation")?;
     if let ControlAction::SessionPlanReplace {
         developer_adapter: requested_developer,
-        reviewer_adapter: requested_reviewer,
+        reviewer_adapters: requested_reviewers,
         ..
     } = &action
-        && (requested_developer != developer_adapter || requested_reviewer != reviewer_adapter)
+        && (requested_developer != developer_adapter || requested_reviewers != reviewer_adapters)
     {
         bail!("architect plan adapters differ from the profiles loaded for this run");
     }
@@ -157,7 +160,11 @@ fn tool_description(action: ActionName) -> &'static str {
     }
 }
 
-fn action_schema(action: ActionName, developer_adapter: &str, reviewer_adapter: &str) -> Value {
+fn action_schema(
+    action: ActionName,
+    developer_adapter: &str,
+    reviewer_adapters: &[ReviewerAdapterBinding],
+) -> Value {
     match action {
         ActionName::SessionRunBegin => object_schema(
             &["expected_session_version", "terminal_run_id"],
@@ -170,7 +177,7 @@ fn action_schema(action: ActionName, developer_adapter: &str, reviewer_adapter: 
             &[
                 "expected_session_version",
                 "developer_adapter",
-                "reviewer_adapter",
+                "reviewer_adapters",
                 "tasks",
             ],
             [
@@ -183,10 +190,11 @@ fn action_schema(action: ActionName, developer_adapter: &str, reviewer_adapter: 
                     }),
                 ),
                 (
-                    "reviewer_adapter",
+                    "reviewer_adapters",
                     json!({
-                        "type":"string",
-                        "enum":[reviewer_adapter]
+                        "type":"array",
+                        "description":"Exact ordered Reviewer1 then Reviewer2 adapter bindings loaded for this run.",
+                        "const":reviewer_adapters
                     }),
                 ),
                 (
@@ -410,11 +418,28 @@ fn positive_uint32_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::profile::ReviewerId;
     use std::collections::BTreeSet;
+
+    fn reviewer_adapters(reviewer1: &str, reviewer2: &str) -> Vec<ReviewerAdapterBinding> {
+        vec![
+            ReviewerAdapterBinding {
+                reviewer_id: ReviewerId::Reviewer1,
+                adapter: reviewer1.into(),
+            },
+            ReviewerAdapterBinding {
+                reviewer_id: ReviewerId::Reviewer2,
+                adapter: reviewer2.into(),
+            },
+        ]
+    }
 
     #[test]
     fn tool_inventory_is_exact_and_contains_no_project_or_generic_authority() {
-        let tools = tool_definitions("codex-developer", "claude-reviewer-2.1.220");
+        let tools = tool_definitions(
+            "codex-developer",
+            &reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
+        );
         let names: BTreeSet<_> = tools
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
@@ -452,7 +477,7 @@ mod tests {
                 "approval_confirmed":true
             }),
             "codex-developer",
-            "claude-reviewer-2.1.220",
+            &reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
         )
         .unwrap();
         assert!(matches!(
@@ -472,7 +497,7 @@ mod tests {
                     "approval_confirmed":false
                 }),
                 "codex-developer",
-                "claude-reviewer-2.1.220",
+                &reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
             )
             .is_err()
         );
@@ -481,7 +506,7 @@ mod tests {
                 "shell",
                 json!({}),
                 "codex-developer",
-                "claude-reviewer-2.1.220",
+                &reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
             )
             .is_err()
         );
@@ -489,7 +514,10 @@ mod tests {
 
     #[test]
     fn next_run_tool_preserves_terminal_evidence_and_does_not_start_work() {
-        let tools = tool_definitions("codex-developer", "codex-reviewer");
+        let tools = tool_definitions(
+            "codex-developer",
+            &reviewer_adapters("codex-reviewer", "codex-reviewer"),
+        );
         let begin = tools
             .iter()
             .find(|tool| tool["name"] == "session_run_begin")
@@ -521,7 +549,7 @@ mod tests {
                 "terminal_run_id":"run-completed"
             }),
             "codex-developer",
-            "codex-reviewer",
+            &reviewer_adapters("codex-reviewer", "codex-reviewer"),
         )
         .unwrap();
         assert!(matches!(
@@ -538,7 +566,10 @@ mod tests {
         let arguments = json!({
             "expected_session_version":0,
             "developer_adapter":"codex-developer",
-            "reviewer_adapter":"claude-reviewer-2.1.220",
+            "reviewer_adapters":[
+                {"reviewer_id":"reviewer1","adapter":"codex-reviewer"},
+                {"reviewer_id":"reviewer2","adapter":"claude-reviewer-2.1.220"}
+            ],
             "tasks":[{
                 "task_key":"p9-task-1",
                 "title":"Phase 9 Task 1",
@@ -554,7 +585,7 @@ mod tests {
             "session_plan_replace",
             arguments.clone(),
             "codex-developer",
-            "claude-reviewer-2.1.220",
+            &reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
         )
         .unwrap();
         assert!(matches!(
@@ -579,14 +610,17 @@ mod tests {
                     "session_plan_replace",
                     invalid,
                     "codex-developer",
-                    "claude-reviewer-2.1.220",
+                    &reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
                 )
                 .is_err(),
                 "legacy inline field {inline_field} was accepted"
             );
         }
 
-        let tools = tool_definitions("codex-developer", "claude-reviewer-2.1.220");
+        let tools = tool_definitions(
+            "codex-developer",
+            &reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
+        );
         let properties = tools
             .iter()
             .find(|tool| tool["name"] == "session_plan_replace")
@@ -613,19 +647,23 @@ mod tests {
 
     #[test]
     fn configured_adapter_is_both_schema_visible_and_enforced() {
-        let tools = tool_definitions("codex-developer", "codex-reviewer");
+        let expected_reviewers = reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220");
+        let tools = tool_definitions("codex-developer", &expected_reviewers);
         let plan = tools
             .iter()
             .find(|tool| tool["name"] == "session_plan_replace")
             .unwrap();
         assert_eq!(
-            plan["inputSchema"]["properties"]["reviewer_adapter"]["enum"],
-            json!(["codex-reviewer"])
+            plan["inputSchema"]["properties"]["reviewer_adapters"]["const"],
+            json!(expected_reviewers)
         );
         let arguments = json!({
             "expected_session_version":0,
             "developer_adapter":"codex-developer",
-            "reviewer_adapter":"claude-reviewer-2.1.220",
+            "reviewer_adapters":[
+                {"reviewer_id":"reviewer1","adapter":"claude-reviewer-2.1.220"},
+                {"reviewer_id":"reviewer2","adapter":"codex-reviewer"}
+            ],
             "tasks":[{
                 "task_key":"one",
                 "title":"one",
@@ -642,7 +680,7 @@ mod tests {
                 "session_plan_replace",
                 arguments,
                 "codex-developer",
-                "codex-reviewer",
+                &expected_reviewers,
             )
             .is_err()
         );
@@ -650,7 +688,10 @@ mod tests {
 
     #[test]
     fn execution_authorization_contract_supports_exact_named_or_prospective_start() {
-        let tools = tool_definitions("codex-developer", "claude-reviewer-2.1.220");
+        let tools = tool_definitions(
+            "codex-developer",
+            &reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
+        );
         let plan = tools
             .iter()
             .find(|tool| tool["name"] == "session_plan_replace")
@@ -744,7 +785,10 @@ mod tests {
         // hcom takes only the task's source directory path. Any description
         // that still promised branch/revision evidence or a drift check would
         // make the Architect report guarantees the supervisor cannot give.
-        let tools = tool_definitions("codex-developer", "claude-reviewer-2.1.220");
+        let tools = tool_definitions(
+            "codex-developer",
+            &reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
+        );
         for tool in &tools {
             let description = tool["description"].as_str().unwrap();
             for forbidden in [
@@ -783,7 +827,10 @@ mod tests {
 
     #[test]
     fn worker_status_contract_uses_latched_action_wait_without_model_polling() {
-        let tools = tool_definitions("codex-developer", "claude-reviewer-2.1.220");
+        let tools = tool_definitions(
+            "codex-developer",
+            &reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
+        );
         let approve = tools
             .iter()
             .find(|tool| tool["name"] == "session_approve_and_start")
@@ -853,7 +900,7 @@ mod tests {
                 "after_progress_sequence":3
             }),
             "codex-developer",
-            "claude-reviewer-2.1.220",
+            &reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
         )
         .unwrap();
         assert!(matches!(
@@ -898,7 +945,10 @@ mod tests {
                 "Architect instructions omitted {required}"
             );
         }
-        let tools = tool_definitions("codex-developer", "codex-reviewer");
+        let tools = tool_definitions(
+            "codex-developer",
+            &reviewer_adapters("codex-reviewer", "codex-reviewer"),
+        );
         let submit = tools
             .iter()
             .find(|tool| tool["name"] == "session_clarification_submit")

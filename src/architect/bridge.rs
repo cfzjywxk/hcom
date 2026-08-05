@@ -7,13 +7,15 @@ use crate::control_api::peer::{
     ProcessExecutableIdentity, peer_credentials, process_birth_identity,
     process_executable_identity, process_has_ancestor, process_is_live_identity,
 };
-use crate::control_api::protocol::PROTOCOL_VERSION;
+use crate::control_api::protocol::{MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, PROTOCOL_VERSION};
 use crate::control_api::registration::{
     CONTROL_REFUSAL_TRANSPORT, RegistrationAction, RegistrationCaller, RegistrationClient,
     RegistrationRequest, TOOL_REFUSAL_ACTION, TOOL_REFUSAL_ENVELOPE,
 };
 use crate::control_api::supervisor::ControlPaths;
-use crate::control_api::{CallerAuth, ControlAction, ControlRequest, ControlResponse};
+use crate::control_api::{
+    CallerAuth, ControlAction, ControlRequest, ControlResponse, ReviewerAdapterBinding,
+};
 use crate::worker::ExecutableIdentity;
 use crate::worker::profile::{
     ArchitectAdapter, CLAUDE_DEVELOPER_ADAPTER, CLAUDE_REVIEWER_ADAPTER, CODEX_DEVELOPER_ADAPTER,
@@ -39,7 +41,22 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use uuid::Uuid;
 
-const MAX_MCP_LINE_BYTES: usize = 256 * 1024;
+const fn max_mcp_line_bytes() -> usize {
+    let duplicated_control_response = match MAX_RESPONSE_BYTES.checked_mul(3) {
+        Some(value) => value,
+        None => panic!("MCP line capacity overflow"),
+    };
+    let with_request_id = match duplicated_control_response.checked_add(MAX_REQUEST_BYTES) {
+        Some(value) => value,
+        None => panic!("MCP line capacity overflow"),
+    };
+    match with_request_id.checked_add(4096) {
+        Some(value) => value,
+        None => panic!("MCP line capacity overflow"),
+    }
+}
+
+const MAX_MCP_LINE_BYTES: usize = max_mcp_line_bytes();
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const RELAY_SOCKET_NAME: &str = "relay.sock";
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -72,7 +89,7 @@ pub(super) struct BridgeConfiguration {
     pub architect_adapter: String,
     pub architect_additional_directories: Vec<PathBuf>,
     pub developer_adapter: String,
-    pub reviewer_adapter: String,
+    pub reviewer_adapters: Vec<ReviewerAdapterBinding>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -269,7 +286,7 @@ fn validate_bridge_configuration(configuration: &BridgeConfiguration) -> Result<
     }
     validate_worker_adapter_binding(
         &configuration.developer_adapter,
-        &configuration.reviewer_adapter,
+        &configuration.reviewer_adapters,
     )?;
     let paths = ControlPaths::new(&configuration.run_root)?;
     if paths.socket_path() != configuration.control_socket_path
@@ -280,21 +297,34 @@ fn validate_bridge_configuration(configuration: &BridgeConfiguration) -> Result<
     Ok(())
 }
 
-fn validate_worker_adapter_binding(developer_adapter: &str, reviewer_adapter: &str) -> Result<()> {
+fn validate_worker_adapter_binding(
+    developer_adapter: &str,
+    reviewer_adapters: &[ReviewerAdapterBinding],
+) -> Result<()> {
+    if reviewer_adapters.len() != 2
+        || reviewer_adapters[0].reviewer_id != crate::worker::profile::ReviewerId::Reviewer1
+        || reviewer_adapters[1].reviewer_id != crate::worker::profile::ReviewerId::Reviewer2
+    {
+        bail!("architect bridge requires ordered Reviewer1 and Reviewer2 adapter bindings");
+    }
     let routed_worker_pair = matches!(
         developer_adapter,
         CODEX_TASK_WORKER_ADAPTER | CLAUDE_TASK_WORKER_ADAPTER
-    ) && matches!(
-        reviewer_adapter,
-        CODEX_TASK_WORKER_ADAPTER | CLAUDE_TASK_WORKER_ADAPTER
-    );
+    ) && reviewer_adapters.iter().all(|binding| {
+        matches!(
+            binding.adapter.as_str(),
+            CODEX_TASK_WORKER_ADAPTER | CLAUDE_TASK_WORKER_ADAPTER
+        )
+    });
     let retained_cli_pair = matches!(
         developer_adapter,
         CODEX_DEVELOPER_ADAPTER | CLAUDE_DEVELOPER_ADAPTER
-    ) && matches!(
-        reviewer_adapter,
-        CODEX_REVIEWER_ADAPTER | CLAUDE_REVIEWER_ADAPTER
-    );
+    ) && reviewer_adapters.iter().all(|binding| {
+        matches!(
+            binding.adapter.as_str(),
+            CODEX_REVIEWER_ADAPTER | CLAUDE_REVIEWER_ADAPTER
+        )
+    });
     if !(routed_worker_pair || retained_cli_pair) {
         bail!("architect bridge received an unknown worker adapter");
     }
@@ -496,7 +526,7 @@ fn serve_mcp_connection(
                     "id":id,
                         "result":{"tools":tool_definitions(
                             &configuration.developer_adapter,
-                            &configuration.reviewer_adapter,
+                            &configuration.reviewer_adapters,
                         )}
                 })
             }),
@@ -660,7 +690,7 @@ fn prepare_control_request(
         &params.name,
         params.arguments,
         &configuration.developer_adapter,
-        &configuration.reviewer_adapter,
+        &configuration.reviewer_adapters,
     )
     .map_err(|_| ToolCallRefusal(TOOL_REFUSAL_ACTION))?;
     Ok(ControlRequest {
@@ -685,7 +715,8 @@ fn request_control(
 }
 
 fn complete_tool_call(id: Value, result: Result<ControlResponse>) -> Value {
-    match result {
+    let response_id = id.clone();
+    let response = match result {
         Ok(response) => {
             let structured = serde_json::to_value(&response).unwrap_or_else(|_| json!({}));
             let text =
@@ -701,6 +732,21 @@ fn complete_tool_call(id: Value, result: Result<ControlResponse>) -> Value {
             })
         }
         Err(error) => tool_call_error(id, &tool_call_refusal_text(&error)),
+    };
+    if serialized_json_line_len(&response).is_some_and(|len| len <= MAX_MCP_LINE_BYTES) {
+        return response;
+    }
+    let bounded_error = tool_call_error(
+        response_id,
+        "architect control response exceeded the bounded MCP transport; retry with session_status or session_wait",
+    );
+    if serialized_json_line_len(&bounded_error).is_some_and(|len| len <= MAX_MCP_LINE_BYTES) {
+        bounded_error
+    } else {
+        tool_call_error(
+            Value::Null,
+            "architect control response exceeded the bounded MCP transport",
+        )
     }
 }
 
@@ -789,6 +835,10 @@ fn write_json_line(writer: &mut impl Write, value: &Value) -> Result<()> {
     writer.write_all(b"\n")?;
     writer.flush()?;
     Ok(())
+}
+
+fn serialized_json_line_len(value: &Value) -> Option<usize> {
+    serde_json::to_vec(value).ok()?.len().checked_add(1)
 }
 
 fn write_shared_json_line(writer: &Mutex<UnixStream>, value: &Value) -> Result<()> {
@@ -931,9 +981,11 @@ mod tests {
         CONTROL_REFUSAL_TRANSPORT, TOOL_REFUSAL_ACTION, TOOL_REFUSAL_ENVELOPE,
     };
     use crate::control_api::{
-        ActionName, ActiveWorkerSnapshot, ControlAction, ControlErrorCode, ControlResult,
-        ReviewerBindingSnapshot, ReviewerResultSnapshot, ReviewerVerdict, SessionProgressEvent,
-        SessionState, SessionStatusSnapshot, TaskState, TaskStatusSnapshot,
+        ActionName, ActiveWorkerSnapshot, ArchitectActionReason, ClarificationPage,
+        ClarificationRecord, ControlAction, ControlErrorCode, ControlResult,
+        MAX_CLARIFICATION_PAGE_RECORDS, ReviewerBindingSnapshot, ReviewerResultSnapshot,
+        ReviewerVerdict, SessionProgressEvent, SessionState, SessionStatusSnapshot, TaskState,
+        TaskStatusSnapshot,
     };
     use crate::worker::profile::ReviewerId;
     use crate::worker::runtime::WorkerLane;
@@ -942,6 +994,20 @@ mod tests {
     use std::time::Instant;
 
     const RELAY_NAMESPACE_HELPER: &str = "HCOM_PHASE9_RELAY_NAMESPACE_HELPER";
+
+    fn reviewer_adapters(reviewer1: &str, reviewer2: &str) -> Vec<ReviewerAdapterBinding> {
+        vec![
+            ReviewerAdapterBinding {
+                reviewer_id: ReviewerId::Reviewer1,
+                adapter: reviewer1.into(),
+            },
+            ReviewerAdapterBinding {
+                reviewer_id: ReviewerId::Reviewer2,
+                adapter: reviewer2.into(),
+            },
+        ]
+    }
+
     struct BridgeTestFixture {
         _temp: tempfile::TempDir,
         configuration: BridgeConfiguration,
@@ -975,34 +1041,49 @@ mod tests {
                     architect_adapter: "codex".into(),
                     architect_additional_directories: Vec::new(),
                     developer_adapter: "codex-developer".into(),
-                    reviewer_adapter: "claude-reviewer-2.1.220".into(),
+                    reviewer_adapters: reviewer_adapters(
+                        "codex-reviewer",
+                        "claude-reviewer-2.1.220",
+                    ),
                 },
             }
         }
     }
 
     #[test]
-    fn bridge_binds_both_architects_to_all_four_routed_worker_pairs() {
+    fn bridge_binds_all_sixteen_architect_and_worker_provider_combinations() {
         let fixture = BridgeTestFixture::new();
         for architect in ["codex", "claude"] {
             for developer in [CODEX_TASK_WORKER_ADAPTER, CLAUDE_TASK_WORKER_ADAPTER] {
-                for reviewer in [CODEX_TASK_WORKER_ADAPTER, CLAUDE_TASK_WORKER_ADAPTER] {
-                    let mut configuration = fixture.configuration.clone();
-                    configuration.architect_adapter = architect.into();
-                    configuration.developer_adapter = developer.into();
-                    configuration.reviewer_adapter = reviewer.into();
-                    validate_bridge_configuration(&configuration).unwrap();
+                for reviewer1 in [CODEX_TASK_WORKER_ADAPTER, CLAUDE_TASK_WORKER_ADAPTER] {
+                    for reviewer2 in [CODEX_TASK_WORKER_ADAPTER, CLAUDE_TASK_WORKER_ADAPTER] {
+                        let mut configuration = fixture.configuration.clone();
+                        configuration.architect_adapter = architect.into();
+                        configuration.developer_adapter = developer.into();
+                        configuration.reviewer_adapters = reviewer_adapters(reviewer1, reviewer2);
+                        validate_bridge_configuration(&configuration).unwrap();
+                    }
                 }
             }
         }
-        validate_worker_adapter_binding(CODEX_DEVELOPER_ADAPTER, CLAUDE_REVIEWER_ADAPTER).unwrap();
+        validate_worker_adapter_binding(
+            CODEX_DEVELOPER_ADAPTER,
+            &reviewer_adapters(CODEX_REVIEWER_ADAPTER, CLAUDE_REVIEWER_ADAPTER),
+        )
+        .unwrap();
         assert!(
-            validate_worker_adapter_binding(CODEX_TASK_WORKER_ADAPTER, CODEX_REVIEWER_ADAPTER,)
-                .is_err()
+            validate_worker_adapter_binding(
+                CODEX_TASK_WORKER_ADAPTER,
+                &reviewer_adapters(CODEX_REVIEWER_ADAPTER, CLAUDE_REVIEWER_ADAPTER),
+            )
+            .is_err()
         );
         assert!(
-            validate_worker_adapter_binding(CODEX_DEVELOPER_ADAPTER, CODEX_TASK_WORKER_ADAPTER,)
-                .is_err()
+            validate_worker_adapter_binding(
+                CODEX_DEVELOPER_ADAPTER,
+                &reviewer_adapters(CODEX_TASK_WORKER_ADAPTER, CLAUDE_TASK_WORKER_ADAPTER),
+            )
+            .is_err()
         );
     }
 
@@ -1096,6 +1177,104 @@ mod tests {
         }
     }
 
+    fn maximum_dual_status_response(path_bytes: usize) -> ControlResponse {
+        let path = format!("/{}", "\\".repeat(path_bytes.saturating_sub(1)));
+        let reviewers = [ReviewerId::Reviewer1, ReviewerId::Reviewer2]
+            .into_iter()
+            .map(|reviewer_id| ReviewerResultSnapshot {
+                reviewer_id,
+                session_bound: true,
+                current_generation: Some(20),
+                current_verdict: Some(ReviewerVerdict::RequestChanges),
+                current_final_message_paths: vec![path.clone(), path.clone()],
+            })
+            .collect::<Vec<_>>();
+        let tasks = (0..64)
+            .map(|ordinal| TaskStatusSnapshot {
+                task_key: format!("task-{ordinal}"),
+                ordinal,
+                state: TaskState::ReviewExhausted,
+                repository_root: path.clone(),
+                task_document_path: path.clone(),
+                design_document_paths: vec![path.clone()],
+                task_selector: format!("task-{ordinal}"),
+                branch: None,
+                review_round: 20,
+                review_generation: 20,
+                max_review_rounds: 20,
+                clarification_rounds_used: 20,
+                max_clarification_rounds: 20,
+                clarification_record_count: 64,
+                base_revision: None,
+                head_revision: None,
+                developer_session_bound: true,
+                reviewers: reviewers.clone(),
+                outcome_detail: Some("review generation exhausted".repeat(32)),
+                latest_developer_final_path: Some(path.clone()),
+            })
+            .collect();
+        ControlResponse::success(
+            "maximum-dual-review-status",
+            ControlResult::Session {
+                session: SessionStatusSnapshot {
+                    run_id: "run-maximum".into(),
+                    state: SessionState::Completed,
+                    version: u64::MAX,
+                    project_root: path,
+                    plan_version: Some(u64::MAX),
+                    plan_hash: Some("f".repeat(64)),
+                    current_task_ordinal: Some(63),
+                    active_workers: Vec::new(),
+                    reviewer_bindings: reviewer_bindings(),
+                    pending_architect_action: None,
+                    terminal_detail: Some("all tasks reached terminal review outcomes".repeat(32)),
+                    tasks,
+                },
+            },
+        )
+    }
+
+    fn largest_control_bounded_dual_status_response() -> ControlResponse {
+        let mut accepted = None;
+        for path_bytes in 1..=4096 {
+            let response = maximum_dual_status_response(path_bytes);
+            if serde_json::to_vec(&response).unwrap().len() <= MAX_RESPONSE_BYTES {
+                accepted = Some(response);
+            } else {
+                break;
+            }
+        }
+        accepted.expect("at least one maximum dual status fixture fits")
+    }
+
+    fn maximum_clarification_response() -> ControlResponse {
+        let path = format!("/{}", "\\".repeat(4095));
+        let records = (1..=u32::from(MAX_CLARIFICATION_PAGE_RECORDS))
+            .map(|sequence| ClarificationRecord {
+                sequence,
+                reason: ArchitectActionReason::Clarification,
+                developer_request_path: path.clone(),
+                architect_clarification_path: path.clone(),
+                human_decision_confirmed: true,
+            })
+            .collect();
+        ControlResponse::success(
+            "maximum-clarification-page",
+            ControlResult::Clarifications {
+                page: ClarificationPage {
+                    run_id: "run-maximum".into(),
+                    session_version: u64::MAX,
+                    task_ordinal: 63,
+                    task_key: "task-63".into(),
+                    total_records: 64,
+                    after_sequence: 56,
+                    records,
+                    next_after_sequence: None,
+                },
+            },
+        )
+    }
+
     fn successful_status_response(request: &ControlRequest) -> ControlResponse {
         ControlResponse::success(
             request.request_id.clone(),
@@ -1149,7 +1328,7 @@ mod tests {
             architect_adapter: "codex".into(),
             architect_additional_directories: Vec::new(),
             developer_adapter: "codex-developer".into(),
-            reviewer_adapter: "claude-reviewer-2.1.220".into(),
+            reviewer_adapters: reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
         };
         let activation = BridgeActivation {
             architect_pid: std::process::id(),
@@ -1833,7 +2012,10 @@ mod tests {
                     "arguments":{
                         "expected_session_version":0,
                         "developer_adapter":"codex-developer",
-                        "reviewer_adapter":"claude-reviewer-2.1.220",
+                        "reviewer_adapters":[
+                            {"reviewer_id":"reviewer1","adapter":"codex-reviewer"},
+                            {"reviewer_id":"reviewer2","adapter":"claude-reviewer-2.1.220"}
+                        ],
                         "tasks":[{
                             "task_key":"p9-task-1",
                             "title":"Phase 9 Task 1",
@@ -1900,10 +2082,13 @@ mod tests {
             ControlAction::SessionPlanReplace {
                 expected_session_version: 0,
                 ref developer_adapter,
-                ref reviewer_adapter,
+                reviewer_adapters: ref requested_reviewers,
                 ref tasks,
             } if developer_adapter == "codex-developer"
-                && reviewer_adapter == "claude-reviewer-2.1.220"
+                && requested_reviewers == &reviewer_adapters(
+                    "codex-reviewer",
+                    "claude-reviewer-2.1.220",
+                )
                 && tasks.len() == 1
                 && tasks[0].task_document_path == "/project/current_todo.md"
                 && tasks[0].design_document_paths == ["/project/architecture.md"]
@@ -2023,6 +2208,75 @@ mod tests {
     }
 
     #[test]
+    fn maximum_control_responses_fit_losslessly_in_the_duplicated_mcp_envelope() {
+        assert_eq!(
+            MAX_MCP_LINE_BYTES,
+            MAX_RESPONSE_BYTES * 3 + MAX_REQUEST_BYTES + 4096
+        );
+        let dual_status = largest_control_bounded_dual_status_response();
+        let dual_payload = serde_json::to_vec(&dual_status).unwrap();
+        assert!(
+            dual_payload.len() > MAX_RESPONSE_BYTES * 99 / 100,
+            "dual status fixture did not reach the control-frame boundary: {}",
+            dual_payload.len()
+        );
+        let next = maximum_dual_status_response(
+            dual_status
+                .result
+                .as_ref()
+                .and_then(|result| match result {
+                    ControlResult::Session { session } => Some(session.project_root.len() + 1),
+                    _ => None,
+                })
+                .unwrap(),
+        );
+        assert!(serde_json::to_vec(&next).unwrap().len() > MAX_RESPONSE_BYTES);
+
+        for response in [dual_status, maximum_clarification_response()] {
+            response.validate().unwrap();
+            let control_payload = serde_json::to_vec(&response).unwrap();
+            assert!(control_payload.len() <= MAX_RESPONSE_BYTES);
+            let envelope = complete_tool_call(json!(u64::MAX), Ok(response));
+            assert_eq!(envelope["result"]["isError"], false);
+            let structured = &envelope["result"]["structuredContent"];
+            let compatibility: Value = serde_json::from_str(
+                envelope["result"]["content"][0]["text"]
+                    .as_str()
+                    .expect("compatibility content is text"),
+            )
+            .unwrap();
+            assert_eq!(&compatibility, structured);
+            assert!(
+                serialized_json_line_len(&envelope).unwrap() <= MAX_MCP_LINE_BYTES,
+                "valid control response exceeded the checked MCP line bound"
+            );
+
+            let mut encoded = Vec::new();
+            write_json_line(&mut encoded, &envelope).unwrap();
+            let mut reader = BufReader::new(encoded.as_slice());
+            let delivered = read_bounded_line(&mut reader).unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(trim_line(&delivered)).unwrap(),
+                envelope
+            );
+        }
+
+        let mut impossible = maximum_dual_status_response(1);
+        let Some(ControlResult::Session { session }) = impossible.result.as_mut() else {
+            unreachable!()
+        };
+        session.terminal_detail = Some("x".repeat(MAX_MCP_LINE_BYTES));
+        let rejected = complete_tool_call(json!(7), Ok(impossible));
+        assert_eq!(rejected["result"]["isError"], true);
+        assert!(
+            rejected["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("exceeded the bounded MCP transport")
+        );
+    }
+
+    #[test]
     fn bridge_configuration_binds_runtime_only_socket_paths() {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
@@ -2053,13 +2307,14 @@ mod tests {
             architect_adapter: "codex".into(),
             architect_additional_directories: Vec::new(),
             developer_adapter: "codex-developer".into(),
-            reviewer_adapter: "claude-reviewer-2.1.220".into(),
+            reviewer_adapters: reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
         };
         validate_bridge_configuration(&configuration).unwrap();
 
         let mut alternate_roles = configuration.clone();
         alternate_roles.developer_adapter = CLAUDE_DEVELOPER_ADAPTER.into();
-        alternate_roles.reviewer_adapter = CODEX_REVIEWER_ADAPTER.into();
+        alternate_roles.reviewer_adapters =
+            reviewer_adapters(CLAUDE_REVIEWER_ADAPTER, CODEX_REVIEWER_ADAPTER);
         validate_bridge_configuration(&alternate_roles).unwrap();
 
         let mut invalid_binding_hash = configuration.clone();
