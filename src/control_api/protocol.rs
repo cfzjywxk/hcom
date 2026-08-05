@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
@@ -13,13 +13,15 @@ const MAX_PATH_BYTES: usize = 4096;
 const MAX_TASKS: usize = 64;
 const MAX_LIST_ITEMS: usize = 256;
 pub const MAX_REVIEW_ROUNDS: u8 = 20;
-pub const REVIEWER_COUNT: usize = 2;
+pub const MIN_SINGLE_REVIEW_ROUNDS: u8 = 5;
+pub const MIN_DUAL_REVIEW_ROUNDS: u8 = 7;
+pub const MAX_REVIEWER_COUNT: usize = 2;
 const MAX_CLARIFICATION_ROUNDS: u8 = 20;
 pub const MAX_CLARIFICATION_PAGE_RECORDS: u8 = 8;
 pub const MAX_CLARIFICATION_RECORDS_PER_TASK: usize = 64;
 pub const MAX_CLARIFICATION_RECORDS_PER_RUN: usize = MAX_TASKS * MAX_CLARIFICATION_ROUNDS as usize;
 const fn max_progress_events_per_run() -> usize {
-    let events_per_round = match (MAX_REVIEW_ROUNDS as usize).checked_mul(REVIEWER_COUNT + 1) {
+    let events_per_round = match (MAX_REVIEW_ROUNDS as usize).checked_mul(MAX_REVIEWER_COUNT + 1) {
         Some(value) => value,
         None => panic!("progress event capacity overflow"),
     };
@@ -219,7 +221,7 @@ impl ControlAction {
             } => {
                 validate_single_line("developer_adapter", developer_adapter, 64)?;
                 validate_reviewer_adapter_bindings(reviewer_adapters)?;
-                validate_tasks(tasks)
+                validate_tasks(tasks, reviewer_adapters.len())
             }
             Self::SessionApproveAndStart {
                 plan_version,
@@ -353,7 +355,15 @@ pub struct TaskDraft {
 }
 
 impl TaskDraft {
+    #[cfg(test)]
     pub(crate) fn validate(&self) -> Result<(), ProtocolValidationError> {
+        self.validate_for_reviewer_count(MAX_REVIEWER_COUNT)
+    }
+
+    pub(crate) fn validate_for_reviewer_count(
+        &self,
+        reviewer_count: usize,
+    ) -> Result<(), ProtocolValidationError> {
         validate_id("task_key", &self.task_key)?;
         if !matches!(
             Path::new(&self.task_key)
@@ -380,10 +390,16 @@ impl TaskDraft {
             }
         }
         validate_single_line("task selector", &self.task_selector, 4096)?;
-        if !(1..=MAX_REVIEW_ROUNDS).contains(&self.max_review_rounds) {
-            return Err(ProtocolValidationError::new(
-                "max_review_rounds must be between 1 and 20",
-            ));
+        let minimum = minimum_review_rounds(reviewer_count)?;
+        if !(minimum..=MAX_REVIEW_ROUNDS).contains(&self.max_review_rounds) {
+            return Err(ProtocolValidationError::new(format!(
+                "max_review_rounds must be between {minimum} and {MAX_REVIEW_ROUNDS} for {} review mode",
+                if reviewer_count == 1 {
+                    "single"
+                } else {
+                    "dual"
+                }
+            )));
         }
         if !(1..=MAX_CLARIFICATION_ROUNDS).contains(&self.max_clarification_rounds) {
             return Err(ProtocolValidationError::new(
@@ -808,7 +824,10 @@ pub(crate) fn parse_canonical_action_set(
     Ok(set)
 }
 
-fn validate_tasks(tasks: &[TaskDraft]) -> Result<(), ProtocolValidationError> {
+fn validate_tasks(
+    tasks: &[TaskDraft],
+    reviewer_count: usize,
+) -> Result<(), ProtocolValidationError> {
     if tasks.is_empty() || tasks.len() > MAX_TASKS {
         return Err(ProtocolValidationError::new(
             "ordered task plan must contain between 1 and 64 tasks",
@@ -816,7 +835,7 @@ fn validate_tasks(tasks: &[TaskDraft]) -> Result<(), ProtocolValidationError> {
     }
     let mut keys = BTreeSet::new();
     for task in tasks {
-        task.validate()?;
+        task.validate_for_reviewer_count(reviewer_count)?;
         if !keys.insert(&task.task_key) {
             return Err(ProtocolValidationError::new(
                 "task_key values must be unique",
@@ -829,18 +848,40 @@ fn validate_tasks(tasks: &[TaskDraft]) -> Result<(), ProtocolValidationError> {
 fn validate_reviewer_adapter_bindings(
     bindings: &[ReviewerAdapterBinding],
 ) -> Result<(), ProtocolValidationError> {
-    if bindings.len() != REVIEWER_COUNT
-        || bindings[0].reviewer_id != ReviewerId::Reviewer1
-        || bindings[1].reviewer_id != ReviewerId::Reviewer2
-    {
+    if !matches!(
+        bindings,
+        [ReviewerAdapterBinding {
+            reviewer_id: ReviewerId::Reviewer1,
+            ..
+        }] | [
+            ReviewerAdapterBinding {
+                reviewer_id: ReviewerId::Reviewer1,
+                ..
+            },
+            ReviewerAdapterBinding {
+                reviewer_id: ReviewerId::Reviewer2,
+                ..
+            }
+        ]
+    ) {
         return Err(ProtocolValidationError::new(
-            "reviewer_adapters must contain ordered Reviewer1 and Reviewer2 bindings",
+            "reviewer_adapters must contain ordered Reviewer1 or Reviewer1 and Reviewer2 bindings",
         ));
     }
     for binding in bindings {
         validate_single_line("reviewer adapter", &binding.adapter, 64)?;
     }
     Ok(())
+}
+
+pub(crate) fn minimum_review_rounds(reviewer_count: usize) -> Result<u8, ProtocolValidationError> {
+    match reviewer_count {
+        1 => Ok(MIN_SINGLE_REVIEW_ROUNDS),
+        2 => Ok(MIN_DUAL_REVIEW_ROUNDS),
+        _ => Err(ProtocolValidationError::new(
+            "reviewer collection must contain one or two entries",
+        )),
+    }
 }
 
 fn validate_id(label: &str, value: &str) -> Result<(), ProtocolValidationError> {
@@ -964,7 +1005,7 @@ mod tests {
             task_document_path: format!("/project/tasks/{key}.md"),
             design_document_paths: vec!["/project/design.md".into()],
             task_selector: key.into(),
-            max_review_rounds: 2,
+            max_review_rounds: MIN_DUAL_REVIEW_ROUNDS,
             max_clarification_rounds: 2,
         }
     }
@@ -1017,6 +1058,87 @@ mod tests {
         assert!(relative_repository.validate().is_err());
         relative_repository.repository_root = "/source/../repository".into();
         assert!(relative_repository.validate().is_err());
+    }
+
+    #[test]
+    fn review_round_minimum_is_bound_to_the_canonical_reviewer_topology() {
+        let single = |rounds| ControlAction::SessionPlanReplace {
+            expected_session_version: 0,
+            developer_adapter: "codex-developer".into(),
+            reviewer_adapters: vec![ReviewerAdapterBinding {
+                reviewer_id: ReviewerId::Reviewer1,
+                adapter: "codex-reviewer".into(),
+            }],
+            tasks: vec![TaskDraft {
+                max_review_rounds: rounds,
+                ..task("single")
+            }],
+        };
+        assert!(single(MIN_SINGLE_REVIEW_ROUNDS).validate().is_ok());
+        assert!(single(MIN_SINGLE_REVIEW_ROUNDS - 1).validate().is_err());
+
+        let mut dual_below = single(MIN_DUAL_REVIEW_ROUNDS - 1);
+        let ControlAction::SessionPlanReplace {
+            reviewer_adapters, ..
+        } = &mut dual_below
+        else {
+            unreachable!()
+        };
+        reviewer_adapters.push(ReviewerAdapterBinding {
+            reviewer_id: ReviewerId::Reviewer2,
+            adapter: "claude-reviewer-2.1.220".into(),
+        });
+        assert!(dual_below.validate().is_err());
+
+        let mut dual_minimum = dual_below;
+        let ControlAction::SessionPlanReplace { tasks, .. } = &mut dual_minimum else {
+            unreachable!()
+        };
+        tasks[0].max_review_rounds = MIN_DUAL_REVIEW_ROUNDS;
+        assert!(dual_minimum.validate().is_ok());
+
+        let mut reviewer2_only = single(MIN_SINGLE_REVIEW_ROUNDS);
+        let ControlAction::SessionPlanReplace {
+            reviewer_adapters, ..
+        } = &mut reviewer2_only
+        else {
+            unreachable!()
+        };
+        reviewer_adapters[0].reviewer_id = ReviewerId::Reviewer2;
+        assert!(reviewer2_only.validate().is_err());
+
+        let mut empty = single(MIN_SINGLE_REVIEW_ROUNDS);
+        let ControlAction::SessionPlanReplace {
+            reviewer_adapters, ..
+        } = &mut empty
+        else {
+            unreachable!()
+        };
+        reviewer_adapters.clear();
+        assert!(empty.validate().is_err());
+
+        let mut duplicate = single(MIN_DUAL_REVIEW_ROUNDS);
+        let ControlAction::SessionPlanReplace {
+            reviewer_adapters, ..
+        } = &mut duplicate
+        else {
+            unreachable!()
+        };
+        reviewer_adapters.push(ReviewerAdapterBinding {
+            reviewer_id: ReviewerId::Reviewer1,
+            adapter: "claude-reviewer-2.1.220".into(),
+        });
+        assert!(duplicate.validate().is_err());
+
+        let mut wrong_order = dual_minimum;
+        let ControlAction::SessionPlanReplace {
+            reviewer_adapters, ..
+        } = &mut wrong_order
+        else {
+            unreachable!()
+        };
+        reviewer_adapters.swap(0, 1);
+        assert!(wrong_order.validate().is_err());
     }
 
     #[test]
@@ -1176,10 +1298,10 @@ mod tests {
 
     #[test]
     fn previous_protocol_version_fails_closed() {
-        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(PROTOCOL_VERSION, 9);
         let request = ControlRequest {
-            protocol_version: 7,
-            request_id: "v7-request".into(),
+            protocol_version: 8,
+            request_id: "v8-request".into(),
             caller: CallerAuth::Human {
                 process_birth: "123:456".into(),
             },
@@ -1188,8 +1310,8 @@ mod tests {
         assert!(request.validate().is_err());
 
         let response = ControlResponse {
-            protocol_version: 7,
-            request_id: "v7-response".into(),
+            protocol_version: 8,
+            request_id: "v8-response".into(),
             ok: false,
             result: None,
             error: Some(ControlErrorBody {

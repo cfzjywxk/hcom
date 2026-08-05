@@ -34,7 +34,7 @@ pub fn run_cli_with_config(args: &[String], config_path: &Path) -> Result<i32> {
 pub fn help_text() -> &'static str {
     r#"Usage:
   cd <project-directory>
-  hcom arch codex [architect-profile-options]
+  hcom arch codex [--single-review] [architect-profile-options]
   hcom arch claude [architect-profile-options]
 
 Launch one blank, foreground Codex or Claude architect with capability-bound
@@ -54,10 +54,14 @@ Profile configuration is read once from $HCOM_DIR/config.toml (default:
 Each table is a partial override: omitted fields keep the built-in role
 default. Codex accepts reasoning_effort or its effort alias. Developer,
 Reviewer1, and Reviewer2 adapters are selected independently; their defaults
-are codex, codex, and claude respectively. A legacy-only
-[architect.reviewer] profile is resolved once and copied to both Reviewer
-lanes with a deprecation notice; mixing it with either canonical Reviewer
-table fails closed.
+are codex, codex, and claude respectively. By default both Reviewer lanes are
+active. `hcom arch codex --single-review` activates only Reviewer1; an explicit
+[architect.reviewer2] table is rejected in that mode, while Reviewer1 may still
+select either provider. The flag is rejected for `hcom arch claude` before any
+interactive process starts. A legacy-only [architect.reviewer] profile is
+resolved once and applied to Reviewer1 in single mode or copied to both
+Reviewer lanes in dual mode, with a deprecation notice; mixing it with either
+canonical Reviewer table fails closed.
 
 Architect CLI overrides (higher priority than TOML):
   --model <model>
@@ -97,7 +101,8 @@ revision/hash and confirmation bit, not OS-level keyboard provenance.
 Only typed profile fields are accepted; arbitrary native argv is not. The
 effective sanitized profiles, their SHA-256 hash, and the exact session binding
 hash are printed at startup and frozen for every sequential run in that
-foreground Architect invocation. The private task-control protocol is v8:
+foreground Architect invocation. Startup also prints `review mode: single` or
+`review mode: dual`. The private task-control protocol is v9:
 its plan hash binds the ordered Reviewer identities and exact session
 profile/runtime contract; the closed bridge bootstrap carries the same binding
 hash. A mismatched hcom and
@@ -139,28 +144,30 @@ the standard lane and must be resolved before start. If that conflict reaches a
 Developer turn, the Developer requests clarification without modifying the
 repository and the Architect must escalate it to the human regardless of
 remaining autonomous clarification budget. The Developer is instructed to add
-and preserve a matching Signed-off-by trailer, and both Reviewers check it.
+and preserve a matching Signed-off-by trailer, and every active Reviewer checks it.
 Local candidate commits do not authorize push, install, release, or an extra
 commit after LGTM.
-Both Reviewers receive the same native host view; source/Git/install
+Every active Reviewer receives the same native host view; source/Git/install
 non-mutation is a role instruction rather than an OS read-only mount. Each
 independently reads the Developer's exact durable final through its path and
-never receives the peer Reviewer's response. Corrections carry both
-same-generation Reviewer response paths in stable Reviewer1-then-Reviewer2
-order; re-reviews carry only the latest Developer path. hcom never pushes,
+never receives another Reviewer's response. Corrections carry every active
+same-generation Reviewer response path in stable binding order; re-reviews
+carry only the latest Developer path. hcom never pushes,
 installs, resets, rebases, merges, or applies changes.
 
 The foreground parent owns every worker and task-local exec runtime; it keeps
 state only in memory and performs no daemon, project store, or cross-session
 recovery. Same-task corrections use the exact native Developer thread and
 re-reviews resume each Reviewer's own exact native thread. Different tasks and
-different runs use fresh workers. Each review generation starts Reviewer1 and
-Reviewer2 concurrently, waits for both logical responses, and completes only
-on same-generation dual LGTM; a Developer amendment invalidates both previous
-verdicts. After dispatch, the Codex
+different runs use fresh workers. Each review generation starts every active
+Reviewer (concurrently in dual mode), waits for all logical responses, and
+completes only on same-generation LGTM from all active Reviewers; a Developer
+amendment invalidates every previous verdict. Single-review plans accept
+`max_review_rounds` from 5 through 20, while dual-review plans accept 7 through
+20. After dispatch, the Codex
 Architect opens one blocking session_wait MCP call bound to the exact run_id
 and a run-local progress cursor. The foreground supervisor advances Developer
-and both Reviewers without Architect model calls and completes that wait for one
+and all active Reviewers without Architect model calls and completes that wait for one
 retained progress event, a terminal state, or a latched Developer
 clarification/blocker action. Progress events are emitted for each review
 generation, each Reviewer response, and task completion. They carry task
@@ -168,10 +175,11 @@ position, completed review round, current generation, Reviewer identity,
 response counts and verdict/outcome where applicable, the exact Developer
 final path, and ordered current-generation Reviewer final paths where
 applicable; review requests also carry the task/design paths, selector, and
-both session-level Reviewer bindings. The Architect displays each event once
-without reading the durable response body, treats the first Reviewer response
-as partial progress, and immediately re-arms session_wait with that event's
-sequence. Worker execution continues while the update is displayed, and
+ordered active Reviewer bindings. The Architect displays each event once
+without reading the durable response body, treats a response as partial while
+fewer than the expected number have arrived, and immediately re-arms
+session_wait with that event's sequence. Worker execution continues while the
+update is displayed, and
 events produced during the display-to-wait gap remain queued in order.
 The Architect answers a defensible action through the exact new clarification
 document path and immediately re-arms session_wait in the same turn. When a
@@ -182,7 +190,7 @@ status polls. Interrupting the wait cancels only that subscription, never the
 run. A still-latched action has priority over queued progress and is
 redelivered only to a wait from a version older than its published_version; a
 same-version repeated wait is rejected until the action is resolved. Queued
-progress, including both Reviewer response events, is delivered before a
+progress, including every Reviewer response event, is delivered before a
 retained terminal result. Status snapshots expose bounded concurrent
 active_workers, session-level ordered Reviewer bindings, each task's
 review_round/review_generation, and typed current-generation Reviewer results;
@@ -190,11 +198,11 @@ they carry clarification counts rather than record bodies.
 session_clarifications_list reads the ordered records in bounded pages bound
 to that run_id.
 The terminal snapshot contains each task's latest Developer final path and
-Reviewer1/Reviewer2 current-generation identities, verdicts, and final-message
-path chains, never either Reviewer body. Only then does the Architect read
-both final Reviewer evidence chains and deliver their original verdicts and
-findings, distinguishing same-generation dual LGTM, review exhaustion, and
-lifecycle failure. It does not rerun tests, review, or validation unless the
+every active Reviewer's current-generation identity, verdict, and final-message
+path chains, never any Reviewer body. Only then does the Architect read the
+active final Reviewer evidence chains and deliver their original verdicts and
+findings, distinguishing same-generation LGTM, review exhaustion, and lifecycle
+failure. It does not rerun tests, review, or validation unless the
 human explicitly requests that work. An LGTM task's final local candidate
 commit is already reviewed at the reported exact range; the Architect reports
 it without asking whether to retain or revert it merely because commit was not

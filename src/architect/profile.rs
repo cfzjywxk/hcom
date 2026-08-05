@@ -210,21 +210,35 @@ fn apply_reviewer_override(
 }
 
 /// Resolver for the production provider-routed task-runtime lane.
+#[cfg(test)]
 pub(super) fn load_task_lane_profiles(
     path: &Path,
     architect_adapter: ArchitectAdapter,
 ) -> Result<LoadedInvocationProfiles> {
-    load_invocation_profiles_with_defaults(path, architect_adapter, true)
+    load_task_lane_profiles_for_mode(path, architect_adapter, false)
+}
+
+pub(super) fn load_task_lane_profiles_for_mode(
+    path: &Path,
+    architect_adapter: ArchitectAdapter,
+    single_review: bool,
+) -> Result<LoadedInvocationProfiles> {
+    load_invocation_profiles_with_defaults(path, architect_adapter, true, single_review)
 }
 
 fn load_invocation_profiles_with_defaults(
     path: &Path,
     architect_adapter: ArchitectAdapter,
     provider_routed_worker_lane: bool,
+    single_review: bool,
 ) -> Result<LoadedInvocationProfiles> {
     let defaults = || {
         if provider_routed_worker_lane {
-            SessionInvocationProfiles::for_task_lane(architect_adapter)
+            if single_review {
+                SessionInvocationProfiles::for_single_review_task_lane(architect_adapter)
+            } else {
+                SessionInvocationProfiles::for_task_lane(architect_adapter)
+            }
         } else {
             Ok(SessionInvocationProfiles::for_architect(architect_adapter))
         }
@@ -314,15 +328,33 @@ fn load_invocation_profiles_with_defaults(
         if configured.reviewer.is_some()
             && (configured.reviewer1.is_some() || configured.reviewer2.is_some())
         {
+            if single_review {
+                bail!(
+                    "legacy [architect.reviewer] cannot be combined with [architect.reviewer1] or [architect.reviewer2]; remove the legacy table and declare [architect.reviewer1] explicitly"
+                );
+            } else {
+                bail!(
+                    "legacy [architect.reviewer] cannot be combined with [architect.reviewer1] or [architect.reviewer2]; remove the legacy table and declare both canonical Reviewer lanes explicitly"
+                );
+            }
+        }
+        if single_review && configured.reviewer2.is_some() {
             bail!(
-                "legacy [architect.reviewer] cannot be combined with [architect.reviewer1] or [architect.reviewer2]; remove the legacy table and declare both canonical Reviewer lanes explicitly"
+                "[architect.reviewer2] is not allowed with --single-review; remove that table or run the default dual review mode"
             );
         }
         if let Some(value) = configured.reviewer {
             let mut resolved = ReviewerInvocationProfile::default();
             apply_reviewer_override(&mut resolved, value, "[architect.reviewer]")
                 .context("invalid [architect.reviewer] configuration")?;
-            profiles.reviewers = SessionInvocationProfiles::legacy_reviewer_pair(resolved);
+            profiles.reviewers = if single_review {
+                vec![crate::worker::profile::ReviewerInvocationBinding::new(
+                    ReviewerId::Reviewer1,
+                    resolved,
+                )]
+            } else {
+                SessionInvocationProfiles::legacy_reviewer_pair(resolved)
+            };
             legacy_reviewer_migrated = true;
         } else {
             if let Some(value) = configured.reviewer1 {
@@ -445,6 +477,89 @@ mod tests {
         );
         assert!(loaded.profiles.reviewer1().codex().is_some());
         assert_eq!(loaded.profiles.reviewer2().claude().unwrap().model, "opus");
+    }
+
+    #[test]
+    fn single_review_defaults_to_codex_reviewer1_without_claude_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let loaded = load_task_lane_profiles_for_mode(
+            &temp.path().join("missing.toml"),
+            ArchitectAdapter::Codex,
+            true,
+        )
+        .unwrap();
+        assert_eq!(loaded.profiles.reviewers.len(), 1);
+        assert!(loaded.profiles.reviewer1().codex().is_some());
+        assert!(!loaded.profiles.uses_claude());
+        assert_eq!(loaded.profiles.review_mode_name(), "single");
+    }
+
+    #[test]
+    fn single_review_applies_only_reviewer1_configuration_and_legacy_once() {
+        let (_temp, canonical) = write_config(
+            r#"
+[architect.reviewer1]
+adapter = "claude"
+model = "reviewer-one"
+"#,
+        );
+        let loaded =
+            load_task_lane_profiles_for_mode(&canonical, ArchitectAdapter::Codex, true).unwrap();
+        assert_eq!(loaded.profiles.reviewers.len(), 1);
+        assert_eq!(
+            loaded.profiles.reviewer1().claude().unwrap().model,
+            "reviewer-one"
+        );
+        assert!(loaded.profiles.uses_claude());
+
+        let (_temp, legacy) = write_config(
+            r#"
+[architect.reviewer]
+adapter = "codex"
+model = "legacy-one"
+"#,
+        );
+        let loaded =
+            load_task_lane_profiles_for_mode(&legacy, ArchitectAdapter::Codex, true).unwrap();
+        assert!(loaded.legacy_reviewer_migrated);
+        assert_eq!(loaded.profiles.reviewers.len(), 1);
+        assert_eq!(
+            loaded.profiles.reviewer1().codex().unwrap().model,
+            "legacy-one"
+        );
+
+        let (_temp, mixed) = write_config(
+            r#"
+[architect.reviewer]
+model = "legacy"
+[architect.reviewer1]
+model = "canonical"
+"#,
+        );
+        let error = load_task_lane_profiles_for_mode(&mixed, ArchitectAdapter::Codex, true)
+            .err()
+            .expect("single review must reject mixed legacy and canonical Reviewer tables");
+        assert!(
+            format!("{error:#}").contains("declare [architect.reviewer1] explicitly"),
+            "unexpected single-review legacy mix error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn single_review_rejects_explicit_reviewer2_configuration() {
+        let (_temp, path) = write_config(
+            r#"
+[architect.reviewer2]
+adapter = "codex"
+"#,
+        );
+        let error = load_task_lane_profiles_for_mode(&path, ArchitectAdapter::Codex, true)
+            .err()
+            .expect("single review must reject Reviewer2 configuration");
+        assert!(
+            format!("{error:#}").contains("[architect.reviewer2] is not allowed"),
+            "unexpected single-review Reviewer2 error: {error:#}"
+        );
     }
 
     #[test]

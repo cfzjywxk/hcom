@@ -301,11 +301,23 @@ fn validate_worker_adapter_binding(
     developer_adapter: &str,
     reviewer_adapters: &[ReviewerAdapterBinding],
 ) -> Result<()> {
-    if reviewer_adapters.len() != 2
-        || reviewer_adapters[0].reviewer_id != crate::worker::profile::ReviewerId::Reviewer1
-        || reviewer_adapters[1].reviewer_id != crate::worker::profile::ReviewerId::Reviewer2
-    {
-        bail!("architect bridge requires ordered Reviewer1 and Reviewer2 adapter bindings");
+    if !matches!(
+        reviewer_adapters,
+        [ReviewerAdapterBinding {
+            reviewer_id: crate::worker::profile::ReviewerId::Reviewer1,
+            ..
+        }] | [
+            ReviewerAdapterBinding {
+                reviewer_id: crate::worker::profile::ReviewerId::Reviewer1,
+                ..
+            },
+            ReviewerAdapterBinding {
+                reviewer_id: crate::worker::profile::ReviewerId::Reviewer2,
+                ..
+            }
+        ]
+    ) {
+        bail!("architect bridge requires a canonical ordered Reviewer adapter topology");
     }
     let routed_worker_pair = matches!(
         developer_adapter,
@@ -1071,6 +1083,46 @@ mod tests {
             &reviewer_adapters(CODEX_REVIEWER_ADAPTER, CLAUDE_REVIEWER_ADAPTER),
         )
         .unwrap();
+        validate_worker_adapter_binding(
+            CODEX_DEVELOPER_ADAPTER,
+            &[ReviewerAdapterBinding {
+                reviewer_id: crate::worker::profile::ReviewerId::Reviewer1,
+                adapter: CODEX_REVIEWER_ADAPTER.into(),
+            }],
+        )
+        .unwrap();
+        for invalid in [
+            Vec::new(),
+            vec![ReviewerAdapterBinding {
+                reviewer_id: ReviewerId::Reviewer2,
+                adapter: CODEX_REVIEWER_ADAPTER.into(),
+            }],
+            vec![
+                ReviewerAdapterBinding {
+                    reviewer_id: ReviewerId::Reviewer1,
+                    adapter: CODEX_REVIEWER_ADAPTER.into(),
+                },
+                ReviewerAdapterBinding {
+                    reviewer_id: ReviewerId::Reviewer1,
+                    adapter: CLAUDE_REVIEWER_ADAPTER.into(),
+                },
+            ],
+            vec![
+                ReviewerAdapterBinding {
+                    reviewer_id: ReviewerId::Reviewer2,
+                    adapter: CLAUDE_REVIEWER_ADAPTER.into(),
+                },
+                ReviewerAdapterBinding {
+                    reviewer_id: ReviewerId::Reviewer1,
+                    adapter: CODEX_REVIEWER_ADAPTER.into(),
+                },
+            ],
+        ] {
+            assert!(
+                validate_worker_adapter_binding(CODEX_DEVELOPER_ADAPTER, &invalid).is_err(),
+                "bridge accepted invalid Reviewer topology: {invalid:?}"
+            );
+        }
         assert!(
             validate_worker_adapter_binding(
                 CODEX_TASK_WORKER_ADAPTER,
@@ -1155,7 +1207,7 @@ mod tests {
             branch: None,
             review_round: 1,
             review_generation: 1,
-            max_review_rounds: 3,
+            max_review_rounds: 7,
             clarification_rounds_used: 0,
             max_clarification_rounds: 2,
             clarification_record_count: 0,
@@ -1468,7 +1520,7 @@ mod tests {
                     total_tasks: 1,
                     review_round: 0,
                     review_generation: 1,
-                    max_review_rounds: 3,
+                    max_review_rounds: 7,
                     reviewer_id: ReviewerId::Reviewer1,
                     reviewer_verdict: ReviewerVerdict::RequestChanges,
                     developer_final_path: "/artifacts/developer/final.md".into(),
@@ -1501,7 +1553,7 @@ mod tests {
     }
 
     #[test]
-    fn status_result_preserves_v8_active_bindings_and_current_generation_without_peer_body() {
+    fn status_result_preserves_v9_active_bindings_and_current_generation_without_peer_body() {
         let reviewer1_path = "/artifacts/reviewer/reviewer1/final.md";
         let mut session = status_snapshot();
         session.state = SessionState::Running;
@@ -1535,7 +1587,7 @@ mod tests {
             branch: None,
             review_round: 0,
             review_generation: 1,
-            max_review_rounds: 3,
+            max_review_rounds: 7,
             clarification_rounds_used: 0,
             max_clarification_rounds: 2,
             clarification_record_count: 0,
@@ -2023,7 +2075,7 @@ mod tests {
                             "task_document_path":"/project/current_todo.md",
                             "design_document_paths":["/project/architecture.md"],
                             "task_selector":"FBTC-01",
-                            "max_review_rounds":3,
+                            "max_review_rounds":7,
                             "max_clarification_rounds":2
                         }]
                     },
@@ -2052,10 +2104,10 @@ mod tests {
         );
         let initialize_instructions = responses[0]["result"]["instructions"].as_str().unwrap();
         for required in [
-            "Reviewer1 and Reviewer2 lanes",
+            "Reviewer1 in single-review mode",
             "review_generation",
             "responses_received",
-            "first Reviewer response is only partial progress",
+            "responses_received` is less than `responses_expected",
             "Only after terminal",
         ] {
             assert!(

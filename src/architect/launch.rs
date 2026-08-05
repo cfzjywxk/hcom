@@ -2,7 +2,7 @@ use super::bridge::{
     BridgeActivation, BridgeConfiguration, activate_bridge, configure_bridge,
     relay_runtime_scope_hash, sha256_hex,
 };
-use super::profile::{LoadedInvocationProfiles, load_task_lane_profiles};
+use super::profile::{LoadedInvocationProfiles, load_task_lane_profiles_for_mode};
 use crate::control_api::peer::{process_birth_identity, process_owns_foreground_tty};
 use crate::control_api::protocol::PROTOCOL_VERSION;
 use crate::control_api::registration::{
@@ -59,6 +59,10 @@ struct ArchitectArgs {
     /// Exact enabled architect adapter.
     adapter: String,
 
+    /// Use only Reviewer1. Available only with the Codex Architect.
+    #[arg(long = "single-review")]
+    single_review: bool,
+
     #[arg(long)]
     model: Option<String>,
 
@@ -92,15 +96,27 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         std::iter::once("hcom arch".to_owned()).chain(argv.iter().skip(1).cloned()),
     )?;
     let architect_adapter = ArchitectAdapter::parse(&args.adapter)?;
+    if args.single_review && architect_adapter != ArchitectAdapter::Codex {
+        bail!("--single-review is available only with `hcom arch codex`");
+    }
     // Both public entrypoints share the same provider-routed task worker lane.
     let mut loaded = match config_path {
-        Some(path) => load_task_lane_profiles(path, architect_adapter)?,
-        None => LoadedInvocationProfiles {
-            profiles: SessionInvocationProfiles::for_task_lane(architect_adapter)?,
-            config_path: PathBuf::from("<built-in defaults>"),
-            loaded_from_file: false,
-            legacy_reviewer_migrated: false,
-        },
+        Some(path) => {
+            load_task_lane_profiles_for_mode(path, architect_adapter, args.single_review)?
+        }
+        None => {
+            let profiles = if args.single_review {
+                SessionInvocationProfiles::for_single_review_task_lane(architect_adapter)?
+            } else {
+                SessionInvocationProfiles::for_task_lane(architect_adapter)?
+            };
+            LoadedInvocationProfiles {
+                profiles,
+                config_path: PathBuf::from("<built-in defaults>"),
+                loaded_from_file: false,
+                legacy_reviewer_migrated: false,
+            }
+        }
     };
     apply_architect_cli_overrides(&args, &mut loaded.profiles)?;
     let (developer_adapter, reviewer_adapters) =
@@ -168,7 +184,11 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
             startup.session_binding_hash
         )?;
         write_profile_summary(&mut stdout, &loaded.profiles)?;
-        write_legacy_reviewer_notice(&mut stdout, loaded.legacy_reviewer_migrated)?;
+        write_legacy_reviewer_notice(
+            &mut stdout,
+            loaded.legacy_reviewer_migrated,
+            &loaded.profiles,
+        )?;
         if loaded.profiles.uses_claude() {
             write_claude_startup_summary(
                 &mut stdout,
@@ -178,7 +198,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         }
         writeln!(
             stdout,
-            "worker runtime: lane-router (one native provider runtime per worker lane; reviewer turns fan out concurrently)"
+            "worker runtime: lane-router (one native provider runtime per effective worker lane)"
         )?;
         writeln!(
             stdout,
@@ -519,6 +539,7 @@ fn write_profile_summary(
     output: &mut impl Write,
     profiles: &SessionInvocationProfiles,
 ) -> Result<()> {
+    writeln!(output, "review mode: {}", profiles.review_mode_name())?;
     match &profiles.architect {
         ArchitectInvocationProfile::Codex { profile } => writeln!(
             output,
@@ -549,17 +570,29 @@ fn write_profile_summary(
             profile.model, profile.effort, profile.dangerously_skip_permissions
         )?,
     }
-    write_reviewer_profile(output, "reviewer1", profiles.reviewer1())?;
-    write_reviewer_profile(output, "reviewer2", profiles.reviewer2())?;
+    for binding in &profiles.reviewers {
+        write_reviewer_profile(output, binding.reviewer_id.as_str(), &binding.profile)?;
+    }
     Ok(())
 }
 
-fn write_legacy_reviewer_notice(output: &mut impl Write, migrated: bool) -> Result<()> {
+fn write_legacy_reviewer_notice(
+    output: &mut impl Write,
+    migrated: bool,
+    profiles: &SessionInvocationProfiles,
+) -> Result<()> {
     if migrated {
-        writeln!(
-            output,
-            "deprecated profile config: [architect.reviewer] was resolved once and copied to reviewer1 and reviewer2; declare both canonical tables explicitly"
-        )?;
+        if profiles.reviewers.len() == 1 {
+            writeln!(
+                output,
+                "deprecated profile config: [architect.reviewer] was resolved once for reviewer1; declare [architect.reviewer1] explicitly"
+            )?;
+        } else {
+            writeln!(
+                output,
+                "deprecated profile config: [architect.reviewer] was resolved once and copied to reviewer1 and reviewer2; declare both canonical tables explicitly"
+            )?;
+        }
     }
     Ok(())
 }
@@ -1473,6 +1506,19 @@ mod tests {
     }
 
     #[test]
+    fn single_review_flag_is_codex_only_before_terminal_or_claude_preflight() {
+        let error = run_cli(
+            &["arch".into(), "claude".into(), "--single-review".into()],
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "--single-review is available only with `hcom arch codex`"
+        );
+    }
+
+    #[test]
     fn codex_native_argv_and_additive_mcp_overlay_remain_unchanged() {
         let (_temp, tools, context) = fixture_context(ArchitectAdapter::Codex, Vec::new());
         let profile = ArchitectInvocationProfile::Codex {
@@ -1741,10 +1787,26 @@ mod tests {
         assert!(output.contains(GUARDIAN_LIFECYCLE_BOUNDARY));
 
         let mut notice = Vec::new();
-        write_legacy_reviewer_notice(&mut notice, true).unwrap();
+        write_legacy_reviewer_notice(&mut notice, true, &profiles).unwrap();
         assert_eq!(
             String::from_utf8(notice).unwrap(),
             "deprecated profile config: [architect.reviewer] was resolved once and copied to reviewer1 and reviewer2; declare both canonical tables explicitly\n"
+        );
+
+        let mut single = profiles;
+        single.retain_reviewer1().unwrap();
+        let mut output = Vec::new();
+        write_profile_summary(&mut output, &single).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("review mode: single"));
+        assert!(output.contains("reviewer1 profile:"));
+        assert!(!output.contains("reviewer2 profile:"));
+
+        let mut notice = Vec::new();
+        write_legacy_reviewer_notice(&mut notice, true, &single).unwrap();
+        assert_eq!(
+            String::from_utf8(notice).unwrap(),
+            "deprecated profile config: [architect.reviewer] was resolved once for reviewer1; declare [architect.reviewer1] explicitly\n"
         );
     }
 }

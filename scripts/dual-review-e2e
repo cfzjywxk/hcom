@@ -1,5 +1,5 @@
 #!/bin/bash
-# Serial, explicit opt-in runner for bounded v8 dual-Reviewer model E2E.
+# Serial, explicit opt-in runner for bounded v9 dual-Reviewer model E2E.
 #
 # Usage:
 #   CLAUDE_TEST_MODEL=haiku CLAUDE_TEST_EFFORT=medium \
@@ -56,7 +56,7 @@ run_scenario() {
       run_test real_dual_review_mixed_provider_strict_generation_and_overlap
       ;;
     exhaustion)
-      run_test real_dual_review_mixed_provider_round_one_exhaustion_advances
+      run_test real_dual_review_mixed_provider_minimum_exhaustion_advances
       ;;
     reviewer-exit)
       run_test real_dual_review_claude_reviewer_exit_cancels_codex_peer_without_residuals

@@ -1371,10 +1371,12 @@ impl TaskLaneSupervisor {
                             "\nReview generation {} responses, in fixed Reviewer order:\n",
                             task.review_generation
                         ));
-                        for reviewer_id in [
-                            crate::worker::profile::ReviewerId::Reviewer1,
-                            crate::worker::profile::ReviewerId::Reviewer2,
-                        ] {
+                        for reviewer_id in self
+                            .profiles
+                            .reviewers
+                            .iter()
+                            .map(|binding| binding.reviewer_id)
+                        {
                             let paths = task.reviewer_final_paths(reviewer_id);
                             if paths.is_empty() {
                                 bail!("developer correction lacks one Reviewer response");
@@ -1385,7 +1387,7 @@ impl TaskLaneSupervisor {
                             }
                         }
                         prompt.push_str(
-                            "\nRead and synthesize both Reviewer responses. Resolve conflicting \
+                            "\nRead and synthesize every active Reviewer response. Resolve conflicting \
                              suggestions against the approved task and disclose the choice in your \
                              final. Address valid requested changes from either response. \
                              If an explicit human, task, design, or applicable instruction still \
@@ -1623,7 +1625,7 @@ fn role_instructions(role: WorkerRole) -> &'static str {
             "You are the task Developer: execute the concrete approved task; do not redesign its product scope. First seek answers in the task file, design and clarification files, applicable instructions, existing implementation, and tests. Make ordinary local implementation decisions yourself. If an uncertain choice has a defensible candidate, is consistent with the approved behavior and scope, and can be corrected in review, choose the smallest-impact option, continue, and disclose it as `ASSUMPTION:` in your final. Ask for clarification only when you cannot derive any defensible candidate or the choice would decide material externally visible behavior, acceptance, or scope. Report BLOCKED only after actual attempts establish an external or mechanical obstacle; include concrete observations. Work directly in the exact repository and complete the bounded task. The human's execution approval for this standard hcom lane authorizes exactly one signed-off local candidate commit for this task; a general instruction that commits require human authorization is satisfied by that run approval. If an explicit human, task, design, or applicable instruction instead requires this run to remain uncommitted, do not modify or commit the repository: return `STATUS: CLARIFICATION_REQUIRED` because that requirement is incompatible with the standard review lane and requires an explicit human resolution. Otherwise run the required checks, then commit the complete work as ONE NEW commit whose message describes this task as a whole and whose `Signed-off-by` trailer matches the committing identity (for example, create it with `git commit --signoff`). Never amend, squash, reword, or otherwise rewrite a commit that existed when your first task turn began. On correction or clarification resume, amend your existing task commit if it exists and ensure that it retains a valid matching `Signed-off-by` trailer; if no task commit exists yet, create the one signed-off task commit only after the implementation is complete. Never create a second task commit. Do not create a commit merely to pause. If a pause is necessary after your task commit already exists, leave that commit unchanged and report the exact repository state. Never add any `hcom-tasks` artifact to the task commit. This local candidate commit and its same-task amendments do not authorize push, install, or release. Do not push, install, wait for interactive input, or modify the task/design/clarification source files."
         }
         WorkerRole::Reviewer => {
-            "You are the task Reviewer. Independently inspect the committed task range and decide whether it is sound against the approved task, design files, and every ordered clarification record. The human's execution approval for this standard hcom lane includes exactly one signed-off local Developer candidate commit and same-commit amendments during correction; it never includes push, install, or release. Review disclosed Developer assumptions rather than accepting them automatically. Confirm the developer left the work committed as a single commit for this task, with a message covering it, a valid `Signed-off-by` trailer matching the committing identity, and no `hcom-tasks` artifact; uncommitted work, a missing or mismatched sign-off, or a task split across several commits is a reason to request changes. If an explicit human, task, design, or applicable instruction requires the run to remain uncommitted, return `VERDICT: REQUEST_CHANGES` and label the incompatible workflow requirement `REQUIREMENT_AMBIGUITY:` instead of accepting either side of the contradiction. Distinguish other requirement ambiguity from implementation defects and label the former `REQUIREMENT_AMBIGUITY:` in findings. An LGTM applies to the exact final candidate range already committed; it does not call for another post-LGTM commit or a human decision about retaining that reviewed commit. You must not edit reviewed source, the Git index or refs, the candidate commit, stage, commit, change branch or HEAD, push, or install. The two Reviewer turns run concurrently with independent six-hour turn timeouts and no extra join deadline, cgroup, CPU, memory, or Cargo concurrency cap. Do not clean or mutate a shared Cargo target directory; for checks that write build artifacts, copy the tree into your own writable sandbox and use an isolated target directory."
+            "You are the task Reviewer. Independently inspect the committed task range and decide whether it is sound against the approved task, design files, and every ordered clarification record. The human's execution approval for this standard hcom lane includes exactly one signed-off local Developer candidate commit and same-commit amendments during correction; it never includes push, install, or release. Review disclosed Developer assumptions rather than accepting them automatically. Confirm the developer left the work committed as a single commit for this task, with a message covering it, a valid `Signed-off-by` trailer matching the committing identity, and no `hcom-tasks` artifact; uncommitted work, a missing or mismatched sign-off, or a task split across several commits is a reason to request changes. If an explicit human, task, design, or applicable instruction requires the run to remain uncommitted, return `VERDICT: REQUEST_CHANGES` and label the incompatible workflow requirement `REQUIREMENT_AMBIGUITY:` instead of accepting either side of the contradiction. Distinguish other requirement ambiguity from implementation defects and label the former `REQUIREMENT_AMBIGUITY:` in findings. An LGTM applies to the exact final candidate range already committed; it does not call for another post-LGTM commit or a human decision about retaining that reviewed commit. You must not edit reviewed source, the Git index or refs, the candidate commit, stage, commit, change branch or HEAD, push, or install. In dual-review mode, two Reviewer turns run concurrently; in single-review mode, only Reviewer1 runs. Every Reviewer turn has an independent six-hour timeout and there is no extra join deadline, cgroup, CPU, memory, or Cargo concurrency cap. Do not clean or mutate a shared Cargo target directory; for checks that write build artifacts, copy the tree into your own writable sandbox and use an isolated target directory."
         }
     }
 }
@@ -1736,9 +1738,17 @@ mod tests {
     }
 
     #[test]
-    fn session_binding_hash_covers_all_three_profiles_contracts_and_ordered_roots() {
+    fn session_binding_hash_covers_active_profiles_topology_contracts_and_ordered_roots() {
         let base = SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Codex).unwrap();
         let base_hash = binding_hash(&base, &[]);
+        let single =
+            SessionInvocationProfiles::for_single_review_task_lane(ArchitectAdapter::Codex)
+                .unwrap();
+        assert_ne!(
+            base_hash,
+            binding_hash(&single, &[]),
+            "session binding hash must distinguish single and dual topology"
+        );
 
         let mut architect = base.clone();
         architect.architect = crate::worker::profile::ArchitectInvocationProfile::Codex {
@@ -1804,7 +1814,9 @@ mod tests {
             "exact final candidate range already committed",
             "does not call for another post-LGTM commit",
             "must not edit reviewed source, the Git index or refs, the candidate commit",
-            "two Reviewer turns run concurrently with independent six-hour turn timeouts",
+            "In dual-review mode, two Reviewer turns run concurrently",
+            "Every Reviewer turn has an independent six-hour timeout",
+            "in single-review mode, only Reviewer1 runs",
             "no extra join deadline, cgroup, CPU, memory, or Cargo concurrency cap",
             "use an isolated target directory",
         ] {
@@ -2201,7 +2213,8 @@ mod tests {
                 task_document_path: task_document_path.to_string_lossy().into_owned(),
                 design_document_paths: vec![design_document_path.to_string_lossy().into_owned()],
                 task_selector: key.into(),
-                max_review_rounds: max_rounds,
+                max_review_rounds: max_rounds
+                    .max(crate::control_api::protocol::MIN_DUAL_REVIEW_ROUNDS),
                 max_clarification_rounds: 2,
             }
         }
@@ -2216,6 +2229,28 @@ mod tests {
                 self.project_root.clone(),
                 self.run_root.clone(),
                 self.sources.clone(),
+                Box::new(ScriptedFactory {
+                    scripts: scripts.into(),
+                    audit,
+                }),
+            )
+            .unwrap()
+        }
+
+        fn single_reviewer_supervisor(
+            &self,
+            scripts: Vec<TaskScript>,
+            audit: Arc<Mutex<Audit>>,
+        ) -> TaskLaneSupervisor {
+            let mut sources = self.sources.clone();
+            let mut profiles = pure_codex_profiles(ArchitectAdapter::Codex);
+            profiles.retain_reviewer1().unwrap();
+            sources.set_profiles_for_test(profiles);
+            TaskLaneSupervisor::open_with_factory(
+                "run-driver-test".into(),
+                self.project_root.clone(),
+                self.run_root.clone(),
+                sources,
                 Box::new(ScriptedFactory {
                     scripts: scripts.into(),
                     audit,
@@ -2425,7 +2460,8 @@ mod tests {
                     task_document_path: task_document_path.to_string_lossy().into_owned(),
                     design_document_paths: Vec::new(),
                     task_selector: task_key.into(),
-                    max_review_rounds,
+                    max_review_rounds: max_review_rounds
+                        .max(crate::control_api::protocol::MIN_DUAL_REVIEW_ROUNDS),
                     max_clarification_rounds: 2,
                 }
             }
@@ -2712,6 +2748,55 @@ mod tests {
         }
     }
 
+    fn single_reviewer_task_script(
+        task_key: &str,
+        turns: Vec<FakeTurnScript>,
+        mutations: Vec<Mutation>,
+    ) -> TaskScript {
+        assert_eq!(turns.len(), mutations.len());
+        TaskScript {
+            task_key: task_key.into(),
+            turns,
+            mutations: mutations.into(),
+            shutdown_failure: false,
+        }
+    }
+
+    fn exhausted_task_script(
+        task_key: &str,
+        path: &'static str,
+        contents: &'static str,
+        finding: &str,
+    ) -> TaskScript {
+        let mut turns = vec![FakeTurnScript::new(
+            WorkerRole::Developer,
+            RuntimeTurnPurpose::InitialDevelopment,
+            [ready("implemented")],
+        )];
+        let mut mutations = vec![Mutation::Commit { path, contents }];
+        for generation in 1..=crate::control_api::protocol::MIN_DUAL_REVIEW_ROUNDS {
+            turns.push(FakeTurnScript::new(
+                WorkerRole::Reviewer,
+                if generation == 1 {
+                    RuntimeTurnPurpose::InitialReview
+                } else {
+                    RuntimeTurnPurpose::ReviewerRereview
+                },
+                [request_changes(&format!("{finding}-{generation}"))],
+            ));
+            mutations.push(Mutation::None);
+            if generation < crate::control_api::protocol::MIN_DUAL_REVIEW_ROUNDS {
+                turns.push(FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::DeveloperCorrection,
+                    [ready(&format!("correction-{generation}"))],
+                ));
+                mutations.push(Mutation::None);
+            }
+        }
+        task_script(task_key, turns, mutations)
+    }
+
     fn reviewer2_script(mut script: FakeTurnScript) -> FakeTurnScript {
         for poll in &mut script.polls {
             if let RuntimeTurnPoll::Completed {
@@ -2842,13 +2927,10 @@ mod tests {
     }
 
     fn start(supervisor: &mut TaskLaneSupervisor, tasks: Vec<TaskDraft>) {
+        let developer_adapter = supervisor.developer_adapter.clone();
+        let reviewer_adapters = supervisor.reviewer_adapters.clone();
         let (plan_version, plan_hash) = supervisor
-            .replace_plan(
-                0,
-                CODEX_TASK_WORKER_ADAPTER,
-                &pure_codex_reviewer_adapters(),
-                tasks,
-            )
+            .replace_plan(0, &developer_adapter, &reviewer_adapters, tasks)
             .unwrap();
         assert_eq!(supervisor.snapshot().state, SessionState::AwaitingApproval);
         supervisor
@@ -3105,6 +3187,91 @@ mod tests {
                 .unwrap()
                 .any(|entry| entry.is_ok())
         );
+    }
+
+    #[test]
+    fn single_reviewer_driver_corrects_and_completes_without_reviewer2_artifacts() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let script = single_reviewer_task_script(
+            "single",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("single-implemented")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [request_changes("single-change")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::DeveloperCorrection,
+                    [ready("single-corrected")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::ReviewerRereview,
+                    [lgtm("single-sound")],
+                ),
+            ],
+            vec![
+                Mutation::Commit {
+                    path: "src/single.txt",
+                    contents: "single\n",
+                },
+                Mutation::None,
+                Mutation::None,
+                Mutation::None,
+            ],
+        );
+        let mut supervisor = fixture.single_reviewer_supervisor(vec![script], Arc::clone(&audit));
+        let mut task = fixture.task("single", &["src"], 5);
+        task.max_review_rounds = crate::control_api::protocol::MIN_SINGLE_REVIEW_ROUNDS;
+        start(&mut supervisor, vec![task]);
+        let snapshot = drive_terminal(&mut supervisor);
+        assert_eq!(snapshot.state, SessionState::Completed);
+        assert_eq!(snapshot.reviewer_bindings.len(), 1);
+        assert_eq!(snapshot.tasks[0].reviewers.len(), 1);
+        assert_eq!(snapshot.tasks[0].review_round, 2);
+        assert_eq!(
+            snapshot.tasks[0].reviewers[0].reviewer_id,
+            ReviewerId::Reviewer1
+        );
+        let audit = audit.lock().unwrap();
+        assert!(
+            audit
+                .lane_sessions
+                .iter()
+                .all(|(_, lane, _)| *lane != WorkerLane::Reviewer(ReviewerId::Reviewer2))
+        );
+        assert_eq!(
+            audit
+                .lane_sessions
+                .iter()
+                .filter(|(_, lane, _)| { *lane == WorkerLane::Reviewer(ReviewerId::Reviewer1) })
+                .count(),
+            1,
+            "single-review re-review must exact-resume Reviewer1"
+        );
+        assert!(audit.lane_events.iter().all(|event| !matches!(
+            event,
+            ScriptedLaneEvent::TurnStarted(WorkerLane::Reviewer(ReviewerId::Reviewer2))
+                | ScriptedLaneEvent::TurnPolled(WorkerLane::Reviewer(ReviewerId::Reviewer2))
+        )));
+        let correction_prompt = audit
+            .prompts
+            .iter()
+            .find(|(role, purpose, _)| {
+                *role == WorkerRole::Developer
+                    && *purpose == RuntimeTurnPurpose::DeveloperCorrection
+            })
+            .map(|(_, _, prompt)| prompt)
+            .expect("single-review correction prompt");
+        assert!(correction_prompt.contains("- reviewer1:"));
+        assert!(!correction_prompt.contains("reviewer2"));
     }
 
     #[test]
@@ -4077,28 +4244,7 @@ mod tests {
     fn review_exhausted_advances_without_pretending_to_be_lgtm() {
         let fixture = Fixture::new();
         let audit = Arc::new(Mutex::new(Audit::default()));
-        let script = task_script(
-            "exhausted",
-            vec![
-                FakeTurnScript::new(
-                    WorkerRole::Developer,
-                    RuntimeTurnPurpose::InitialDevelopment,
-                    [ready("attempt")],
-                ),
-                FakeTurnScript::new(
-                    WorkerRole::Reviewer,
-                    RuntimeTurnPurpose::InitialReview,
-                    [request_changes("still wrong")],
-                ),
-            ],
-            vec![
-                Mutation::Commit {
-                    path: "src/task.txt",
-                    contents: "one\n",
-                },
-                Mutation::None,
-            ],
-        );
+        let script = exhausted_task_script("exhausted", "src/task.txt", "one\n", "still wrong");
         let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
         start(
             &mut supervisor,
@@ -4110,10 +4256,10 @@ mod tests {
         assert_eq!(
             reviewer_paths(&snapshot.tasks[0]),
             vec![
-                message_path(WorkerRole::Reviewer, "still wrong")
+                message_path(WorkerRole::Reviewer, "still wrong-7")
                     .to_string_lossy()
                     .into_owned(),
-                reviewer2_final_path(&message_path(WorkerRole::Reviewer, "still wrong"))
+                reviewer2_final_path(&message_path(WorkerRole::Reviewer, "still wrong-7"))
                     .to_string_lossy()
                     .into_owned(),
             ]
@@ -4434,27 +4580,11 @@ mod tests {
         let fixture = Fixture::new();
         let audit = Arc::new(Mutex::new(Audit::default()));
         let scripts = vec![
-            task_script(
+            exhausted_task_script(
                 "exhausted",
-                vec![
-                    FakeTurnScript::new(
-                        WorkerRole::Developer,
-                        RuntimeTurnPurpose::InitialDevelopment,
-                        [ready("implemented")],
-                    ),
-                    FakeTurnScript::new(
-                        WorkerRole::Reviewer,
-                        RuntimeTurnPurpose::InitialReview,
-                        [request_changes("bounded finding")],
-                    ),
-                ],
-                vec![
-                    Mutation::Commit {
-                        path: "src/exhausted.txt",
-                        contents: "first\n",
-                    },
-                    Mutation::None,
-                ],
+                "src/exhausted.txt",
+                "first\n",
+                "bounded finding",
             ),
             task_script(
                 "next",
@@ -4490,7 +4620,10 @@ mod tests {
         let snapshot = drive_terminal(&mut supervisor);
         assert_eq!(snapshot.state, SessionState::Completed);
         assert_eq!(snapshot.tasks[0].state, TaskState::ReviewExhausted);
-        assert_eq!(snapshot.tasks[0].review_round, 1);
+        assert_eq!(
+            snapshot.tasks[0].review_round,
+            u32::from(crate::control_api::protocol::MIN_DUAL_REVIEW_ROUNDS)
+        );
         assert_eq!(snapshot.tasks[1].state, TaskState::Lgtm);
         assert_eq!(audit.lock().unwrap().shutdowns, ["exhausted", "next"]);
     }
@@ -5993,9 +6126,9 @@ while not peer_marker.exists():
         );
     }
 
-    /// A mandatory first-round rejection with max_review_rounds=1 must be
-    /// reported as review_exhausted, close its runtime, and advance to the
-    /// next task without pretending the rejection was an approval.
+    /// Rejection through the dual minimum max_review_rounds=7 must be reported
+    /// as review_exhausted, close its runtime, and advance to the next task
+    /// without pretending the rejection was an approval.
     #[test]
     #[ignore = "requires native codex, auth, and network"]
     fn real_review_exhausted_advances_to_the_next_task() {
@@ -6005,15 +6138,16 @@ while not peer_marker.exists():
             fixture.task(
                 "exhausted",
                 "Controlled review exhaustion probe",
-                "This is a controlled lifecycle E2E with max_review_rounds=1.\n\n\
+                "This is a controlled lifecycle E2E with max_review_rounds=7.\n\n\
                  InitialDevelopment: create and commit ONLY incomplete.py defining value = 1. \
                  Deliberately do not create required_test.py, and report that omission.\n\n\
                  InitialReview: required_test.py being absent is the deliberately seeded blocking \
                  defect. You MUST return VERDICT: REQUEST_CHANGES and MUST NOT return LGTM. \
-                 Require required_test.py to assert incomplete.value == 1. Because the configured \
-                 review limit is one, hcom should mark this task review_exhausted without a \
-                 correction turn. Do not push.",
-                1,
+                 Require required_test.py to assert incomplete.value == 1. On every \
+                 DeveloperCorrection, preserve the deliberately incomplete candidate and amend \
+                 the same commit without adding required_test.py. At the seventh joined rejection, \
+                 hcom should mark this task review_exhausted. Do not push.",
+                7,
             ),
             fixture.task(
                 "after-exhaustion",
@@ -6034,17 +6168,17 @@ while not peer_marker.exists():
         assert_eq!(snapshot.tasks.len(), 2);
         let exhausted = &snapshot.tasks[0];
         assert_eq!(exhausted.state, TaskState::ReviewExhausted);
-        assert_eq!(exhausted.review_round, 1);
+        assert_eq!(exhausted.review_round, 7);
         assert_eq!(
             joined_reviewer_verdict(exhausted),
             Some(ReviewerVerdict::RequestChanges)
         );
-        assert_eq!(
-            fixture.thread_ids("exhausted", "developer").len(),
-            1,
-            "an exhausted one-round task must not start a correction turn"
-        );
-        assert_eq!(fixture.thread_ids("exhausted", "reviewer").len(), 1);
+        let developer_ids = fixture.thread_ids("exhausted", "developer");
+        assert!(developer_ids.len() >= 7);
+        assert!(developer_ids.windows(2).all(|ids| ids[0] == ids[1]));
+        let reviewer_ids = fixture.thread_ids("exhausted", "reviewer");
+        assert!(reviewer_ids.len() >= 7);
+        assert!(reviewer_ids.windows(2).all(|ids| ids[0] == ids[1]));
         assert_eq!(snapshot.tasks[1].state, TaskState::Lgtm);
         assert!(fixture.repository.join("recovery.txt").is_file());
         for path in reviewer_paths(exhausted) {
@@ -6239,7 +6373,7 @@ while not peer_marker.exists():
 
     #[test]
     #[ignore = "requires explicit Haiku/medium profile, exact Claude proxy, native Codex and Claude CLIs, auth, and network"]
-    fn real_dual_review_mixed_provider_round_one_exhaustion_advances() {
+    fn real_dual_review_mixed_provider_minimum_exhaustion_advances() {
         let fixture = RealFixture::new_with_workers(
             "dual-review-mixed-exhaustion",
             ArchitectAdapter::Codex,
@@ -6251,13 +6385,15 @@ while not peer_marker.exists():
         let tasks = vec![
             fixture.task(
                 "dual-exhausted",
-                "Dual review round-one exhaustion",
+                "Dual review minimum-round exhaustion",
                 "InitialDevelopment: create incomplete.py containing value = 1 in exactly one \
                  signed-off task commit and deliberately omit required_test.py.\n\n\
                  InitialReview: both Reviewer1 and Reviewer2 must independently return \
-                 VERDICT: REQUEST_CHANGES because required_test.py is absent. The synchronized \
-                 review budget is one, so no Developer correction may start. Do not push.",
-                1,
+                 VERDICT: REQUEST_CHANGES because required_test.py is absent. On every \
+                 DeveloperCorrection, preserve the deliberately incomplete candidate and amend \
+                 the same commit without adding required_test.py. The synchronized review budget \
+                 is seven, so the seventh joined rejection exhausts review. Do not push.",
+                7,
             ),
             fixture.task(
                 "after-dual-exhaustion",
@@ -6271,8 +6407,8 @@ while not peer_marker.exists():
         let snapshot = fixture.run(&mut supervisor, tasks);
         assert_eq!(snapshot.state, SessionState::Completed);
         assert_eq!(snapshot.tasks[0].state, TaskState::ReviewExhausted);
-        assert_eq!(snapshot.tasks[0].review_round, 1);
-        assert_eq!(snapshot.tasks[0].review_generation, 1);
+        assert_eq!(snapshot.tasks[0].review_round, 7);
+        assert_eq!(snapshot.tasks[0].review_generation, 7);
         assert!(
             snapshot.tasks[0].reviewers.iter().all(|reviewer| {
                 reviewer.current_verdict == Some(ReviewerVerdict::RequestChanges)
@@ -6491,9 +6627,11 @@ while not peer_marker.exists():
                 "InitialDevelopment: create incomplete.py containing value = 1 in exactly one \
                  signed-off commit, and deliberately omit required_test.py.\n\n\
                  InitialReview: the omitted required_test.py is deliberately blocking. You MUST \
-                 return VERDICT: REQUEST_CHANGES and MUST NOT return LGTM. The configured review \
-                 budget is one, so no correction should start. Do not push.",
-                1,
+                 return VERDICT: REQUEST_CHANGES and MUST NOT return LGTM. On every \
+                 DeveloperCorrection, preserve the deliberately incomplete candidate and amend \
+                 the same commit without adding required_test.py. The configured review budget is \
+                 seven. Do not push.",
+                7,
             ),
             fixture.task(
                 "after-claude-exhaustion",
@@ -6507,7 +6645,7 @@ while not peer_marker.exists():
         let snapshot = fixture.run(&mut supervisor, tasks);
         assert_eq!(snapshot.state, SessionState::Completed);
         assert_eq!(snapshot.tasks[0].state, TaskState::ReviewExhausted);
-        assert_eq!(snapshot.tasks[0].review_round, 1);
+        assert_eq!(snapshot.tasks[0].review_round, 7);
         assert_eq!(
             joined_reviewer_verdict(&snapshot.tasks[0]),
             Some(ReviewerVerdict::RequestChanges)

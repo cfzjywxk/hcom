@@ -399,24 +399,37 @@ impl TaskWorkerProfiles {
 
     pub fn validate(&self) -> Result<(), RuntimeError> {
         self.developer.validate("developer runtime profile")?;
-        let [reviewer1, reviewer2] = self.reviewers.as_slice() else {
+        if !matches!(
+            self.reviewers.as_slice(),
+            [ReviewerRuntimeProfile {
+                reviewer_id: ReviewerId::Reviewer1,
+                ..
+            }] | [
+                ReviewerRuntimeProfile {
+                    reviewer_id: ReviewerId::Reviewer1,
+                    ..
+                },
+                ReviewerRuntimeProfile {
+                    reviewer_id: ReviewerId::Reviewer2,
+                    ..
+                }
+            ]
+        ) {
             return Err(RuntimeError::invalid_profile(
-                "runtime reviewer collection must contain ordered Reviewer1 and Reviewer2 entries",
-            ));
-        };
-        if reviewer1.reviewer_id != ReviewerId::Reviewer1
-            || reviewer2.reviewer_id != ReviewerId::Reviewer2
-        {
-            return Err(RuntimeError::invalid_profile(
-                "runtime reviewer collection must contain ordered Reviewer1 and Reviewer2 entries",
+                "runtime reviewer collection must contain ordered Reviewer1 or Reviewer1 and Reviewer2 entries",
             ));
         }
-        reviewer1.profile.validate("Reviewer1 runtime profile")?;
-        reviewer2.profile.validate("Reviewer2 runtime profile")
+        for binding in &self.reviewers {
+            binding.profile.validate(match binding.reviewer_id {
+                ReviewerId::Reviewer1 => "Reviewer1 runtime profile",
+                ReviewerId::Reviewer2 => "Reviewer2 runtime profile",
+            })?;
+        }
+        Ok(())
     }
 
     pub fn canonical_hash(&self) -> String {
-        canonical_hash(&("hcom-exec-worker-profiles-v2", self))
+        canonical_hash(&("hcom-exec-worker-profiles-v3", self))
     }
 
     pub fn reviewer1(&self) -> &RuntimeProfile {
@@ -432,7 +445,7 @@ impl TaskWorkerProfiles {
             .reviewers
             .iter()
             .find(|binding| binding.reviewer_id == reviewer_id)
-            .expect("validated task worker profiles contain both Reviewer lanes")
+            .expect("requested Reviewer lane is active in the validated task worker profiles")
             .profile
     }
 
@@ -1183,7 +1196,7 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_runtime_collection_is_ordered_identity_bound_and_exactly_two() {
+    fn reviewer_runtime_collection_is_ordered_identity_bound_and_canonical() {
         let profiles = TaskWorkerProfiles::defaults();
         profiles.validate().unwrap();
         assert_eq!(profiles.reviewers.len(), 2);
@@ -1231,9 +1244,22 @@ mod tests {
 
         let mut missing_reviewer2 = profiles.clone();
         missing_reviewer2.reviewers.pop();
+        missing_reviewer2.validate().unwrap();
+        assert_ne!(
+            profiles.canonical_hash(),
+            missing_reviewer2.canonical_hash(),
+            "single and dual runtime topology must be hash-bound"
+        );
+        assert!(
+            missing_reviewer2
+                .profile_for_lane(WorkerLane::Reviewer(ReviewerId::Reviewer2))
+                .is_err()
+        );
+        let mut missing_all_reviewers = missing_reviewer2.clone();
+        missing_all_reviewers.reviewers.clear();
         let mut reviewer2_then_reviewer1 = profiles.clone();
         reviewer2_then_reviewer1.reviewers.swap(0, 1);
-        assert!(missing_reviewer2.validate().is_err());
+        assert!(missing_all_reviewers.validate().is_err());
         assert!(reviewer2_then_reviewer1.validate().is_err());
         assert_ne!(
             profiles.canonical_hash(),

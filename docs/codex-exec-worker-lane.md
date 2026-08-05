@@ -28,14 +28,14 @@ a review round or a local commit, both cheap and revertible.
 **The approved lane includes its local candidate commit.** Each Developer
 creates exactly one signed-off local task commit before review and amends only
 that commit for corrections. Its create/amend instructions require a matching
-`Signed-off-by` trailer, which both Reviewers check. A general instruction
+`Signed-off-by` trailer, which every active Reviewer checks. A general instruction
 requiring human authorization for commits is satisfied by approval of the
 standard run. An explicit no-commit requirement is incompatible and routes to
 clarification instead of being silently ignored. That authority conflict is
 included in the per-turn `CLARIFICATION_REQUIRED` output contract; the Architect
 must escalate it to the human regardless of remaining autonomous clarification
 budget and cannot autonomously override it. Reviewer LGTM applies to the exact
-final candidate range already committed only when both Reviewers return LGTM
+final candidate range already committed only when every active Reviewer returns LGTM
 for the same generation; it does not authorize or require another commit.
 Push, install, and release always remain separate.
 
@@ -157,7 +157,7 @@ stops for a human; its successfully published paths remain in the snapshot.
 hcom checks only that `repository_root` is an existing directory. It never
 opens Git, records a branch or revision, checks cleanliness, or drift-checks
 the bound task/design documents. Source state and the appropriate review range
-are for the Developer, both Reviewers, and human to establish from the original
+are for the Developer, active Reviewers, and human to establish from the original
 files and repository.
 
 ## File-backed task and peer routing
@@ -254,9 +254,10 @@ group would hang the supervisor itself.
   abnormal worker exit. Gate 1 uses an explicit controlled lifecycle probe:
   its first task must go through REQUEST_CHANGES with an exact developer resume
   and exact reviewer re-review, its second task must be approved on the first
-  review, and all four role sessions must be fresh. The exhaustion run requires
-  a first-round rejection with `max_review_rounds=1`, proves no correction turn
-  starts, and proves the next task still runs. The abnormal-exit run SIGKILLs
+  review, and all role sessions must be fresh. The exhaustion run requires
+  rejection through the dual-mode minimum `max_review_rounds=7`, proves exact
+  correction and re-review resumes, and proves the next task still runs. The
+  abnormal-exit run SIGKILLs
   only the Codex process whose `--output-last-message` target belongs to that
   fixture, then requires `needs_human`, no routed partial final, no Reviewer,
   and no surviving descendant. Gate 1 reads native thread ids back out of the
@@ -425,11 +426,11 @@ foreground in-memory parent. Parent or terminal exit still cancels the run.
 
 At terminal return, every task snapshot exposes
 `latest_developer_final_path`, `review_round`, `review_generation`, and ordered
-Reviewer1/Reviewer2 current-generation typed result/path chains, plus a bounded
+active Reviewer current-generation typed result/path chains, plus a bounded
 clarification record count. Ordered clarification records are read separately
-in pages of at most eight. Only then does the Architect read both Reviewers'
+in pages of at most eight. Only then does the Architect read every active Reviewer's
 non-empty current-generation evidence and report their original
-verdicts/findings, distinguishing same-generation dual LGTM,
+verdicts/findings, distinguishing same-generation LGTM,
 `review_exhausted`, and lifecycle failure. Neither MCP response shape embeds
 either Reviewer body, and the Architect does not rerun tests, review, or
 validation unless the human asks. For LGTM, it reports the final reviewed local

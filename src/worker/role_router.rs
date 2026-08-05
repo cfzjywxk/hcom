@@ -629,6 +629,62 @@ mod tests {
     }
 
     #[test]
+    fn single_reviewer_profiles_create_no_reviewer2_runtime_slot() {
+        let mut profiles = profiles(RuntimeProvider::CodexExec, RuntimeProvider::CodexExec);
+        profiles.reviewers.pop();
+        profiles.validate().unwrap();
+        let reviewer_script = FakeTurnScript::new(
+            WorkerRole::Reviewer,
+            RuntimeTurnPurpose::InitialReview,
+            [completed(WorkerRole::Reviewer)],
+        );
+        let mut runtime = TaskRuntimeBundle::new(
+            &profiles,
+            [
+                available_slot(DEVELOPER, profiles.developer.provider, Vec::new()),
+                available_slot(
+                    REVIEWER1,
+                    profiles.reviewer1().provider,
+                    vec![reviewer_script],
+                ),
+            ],
+        )
+        .unwrap();
+        let reviewer1_session = runtime
+            .open_session(
+                REVIEWER1,
+                session_spec(WorkerRole::Reviewer, profiles.reviewer1().clone()),
+            )
+            .unwrap();
+        assert!(
+            runtime
+                .open_session(
+                    REVIEWER2,
+                    session_spec(WorkerRole::Reviewer, profiles.reviewer1().clone()),
+                )
+                .is_err()
+        );
+        let reviewer1_turn = runtime
+            .start_turn(
+                REVIEWER1,
+                reviewer1_session,
+                turn_spec(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    profiles.reviewer1().clone(),
+                ),
+            )
+            .unwrap();
+        assert!(
+            runtime
+                .poll_turn(REVIEWER1, reviewer1_turn)
+                .unwrap()
+                .poll
+                .is_terminal()
+        );
+    }
+
+    #[test]
     fn unavailable_lane_fails_closed_before_a_child_turn_exists() {
         let profiles = profiles(RuntimeProvider::CodexExec, RuntimeProvider::ClaudeExec);
         let mut runtime = TaskRuntimeBundle::new(

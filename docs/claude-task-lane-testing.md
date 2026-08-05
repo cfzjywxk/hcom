@@ -5,10 +5,10 @@ Real Claude tests are explicit, serial, headless opt-ins. Ordinary
 No test launches the interactive Architect TUI.
 
 The named task-lane scenarios below are the released protocol-v7
-single-Reviewer evidence. They do not constitute protocol-v8 concurrent
+single-Reviewer evidence. They do not constitute protocol-v9 concurrent
 dual-review acceptance, and the former 10/10 result must not be reported as
-v8 evidence. The explicit v8 dual-review E2E definitions are listed below,
-but they have not been authorized or executed: real-model v8 dual-review E2E
+v9 evidence. The explicit v9 dual-review E2E definitions are listed below,
+but they have not been authorized or executed: real-model v9 dual-review E2E
 is **NOT RUN**.
 
 ## Mandatory caller environment
@@ -84,11 +84,11 @@ Coverage:
 | `native-contract` | native instructions/settings/hook/MCP/environment and create/resume transport |
 
 These historical real scenarios cover all four released-v7
-Developer/Reviewer pairs. Current deterministic tests cover the v8
+Developer/Reviewer pairs. Current deterministic tests cover the v9
 Architect/Developer/Reviewer1/Reviewer2 profile matrix without making provider
 calls. Real scenarios add model evidence only where native behavior matters.
 
-## Protocol-v8 concurrent dual-review scenarios
+## Protocol-v9 concurrent dual-review scenarios
 
 Run one separately authorized scenario at a time:
 
@@ -106,7 +106,7 @@ native Reviewer turns overlap. Generation 1 produces one LGTM and one
 REQUEST_CHANGES, the Developer reads both ordered responses and amends the
 single signed-off commit, and both Reviewer sessions exact-resume before
 generation 2 can finish with dual LGTM. The exhaustion scenario proves a
-synchronized `max_review_rounds=1` rejection advances to the next task. The
+synchronized `max_review_rounds=7` rejection advances to the next task. The
 reviewer-exit scenario kills only the fixture-owned Claude Reviewer2 and
 requires peer cancellation, `needs_human`, zero consumed review rounds, and no
 residual process. The parent-stop scenario stops the foreground supervisor only

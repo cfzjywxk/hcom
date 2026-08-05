@@ -413,13 +413,13 @@ fn fork_version_help_and_status_use_human_visible_version() {
 
     let (code, stdout, stderr) = h.run(["--version"]);
     assert_eq!(code, 0);
-    assert_eq!(stdout, "hcom 1.0.14\n");
+    assert_eq!(stdout, "hcom 1.0.15\n");
     assert!(stderr.is_empty(), "stderr={stderr}");
 
     let (code, stdout, stderr) = h.run(["--help"]);
     assert_eq!(code, 0, "stderr={stderr}");
     assert!(
-        stdout.starts_with("hcom (hook-comms) v1.0.14 "),
+        stdout.starts_with("hcom (hook-comms) v1.0.15 "),
         "stdout={stdout}"
     );
     assert!(
@@ -430,14 +430,14 @@ fn fork_version_help_and_status_use_human_visible_version() {
 
     let (code, stdout, stderr) = h.run(["status"]);
     assert_eq!(code, 0, "stderr={stderr}");
-    assert_eq!(stdout.lines().next(), Some("hcom 1.0.14"));
+    assert_eq!(stdout.lines().next(), Some("hcom 1.0.15"));
     assert!(stderr.is_empty(), "stderr={stderr}");
 
     let (code, stdout, stderr) = h.run(["status", "--json"]);
     assert_eq!(code, 0, "stderr={stderr}");
     assert!(stderr.is_empty(), "stderr={stderr}");
     let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(status["version"]["current"], "1.0.14");
+    assert_eq!(status["version"]["current"], "1.0.15");
     assert!(status["version"]["latest"].is_null());
     assert_eq!(status["version"]["update_available"], false);
     assert!(status["version"]["update_cmd"].is_null());
@@ -636,7 +636,7 @@ fn misordered_architect_form_fails_before_opening_state() {
         "stderr={stderr}"
     );
     assert!(
-        stderr.contains("`hcom arch codex [architect-profile-options]`"),
+        stderr.contains("`hcom arch codex [--single-review] [architect-profile-options]`"),
         "stderr={stderr}"
     );
     assert!(
@@ -661,8 +661,8 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     assert!(stdout.contains("Claude opus/xhigh"), "stdout={stdout}");
     assert!(
         stdout.contains("provider-routed worker")
-            && stdout.contains("Each review generation starts Reviewer1")
-            && stdout.contains("Reviewer2 concurrently"),
+            && stdout.contains("Each review generation starts every active")
+            && stdout.contains("concurrently in dual mode"),
         "stdout={stdout}"
     );
     let normalized_stdout = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -682,7 +682,7 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     );
     assert!(
         normalized_stdout.contains(
-            "Both Reviewers receive the same native host view; source/Git/install non-mutation is a role instruction rather than an OS read-only mount"
+            "Every active Reviewer receives the same native host view; source/Git/install non-mutation is a role instruction rather than an OS read-only mount"
         ) && normalized_stdout.contains("hcom has no repository-root allowlist and does not inspect or repair Git"),
         "stdout={stdout}"
     );
@@ -752,15 +752,15 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
         ) && normalized_stdout.contains(
             "Architect must escalate it to the human regardless of remaining autonomous clarification budget"
         ) && normalized_stdout.contains(
-            "both Reviewers check it"
+            "every active Reviewer checks it"
         ),
         "stdout={stdout}"
     );
     assert!(
         normalized_stdout.contains(
-            "terminal snapshot contains each task's latest Developer final path and Reviewer1/Reviewer2 current-generation identities, verdicts, and final-message path chains, never either Reviewer body"
+            "terminal snapshot contains each task's latest Developer final path and every active Reviewer's current-generation identity, verdict, and final-message path chains, never any Reviewer body"
         ) && normalized_stdout.contains(
-            "Only then does the Architect read both final Reviewer evidence chains and deliver their original verdicts and findings"
+            "Only then does the Architect read the active final Reviewer evidence chains and deliver their original verdicts and findings"
         ) && normalized_stdout.contains(
             "does not rerun tests, review, or validation unless the human explicitly requests that work"
         ) && normalized_stdout.contains(
@@ -776,10 +776,17 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     assert!(stdout.contains("[architect.reviewer]"), "stdout={stdout}");
     assert!(
         normalized_stdout.contains(
-            "first Reviewer response as partial progress, and immediately re-arms session_wait"
+            "treats a response as partial while fewer than the expected number have arrived"
         ) && normalized_stdout.contains(
             "completed review round, current generation, Reviewer identity, response counts"
         ),
+        "stdout={stdout}"
+    );
+    assert!(stdout.contains("--single-review"), "stdout={stdout}");
+    assert!(stdout.contains("review mode: single"), "stdout={stdout}");
+    assert!(
+        normalized_stdout.contains("Single-review plans accept")
+            && normalized_stdout.contains("dual-review plans accept 7 through 20"),
         "stdout={stdout}"
     );
     assert!(stdout.contains("--ask-for-approval"), "stdout={stdout}");
@@ -787,6 +794,25 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
         !db_path.exists(),
         "session architect help must not initialize retained v24 state"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn claude_architect_rejects_single_review_before_terminal_preflight() {
+    let h = Hcom::new();
+    let db_path = h.path().join("hcom.db");
+    let (code, stdout, stderr) = h.run(["arch", "claude", "--single-review"]);
+    assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.is_empty(), "stdout={stdout}");
+    assert!(
+        stderr.contains("--single-review is available only with `hcom arch codex`"),
+        "stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("foreground terminal"),
+        "mode rejection must precede terminal preflight: {stderr}"
+    );
+    assert!(!db_path.exists());
 }
 
 #[cfg(target_os = "linux")]

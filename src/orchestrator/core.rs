@@ -415,7 +415,7 @@ pub struct CoreTask {
 }
 
 impl CoreTask {
-    fn new(spec: TaskDraft) -> Self {
+    fn new(spec: TaskDraft, reviewer_ids: &[ReviewerId]) -> Self {
         Self {
             spec,
             state: TaskState::Pending,
@@ -428,8 +428,9 @@ impl CoreTask {
             latest_developer_final_path: None,
             latest_reviewer_final_paths: Vec::new(),
             reviewer_results: BTreeMap::new(),
-            historical_reviewer_final_paths: reviewer_ids()
-                .into_iter()
+            historical_reviewer_final_paths: reviewer_ids
+                .iter()
+                .copied()
                 .map(|reviewer_id| (reviewer_id, Vec::new()))
                 .collect(),
             review_requested_generation: None,
@@ -650,11 +651,12 @@ impl SupervisorCore {
 
     pub fn expected_plan_hash(&self, plan_version: u64, tasks: &[TaskDraft]) -> String {
         canonical_hash(&(
-            "hcom-provider-routed-session-plan-v1",
+            "hcom-provider-routed-session-plan-v2",
             &self.run_id,
             plan_version,
             &self.project_root,
             &self.profile_hash,
+            &self.reviewer_bindings,
             tasks,
         ))
     }
@@ -707,7 +709,8 @@ impl SupervisorCore {
                     base_revision: None,
                     head_revision: None,
                     developer_session_bound: task.developer_session.is_some(),
-                    reviewers: reviewer_ids()
+                    reviewers: self
+                        .reviewer_ids()
                         .into_iter()
                         .map(|reviewer_id| {
                             let result = task.reviewer_results.get(&reviewer_id);
@@ -1018,7 +1021,7 @@ impl SupervisorCore {
         }
         let mut keys = BTreeSet::new();
         for task in &tasks {
-            task.validate()
+            task.validate_for_reviewer_count(self.reviewer_bindings.len())
                 .map_err(|error| SupervisorError::invalid_plan(error.to_string()))?;
             if !keys.insert(task.task_key.as_str()) {
                 return Err(SupervisorError::invalid_plan(
@@ -1037,7 +1040,11 @@ impl SupervisorCore {
             .checked_add(1)
             .ok_or_else(|| SupervisorError::overflow("plan version overflow"))?;
 
-        self.tasks = tasks.into_iter().map(CoreTask::new).collect();
+        let reviewer_ids = self.reviewer_ids();
+        self.tasks = tasks
+            .into_iter()
+            .map(|task| CoreTask::new(task, &reviewer_ids))
+            .collect();
         self.plan_version = Some(plan_version);
         self.plan_hash = Some(plan_hash);
         self.next_plan_version = next_plan_version;
@@ -1245,7 +1252,7 @@ impl SupervisorCore {
             },
         );
         if lane.role() == WorkerRole::Reviewer
-            && reviewer_ids().into_iter().all(|reviewer_id| {
+            && self.reviewer_ids().into_iter().all(|reviewer_id| {
                 self.active_turns
                     .contains_key(&WorkerLane::Reviewer(reviewer_id))
             })
@@ -1734,6 +1741,7 @@ impl SupervisorCore {
         task_ordinal: usize,
         developer_final_path: String,
     ) -> Result<(), SupervisorError> {
+        let reviewer_ids = self.reviewer_ids();
         let task = &mut self.tasks[task_ordinal];
         if task.review_round >= u32::from(task.spec.max_review_rounds) {
             return Err(SupervisorError::invariant(
@@ -1744,11 +1752,11 @@ impl SupervisorCore {
             .review_round
             .checked_add(1)
             .ok_or_else(|| SupervisorError::overflow("review generation overflow"))?;
-        for reviewer_id in reviewer_ids() {
+        for reviewer_id in reviewer_ids {
             if let Some(result) = task.reviewer_results.remove(&reviewer_id) {
                 task.historical_reviewer_final_paths
                     .get_mut(&reviewer_id)
-                    .expect("CoreTask initializes both Reviewer history lanes")
+                    .expect("CoreTask initializes every active Reviewer history lane")
                     .extend(result.final_message_paths);
             }
         }
@@ -1756,18 +1764,19 @@ impl SupervisorCore {
         task.review_requested_generation = None;
         task.latest_developer_final_path = Some(developer_final_path);
         task.state = TaskState::Reviewing;
-        task.outcome_detail = Some("Developer completed; routing to concurrent dual review".into());
+        task.outcome_detail = Some("Developer completed; routing to active Reviewers".into());
         Ok(())
     }
 
-    /// Atomically schedule both fixed Reviewer lanes for one generation.
+    /// Atomically schedule every active Reviewer lane for one generation.
     fn start_reviewers(
         &mut self,
         task_ordinal: usize,
     ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
         let rereview = self.tasks[task_ordinal].review_round > 0;
-        let mut effects = Vec::with_capacity(2);
-        for reviewer_id in reviewer_ids() {
+        let reviewer_ids = self.reviewer_ids();
+        let mut effects = Vec::with_capacity(reviewer_ids.len());
+        for reviewer_id in reviewer_ids {
             let lane = WorkerLane::Reviewer(reviewer_id);
             if let Some(session) = self.tasks[task_ordinal]
                 .reviewer_sessions
@@ -1799,6 +1808,12 @@ impl SupervisorCore {
         outcome: ReviewerOutcomeV1,
         final_message_path: String,
     ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        let reviewer_ids = self.reviewer_ids();
+        if !reviewer_ids.contains(&reviewer_id) {
+            return Err(SupervisorError::invalid_identity(
+                "Reviewer completion references an inactive lane",
+            ));
+        }
         let task = &self.tasks[task_ordinal];
         if task.state != TaskState::Reviewing {
             return Err(SupervisorError::invalid_transition(
@@ -1845,13 +1860,13 @@ impl SupervisorCore {
                 final_message_paths: paths,
             },
         );
-        if self.tasks[task_ordinal].reviewer_results.len() < reviewer_ids().len() {
+        if self.tasks[task_ordinal].reviewer_results.len() < reviewer_ids.len() {
             return Ok(Vec::new());
         }
-        if reviewer_ids().into_iter().any(|id| {
+        if reviewer_ids.iter().any(|id| {
             self.tasks[task_ordinal]
                 .reviewer_results
-                .get(&id)
+                .get(id)
                 .is_none_or(|result| result.generation != generation)
         }) {
             return Err(SupervisorError::invariant(
@@ -1861,25 +1876,24 @@ impl SupervisorCore {
         {
             let task = &mut self.tasks[task_ordinal];
             task.review_round = generation;
-            task.latest_reviewer_final_paths = reviewer_ids()
-                .into_iter()
+            task.latest_reviewer_final_paths = reviewer_ids
+                .iter()
                 .flat_map(|id| {
                     task.reviewer_results
-                        .get(&id)
+                        .get(id)
                         .expect("joined Reviewer result exists")
                         .final_message_paths
                         .clone()
                 })
                 .collect();
         }
-        let all_lgtm = reviewer_ids().into_iter().all(|id| {
-            self.tasks[task_ordinal].reviewer_results[&id].verdict == ReviewerVerdict::Lgtm
+        let all_lgtm = reviewer_ids.iter().all(|id| {
+            self.tasks[task_ordinal].reviewer_results[id].verdict == ReviewerVerdict::Lgtm
         });
         if all_lgtm {
             let task = &mut self.tasks[task_ordinal];
             task.state = TaskState::Lgtm;
-            task.outcome_detail =
-                Some("same-generation Reviewer1 and Reviewer2 returned LGTM".into());
+            task.outcome_detail = Some("all active same-generation Reviewers returned LGTM".into());
             self.complete_current_task(task_ordinal)
         } else if generation >= u32::from(self.tasks[task_ordinal].spec.max_review_rounds) {
             let task = &mut self.tasks[task_ordinal];
@@ -2041,7 +2055,8 @@ impl SupervisorCore {
                 reviewer_final_message_paths: result.final_message_paths.clone(),
                 responses_received: u8::try_from(task.reviewer_results.len())
                     .map_err(|_| SupervisorError::overflow("Reviewer response count overflow"))?,
-                responses_expected: 2,
+                responses_expected: u8::try_from(self.reviewer_bindings.len())
+                    .map_err(|_| SupervisorError::overflow("Reviewer binding count overflow"))?,
             });
         Ok(())
     }
@@ -2066,9 +2081,9 @@ impl SupervisorCore {
         let developer_final_path = task.latest_developer_final_path.clone().ok_or_else(|| {
             SupervisorError::invariant("completed progress lacks a Developer final path")
         })?;
-        if task.reviewer_results.len() != 2 {
+        if task.reviewer_results.len() != self.reviewer_bindings.len() {
             return Err(SupervisorError::invariant(
-                "completed progress lacks two Reviewer results",
+                "completed progress lacks the active Reviewer results",
             ));
         }
         self.progress_events
@@ -2083,7 +2098,7 @@ impl SupervisorCore {
                 max_review_rounds: task.spec.max_review_rounds,
                 outcome,
                 developer_final_path,
-                reviewers: reviewer_result_snapshots(task),
+                reviewers: reviewer_result_snapshots(task, &self.reviewer_ids()),
             });
         Ok(())
     }
@@ -2319,12 +2334,24 @@ impl SupervisorCore {
                 "core contains more than 64 tasks",
             ));
         }
-        if self.reviewer_bindings.len() != 2
-            || self.reviewer_bindings[0].reviewer_id != ReviewerId::Reviewer1
-            || self.reviewer_bindings[1].reviewer_id != ReviewerId::Reviewer2
-        {
+        if !matches!(
+            self.reviewer_bindings.as_slice(),
+            [ReviewerBindingSnapshot {
+                reviewer_id: ReviewerId::Reviewer1,
+                ..
+            }] | [
+                ReviewerBindingSnapshot {
+                    reviewer_id: ReviewerId::Reviewer1,
+                    ..
+                },
+                ReviewerBindingSnapshot {
+                    reviewer_id: ReviewerId::Reviewer2,
+                    ..
+                }
+            ]
+        ) {
             return Err(SupervisorError::invariant(
-                "session Reviewer bindings are not the fixed ordered pair",
+                "session Reviewer bindings are not a canonical ordered topology",
             ));
         }
         for binding in &self.reviewer_bindings {
@@ -2452,11 +2479,11 @@ impl SupervisorCore {
         let scheduled_operations = self.pending_session_opens.len()
             + self.pending_turn_starts.len()
             + self.active_turns.len();
-        if scheduled_operations > 2
+        if scheduled_operations > self.reviewer_bindings.len().max(1)
             || (self.pending_runtime_open.is_some() && scheduled_operations != 0)
         {
             return Err(SupervisorError::invariant(
-                "worker operation count exceeds the dual-review structural ceiling",
+                "worker operation count exceeds the active topology ceiling",
             ));
         }
         if let Some(task_ordinal) = self.pending_runtime_open
@@ -2490,7 +2517,10 @@ impl SupervisorCore {
                 WorkerRole::Developer => TaskState::Developing,
                 WorkerRole::Reviewer => TaskState::Reviewing,
             };
-            if *lane != expected.lane
+            if lane
+                .reviewer_id()
+                .is_some_and(|reviewer_id| !self.reviewer_ids().contains(&reviewer_id))
+                || *lane != expected.lane
                 || self.runtime_open != Some(expected.task_ordinal)
                 || self
                     .tasks
@@ -2508,7 +2538,10 @@ impl SupervisorCore {
                 WorkerRole::Developer => TaskState::Developing,
                 WorkerRole::Reviewer => TaskState::Reviewing,
             };
-            if *lane != expected.lane
+            if lane
+                .reviewer_id()
+                .is_some_and(|reviewer_id| !self.reviewer_ids().contains(&reviewer_id))
+                || *lane != expected.lane
                 || self.runtime_open != Some(expected.task_ordinal)
                 || expected.purpose.role() != lane.role()
                 || self.session_for(expected.task_ordinal, *lane) != Some(expected.session)
@@ -2635,9 +2668,14 @@ impl SupervisorCore {
                     "Reviewer session exists without the task Developer session",
                 ));
             }
-            if task.reviewer_results.len() > 2
+            let reviewer_ids = self.reviewer_ids();
+            if task
+                .reviewer_sessions
+                .keys()
+                .any(|reviewer_id| !reviewer_ids.contains(reviewer_id))
+                || task.reviewer_results.len() > reviewer_ids.len()
                 || task.reviewer_results.iter().any(|(reviewer_id, result)| {
-                    !reviewer_ids().contains(reviewer_id)
+                    !reviewer_ids.contains(reviewer_id)
                         || result.generation != task.review_generation
                         || result.final_message_paths.is_empty()
                         || result.final_message_paths.len() > 2
@@ -2647,8 +2685,8 @@ impl SupervisorCore {
                     "current Reviewer result set is invalid",
                 ));
             }
-            if task.historical_reviewer_final_paths.len() != 2
-                || reviewer_ids().into_iter().any(|reviewer_id| {
+            if task.historical_reviewer_final_paths.len() != reviewer_ids.len()
+                || reviewer_ids.into_iter().any(|reviewer_id| {
                     task.historical_reviewer_final_paths
                         .get(&reviewer_id)
                         .is_none_or(|paths| {
@@ -2757,7 +2795,10 @@ impl SupervisorCore {
             ));
         }
         for (lane, active) in &self.active_turns {
-            if self.current_task != Some(active.task_ordinal)
+            if lane
+                .reviewer_id()
+                .is_some_and(|reviewer_id| !self.reviewer_ids().contains(&reviewer_id))
+                || self.current_task != Some(active.task_ordinal)
                 || self.runtime_open != Some(active.task_ordinal)
                 || *lane != active.lane
                 || self.session_for(active.task_ordinal, *lane) != Some(active.session)
@@ -2791,12 +2832,20 @@ impl SupervisorCore {
         }
         Ok(())
     }
+
+    fn reviewer_ids(&self) -> Vec<ReviewerId> {
+        self.reviewer_bindings
+            .iter()
+            .map(|binding| binding.reviewer_id)
+            .collect()
+    }
 }
 
 fn validate_identifier(label: &str, value: &str) -> Result<(), SupervisorError> {
     validate_identifier_with_bound(label, value, 128)
 }
 
+#[cfg(test)]
 fn reviewer_ids() -> [ReviewerId; 2] {
     [ReviewerId::Reviewer1, ReviewerId::Reviewer2]
 }
@@ -2817,9 +2866,13 @@ fn default_reviewer_bindings() -> Vec<ReviewerBindingSnapshot> {
     .collect()
 }
 
-fn reviewer_result_snapshots(task: &CoreTask) -> Vec<ReviewerResultSnapshot> {
-    reviewer_ids()
-        .into_iter()
+fn reviewer_result_snapshots(
+    task: &CoreTask,
+    reviewer_ids: &[ReviewerId],
+) -> Vec<ReviewerResultSnapshot> {
+    reviewer_ids
+        .iter()
+        .copied()
         .map(|reviewer_id| {
             let result = task.reviewer_results.get(&reviewer_id);
             ReviewerResultSnapshot {
@@ -2924,7 +2977,7 @@ fn canonical_hash(value: &impl Serialize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control_api::protocol::MAX_REVIEW_ROUNDS;
+    use crate::control_api::protocol::{MAX_REVIEW_ROUNDS, MIN_DUAL_REVIEW_ROUNDS};
     use crate::worker::runtime::DeveloperOutcomeV1;
 
     const PROFILE_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -2937,7 +2990,7 @@ mod tests {
             task_document_path: format!("/project/tasks/{key}.md"),
             design_document_paths: vec!["/project/design.md".into()],
             task_selector: key.into(),
-            max_review_rounds,
+            max_review_rounds: max_review_rounds.max(MIN_DUAL_REVIEW_ROUNDS),
             max_clarification_rounds: 2,
         }
     }
@@ -3309,6 +3362,7 @@ mod tests {
         // developer's completion; this helper only drives what follows.
         let reviewer1 = ReviewerId::Reviewer1;
         let reviewer2 = ReviewerId::Reviewer2;
+        let dual_review = core.reviewer_bindings.len() == 2;
         let session = if first {
             let session = RuntimeSessionKey::from_counter(session_counter).unwrap();
             assert_eq!(
@@ -3324,13 +3378,16 @@ mod tests {
                     SupervisorEffect::PublishStatus,
                 ]
             );
-            let peer_session = RuntimeSessionKey::from_counter(session_counter + 10_000).unwrap();
-            open_lane_session(
-                core,
-                task_ordinal,
-                WorkerLane::Reviewer(reviewer2),
-                peer_session,
-            );
+            if dual_review {
+                let peer_session =
+                    RuntimeSessionKey::from_counter(session_counter + 10_000).unwrap();
+                open_lane_session(
+                    core,
+                    task_ordinal,
+                    WorkerLane::Reviewer(reviewer2),
+                    peer_session,
+                );
+            }
             session
         } else {
             core.tasks[task_ordinal].reviewer_sessions[&reviewer1]
@@ -3353,18 +3410,20 @@ mod tests {
             ),
             vec![SupervisorEffect::PublishStatus]
         );
-        let peer_session = core.tasks[task_ordinal].reviewer_sessions[&reviewer2];
-        let peer_turn = RuntimeTurnKey::from_counter(turn_counter + 10_000).unwrap();
-        let peer_token: &'static str = Box::leak(format!("{token}-reviewer2").into_boxed_str());
-        start_lane_turn(
-            core,
-            task_ordinal,
-            WorkerLane::Reviewer(reviewer2),
-            purpose,
-            peer_session,
-            peer_turn,
-            peer_token,
-        );
+        if dual_review {
+            let peer_session = core.tasks[task_ordinal].reviewer_sessions[&reviewer2];
+            let peer_turn = RuntimeTurnKey::from_counter(turn_counter + 10_000).unwrap();
+            let peer_token: &'static str = Box::leak(format!("{token}-reviewer2").into_boxed_str());
+            start_lane_turn(
+                core,
+                task_ordinal,
+                WorkerLane::Reviewer(reviewer2),
+                purpose,
+                peer_session,
+                peer_turn,
+                peer_token,
+            );
+        }
         ActiveIdentity {
             task: task_ordinal,
             role: WorkerRole::Reviewer,
@@ -3392,6 +3451,9 @@ mod tests {
             active.token,
             outcome.clone(),
         );
+        if core.reviewer_bindings.len() == 1 {
+            return first;
+        }
         assert_eq!(first, vec![SupervisorEffect::PublishStatus]);
         let peer_lane = WorkerLane::Reviewer(ReviewerId::Reviewer2);
         let peer = core
@@ -3573,6 +3635,26 @@ mod tests {
         (core, reviewer)
     }
 
+    fn active_single_reviewer_core(max_review_rounds: u8) -> (SupervisorCore, ActiveIdentity) {
+        let mut bindings = default_reviewer_bindings();
+        bindings.truncate(1);
+        let mut core = SupervisorCore::new_with_reviewer_bindings(
+            "run-single".into(),
+            PathBuf::from("/project"),
+            PROFILE_HASH.into(),
+            bindings,
+        )
+        .unwrap();
+        let mut spec = task("one", "/repo", MIN_DUAL_REVIEW_ROUNDS);
+        spec.max_review_rounds = max_review_rounds;
+        bind(&mut core, vec![spec]);
+        authorize(&mut core);
+        let developer = start_first_developer(&mut core, 0, 1, 1, "single-developer");
+        complete_developer_ready(&mut core, developer);
+        let reviewer = start_reviewer(&mut core, 0, 2, 2, "single-reviewer", true);
+        (core, reviewer)
+    }
+
     /// The developer's `Ready` completion already scheduled the reviewer's
     /// session open, so this is the reviewing task with that open still pending.
     fn reviewing_pending_session_core() -> SupervisorCore {
@@ -3593,9 +3675,36 @@ mod tests {
     }
 
     fn review_exhausted_core() -> SupervisorCore {
-        let (mut core, reviewer) = active_reviewer_core(1);
-        complete_review(&mut core, reviewer, request_changes());
+        let (mut core, reviewer) = active_reviewer_core(MIN_DUAL_REVIEW_ROUNDS);
+        exhaust_review(&mut core, reviewer);
         core
+    }
+
+    fn exhaust_review(
+        core: &mut SupervisorCore,
+        mut reviewer: ActiveIdentity,
+    ) -> Vec<SupervisorEffect> {
+        let maximum = core.tasks[reviewer.task].spec.max_review_rounds;
+        for generation in 1..=maximum {
+            let effects = complete_review(core, reviewer, request_changes());
+            if generation == maximum {
+                return effects;
+            }
+            let developer_turn = u64::from(generation) * 2 + 1;
+            let developer_token: &'static str =
+                Box::leak(format!("exhaust-developer-{}", generation + 1).into_boxed_str());
+            let reviewer_token: &'static str =
+                Box::leak(format!("exhaust-reviewer-{}", generation + 1).into_boxed_str());
+            reviewer = correct_and_start_rereview(
+                core,
+                0,
+                developer_turn,
+                developer_turn + 1,
+                developer_token,
+                reviewer_token,
+            );
+        }
+        unreachable!("bounded review loop returns at the configured maximum")
     }
 
     fn active_canceled_core() -> SupervisorCore {
@@ -4026,6 +4135,25 @@ mod tests {
     }
 
     #[test]
+    fn plan_hash_is_bound_to_single_or_dual_reviewer_topology() {
+        let dual = new_core();
+        let mut bindings = default_reviewer_bindings();
+        bindings.truncate(1);
+        let single = SupervisorCore::new_with_reviewer_bindings(
+            "run-1".into(),
+            PathBuf::from("/project"),
+            PROFILE_HASH.into(),
+            bindings,
+        )
+        .unwrap();
+        let tasks = vec![task("one", "/repo", MIN_DUAL_REVIEW_ROUNDS)];
+        assert_ne!(
+            dual.expected_plan_hash(1, &tasks),
+            single.expected_plan_hash(1, &tasks)
+        );
+    }
+
+    #[test]
     fn provider_transport_types_do_not_leak_into_the_core_source() {
         let source = include_str!("core.rs");
         let implementation = source
@@ -4324,9 +4452,9 @@ mod tests {
         edges.insert((name(before), "lgtm", name(approved.tasks[0].state)));
         observed_states.insert(name(approved.tasks[0].state));
 
-        let (mut exhausted, reviewer) = active_reviewer_core(1);
+        let (mut exhausted, reviewer) = active_reviewer_core(MIN_DUAL_REVIEW_ROUNDS);
         let before = exhausted.tasks[0].state;
-        complete_review(&mut exhausted, reviewer, request_changes());
+        exhaust_review(&mut exhausted, reviewer);
         edges.insert((
             name(before),
             "max_round_request_changes",
@@ -4704,6 +4832,143 @@ mod tests {
             Vec::<SupervisorEffect>::new()
         );
         assert_eq!(core, before);
+    }
+
+    #[test]
+    fn single_review_has_no_reviewer2_state_and_completes_on_reviewer1() {
+        let (mut core, reviewer) =
+            active_single_reviewer_core(crate::control_api::protocol::MIN_SINGLE_REVIEW_ROUNDS);
+        assert_eq!(core.reviewer_bindings.len(), 1);
+        assert_eq!(core.reviewer_bindings[0].reviewer_id, ReviewerId::Reviewer1);
+        assert!(
+            !core.tasks[0]
+                .reviewer_sessions
+                .contains_key(&ReviewerId::Reviewer2)
+        );
+        assert!(
+            !core
+                .active_turns
+                .contains_key(&WorkerLane::Reviewer(ReviewerId::Reviewer2))
+        );
+
+        assert_eq!(
+            complete_review(&mut core, reviewer, lgtm()),
+            vec![
+                SupervisorEffect::CloseTaskRuntime { task_ordinal: 0 },
+                SupervisorEffect::FinishSession {
+                    state: SessionState::Completed,
+                    detail: "all ordered tasks reached a terminal review outcome".into(),
+                },
+                SupervisorEffect::PublishStatus,
+            ]
+        );
+        let snapshot = core.snapshot();
+        assert_eq!(snapshot.tasks[0].reviewers.len(), 1);
+        assert_eq!(
+            snapshot.tasks[0].reviewers[0].reviewer_id,
+            ReviewerId::Reviewer1
+        );
+        assert!(matches!(
+            core.progress_event_after("run-single", 1).unwrap(),
+            Some(SessionProgressEvent::ReviewResponded {
+                reviewer_id: ReviewerId::Reviewer1,
+                responses_received: 1,
+                responses_expected: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn single_review_exhausts_at_five_generations_without_reviewer2() {
+        let (mut core, reviewer) =
+            active_single_reviewer_core(crate::control_api::protocol::MIN_SINGLE_REVIEW_ROUNDS);
+        exhaust_review(&mut core, reviewer);
+        assert_eq!(core.session_state(), SessionState::Completed);
+        assert_eq!(core.tasks[0].state, TaskState::ReviewExhausted);
+        assert_eq!(
+            core.tasks[0].review_round,
+            u32::from(crate::control_api::protocol::MIN_SINGLE_REVIEW_ROUNDS)
+        );
+        assert_eq!(core.tasks[0].reviewer_results.len(), 1);
+        assert!(
+            !core.tasks[0]
+                .historical_reviewer_final_paths
+                .contains_key(&ReviewerId::Reviewer2)
+        );
+    }
+
+    #[test]
+    fn single_review_failure_cancel_and_parent_stop_never_target_reviewer2() {
+        let assert_single_reviewer_effects = |effects: &[SupervisorEffect]| {
+            assert!(effects.iter().all(|effect| !matches!(
+                effect,
+                SupervisorEffect::OpenRoleSession {
+                    lane: WorkerLane::Reviewer(ReviewerId::Reviewer2),
+                    ..
+                } | SupervisorEffect::StartTurn {
+                    lane: WorkerLane::Reviewer(ReviewerId::Reviewer2),
+                    ..
+                } | SupervisorEffect::InterruptTurn {
+                    lane: WorkerLane::Reviewer(ReviewerId::Reviewer2),
+                    ..
+                }
+            )));
+        };
+
+        let (mut failed, reviewer) =
+            active_single_reviewer_core(crate::control_api::protocol::MIN_SINGLE_REVIEW_ROUNDS);
+        let effects = failed
+            .reduce(SupervisorEvent::TurnFailed {
+                expected_version: failed.version(),
+                task_ordinal: reviewer.task,
+                lane: reviewer.lane,
+                review_generation: Some(1),
+                session: reviewer.session,
+                turn: reviewer.turn,
+                completion_token: reviewer.token.into(),
+                failure: runtime_failure(RuntimeFailureClass::Process, false, "Reviewer1 failed"),
+            })
+            .unwrap();
+        assert_single_reviewer_effects(&effects);
+        assert_eq!(failed.session_state(), SessionState::NeedsHuman);
+        assert_eq!(failed.snapshot().reviewer_bindings.len(), 1);
+        assert_eq!(failed.snapshot().tasks[0].reviewers.len(), 1);
+
+        let (mut canceled, _) =
+            active_single_reviewer_core(crate::control_api::protocol::MIN_SINGLE_REVIEW_ROUNDS);
+        let effects = canceled
+            .reduce(SupervisorEvent::CancelRequested {
+                expected_version: canceled.version(),
+                reason: "cancel single review".into(),
+            })
+            .unwrap();
+        assert_single_reviewer_effects(&effects);
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, SupervisorEffect::InterruptTurn { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(canceled.session_state(), SessionState::Canceled);
+
+        let (mut parent_stopping, _) =
+            active_single_reviewer_core(crate::control_api::protocol::MIN_SINGLE_REVIEW_ROUNDS);
+        let effects = parent_stopping
+            .reduce(SupervisorEvent::ParentStopping {
+                expected_version: parent_stopping.version(),
+            })
+            .unwrap();
+        assert_single_reviewer_effects(&effects);
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, SupervisorEffect::InterruptTurn { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(parent_stopping.session_state(), SessionState::Canceled);
     }
 
     #[test]
@@ -5392,7 +5657,10 @@ mod tests {
         let mut core = new_core();
         bind(
             &mut core,
-            vec![task("one", "/repo", 2), task("two", "/repo", 2)],
+            vec![
+                task("one", "/repo", MIN_DUAL_REVIEW_ROUNDS),
+                task("two", "/repo", MIN_DUAL_REVIEW_ROUNDS),
+            ],
         );
         authorize(&mut core);
 
@@ -5594,11 +5862,9 @@ mod tests {
         authorize(&mut core);
         let developer = start_first_developer(&mut core, 0, 1, 1, "d1");
         complete_developer_ready(&mut core, developer);
-        let mut reviewer = start_reviewer(&mut core, 0, 2, 2, "r1", true);
-        complete_review(&mut core, reviewer, request_changes());
-        reviewer = correct_and_start_rereview(&mut core, 0, 3, 4, "d2", "r2");
+        let reviewer = start_reviewer(&mut core, 0, 2, 2, "r1", true);
         assert_eq!(
-            complete_review(&mut core, reviewer, request_changes()),
+            exhaust_review(&mut core, reviewer),
             vec![
                 SupervisorEffect::CloseTaskRuntime { task_ordinal: 0 },
                 SupervisorEffect::OpenTaskRuntime { task_ordinal: 1 },
@@ -5606,17 +5872,20 @@ mod tests {
             ]
         );
         assert_eq!(core.tasks[0].state, TaskState::ReviewExhausted);
-        assert_eq!(core.tasks[0].review_round, 2);
+        assert_eq!(
+            core.tasks[0].review_round,
+            u32::from(MIN_DUAL_REVIEW_ROUNDS)
+        );
         let exhausted = &core.snapshot().tasks[0];
         assert_eq!(
             exhausted.latest_developer_final_path.as_deref(),
-            Some("/artifacts/developer/turn-3/native-final.partial")
+            Some("/artifacts/developer/turn-13/native-final.partial")
         );
         assert_eq!(
             reviewer_paths(exhausted),
             [
-                "/artifacts/reviewer/turn-4/native-final.partial",
-                "/artifacts/reviewer/turn-10004/native-final.partial",
+                "/artifacts/reviewer/turn-14/native-final.partial",
+                "/artifacts/reviewer/turn-10014/native-final.partial",
             ],
             "review exhaustion carries only the last REQUEST_CHANGES round"
         );
@@ -5625,9 +5894,9 @@ mod tests {
             Some(ReviewerVerdict::RequestChanges)
         );
         assert!(matches!(
-            core.progress_event_after("run-1", 6).unwrap(),
+            core.progress_event_after("run-1", 21).unwrap(),
             Some(SessionProgressEvent::TaskCompleted {
-                sequence: 7,
+                sequence: 22,
                 task_ordinal: 0,
                 completed_tasks: 1,
                 total_tasks: 2,
@@ -5639,7 +5908,7 @@ mod tests {
             })
         ));
         assert_eq!(core.current_task(), Some(1));
-        start_first_developer(&mut core, 1, 3, 5, "next-developer");
+        start_first_developer(&mut core, 1, 3, 15, "next-developer");
         assert_eq!(core.tasks[1].state, TaskState::Developing);
     }
 
@@ -6173,14 +6442,17 @@ mod tests {
 
         for (rounds, accepted) in [
             (0, false),
-            (1, true),
-            (3, true),
-            (5, true),
+            (1, false),
+            (3, false),
+            (6, false),
+            (7, true),
             (20, true),
             (21, false),
         ] {
+            let mut candidate = task("rounds", "/repo", MIN_DUAL_REVIEW_ROUNDS);
+            candidate.max_review_rounds = rounds;
             assert_eq!(
-                plan_result(vec![task("rounds", "/repo", rounds)]).is_ok(),
+                plan_result(vec![candidate]).is_ok(),
                 accepted,
                 "unexpected max_review_rounds boundary result for {rounds}"
             );
