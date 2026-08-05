@@ -1507,7 +1507,7 @@ mod tests {
             self.snapshot.plan_version = None;
             self.snapshot.plan_hash = None;
             self.snapshot.current_task_ordinal = None;
-            self.snapshot.active_worker = None;
+            self.snapshot.active_workers.clear();
             self.snapshot.pending_architect_action = None;
             self.snapshot.terminal_detail = None;
             self.snapshot.tasks.clear();
@@ -1694,7 +1694,8 @@ mod tests {
             plan_version: Some(1),
             plan_hash: Some("a".repeat(64)),
             current_task_ordinal: Some(0),
-            active_worker: None,
+            active_workers: Vec::new(),
+            reviewer_bindings: Vec::new(),
             pending_architect_action,
             terminal_detail: state
                 .is_terminal()
@@ -1709,6 +1710,7 @@ mod tests {
                 task_selector: "FBTC-03".into(),
                 branch: None,
                 review_round: 1,
+                review_generation: 1,
                 max_review_rounds: 3,
                 clarification_rounds_used: 0,
                 max_clarification_rounds: 2,
@@ -1716,15 +1718,25 @@ mod tests {
                 base_revision: None,
                 head_revision: None,
                 developer_session_bound: true,
-                reviewer_session_bound: true,
+                reviewers: [
+                    crate::worker::profile::ReviewerId::Reviewer1,
+                    crate::worker::profile::ReviewerId::Reviewer2,
+                ]
+                .into_iter()
+                .map(|reviewer_id| crate::control_api::ReviewerResultSnapshot {
+                    reviewer_id,
+                    session_bound: true,
+                    current_generation: Some(1),
+                    current_verdict: Some(reviewer_verdict),
+                    current_final_message_paths: vec![
+                        "/artifacts/reviewer/native-final.partial".into(),
+                    ],
+                })
+                .collect(),
                 outcome_detail: Some("Reviewer returned LGTM".into()),
                 latest_developer_final_path: Some(
                     "/artifacts/developer/native-final.partial".into(),
                 ),
-                final_reviewer_message_paths: vec![
-                    "/artifacts/reviewer/native-final.partial".into(),
-                ],
-                reviewer_verdict: Some(reviewer_verdict),
             }],
         };
         let binding_id = "binding-wait-test";
@@ -1812,12 +1824,14 @@ mod tests {
             completed_tasks: 0,
             total_tasks: 1,
             review_round: 1,
+            review_generation: 1,
             max_review_rounds: 3,
             developer_final_path: "/artifacts/developer/native-final.partial".into(),
             task_document_path: "/project/current_todo.md".into(),
             design_document_paths: vec!["/project/design.md".into()],
             task_selector: "FBTC-03".into(),
             clarification_record_count: 0,
+            reviewer_bindings: Vec::new(),
         }
     }
 
@@ -1852,11 +1866,11 @@ mod tests {
             Some("terminal after wait")
         );
         assert_eq!(
-            session.tasks[0].final_reviewer_message_paths,
+            session.tasks[0].reviewers[0].current_final_message_paths,
             ["/artifacts/reviewer/native-final.partial"]
         );
         assert_eq!(
-            session.tasks[0].reviewer_verdict,
+            session.tasks[0].reviewers[0].current_verdict,
             Some(crate::control_api::ReviewerVerdict::RequestChanges)
         );
 
@@ -2229,7 +2243,7 @@ mod tests {
             Some("/artifacts/developer/native-final.partial")
         );
         assert_eq!(
-            session.tasks[0].final_reviewer_message_paths,
+            session.tasks[0].reviewers[0].current_final_message_paths,
             ["/artifacts/reviewer/native-final.partial"]
         );
         assert!(control.pending_wait.is_some());

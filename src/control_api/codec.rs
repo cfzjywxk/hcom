@@ -108,8 +108,11 @@ mod tests {
     use crate::control_api::protocol::PROTOCOL_VERSION;
     use crate::control_api::{
         ArchitectActionReason, ClarificationPage, ClarificationRecord, ControlResponse,
-        ControlResult, MAX_CLARIFICATION_PAGE_RECORDS,
+        ControlResult, MAX_CLARIFICATION_PAGE_RECORDS, ReviewerBindingSnapshot,
+        ReviewerResultSnapshot, ReviewerVerdict, SessionState, SessionStatusSnapshot, TaskState,
+        TaskStatusSnapshot,
     };
+    use crate::worker::profile::ReviewerId;
     use std::io::Cursor;
 
     #[test]
@@ -194,5 +197,94 @@ mod tests {
         write_response_frame(&mut frame, &payload).unwrap();
         let decoded = read_response_frame(&mut Cursor::new(frame)).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn maximum_dual_reviewer_status_shape_stays_within_the_response_frame() {
+        let reviewer_path = format!("/{}", "p".repeat(699));
+        let reviewers = [ReviewerId::Reviewer1, ReviewerId::Reviewer2]
+            .into_iter()
+            .map(|reviewer_id| ReviewerResultSnapshot {
+                reviewer_id,
+                session_bound: true,
+                current_generation: Some(20),
+                current_verdict: Some(ReviewerVerdict::RequestChanges),
+                current_final_message_paths: vec![reviewer_path.clone(), reviewer_path.clone()],
+            })
+            .collect::<Vec<_>>();
+        let tasks = (0..64)
+            .map(|ordinal| TaskStatusSnapshot {
+                task_key: format!("task-{ordinal}"),
+                ordinal,
+                state: TaskState::ReviewExhausted,
+                repository_root: "/repository".into(),
+                task_document_path: "/project/task.md".into(),
+                design_document_paths: vec!["/project/design.md".into()],
+                task_selector: format!("task-{ordinal}"),
+                branch: None,
+                review_round: 20,
+                review_generation: 20,
+                max_review_rounds: 20,
+                clarification_rounds_used: 0,
+                max_clarification_rounds: 20,
+                clarification_record_count: 0,
+                base_revision: None,
+                head_revision: None,
+                developer_session_bound: true,
+                reviewers: reviewers.clone(),
+                outcome_detail: Some("maximum synchronized review generations exhausted".into()),
+                latest_developer_final_path: Some("/artifacts/developer/final.md".into()),
+            })
+            .collect();
+        let reviewer_bindings = [
+            (ReviewerId::Reviewer1, "codex-exec", "gpt-5.6-sol"),
+            (ReviewerId::Reviewer2, "claude-exec", "opus"),
+        ]
+        .into_iter()
+        .map(|(reviewer_id, provider, model)| ReviewerBindingSnapshot {
+            reviewer_id,
+            provider: provider.into(),
+            model: model.into(),
+            reasoning_effort: "xhigh".into(),
+            contract_sha256: "a".repeat(64),
+        })
+        .collect();
+        let response = ControlResponse::success(
+            "maximum-dual-reviewer-status",
+            ControlResult::Session {
+                session: SessionStatusSnapshot {
+                    run_id: "run".into(),
+                    state: SessionState::Completed,
+                    version: 1,
+                    project_root: "/project".into(),
+                    plan_version: Some(1),
+                    plan_hash: Some("b".repeat(64)),
+                    current_task_ordinal: Some(63),
+                    active_workers: Vec::new(),
+                    reviewer_bindings,
+                    pending_architect_action: None,
+                    terminal_detail: Some(
+                        "all ordered tasks reached a terminal review outcome".into(),
+                    ),
+                    tasks,
+                },
+            },
+        );
+        let payload = serde_json::to_vec(&response).unwrap();
+        assert!(
+            payload.len() > MAX_RESPONSE_BYTES / 2,
+            "fixture must exercise a materially large dual-Reviewer frame"
+        );
+        assert!(
+            payload.len() < MAX_RESPONSE_BYTES,
+            "dual-Reviewer status frame was {} bytes",
+            payload.len()
+        );
+        let mut frame = Vec::new();
+        write_response_frame(&mut frame, &payload).unwrap();
+        assert_eq!(
+            read_response_frame(&mut Cursor::new(frame)).unwrap(),
+            payload
+        );
     }
 }

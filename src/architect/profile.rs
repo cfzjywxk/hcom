@@ -1,7 +1,7 @@
 use crate::worker::profile::{
     ArchitectAdapter, ArchitectInvocationProfile, ClaudeInvocationProfile, CodexApprovalPolicy,
-    CodexInvocationProfile, CodexSandbox, DeveloperInvocationProfile, ReviewerInvocationProfile,
-    SessionInvocationProfiles,
+    CodexInvocationProfile, CodexSandbox, DeveloperInvocationProfile, ReviewerId,
+    ReviewerInvocationProfile, SessionInvocationProfiles,
 };
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -16,6 +16,7 @@ pub(super) struct LoadedInvocationProfiles {
     pub profiles: SessionInvocationProfiles,
     pub config_path: PathBuf,
     pub loaded_from_file: bool,
+    pub legacy_reviewer_migrated: bool,
 }
 
 #[derive(Deserialize)]
@@ -24,6 +25,8 @@ struct ArchitectToml {
     profile: Option<toml::Value>,
     developer: Option<toml::Value>,
     reviewer: Option<toml::Value>,
+    reviewer1: Option<toml::Value>,
+    reviewer2: Option<toml::Value>,
 }
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -172,10 +175,11 @@ fn apply_developer_override(
 fn apply_reviewer_override(
     profile: &mut ReviewerInvocationProfile,
     value: toml::Value,
+    table: &str,
 ) -> Result<()> {
     let mut configured: ProfileOverride = value
         .try_into()
-        .context("invalid [architect.reviewer] profile fields")?;
+        .with_context(|| format!("invalid {table} profile fields"))?;
     let adapter = configured.adapter.take().unwrap_or(match profile {
         ReviewerInvocationProfile::Codex { .. } => ConfiguredAdapter::Codex,
         ReviewerInvocationProfile::Claude { .. } => ConfiguredAdapter::Claude,
@@ -188,7 +192,7 @@ fn apply_reviewer_override(
                     CodexInvocationProfile::reviewer_default()
                 }
             };
-            apply_codex_override(&mut merged, configured, "Codex [architect.reviewer]")?;
+            apply_codex_override(&mut merged, configured, &format!("Codex {table}"))?;
             ReviewerInvocationProfile::Codex { profile: merged }
         }
         ConfiguredAdapter::Claude => {
@@ -198,7 +202,7 @@ fn apply_reviewer_override(
                     ClaudeInvocationProfile::reviewer_default()
                 }
             };
-            apply_claude_override(&mut merged, configured, "Claude [architect.reviewer]")?;
+            apply_claude_override(&mut merged, configured, &format!("Claude {table}"))?;
             ReviewerInvocationProfile::Claude { profile: merged }
         }
     };
@@ -234,6 +238,7 @@ fn load_invocation_profiles_with_defaults(
                 profiles,
                 config_path: path.to_owned(),
                 loaded_from_file: false,
+                legacy_reviewer_migrated: false,
             });
         }
         Err(error) => {
@@ -292,6 +297,7 @@ fn load_invocation_profiles_with_defaults(
         .parse()
         .context("architect profile configuration is malformed TOML")?;
     let mut profiles = defaults()?;
+    let mut legacy_reviewer_migrated = false;
     if let Some(value) = document.get("architect") {
         let configured: ArchitectToml = value
             .clone()
@@ -305,9 +311,36 @@ fn load_invocation_profiles_with_defaults(
             apply_developer_override(&mut profiles.developer, value)
                 .context("invalid [architect.developer] configuration")?;
         }
+        if configured.reviewer.is_some()
+            && (configured.reviewer1.is_some() || configured.reviewer2.is_some())
+        {
+            bail!(
+                "legacy [architect.reviewer] cannot be combined with [architect.reviewer1] or [architect.reviewer2]; remove the legacy table and declare both canonical Reviewer lanes explicitly"
+            );
+        }
         if let Some(value) = configured.reviewer {
-            apply_reviewer_override(profiles.reviewer1_mut(), value)
+            let mut resolved = ReviewerInvocationProfile::default();
+            apply_reviewer_override(&mut resolved, value, "[architect.reviewer]")
                 .context("invalid [architect.reviewer] configuration")?;
+            profiles.reviewers = SessionInvocationProfiles::legacy_reviewer_pair(resolved);
+            legacy_reviewer_migrated = true;
+        } else {
+            if let Some(value) = configured.reviewer1 {
+                apply_reviewer_override(
+                    profiles.reviewer_mut(ReviewerId::Reviewer1),
+                    value,
+                    "[architect.reviewer1]",
+                )
+                .context("invalid [architect.reviewer1] configuration")?;
+            }
+            if let Some(value) = configured.reviewer2 {
+                apply_reviewer_override(
+                    profiles.reviewer_mut(ReviewerId::Reviewer2),
+                    value,
+                    "[architect.reviewer2]",
+                )
+                .context("invalid [architect.reviewer2] configuration")?;
+            }
         }
     }
     profiles.validate()?;
@@ -319,6 +352,7 @@ fn load_invocation_profiles_with_defaults(
         profiles,
         config_path: path.to_owned(),
         loaded_from_file: true,
+        legacy_reviewer_migrated,
     })
 }
 
@@ -363,12 +397,16 @@ mod tests {
         );
         assert_eq!(
             loaded.profiles.reviewer_adapter_name(),
-            CLAUDE_REVIEWER_ADAPTER
+            CODEX_REVIEWER_ADAPTER
         );
-        let reviewer = loaded.profiles.reviewer1().claude().unwrap();
-        assert_eq!(reviewer.model, "opus");
-        assert_eq!(reviewer.effort, "xhigh");
-        assert!(reviewer.dangerously_skip_permissions);
+        assert_eq!(
+            loaded.profiles.reviewer1().codex().unwrap().model,
+            "gpt-5.6-sol"
+        );
+        let reviewer2 = loaded.profiles.reviewer2().claude().unwrap();
+        assert_eq!(reviewer2.model, "opus");
+        assert_eq!(reviewer2.effort, "xhigh");
+        assert!(reviewer2.dangerously_skip_permissions);
     }
 
     #[test]
@@ -386,9 +424,9 @@ mod tests {
         );
         assert_eq!(
             loaded.profiles.reviewer_adapter_name(),
-            CLAUDE_REVIEWER_ADAPTER
+            CODEX_REVIEWER_ADAPTER
         );
-        assert_eq!(loaded.profiles.reviewer1().claude().unwrap().model, "opus");
+        assert_eq!(loaded.profiles.reviewer2().claude().unwrap().model, "opus");
     }
 
     #[test]
@@ -403,9 +441,10 @@ mod tests {
         );
         assert_eq!(
             loaded.profiles.reviewer_adapter_name(),
-            CLAUDE_REVIEWER_ADAPTER
+            CODEX_REVIEWER_ADAPTER
         );
-        assert_eq!(loaded.profiles.reviewer1().claude().unwrap().model, "opus");
+        assert!(loaded.profiles.reviewer1().codex().is_some());
+        assert_eq!(loaded.profiles.reviewer2().claude().unwrap().model, "opus");
     }
 
     #[test]
@@ -420,11 +459,17 @@ dangerously_skip_permissions = true
 "#,
         );
         let loaded = load_task_lane_profiles(&path, ArchitectAdapter::Codex).unwrap();
+        assert!(loaded.legacy_reviewer_migrated);
         assert_eq!(
             loaded.profiles.developer_adapter_name(),
             CODEX_DEVELOPER_ADAPTER
         );
         assert!(loaded.profiles.reviewer1().claude().is_some());
+        assert_eq!(
+            loaded.profiles.reviewer1(),
+            loaded.profiles.reviewer2(),
+            "legacy Reviewer profile must be copied completely to both lanes"
+        );
         let runtime =
             crate::worker::runtime::TaskWorkerProfiles::from_session_profiles(&loaded.profiles)
                 .unwrap();
@@ -464,6 +509,7 @@ ask_for_approval = "never"
         assert_eq!(developer.reasoning_effort, "max");
         assert_eq!(reviewer.model, "reviewer-override");
         assert_eq!(reviewer.reasoning_effort, "high");
+        assert_eq!(loaded.profiles.reviewer1(), loaded.profiles.reviewer2());
     }
 
     #[test]
@@ -497,6 +543,7 @@ effort = "medium"
         assert_eq!(reviewer.model, "opus");
         assert_eq!(reviewer.effort, "medium");
         assert!(reviewer.dangerously_skip_permissions);
+        assert_eq!(loaded.profiles.reviewer1(), loaded.profiles.reviewer2());
     }
 
     #[test]
@@ -522,62 +569,77 @@ reasoning_effort = "high"
         assert_eq!(reviewer.reasoning_effort, "high");
         assert_eq!(reviewer.sandbox, CodexSandbox::DangerFullAccess);
         assert_eq!(reviewer.approval_policy, CodexApprovalPolicy::Never);
+        assert_eq!(loaded.profiles.reviewer1(), loaded.profiles.reviewer2());
     }
 
     #[test]
-    fn both_architects_bind_all_four_worker_pairs_exactly() {
+    fn all_sixteen_architect_and_worker_provider_combinations_bind_exactly() {
         use crate::worker::runtime::{RuntimeProvider, TaskWorkerProfiles};
 
         for architect in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
             for developer in [ConfiguredAdapter::Codex, ConfiguredAdapter::Claude] {
-                for reviewer in [ConfiguredAdapter::Codex, ConfiguredAdapter::Claude] {
-                    let developer_name = match developer {
-                        ConfiguredAdapter::Codex => "codex",
-                        ConfiguredAdapter::Claude => "claude",
-                    };
-                    let reviewer_name = match reviewer {
-                        ConfiguredAdapter::Codex => "codex",
-                        ConfiguredAdapter::Claude => "claude",
-                    };
-                    let config = format!(
-                        "[architect.developer]\nadapter = \"{developer_name}\"\n\n\
-                         [architect.reviewer]\nadapter = \"{reviewer_name}\"\n"
-                    );
-                    let (_temp, path) = write_config(&config);
-                    let loaded = load_task_lane_profiles(&path, architect).unwrap();
-                    assert_eq!(loaded.profiles.architect.adapter(), architect);
-                    assert_eq!(
-                        loaded.profiles.developer_adapter_name(),
-                        match developer {
-                            ConfiguredAdapter::Codex => CODEX_DEVELOPER_ADAPTER,
-                            ConfiguredAdapter::Claude => CLAUDE_DEVELOPER_ADAPTER,
-                        }
-                    );
-                    assert_eq!(
-                        loaded.profiles.reviewer_adapter_name(),
-                        match reviewer {
-                            ConfiguredAdapter::Codex => CODEX_REVIEWER_ADAPTER,
-                            ConfiguredAdapter::Claude => CLAUDE_REVIEWER_ADAPTER,
-                        }
-                    );
-                    let runtime =
-                        TaskWorkerProfiles::from_session_profiles(&loaded.profiles).unwrap();
-                    assert_eq!(
-                        runtime.developer.provider,
-                        match developer {
-                            ConfiguredAdapter::Codex => RuntimeProvider::CodexExec,
-                            ConfiguredAdapter::Claude => RuntimeProvider::ClaudeExec,
-                        }
-                    );
-                    assert_eq!(
-                        runtime.reviewer1().provider,
-                        match reviewer {
-                            ConfiguredAdapter::Codex => RuntimeProvider::CodexExec,
-                            ConfiguredAdapter::Claude => RuntimeProvider::ClaudeExec,
-                        }
-                    );
-                    assert_eq!(loaded.profiles.canonical_hash().len(), 64);
-                    assert_eq!(runtime.canonical_hash().len(), 64);
+                for reviewer1 in [ConfiguredAdapter::Codex, ConfiguredAdapter::Claude] {
+                    for reviewer2 in [ConfiguredAdapter::Codex, ConfiguredAdapter::Claude] {
+                        let developer_name = match developer {
+                            ConfiguredAdapter::Codex => "codex",
+                            ConfiguredAdapter::Claude => "claude",
+                        };
+                        let reviewer1_name = match reviewer1 {
+                            ConfiguredAdapter::Codex => "codex",
+                            ConfiguredAdapter::Claude => "claude",
+                        };
+                        let reviewer2_name = match reviewer2 {
+                            ConfiguredAdapter::Codex => "codex",
+                            ConfiguredAdapter::Claude => "claude",
+                        };
+                        let config = format!(
+                            "[architect.developer]\nadapter = \"{developer_name}\"\n\n\
+                         [architect.reviewer1]\nadapter = \"{reviewer1_name}\"\n\n\
+                         [architect.reviewer2]\nadapter = \"{reviewer2_name}\"\n"
+                        );
+                        let (_temp, path) = write_config(&config);
+                        let loaded = load_task_lane_profiles(&path, architect).unwrap();
+                        assert_eq!(loaded.profiles.architect.adapter(), architect);
+                        assert_eq!(
+                            loaded.profiles.developer_adapter_name(),
+                            match developer {
+                                ConfiguredAdapter::Codex => CODEX_DEVELOPER_ADAPTER,
+                                ConfiguredAdapter::Claude => CLAUDE_DEVELOPER_ADAPTER,
+                            }
+                        );
+                        assert_eq!(
+                            loaded.profiles.reviewer_adapter_name(),
+                            match reviewer1 {
+                                ConfiguredAdapter::Codex => CODEX_REVIEWER_ADAPTER,
+                                ConfiguredAdapter::Claude => CLAUDE_REVIEWER_ADAPTER,
+                            }
+                        );
+                        let runtime =
+                            TaskWorkerProfiles::from_session_profiles(&loaded.profiles).unwrap();
+                        assert_eq!(
+                            runtime.developer.provider,
+                            match developer {
+                                ConfiguredAdapter::Codex => RuntimeProvider::CodexExec,
+                                ConfiguredAdapter::Claude => RuntimeProvider::ClaudeExec,
+                            }
+                        );
+                        assert_eq!(
+                            runtime.reviewer1().provider,
+                            match reviewer1 {
+                                ConfiguredAdapter::Codex => RuntimeProvider::CodexExec,
+                                ConfiguredAdapter::Claude => RuntimeProvider::ClaudeExec,
+                            }
+                        );
+                        assert_eq!(
+                            runtime.reviewer2().provider,
+                            match reviewer2 {
+                                ConfiguredAdapter::Codex => RuntimeProvider::CodexExec,
+                                ConfiguredAdapter::Claude => RuntimeProvider::ClaudeExec,
+                            }
+                        );
+                        assert_eq!(loaded.profiles.canonical_hash().len(), 64);
+                        assert_eq!(runtime.canonical_hash().len(), 64);
+                    }
                 }
             }
         }
@@ -621,6 +683,7 @@ ask_for_approval = "never"
         );
         for architect_adapter in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
             let loaded = load_task_lane_profiles(&path, architect_adapter).unwrap();
+            assert!(loaded.legacy_reviewer_migrated);
             assert_eq!(
                 loaded.profiles.developer_adapter_name(),
                 CODEX_DEVELOPER_ADAPTER
@@ -629,6 +692,12 @@ ask_for_approval = "never"
                 loaded.profiles.reviewer_adapter_name(),
                 CODEX_REVIEWER_ADAPTER
             );
+            if architect_adapter == ArchitectAdapter::Codex {
+                assert!(
+                    !loaded.profiles.uses_claude(),
+                    "pure-Codex legacy migration must not trigger the Claude gate"
+                );
+            }
         }
     }
 
@@ -700,16 +769,42 @@ args = ["--resume", "foreign-session"]
     }
 
     #[test]
-    fn unreleased_reviewer_lane_tables_remain_rejected() {
-        for table in ["reviewer1", "reviewer2"] {
-            let (_temp, path) =
-                write_config(&format!("[architect.{table}]\nadapter = \"codex\"\n"));
+    fn canonical_reviewer_tables_are_independent_and_cannot_mix_with_legacy() {
+        let (_temp, path) = write_config(
+            r#"
+[architect.reviewer1]
+adapter = "claude"
+model = "reviewer-one"
+
+[architect.reviewer2]
+adapter = "codex"
+model = "reviewer-two"
+"#,
+        );
+        let loaded = load_task_lane_profiles(&path, ArchitectAdapter::Codex).unwrap();
+        assert!(!loaded.legacy_reviewer_migrated);
+        assert_eq!(
+            loaded.profiles.reviewer1().claude().unwrap().model,
+            "reviewer-one"
+        );
+        assert_eq!(
+            loaded.profiles.reviewer2().codex().unwrap().model,
+            "reviewer-two"
+        );
+
+        for canonical in ["reviewer1", "reviewer2"] {
+            let (_temp, path) = write_config(&format!(
+                "[architect.reviewer]\nadapter = \"codex\"\n\n\
+                 [architect.{canonical}]\nadapter = \"claude\"\n"
+            ));
             let error = load_task_lane_profiles(&path, ArchitectAdapter::Codex)
                 .err()
-                .expect("unreleased reviewer lane table must remain rejected");
+                .expect("legacy and canonical Reviewer tables must fail closed");
             assert!(
-                format!("{error:#}").contains("invalid [architect] profile configuration"),
-                "unexpected error for {table}: {error:#}"
+                format!("{error:#}").contains(
+                    "legacy [architect.reviewer] cannot be combined with [architect.reviewer1] or [architect.reviewer2]"
+                ),
+                "unexpected mixed-table error: {error:#}"
             );
         }
     }

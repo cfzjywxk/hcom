@@ -32,7 +32,8 @@ const DEFAULT_REASONING_EFFORT: &str = "xhigh";
 const MAX_TASK_KEY_BYTES: usize = 128;
 const MAX_PATH_BYTES: usize = 4096;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkerLane {
     Developer,
     Reviewer(ReviewerId),
@@ -345,10 +346,16 @@ impl TaskWorkerProfiles {
     pub fn defaults() -> Self {
         Self {
             developer: RuntimeProfile::codex_exec_default(),
-            reviewers: vec![ReviewerRuntimeProfile {
-                reviewer_id: ReviewerId::Reviewer1,
-                profile: RuntimeProfile::claude_exec_default(),
-            }],
+            reviewers: vec![
+                ReviewerRuntimeProfile {
+                    reviewer_id: ReviewerId::Reviewer1,
+                    profile: RuntimeProfile::codex_exec_default(),
+                },
+                ReviewerRuntimeProfile {
+                    reviewer_id: ReviewerId::Reviewer2,
+                    profile: RuntimeProfile::claude_exec_default(),
+                },
+            ],
         }
     }
 
@@ -392,17 +399,20 @@ impl TaskWorkerProfiles {
 
     pub fn validate(&self) -> Result<(), RuntimeError> {
         self.developer.validate("developer runtime profile")?;
-        let [reviewer] = self.reviewers.as_slice() else {
+        let [reviewer1, reviewer2] = self.reviewers.as_slice() else {
             return Err(RuntimeError::invalid_profile(
-                "runtime reviewer collection must contain exactly one Reviewer1 entry",
+                "runtime reviewer collection must contain ordered Reviewer1 and Reviewer2 entries",
             ));
         };
-        if reviewer.reviewer_id != ReviewerId::Reviewer1 {
+        if reviewer1.reviewer_id != ReviewerId::Reviewer1
+            || reviewer2.reviewer_id != ReviewerId::Reviewer2
+        {
             return Err(RuntimeError::invalid_profile(
-                "runtime reviewer collection must contain exactly one Reviewer1 entry",
+                "runtime reviewer collection must contain ordered Reviewer1 and Reviewer2 entries",
             ));
         }
-        reviewer.profile.validate("Reviewer1 runtime profile")
+        reviewer1.profile.validate("Reviewer1 runtime profile")?;
+        reviewer2.profile.validate("Reviewer2 runtime profile")
     }
 
     pub fn canonical_hash(&self) -> String {
@@ -410,11 +420,19 @@ impl TaskWorkerProfiles {
     }
 
     pub fn reviewer1(&self) -> &RuntimeProfile {
+        self.reviewer(ReviewerId::Reviewer1)
+    }
+
+    pub fn reviewer2(&self) -> &RuntimeProfile {
+        self.reviewer(ReviewerId::Reviewer2)
+    }
+
+    pub fn reviewer(&self, reviewer_id: ReviewerId) -> &RuntimeProfile {
         &self
             .reviewers
             .iter()
-            .find(|binding| binding.reviewer_id == ReviewerId::Reviewer1)
-            .expect("validated task worker profiles contain Reviewer1")
+            .find(|binding| binding.reviewer_id == reviewer_id)
+            .expect("validated task worker profiles contain both Reviewer lanes")
             .profile
     }
 
@@ -453,10 +471,14 @@ impl TaskWorkerProfiles {
     }
 
     pub fn contract_identity(&self) -> RuntimeContractIdentity {
-        RuntimeContractIdentity::for_role_providers(
-            self.developer.provider,
-            self.reviewer1().provider,
-        )
+        RuntimeContractIdentity::for_lane_providers(self.lanes().map(|lane| {
+            (
+                lane,
+                self.profile_for_lane(lane)
+                    .expect("validated lane")
+                    .provider,
+            )
+        }))
     }
 }
 
@@ -493,28 +515,26 @@ impl RuntimeContractIdentity {
         )
     }
 
-    pub fn for_role_providers(developer: RuntimeProvider, reviewer: RuntimeProvider) -> Self {
-        let developer_contract = developer.contract_identity();
-        let reviewer_contract = reviewer.contract_identity();
-        if developer == reviewer {
-            return developer_contract;
-        }
+    pub fn for_lane_providers(
+        providers: impl IntoIterator<Item = (WorkerLane, RuntimeProvider)>,
+    ) -> Self {
+        let providers = providers.into_iter().collect::<Vec<_>>();
         Self::new(
             ROLE_ROUTER_TASK_WORKER_ADAPTER,
-            vec![
-                format!("developer={}", developer.as_str()),
-                format!("reviewer={}", reviewer.as_str()),
-            ],
-            vec![
-                format!(
-                    "developer.contract_sha256={}",
-                    developer_contract.contract_sha256
-                ),
-                format!(
-                    "reviewer.contract_sha256={}",
-                    reviewer_contract.contract_sha256
-                ),
-            ],
+            providers
+                .iter()
+                .map(|(lane, provider)| format!("{}={}", lane.as_str(), provider.as_str()))
+                .collect(),
+            providers
+                .iter()
+                .map(|(lane, provider)| {
+                    format!(
+                        "{}.contract_sha256={}",
+                        lane.as_str(),
+                        provider.contract_identity().contract_sha256
+                    )
+                })
+                .collect(),
         )
     }
 
@@ -1097,8 +1117,7 @@ fn canonical_hash(value: &impl Serialize) -> String {
 mod tests {
     use super::*;
     use crate::worker::profile::{
-        ClaudeInvocationProfile, DeveloperInvocationProfile, ReviewerInvocationBinding,
-        ReviewerInvocationProfile,
+        ClaudeInvocationProfile, DeveloperInvocationProfile, ReviewerInvocationProfile,
     };
 
     #[test]
@@ -1126,20 +1145,27 @@ mod tests {
             ]
         );
 
-        let reviewer = profiles.reviewer1();
-        assert_eq!(reviewer.provider, RuntimeProvider::ClaudeExec);
-        assert_eq!(reviewer.model, "opus");
-        assert_eq!(reviewer.reasoning_effort, "xhigh");
-        assert_eq!(reviewer.sandbox, RuntimeSandbox::DangerFullAccess);
-        assert_eq!(reviewer.approval_policy, RuntimeApprovalPolicy::Never);
+        let reviewer1 = profiles.reviewer1();
+        assert_eq!(reviewer1.provider, RuntimeProvider::CodexExec);
+        assert_eq!(reviewer1.model, "gpt-5.6-sol");
+        assert_eq!(reviewer1.reasoning_effort, "xhigh");
+        assert_eq!(reviewer1.sandbox, RuntimeSandbox::DangerFullAccess);
+        assert_eq!(reviewer1.approval_policy, RuntimeApprovalPolicy::Never);
+        assert_eq!(reviewer1.claude_permissions, None);
+        let reviewer2 = profiles.reviewer2();
+        assert_eq!(reviewer2.provider, RuntimeProvider::ClaudeExec);
+        assert_eq!(reviewer2.model, "opus");
+        assert_eq!(reviewer2.reasoning_effort, "xhigh");
+        assert_eq!(reviewer2.sandbox, RuntimeSandbox::DangerFullAccess);
+        assert_eq!(reviewer2.approval_policy, RuntimeApprovalPolicy::Never);
         assert_eq!(
-            reviewer.claude_permissions,
+            reviewer2.claude_permissions,
             Some(RuntimeClaudePermissions {
                 dangerously_skip_permissions: true,
             })
         );
         assert_eq!(
-            reviewer.cli_equivalent_arguments(),
+            reviewer2.cli_equivalent_arguments(),
             [
                 "--model",
                 "opus",
@@ -1157,16 +1183,18 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_runtime_collection_is_ordered_identity_bound_and_exactly_reviewer1() {
+    fn reviewer_runtime_collection_is_ordered_identity_bound_and_exactly_two() {
         let profiles = TaskWorkerProfiles::defaults();
         profiles.validate().unwrap();
-        assert_eq!(profiles.reviewers.len(), 1);
+        assert_eq!(profiles.reviewers.len(), 2);
         assert_eq!(profiles.reviewers[0].reviewer_id, ReviewerId::Reviewer1);
+        assert_eq!(profiles.reviewers[1].reviewer_id, ReviewerId::Reviewer2);
         assert_eq!(
             profiles.lanes().collect::<Vec<_>>(),
             [
                 WorkerLane::Developer,
-                WorkerLane::Reviewer(ReviewerId::Reviewer1)
+                WorkerLane::Reviewer(ReviewerId::Reviewer1),
+                WorkerLane::Reviewer(ReviewerId::Reviewer2),
             ]
         );
         assert_eq!(profiles.profile(WorkerRole::Developer), &profiles.developer);
@@ -1180,13 +1208,12 @@ mod tests {
         assert_eq!(
             profiles
                 .profile_for_lane(WorkerLane::Reviewer(ReviewerId::Reviewer2))
-                .unwrap_err()
-                .code,
-            RuntimeErrorCode::InvalidIdentity
+                .unwrap(),
+            profiles.reviewer2()
         );
 
         let mut wrong_identity = profiles.clone();
-        wrong_identity.reviewers[0].reviewer_id = ReviewerId::Reviewer2;
+        wrong_identity.reviewers.swap(0, 1);
         assert!(wrong_identity.validate().is_err());
         assert_ne!(
             profiles.canonical_hash(),
@@ -1202,18 +1229,14 @@ mod tests {
             "the complete reviewer runtime profile must be hash-bound"
         );
 
-        let reviewer2 = ReviewerRuntimeProfile {
-            reviewer_id: ReviewerId::Reviewer2,
-            profile: profiles.reviewer1().clone(),
-        };
-        let mut reviewer1_then_reviewer2 = profiles.clone();
-        reviewer1_then_reviewer2.reviewers.push(reviewer2.clone());
+        let mut missing_reviewer2 = profiles.clone();
+        missing_reviewer2.reviewers.pop();
         let mut reviewer2_then_reviewer1 = profiles.clone();
-        reviewer2_then_reviewer1.reviewers.insert(0, reviewer2);
-        assert!(reviewer1_then_reviewer2.validate().is_err());
+        reviewer2_then_reviewer1.reviewers.swap(0, 1);
+        assert!(missing_reviewer2.validate().is_err());
         assert!(reviewer2_then_reviewer1.validate().is_err());
         assert_ne!(
-            reviewer1_then_reviewer2.canonical_hash(),
+            profiles.canonical_hash(),
             reviewer2_then_reviewer1.canonical_hash(),
             "runtime reviewer order must be hash-bound"
         );
@@ -1230,18 +1253,15 @@ mod tests {
                     approval_policy: CodexApprovalPolicy::Never,
                 },
             },
-            reviewers: vec![ReviewerInvocationBinding {
-                reviewer_id: ReviewerId::Reviewer1,
-                profile: ReviewerInvocationProfile::Codex {
-                    profile: CodexInvocationProfile {
-                        model: "reviewer-override".into(),
-                        reasoning_effort: "high".into(),
-                        sandbox: CodexSandbox::DangerFullAccess,
-                        approval_policy: CodexApprovalPolicy::Never,
-                    },
-                },
-            }],
             ..SessionInvocationProfiles::default()
+        };
+        *profiles.reviewer1_mut() = ReviewerInvocationProfile::Codex {
+            profile: CodexInvocationProfile {
+                model: "reviewer-override".into(),
+                reasoning_effort: "high".into(),
+                sandbox: CodexSandbox::DangerFullAccess,
+                approval_policy: CodexApprovalPolicy::Never,
+            },
         };
         let resolved = TaskWorkerProfiles::from_session_profiles(&profiles).unwrap();
         assert_eq!(resolved.developer.model, "developer-override");
@@ -1328,24 +1348,17 @@ mod tests {
         claude.validate().unwrap();
         assert_eq!(claude.adapter, CLAUDE_TASK_WORKER_ADAPTER);
         assert_eq!(
-            RuntimeContractIdentity::for_role_providers(
-                RuntimeProvider::CodexExec,
-                RuntimeProvider::CodexExec,
-            ),
-            identity
-        );
-        assert_eq!(
-            RuntimeContractIdentity::for_role_providers(
-                RuntimeProvider::ClaudeExec,
-                RuntimeProvider::ClaudeExec,
-            ),
-            claude
-        );
-        assert_eq!(
-            RuntimeContractIdentity::for_role_providers(
-                RuntimeProvider::CodexExec,
-                RuntimeProvider::ClaudeExec,
-            )
+            RuntimeContractIdentity::for_lane_providers([
+                (WorkerLane::Developer, RuntimeProvider::CodexExec),
+                (
+                    WorkerLane::Reviewer(ReviewerId::Reviewer1),
+                    RuntimeProvider::CodexExec,
+                ),
+                (
+                    WorkerLane::Reviewer(ReviewerId::Reviewer2),
+                    RuntimeProvider::ClaudeExec,
+                ),
+            ])
             .adapter,
             ROLE_ROUTER_TASK_WORKER_ADAPTER
         );

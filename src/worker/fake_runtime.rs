@@ -154,11 +154,6 @@ impl TaskWorkerRuntime for FakeTaskWorkerRuntime {
     ) -> Result<RuntimeTurnKey, RuntimeError> {
         self.require_open()?;
         spec.validate()?;
-        if !self.active.is_empty() {
-            return Err(RuntimeError::invalid_transition(
-                "task runtime already has an active turn",
-            ));
-        }
         let role_session = self
             .sessions
             .get(&session)

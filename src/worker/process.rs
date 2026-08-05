@@ -1007,6 +1007,7 @@ mod tests {
                 run_id: "run-1".into(),
                 task_id: "task-1".into(),
                 role: WorkerRole::Developer,
+                reviewer_id: None,
                 logical_session_id: "session-1".into(),
                 turn_sequence: 1,
                 attempt: 1,

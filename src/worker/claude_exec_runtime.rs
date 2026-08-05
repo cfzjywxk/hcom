@@ -23,6 +23,7 @@ use crate::artifact::{
     ArtifactAttempt, ArtifactKind, ArtifactRoot, ArtifactScope, MAX_NATIVE_ARTIFACT_BYTES,
 };
 use crate::control_api::WorkerRole;
+use crate::worker::profile::ReviewerId;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -49,6 +50,7 @@ pub struct ClaudeExecRuntimeConfig {
     pub artifact_root_path: PathBuf,
     pub run_id: String,
     pub task_id: String,
+    pub reviewer_id: Option<ReviewerId>,
     pub cleanup_registry: GuardianCleanupRegistry,
 }
 
@@ -213,6 +215,8 @@ impl ClaudeExecTaskWorkerRuntime {
             run_id: self.config.run_id.clone(),
             task_id: self.config.task_id.clone(),
             role: session.role,
+            reviewer_id: (session.role == WorkerRole::Reviewer)
+                .then_some(self.config.reviewer_id.unwrap_or(ReviewerId::Reviewer1)),
             logical_session_id: session.label.clone(),
             turn_sequence: session.turn_sequence,
             attempt: attempt_no,

@@ -145,6 +145,7 @@ cat > "$CAPTURE/prompt-$COUNT"
             artifact_root_path: artifacts.clone(),
             run_id: "run-claude-exec".into(),
             task_id: "task-claude-exec".into(),
+            reviewer_id: None,
             cleanup_registry: registry.clone(),
         })
         .unwrap();
@@ -546,6 +547,7 @@ sleep 30
         artifact_root_path: timeout.artifacts.clone(),
         run_id: "run-invalid-proxy".into(),
         task_id: "task-invalid-proxy".into(),
+        reviewer_id: None,
         cleanup_registry: GuardianCleanupRegistry::default(),
     });
     assert!(result.is_err());

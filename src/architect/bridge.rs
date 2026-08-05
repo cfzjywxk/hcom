@@ -931,9 +931,11 @@ mod tests {
         CONTROL_REFUSAL_TRANSPORT, TOOL_REFUSAL_ACTION, TOOL_REFUSAL_ENVELOPE,
     };
     use crate::control_api::{
-        ActionName, ControlAction, ControlErrorCode, ControlResult, ReviewerVerdict,
-        SessionProgressEvent, SessionState, SessionStatusSnapshot, TaskState, TaskStatusSnapshot,
+        ActionName, ControlAction, ControlErrorCode, ControlResult, ReviewerResultSnapshot,
+        ReviewerVerdict, SessionProgressEvent, SessionState, SessionStatusSnapshot, TaskState,
+        TaskStatusSnapshot,
     };
+    use crate::worker::profile::ReviewerId;
     use std::process::{Command, Stdio};
     use std::thread::JoinHandle;
     use std::time::Instant;
@@ -1032,7 +1034,8 @@ mod tests {
             plan_version: None,
             plan_hash: None,
             current_task_ordinal: None,
-            active_worker: None,
+            active_workers: Vec::new(),
+            reviewer_bindings: Vec::new(),
             pending_architect_action: None,
             terminal_detail: None,
             tasks: Vec::new(),
@@ -1050,6 +1053,7 @@ mod tests {
             task_selector: "FBTC-03".into(),
             branch: None,
             review_round: 1,
+            review_generation: 1,
             max_review_rounds: 3,
             clarification_rounds_used: 0,
             max_clarification_rounds: 2,
@@ -1057,11 +1061,18 @@ mod tests {
             base_revision: None,
             head_revision: None,
             developer_session_bound: true,
-            reviewer_session_bound: true,
+            reviewers: [ReviewerId::Reviewer1, ReviewerId::Reviewer2]
+                .into_iter()
+                .map(|reviewer_id| ReviewerResultSnapshot {
+                    reviewer_id,
+                    session_bound: true,
+                    current_generation: Some(1),
+                    current_verdict: Some(ReviewerVerdict::Lgtm),
+                    current_final_message_paths: vec![reviewer_path.to_string_lossy().into_owned()],
+                })
+                .collect(),
             outcome_detail: Some("Reviewer returned LGTM".into()),
             latest_developer_final_path: Some("/artifacts/developer/native-final.partial".into()),
-            final_reviewer_message_paths: vec![reviewer_path.to_string_lossy().into_owned()],
-            reviewer_verdict: Some(ReviewerVerdict::Lgtm),
         }
     }
 
@@ -1257,10 +1268,14 @@ mod tests {
                     completed_tasks: 0,
                     total_tasks: 1,
                     review_round: 1,
+                    review_generation: 1,
                     max_review_rounds: 3,
+                    reviewer_id: ReviewerId::Reviewer1,
                     reviewer_verdict: ReviewerVerdict::RequestChanges,
                     developer_final_path: "/artifacts/developer/final.md".into(),
                     reviewer_final_message_paths: vec!["/artifacts/reviewer/final.md".into()],
+                    responses_received: 1,
+                    responses_expected: 2,
                 },
             },
         );
@@ -1364,12 +1379,16 @@ mod tests {
         );
         let structured = &terminal["result"]["structuredContent"];
         assert_eq!(
-            structured["result"]["session"]["tasks"][0]["final_reviewer_message_paths"],
-            json!([reviewer_path_text])
+            structured["result"]["session"]["tasks"][0]["reviewers"][0]["current_final_message_paths"],
+            json!([reviewer_path_text.clone()])
         );
         assert_eq!(
-            structured["result"]["session"]["tasks"][0]["reviewer_verdict"],
+            structured["result"]["session"]["tasks"][0]["reviewers"][0]["current_verdict"],
             "lgtm"
+        );
+        assert_eq!(
+            structured["result"]["session"]["tasks"][0]["reviewers"][1]["current_final_message_paths"],
+            json!([reviewer_path_text])
         );
         let content_text = terminal["result"]["content"][0]["text"]
             .as_str()

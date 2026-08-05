@@ -9,16 +9,19 @@ use crate::control_api::{
     ActiveWorkerSnapshot, ArchitectActionReason, ClarificationPage, ClarificationRecord,
     MAX_CLARIFICATION_PAGE_RECORDS, MAX_CLARIFICATION_RECORDS_PER_RUN,
     MAX_CLARIFICATION_RECORDS_PER_TASK, MAX_PROGRESS_EVENTS_PER_RUN,
-    PendingArchitectActionSnapshot, SessionProgressEvent, SessionState, SessionStatusSnapshot,
-    TaskCompletionOutcome, TaskDraft, TaskState, TaskStatusSnapshot, WorkerRole,
+    PendingArchitectActionSnapshot, ReviewerBindingSnapshot, ReviewerResultSnapshot,
+    SessionProgressEvent, SessionState, SessionStatusSnapshot, TaskCompletionOutcome, TaskDraft,
+    TaskState, TaskStatusSnapshot, WorkerRole,
 };
+use crate::worker::profile::ReviewerId;
 use crate::worker::runtime::{
     DeveloperOutcomeStatus, ReviewerOutcomeV1, ReviewerVerdict, RuntimeFailureClass,
-    RuntimeOutcome, RuntimeSessionKey, RuntimeTurnKey, RuntimeTurnPurpose, SanitizedRuntimeFailure,
+    RuntimeOutcome, RuntimeProfile, RuntimeSessionKey, RuntimeTurnKey, RuntimeTurnPurpose,
+    SanitizedRuntimeFailure, WorkerLane,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
@@ -84,13 +87,14 @@ pub enum SupervisorEvent {
     RoleSessionOpened {
         expected_version: u64,
         task_ordinal: usize,
-        role: WorkerRole,
+        lane: WorkerLane,
         session: RuntimeSessionKey,
     },
     TurnStarted {
         expected_version: u64,
         task_ordinal: usize,
-        role: WorkerRole,
+        lane: WorkerLane,
+        review_generation: Option<u32>,
         purpose: RuntimeTurnPurpose,
         session: RuntimeSessionKey,
         turn: RuntimeTurnKey,
@@ -99,7 +103,8 @@ pub enum SupervisorEvent {
     TurnCompleted {
         expected_version: u64,
         task_ordinal: usize,
-        role: WorkerRole,
+        lane: WorkerLane,
+        review_generation: Option<u32>,
         session: RuntimeSessionKey,
         turn: RuntimeTurnKey,
         completion_token: String,
@@ -125,7 +130,8 @@ pub enum SupervisorEvent {
     TurnFailed {
         expected_version: u64,
         task_ordinal: usize,
-        role: WorkerRole,
+        lane: WorkerLane,
+        review_generation: Option<u32>,
         session: RuntimeSessionKey,
         turn: RuntimeTurnKey,
         completion_token: String,
@@ -139,7 +145,8 @@ pub enum SupervisorEvent {
     Timeout {
         expected_version: u64,
         task_ordinal: usize,
-        role: WorkerRole,
+        lane: WorkerLane,
+        review_generation: Option<u32>,
         session: RuntimeSessionKey,
         turn: RuntimeTurnKey,
         completion_token: String,
@@ -244,17 +251,18 @@ pub enum SupervisorEffect {
     },
     OpenRoleSession {
         task_ordinal: usize,
-        role: WorkerRole,
+        lane: WorkerLane,
     },
     StartTurn {
         task_ordinal: usize,
-        role: WorkerRole,
+        lane: WorkerLane,
+        review_generation: Option<u32>,
         purpose: RuntimeTurnPurpose,
         session: RuntimeSessionKey,
     },
     InterruptTurn {
         task_ordinal: usize,
-        role: WorkerRole,
+        lane: WorkerLane,
         session: RuntimeSessionKey,
         turn: RuntimeTurnKey,
     },
@@ -393,13 +401,16 @@ pub struct CoreTask {
     pub spec: TaskDraft,
     pub state: TaskState,
     pub review_round: u32,
+    pub review_generation: u32,
     pub clarification_rounds_used: u32,
     pub developer_session: Option<RuntimeSessionKey>,
-    pub reviewer_session: Option<RuntimeSessionKey>,
+    pub reviewer_sessions: BTreeMap<ReviewerId, RuntimeSessionKey>,
     pub outcome_detail: Option<String>,
     latest_developer_final_path: Option<String>,
     latest_reviewer_final_paths: Vec<String>,
-    latest_reviewer_verdict: Option<ReviewerVerdict>,
+    reviewer_results: BTreeMap<ReviewerId, CoreReviewerResult>,
+    historical_reviewer_final_paths: BTreeMap<ReviewerId, Vec<String>>,
+    review_requested_generation: Option<u32>,
     clarification_records: Vec<ClarificationRecord>,
 }
 
@@ -409,13 +420,19 @@ impl CoreTask {
             spec,
             state: TaskState::Pending,
             review_round: 0,
+            review_generation: 0,
             clarification_rounds_used: 0,
             developer_session: None,
-            reviewer_session: None,
+            reviewer_sessions: BTreeMap::new(),
             outcome_detail: None,
             latest_developer_final_path: None,
             latest_reviewer_final_paths: Vec::new(),
-            latest_reviewer_verdict: None,
+            reviewer_results: BTreeMap::new(),
+            historical_reviewer_final_paths: reviewer_ids()
+                .into_iter()
+                .map(|reviewer_id| (reviewer_id, Vec::new()))
+                .collect(),
+            review_requested_generation: None,
             clarification_records: Vec::new(),
         }
     }
@@ -428,21 +445,36 @@ impl CoreTask {
         &self.latest_reviewer_final_paths
     }
 
+    pub fn reviewer_final_paths(&self, reviewer_id: ReviewerId) -> &[String] {
+        self.reviewer_results
+            .get(&reviewer_id)
+            .map(|result| result.final_message_paths.as_slice())
+            .unwrap_or_default()
+    }
+
     pub fn clarification_records(&self) -> &[ClarificationRecord] {
         &self.clarification_records
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct CoreReviewerResult {
+    generation: u32,
+    verdict: ReviewerVerdict,
+    final_message_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ExpectedSessionOpen {
     task_ordinal: usize,
-    role: WorkerRole,
+    lane: WorkerLane,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExpectedTurnStart {
     task_ordinal: usize,
-    role: WorkerRole,
+    lane: WorkerLane,
+    review_generation: Option<u32>,
     purpose: RuntimeTurnPurpose,
     session: RuntimeSessionKey,
 }
@@ -450,7 +482,8 @@ struct ExpectedTurnStart {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CoreActiveTurn {
     task_ordinal: usize,
-    role: WorkerRole,
+    lane: WorkerLane,
+    review_generation: Option<u32>,
     purpose: RuntimeTurnPurpose,
     session: RuntimeSessionKey,
     turn: RuntimeTurnKey,
@@ -462,6 +495,7 @@ pub struct SupervisorCore {
     run_id: String,
     project_root: PathBuf,
     profile_hash: String,
+    reviewer_bindings: Vec<ReviewerBindingSnapshot>,
     session_state: SessionState,
     version: u64,
     next_plan_version: u64,
@@ -473,9 +507,9 @@ pub struct SupervisorCore {
     pending_architect_action: Option<PendingArchitectActionSnapshot>,
     pending_runtime_open: Option<usize>,
     runtime_open: Option<usize>,
-    pending_session_open: Option<ExpectedSessionOpen>,
-    pending_turn_start: Option<ExpectedTurnStart>,
-    active_turn: Option<CoreActiveTurn>,
+    pending_session_opens: BTreeMap<WorkerLane, ExpectedSessionOpen>,
+    pending_turn_starts: BTreeMap<WorkerLane, ExpectedTurnStart>,
+    active_turns: BTreeMap<WorkerLane, CoreActiveTurn>,
     used_sessions: BTreeSet<RuntimeSessionKey>,
     used_turns: BTreeSet<RuntimeTurnKey>,
     accepted_completion_tokens: BTreeSet<String>,
@@ -488,13 +522,28 @@ impl SupervisorCore {
         project_root: PathBuf,
         profile_hash: String,
     ) -> Result<Self, SupervisorError> {
-        Self::new_at_version(run_id, project_root, profile_hash, 0)
+        Self::new_with_reviewer_bindings(
+            run_id,
+            project_root,
+            profile_hash,
+            default_reviewer_bindings(),
+        )
+    }
+
+    pub fn new_with_reviewer_bindings(
+        run_id: String,
+        project_root: PathBuf,
+        profile_hash: String,
+        reviewer_bindings: Vec<ReviewerBindingSnapshot>,
+    ) -> Result<Self, SupervisorError> {
+        Self::new_at_version(run_id, project_root, profile_hash, reviewer_bindings, 0)
     }
 
     fn new_at_version(
         run_id: String,
         project_root: PathBuf,
         profile_hash: String,
+        reviewer_bindings: Vec<ReviewerBindingSnapshot>,
         version: u64,
     ) -> Result<Self, SupervisorError> {
         validate_identifier("run id", &run_id)?;
@@ -507,6 +556,7 @@ impl SupervisorCore {
             run_id,
             project_root,
             profile_hash,
+            reviewer_bindings,
             session_state: SessionState::AwaitingPlan,
             version,
             next_plan_version: 1,
@@ -518,9 +568,9 @@ impl SupervisorCore {
             pending_architect_action: None,
             pending_runtime_open: None,
             runtime_open: None,
-            pending_session_open: None,
-            pending_turn_start: None,
-            active_turn: None,
+            pending_session_opens: BTreeMap::new(),
+            pending_turn_starts: BTreeMap::new(),
+            active_turns: BTreeMap::new(),
             used_sessions: BTreeSet::new(),
             used_turns: BTreeSet::new(),
             accepted_completion_tokens: BTreeSet::new(),
@@ -551,6 +601,7 @@ impl SupervisorCore {
             run_id,
             self.project_root.clone(),
             self.profile_hash.clone(),
+            self.reviewer_bindings.clone(),
             version,
         )
     }
@@ -619,15 +670,18 @@ impl SupervisorCore {
             current_task_ordinal: self
                 .current_task
                 .and_then(|index| u32::try_from(index).ok()),
-            active_worker: self
-                .active_turn
-                .as_ref()
+            active_workers: self
+                .active_turns
+                .values()
                 .map(|active| ActiveWorkerSnapshot {
                     task_ordinal: u32::try_from(active.task_ordinal).unwrap_or(u32::MAX),
                     task_key: self.tasks[active.task_ordinal].spec.task_key.clone(),
-                    role: active.role,
+                    worker_lane: active.lane,
+                    reviewer_id: active.lane.reviewer_id(),
                     purpose: active.purpose.as_str().into(),
-                }),
+                })
+                .collect(),
+            reviewer_bindings: self.reviewer_bindings.clone(),
             pending_architect_action: self.pending_architect_action.clone(),
             terminal_detail: self.terminal_detail.clone(),
             tasks: self
@@ -644,6 +698,7 @@ impl SupervisorCore {
                     task_selector: task.spec.task_selector.clone(),
                     branch: None,
                     review_round: task.review_round,
+                    review_generation: task.review_generation,
                     max_review_rounds: task.spec.max_review_rounds,
                     clarification_rounds_used: task.clarification_rounds_used,
                     max_clarification_rounds: task.spec.max_clarification_rounds,
@@ -652,11 +707,23 @@ impl SupervisorCore {
                     base_revision: None,
                     head_revision: None,
                     developer_session_bound: task.developer_session.is_some(),
-                    reviewer_session_bound: task.reviewer_session.is_some(),
+                    reviewers: reviewer_ids()
+                        .into_iter()
+                        .map(|reviewer_id| {
+                            let result = task.reviewer_results.get(&reviewer_id);
+                            ReviewerResultSnapshot {
+                                reviewer_id,
+                                session_bound: task.reviewer_sessions.contains_key(&reviewer_id),
+                                current_generation: result.map(|result| result.generation),
+                                current_verdict: result.map(|result| result.verdict),
+                                current_final_message_paths: result
+                                    .map(|result| result.final_message_paths.clone())
+                                    .unwrap_or_default(),
+                            }
+                        })
+                        .collect(),
                     outcome_detail: task.outcome_detail.clone(),
                     latest_developer_final_path: task.latest_developer_final_path.clone(),
-                    final_reviewer_message_paths: task.latest_reviewer_final_paths.clone(),
-                    reviewer_verdict: task.latest_reviewer_verdict,
                 })
                 .collect(),
         }
@@ -808,22 +875,32 @@ impl SupervisorCore {
             }
             SupervisorEvent::RoleSessionOpened {
                 task_ordinal,
-                role,
+                lane,
                 session,
                 ..
-            } => self.role_session_opened(task_ordinal, role, session),
+            } => self.role_session_opened(task_ordinal, lane, session),
             SupervisorEvent::TurnStarted {
                 task_ordinal,
-                role,
+                lane,
+                review_generation,
                 purpose,
                 session,
                 turn,
                 completion_token,
                 ..
-            } => self.turn_started(task_ordinal, role, purpose, session, turn, completion_token),
+            } => self.turn_started(
+                task_ordinal,
+                lane,
+                review_generation,
+                purpose,
+                session,
+                turn,
+                completion_token,
+            ),
             SupervisorEvent::TurnCompleted {
                 task_ordinal,
-                role,
+                lane,
+                review_generation,
                 session,
                 turn,
                 completion_token,
@@ -832,7 +909,8 @@ impl SupervisorCore {
                 ..
             } => self.turn_completed(
                 task_ordinal,
-                role,
+                lane,
+                review_generation,
                 session,
                 turn,
                 &completion_token,
@@ -869,7 +947,8 @@ impl SupervisorCore {
             ),
             SupervisorEvent::TurnFailed {
                 task_ordinal,
-                role,
+                lane,
+                review_generation,
                 session,
                 turn,
                 completion_token,
@@ -877,7 +956,8 @@ impl SupervisorCore {
                 ..
             } => self.turn_failed(
                 task_ordinal,
-                role,
+                lane,
+                review_generation,
                 session,
                 turn,
                 &completion_token,
@@ -890,12 +970,20 @@ impl SupervisorCore {
             } => self.driver_failed(task_ordinal, failure),
             SupervisorEvent::Timeout {
                 task_ordinal,
-                role,
+                lane,
+                review_generation,
                 session,
                 turn,
                 completion_token,
                 ..
-            } => self.timeout(task_ordinal, role, session, turn, &completion_token),
+            } => self.timeout(
+                task_ordinal,
+                lane,
+                review_generation,
+                session,
+                turn,
+                &completion_token,
+            ),
             SupervisorEvent::CancelRequested { reason, .. } => self.cancel(&reason),
             SupervisorEvent::ParentStopping { .. } => self.parent_stopping(),
             SupervisorEvent::StatusRequested => unreachable!("handled before mutation"),
@@ -1030,22 +1118,22 @@ impl SupervisorCore {
         self.pending_runtime_open = None;
         self.runtime_open = Some(task_ordinal);
         self.tasks[task_ordinal].state = TaskState::Developing;
-        self.schedule_session_open(task_ordinal, WorkerRole::Developer)
+        self.schedule_session_open(task_ordinal, WorkerLane::Developer)
     }
 
     fn role_session_opened(
         &mut self,
         task_ordinal: usize,
-        role: WorkerRole,
+        lane: WorkerLane,
         session: RuntimeSessionKey,
     ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
         self.require_running_task(task_ordinal)?;
-        let expected = self.pending_session_open.as_ref().ok_or_else(|| {
+        let expected = self.pending_session_opens.get(&lane).ok_or_else(|| {
             SupervisorError::invalid_transition("role session opened without a pending effect")
         })?;
-        if expected.task_ordinal != task_ordinal || expected.role != role {
+        if expected.task_ordinal != task_ordinal || expected.lane != lane {
             return Err(SupervisorError::invalid_identity(
-                "role session open does not match the expected task and role",
+                "role session open does not match the expected task and lane",
             ));
         }
         if self.runtime_open != Some(task_ordinal) {
@@ -1058,33 +1146,42 @@ impl SupervisorCore {
                 "logical runtime session key was reused",
             ));
         }
-        let slot = match role {
-            WorkerRole::Developer => &mut self.tasks[task_ordinal].developer_session,
-            WorkerRole::Reviewer => &mut self.tasks[task_ordinal].reviewer_session,
-        };
-        if slot.is_some() {
-            return Err(SupervisorError::invalid_transition(
-                "role already owns a logical runtime session",
-            ));
-        }
-        *slot = Some(session);
-        self.used_sessions.insert(session);
-        self.pending_session_open = None;
-        let purpose = match role {
-            WorkerRole::Developer => RuntimeTurnPurpose::InitialDevelopment,
-            WorkerRole::Reviewer if self.tasks[task_ordinal].review_round == 0 => {
-                RuntimeTurnPurpose::InitialReview
+        match lane {
+            WorkerLane::Developer => {
+                let slot = &mut self.tasks[task_ordinal].developer_session;
+                if slot.replace(session).is_some() {
+                    return Err(SupervisorError::invalid_transition(
+                        "Developer already owns a logical runtime session",
+                    ));
+                }
             }
-            WorkerRole::Reviewer => RuntimeTurnPurpose::ReviewerRereview,
+            WorkerLane::Reviewer(reviewer_id) => {
+                if self.tasks[task_ordinal]
+                    .reviewer_sessions
+                    .insert(reviewer_id, session)
+                    .is_some()
+                {
+                    return Err(SupervisorError::invalid_transition(
+                        "Reviewer lane already owns a logical runtime session",
+                    ));
+                }
+            }
+        }
+        self.used_sessions.insert(session);
+        self.pending_session_opens.remove(&lane);
+        let purpose = match lane {
+            WorkerLane::Developer => RuntimeTurnPurpose::InitialDevelopment,
+            WorkerLane::Reviewer(_) => RuntimeTurnPurpose::InitialReview,
         };
-        self.schedule_turn(task_ordinal, role, purpose, session)
+        self.schedule_turn(task_ordinal, lane, purpose, session)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn turn_started(
         &mut self,
         task_ordinal: usize,
-        role: WorkerRole,
+        lane: WorkerLane,
+        review_generation: Option<u32>,
         purpose: RuntimeTurnPurpose,
         session: RuntimeSessionKey,
         turn: RuntimeTurnKey,
@@ -1096,21 +1193,22 @@ impl SupervisorCore {
             &completion_token,
             MAX_COMPLETION_TOKEN_BYTES,
         )?;
-        let expected = self.pending_turn_start.as_ref().ok_or_else(|| {
+        let expected = self.pending_turn_starts.get(&lane).ok_or_else(|| {
             SupervisorError::invalid_transition("turn started without a pending start effect")
         })?;
         if expected.task_ordinal != task_ordinal
-            || expected.role != role
+            || expected.lane != lane
+            || expected.review_generation != review_generation
             || expected.purpose != purpose
             || expected.session != session
         {
             return Err(SupervisorError::invalid_identity(
-                "turn start does not match its exact task, role, purpose, and session",
+                "turn start does not match its exact task, lane, generation, purpose, and session",
             ));
         }
-        if purpose.role() != role || self.session_for(task_ordinal, role) != Some(session) {
+        if purpose.role() != lane.role() || self.session_for(task_ordinal, lane) != Some(session) {
             return Err(SupervisorError::invalid_identity(
-                "turn purpose or logical session does not match the role",
+                "turn purpose or logical session does not match the lane",
             ));
         }
         if self.used_turns.contains(&turn) {
@@ -1123,21 +1221,41 @@ impl SupervisorCore {
                 "completion token was already accepted",
             ));
         }
-        if self.active_turn.is_some() {
+        if self.active_turns.contains_key(&lane)
+            || (lane == WorkerLane::Developer && !self.active_turns.is_empty())
+            || (lane.role() == WorkerRole::Reviewer
+                && self.active_turns.contains_key(&WorkerLane::Developer))
+        {
             return Err(SupervisorError::invalid_transition(
-                "a second active turn is forbidden",
+                "worker lane conflicts with an active turn",
             ));
         }
-        self.pending_turn_start = None;
+        self.pending_turn_starts.remove(&lane);
         self.used_turns.insert(turn);
-        self.active_turn = Some(CoreActiveTurn {
-            task_ordinal,
-            role,
-            purpose,
-            session,
-            turn,
-            completion_token,
-        });
+        self.active_turns.insert(
+            lane,
+            CoreActiveTurn {
+                task_ordinal,
+                lane,
+                review_generation,
+                purpose,
+                session,
+                turn,
+                completion_token,
+            },
+        );
+        if lane.role() == WorkerRole::Reviewer
+            && reviewer_ids().into_iter().all(|reviewer_id| {
+                self.active_turns
+                    .contains_key(&WorkerLane::Reviewer(reviewer_id))
+            })
+            && self.tasks[task_ordinal].review_requested_generation
+                != Some(self.tasks[task_ordinal].review_generation)
+        {
+            self.tasks[task_ordinal].review_requested_generation =
+                Some(self.tasks[task_ordinal].review_generation);
+            self.push_review_requested(task_ordinal)?;
+        }
         Ok(Vec::new())
     }
 
@@ -1145,7 +1263,8 @@ impl SupervisorCore {
     fn turn_completed(
         &mut self,
         task_ordinal: usize,
-        role: WorkerRole,
+        lane: WorkerLane,
+        review_generation: Option<u32>,
         session: RuntimeSessionKey,
         turn: RuntimeTurnKey,
         completion_token: &str,
@@ -1153,12 +1272,18 @@ impl SupervisorCore {
         final_message_path: PathBuf,
     ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
         self.require_running_task(task_ordinal)?;
-        let active =
-            self.take_matching_active(task_ordinal, role, session, turn, completion_token)?;
+        let active = self.take_matching_active(
+            task_ordinal,
+            lane,
+            review_generation,
+            session,
+            turn,
+            completion_token,
+        )?;
         outcome
             .validate()
             .map_err(|_| SupervisorError::invalid_event("typed runtime outcome is invalid"))?;
-        if outcome.role() != role {
+        if outcome.role() != lane.role() {
             return Err(SupervisorError::invalid_event(
                 "typed runtime outcome role does not match the active turn",
             ));
@@ -1178,19 +1303,18 @@ impl SupervisorCore {
                 // The developer's exit routes straight to review. The
                 // supervisor inspects nothing about the work itself.
                 DeveloperOutcomeStatus::Ready => {
+                    if lane != WorkerLane::Developer {
+                        return Err(SupervisorError::invalid_identity(
+                            "Developer outcome arrived on a Reviewer lane",
+                        ));
+                    }
                     if self.tasks[task_ordinal].state != TaskState::Developing {
                         return Err(SupervisorError::invalid_transition(
                             "developer completion requires a developing task",
                         ));
                     }
-                    let task = &mut self.tasks[task_ordinal];
-                    task.latest_developer_final_path = Some(final_message_path);
-                    task.state = TaskState::Reviewing;
-                    task.outcome_detail =
-                        Some("developer turn completed; routing to review".into());
-                    let effects = self.start_reviewer(task_ordinal)?;
-                    self.push_review_requested(task_ordinal)?;
-                    Ok(effects)
+                    self.begin_review_generation(task_ordinal, final_message_path)?;
+                    self.start_reviewers(task_ordinal)
                 }
                 DeveloperOutcomeStatus::ClarificationRequired => self.await_architect_action(
                     task_ordinal,
@@ -1204,9 +1328,24 @@ impl SupervisorCore {
                 ),
             },
             RuntimeOutcome::Reviewer(reviewer) => {
-                let effects =
-                    self.handle_reviewer_verdict(task_ordinal, reviewer, final_message_path)?;
-                self.push_review_responded(task_ordinal)?;
+                let reviewer_id = lane.reviewer_id().ok_or_else(|| {
+                    SupervisorError::invalid_identity(
+                        "Reviewer outcome arrived on the Developer lane",
+                    )
+                })?;
+                let generation = review_generation.ok_or_else(|| {
+                    SupervisorError::invalid_identity(
+                        "Reviewer completion omitted its review generation",
+                    )
+                })?;
+                let effects = self.handle_reviewer_verdict(
+                    task_ordinal,
+                    reviewer_id,
+                    generation,
+                    reviewer,
+                    final_message_path,
+                )?;
+                self.push_review_responded(task_ordinal, reviewer_id)?;
                 if matches!(
                     self.tasks[task_ordinal].state,
                     TaskState::Lgtm | TaskState::ReviewExhausted
@@ -1375,7 +1514,7 @@ impl SupervisorCore {
             .ok_or_else(|| SupervisorError::invariant("developer session disappeared"))?;
         self.schedule_turn(
             task_ordinal,
-            WorkerRole::Developer,
+            WorkerLane::Developer,
             RuntimeTurnPurpose::DeveloperClarificationResume,
             session,
         )
@@ -1442,7 +1581,8 @@ impl SupervisorCore {
     fn turn_failed(
         &mut self,
         task_ordinal: usize,
-        role: WorkerRole,
+        lane: WorkerLane,
+        review_generation: Option<u32>,
         session: RuntimeSessionKey,
         turn: RuntimeTurnKey,
         completion_token: &str,
@@ -1454,8 +1594,14 @@ impl SupervisorCore {
             &failure.detail,
             MAX_CORE_DIAGNOSTIC_BYTES,
         )?;
-        let active =
-            self.take_matching_active(task_ordinal, role, session, turn, completion_token)?;
+        let active = self.take_matching_active(
+            task_ordinal,
+            lane,
+            review_generation,
+            session,
+            turn,
+            completion_token,
+        )?;
         self.accepted_completion_tokens
             .insert(active.completion_token);
 
@@ -1495,7 +1641,8 @@ impl SupervisorCore {
             format!("{label}: {}", failure.detail)
         };
         truncate_utf8(&mut detail, MAX_CORE_DIAGNOSTIC_BYTES);
-        self.terminalize_current(session_state, task_state, &detail, Vec::new())
+        let peer_interrupts = self.interrupt_active_effects();
+        self.terminalize_current(session_state, task_state, &detail, peer_interrupts)
     }
 
     fn driver_failed(
@@ -1528,33 +1675,42 @@ impl SupervisorCore {
     fn timeout(
         &mut self,
         task_ordinal: usize,
-        role: WorkerRole,
+        lane: WorkerLane,
+        review_generation: Option<u32>,
         session: RuntimeSessionKey,
         turn: RuntimeTurnKey,
         completion_token: &str,
     ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
         self.require_running_task(task_ordinal)?;
-        let active =
-            self.take_matching_active(task_ordinal, role, session, turn, completion_token)?;
+        let active = self.take_matching_active(
+            task_ordinal,
+            lane,
+            review_generation,
+            session,
+            turn,
+            completion_token,
+        )?;
         self.accepted_completion_tokens
             .insert(active.completion_token);
         let interrupt = SupervisorEffect::InterruptTurn {
             task_ordinal,
-            role,
+            lane,
             session,
             turn,
         };
+        let mut interrupts = vec![interrupt];
+        interrupts.extend(self.interrupt_active_effects());
         self.terminalize_current(
             SessionState::NeedsHuman,
             TaskState::NeedsHuman,
             "worker turn timed out",
-            vec![interrupt],
+            interrupts,
         )
     }
 
     fn cancel(&mut self, reason: &str) -> Result<Vec<SupervisorEffect>, SupervisorError> {
         validate_single_line("cancel reason", reason, 4096)?;
-        let effects = self.interrupt_active_effect();
+        let effects = self.interrupt_active_effects();
         self.terminalize_current(
             SessionState::Canceled,
             TaskState::Canceled,
@@ -1564,7 +1720,7 @@ impl SupervisorCore {
     }
 
     fn parent_stopping(&mut self) -> Result<Vec<SupervisorEffect>, SupervisorError> {
-        let effects = self.interrupt_active_effect();
+        let effects = self.interrupt_active_effects();
         self.terminalize_current(
             SessionState::Canceled,
             TaskState::Canceled,
@@ -1573,103 +1729,178 @@ impl SupervisorCore {
         )
     }
 
-    /// Start (or resume) the reviewer for a task already in review.
-    ///
-    /// Deliberately takes no Git observation: the diff base and head were
-    /// captured at task start and developer completion, which is everything
-    /// routing needs. Re-inspecting the repository here would reintroduce a
-    /// quality gate — whether the tree drifted is the reviewer's and the
-    /// human's call.
-    fn start_reviewer(
+    fn begin_review_generation(
+        &mut self,
+        task_ordinal: usize,
+        developer_final_path: String,
+    ) -> Result<(), SupervisorError> {
+        let task = &mut self.tasks[task_ordinal];
+        if task.review_round >= u32::from(task.spec.max_review_rounds) {
+            return Err(SupervisorError::invariant(
+                "Developer READY cannot allocate a review generation beyond the task maximum",
+            ));
+        }
+        task.review_generation = task
+            .review_round
+            .checked_add(1)
+            .ok_or_else(|| SupervisorError::overflow("review generation overflow"))?;
+        for reviewer_id in reviewer_ids() {
+            if let Some(result) = task.reviewer_results.remove(&reviewer_id) {
+                task.historical_reviewer_final_paths
+                    .get_mut(&reviewer_id)
+                    .expect("CoreTask initializes both Reviewer history lanes")
+                    .extend(result.final_message_paths);
+            }
+        }
+        task.latest_reviewer_final_paths.clear();
+        task.review_requested_generation = None;
+        task.latest_developer_final_path = Some(developer_final_path);
+        task.state = TaskState::Reviewing;
+        task.outcome_detail = Some("Developer completed; routing to concurrent dual review".into());
+        Ok(())
+    }
+
+    /// Atomically schedule both fixed Reviewer lanes for one generation.
+    fn start_reviewers(
         &mut self,
         task_ordinal: usize,
     ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
-        let task = &mut self.tasks[task_ordinal];
-        if let Some(session) = task.reviewer_session {
-            let purpose = if task.review_round == 0 {
-                RuntimeTurnPurpose::InitialReview
+        let rereview = self.tasks[task_ordinal].review_round > 0;
+        let mut effects = Vec::with_capacity(2);
+        for reviewer_id in reviewer_ids() {
+            let lane = WorkerLane::Reviewer(reviewer_id);
+            if let Some(session) = self.tasks[task_ordinal]
+                .reviewer_sessions
+                .get(&reviewer_id)
+                .copied()
+            {
+                effects.extend(self.schedule_turn(
+                    task_ordinal,
+                    lane,
+                    if rereview {
+                        RuntimeTurnPurpose::ReviewerRereview
+                    } else {
+                        RuntimeTurnPurpose::InitialReview
+                    },
+                    session,
+                )?);
             } else {
-                RuntimeTurnPurpose::ReviewerRereview
-            };
-            self.schedule_turn(task_ordinal, WorkerRole::Reviewer, purpose, session)
-        } else {
-            self.schedule_session_open(task_ordinal, WorkerRole::Reviewer)
+                effects.extend(self.schedule_session_open(task_ordinal, lane)?);
+            }
         }
+        Ok(effects)
     }
 
     fn handle_reviewer_verdict(
         &mut self,
         task_ordinal: usize,
+        reviewer_id: ReviewerId,
+        generation: u32,
         outcome: ReviewerOutcomeV1,
         final_message_path: String,
     ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
-        if self.tasks[task_ordinal].state != TaskState::Reviewing {
+        let task = &self.tasks[task_ordinal];
+        if task.state != TaskState::Reviewing {
             return Err(SupervisorError::invalid_transition(
                 "a reviewer verdict requires a reviewing task",
             ));
         }
-        let next_round = self.tasks[task_ordinal]
-            .review_round
-            .checked_add(1)
-            .ok_or_else(|| SupervisorError::overflow("review round overflow"))?;
-        if next_round > u32::from(self.tasks[task_ordinal].spec.max_review_rounds) {
+        if generation != task.review_generation
+            || generation
+                != task
+                    .review_round
+                    .checked_add(1)
+                    .ok_or_else(|| SupervisorError::overflow("review generation overflow"))?
+        {
+            return Err(SupervisorError::invalid_identity(
+                "Reviewer completion generation is stale or future",
+            ));
+        }
+        if task.reviewer_results.contains_key(&reviewer_id) {
+            return Err(SupervisorError::duplicate(
+                "Reviewer already completed the current generation",
+            ));
+        }
+        let mut paths = Vec::with_capacity(
+            outcome
+                .preceding_final_message_paths
+                .len()
+                .saturating_add(1),
+        );
+        for path in &outcome.preceding_final_message_paths {
+            let path = path.to_str().ok_or_else(|| {
+                SupervisorError::invalid_event(
+                    "preceding reviewer final message path must be UTF-8",
+                )
+            })?;
+            validate_absolute_path("preceding reviewer final message path", path)?;
+            paths.push(path.to_owned());
+        }
+        paths.push(final_message_path);
+        self.tasks[task_ordinal].reviewer_results.insert(
+            reviewer_id,
+            CoreReviewerResult {
+                generation,
+                verdict: outcome.verdict,
+                final_message_paths: paths,
+            },
+        );
+        if self.tasks[task_ordinal].reviewer_results.len() < reviewer_ids().len() {
+            return Ok(Vec::new());
+        }
+        if reviewer_ids().into_iter().any(|id| {
+            self.tasks[task_ordinal]
+                .reviewer_results
+                .get(&id)
+                .is_none_or(|result| result.generation != generation)
+        }) {
             return Err(SupervisorError::invariant(
-                "review round exceeded the task maximum",
+                "joined Reviewer results do not share the current generation",
             ));
         }
         {
             let task = &mut self.tasks[task_ordinal];
-            task.review_round = next_round;
-            let mut paths = Vec::with_capacity(
-                outcome
-                    .preceding_final_message_paths
-                    .len()
-                    .saturating_add(1),
-            );
-            for path in &outcome.preceding_final_message_paths {
-                let path = path.to_str().ok_or_else(|| {
-                    SupervisorError::invalid_event(
-                        "preceding reviewer final message path must be UTF-8",
-                    )
-                })?;
-                validate_absolute_path("preceding reviewer final message path", path)?;
-                paths.push(path.to_owned());
-            }
-            paths.push(final_message_path);
-            task.latest_reviewer_final_paths = paths;
-            task.latest_reviewer_verdict = Some(outcome.verdict);
+            task.review_round = generation;
+            task.latest_reviewer_final_paths = reviewer_ids()
+                .into_iter()
+                .flat_map(|id| {
+                    task.reviewer_results
+                        .get(&id)
+                        .expect("joined Reviewer result exists")
+                        .final_message_paths
+                        .clone()
+                })
+                .collect();
         }
-
-        match outcome.verdict {
-            ReviewerVerdict::Lgtm => {
-                let task = &mut self.tasks[task_ordinal];
-                task.state = TaskState::Lgtm;
-                task.outcome_detail = Some("Reviewer returned LGTM".into());
-                self.complete_current_task(task_ordinal)
-            }
-            ReviewerVerdict::RequestChanges
-                if next_round >= u32::from(self.tasks[task_ordinal].spec.max_review_rounds) =>
-            {
-                let task = &mut self.tasks[task_ordinal];
-                task.state = TaskState::ReviewExhausted;
-                task.outcome_detail =
-                    Some("maximum review rounds exhausted; advancing by policy".into());
-                self.complete_current_task(task_ordinal)
-            }
-            ReviewerVerdict::RequestChanges => {
-                let session = self.tasks[task_ordinal]
-                    .developer_session
-                    .ok_or_else(|| SupervisorError::invariant("developer session disappeared"))?;
-                let task = &mut self.tasks[task_ordinal];
-                task.state = TaskState::Developing;
-                task.outcome_detail = Some("Reviewer requested changes".into());
-                self.schedule_turn(
-                    task_ordinal,
-                    WorkerRole::Developer,
-                    RuntimeTurnPurpose::DeveloperCorrection,
-                    session,
-                )
-            }
+        let all_lgtm = reviewer_ids().into_iter().all(|id| {
+            self.tasks[task_ordinal].reviewer_results[&id].verdict == ReviewerVerdict::Lgtm
+        });
+        if all_lgtm {
+            let task = &mut self.tasks[task_ordinal];
+            task.state = TaskState::Lgtm;
+            task.outcome_detail =
+                Some("same-generation Reviewer1 and Reviewer2 returned LGTM".into());
+            self.complete_current_task(task_ordinal)
+        } else if generation >= u32::from(self.tasks[task_ordinal].spec.max_review_rounds) {
+            let task = &mut self.tasks[task_ordinal];
+            task.state = TaskState::ReviewExhausted;
+            task.outcome_detail = Some(
+                "maximum synchronized review generations exhausted; advancing by policy".into(),
+            );
+            self.complete_current_task(task_ordinal)
+        } else {
+            let session = self.tasks[task_ordinal]
+                .developer_session
+                .ok_or_else(|| SupervisorError::invariant("developer session disappeared"))?;
+            let task = &mut self.tasks[task_ordinal];
+            task.state = TaskState::Developing;
+            task.outcome_detail = Some("at least one Reviewer requested changes".into());
+            self.schedule_turn(
+                task_ordinal,
+                WorkerLane::Developer,
+                RuntimeTurnPurpose::DeveloperCorrection,
+                session,
+            )
         }
     }
 
@@ -1683,9 +1914,9 @@ impl SupervisorCore {
             ));
         }
         self.runtime_open = None;
-        self.pending_session_open = None;
-        self.pending_turn_start = None;
-        self.active_turn = None;
+        self.pending_session_opens.clear();
+        self.pending_turn_starts.clear();
+        self.active_turns.clear();
 
         let mut effects = vec![SupervisorEffect::CloseTaskRuntime { task_ordinal }];
         if task_ordinal + 1 < self.tasks.len() {
@@ -1745,10 +1976,6 @@ impl SupervisorCore {
             .tasks
             .get(task_ordinal)
             .ok_or_else(|| SupervisorError::invariant("review-request progress task is missing"))?;
-        let review_round = task
-            .review_round
-            .checked_add(1)
-            .ok_or_else(|| SupervisorError::overflow("review request round overflow"))?;
         let developer_final_path = task.latest_developer_final_path.clone().ok_or_else(|| {
             SupervisorError::invariant("review-request progress lacks a Developer final path")
         })?;
@@ -1763,18 +1990,24 @@ impl SupervisorCore {
                 task_key: task.spec.task_key.clone(),
                 completed_tasks,
                 total_tasks,
-                review_round,
+                review_round: task.review_round,
+                review_generation: task.review_generation,
                 max_review_rounds: task.spec.max_review_rounds,
                 developer_final_path,
                 task_document_path: task.spec.task_document_path.clone(),
                 design_document_paths: task.spec.design_document_paths.clone(),
                 task_selector: task.spec.task_selector.clone(),
                 clarification_record_count,
+                reviewer_bindings: self.reviewer_bindings.clone(),
             });
         Ok(())
     }
 
-    fn push_review_responded(&mut self, task_ordinal: usize) -> Result<(), SupervisorError> {
+    fn push_review_responded(
+        &mut self,
+        task_ordinal: usize,
+        reviewer_id: ReviewerId,
+    ) -> Result<(), SupervisorError> {
         let sequence = self.next_progress_sequence()?;
         let (completed_tasks, total_tasks) = self.progress_task_counts()?;
         let task_ordinal_value = self.progress_task_ordinal(task_ordinal)?;
@@ -1784,10 +2017,10 @@ impl SupervisorCore {
         let developer_final_path = task.latest_developer_final_path.clone().ok_or_else(|| {
             SupervisorError::invariant("review-response progress lacks a Developer final path")
         })?;
-        let reviewer_verdict = task.latest_reviewer_verdict.ok_or_else(|| {
+        let result = task.reviewer_results.get(&reviewer_id).ok_or_else(|| {
             SupervisorError::invariant("review-response progress lacks a Reviewer verdict")
         })?;
-        if task.latest_reviewer_final_paths.is_empty() {
+        if result.final_message_paths.is_empty() {
             return Err(SupervisorError::invariant(
                 "review-response progress lacks a Reviewer final path",
             ));
@@ -1800,10 +2033,15 @@ impl SupervisorCore {
                 completed_tasks,
                 total_tasks,
                 review_round: task.review_round,
+                review_generation: task.review_generation,
                 max_review_rounds: task.spec.max_review_rounds,
-                reviewer_verdict,
+                reviewer_id,
+                reviewer_verdict: result.verdict,
                 developer_final_path,
-                reviewer_final_message_paths: task.latest_reviewer_final_paths.clone(),
+                reviewer_final_message_paths: result.final_message_paths.clone(),
+                responses_received: u8::try_from(task.reviewer_results.len())
+                    .map_err(|_| SupervisorError::overflow("Reviewer response count overflow"))?,
+                responses_expected: 2,
             });
         Ok(())
     }
@@ -1828,12 +2066,9 @@ impl SupervisorCore {
         let developer_final_path = task.latest_developer_final_path.clone().ok_or_else(|| {
             SupervisorError::invariant("completed progress lacks a Developer final path")
         })?;
-        let reviewer_verdict = task.latest_reviewer_verdict.ok_or_else(|| {
-            SupervisorError::invariant("completed progress lacks a Reviewer verdict")
-        })?;
-        if task.latest_reviewer_final_paths.is_empty() {
+        if task.reviewer_results.len() != 2 {
             return Err(SupervisorError::invariant(
-                "completed progress lacks a Reviewer final path",
+                "completed progress lacks two Reviewer results",
             ));
         }
         self.progress_events
@@ -1844,11 +2079,11 @@ impl SupervisorCore {
                 completed_tasks,
                 total_tasks,
                 review_round: task.review_round,
+                review_generation: task.review_generation,
                 max_review_rounds: task.spec.max_review_rounds,
                 outcome,
-                reviewer_verdict,
                 developer_final_path,
-                reviewer_final_message_paths: task.latest_reviewer_final_paths.clone(),
+                reviewers: reviewer_result_snapshots(task),
             });
         Ok(())
     }
@@ -1856,38 +2091,47 @@ impl SupervisorCore {
     fn schedule_session_open(
         &mut self,
         task_ordinal: usize,
-        role: WorkerRole,
+        lane: WorkerLane,
     ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
-        self.require_no_pending_operation()?;
-        self.pending_session_open = Some(ExpectedSessionOpen { task_ordinal, role });
+        self.require_lane_available(lane)?;
+        self.pending_session_opens
+            .insert(lane, ExpectedSessionOpen { task_ordinal, lane });
         Ok(vec![SupervisorEffect::OpenRoleSession {
             task_ordinal,
-            role,
+            lane,
         }])
     }
 
     fn schedule_turn(
         &mut self,
         task_ordinal: usize,
-        role: WorkerRole,
+        lane: WorkerLane,
         purpose: RuntimeTurnPurpose,
         session: RuntimeSessionKey,
     ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
-        self.require_no_pending_operation()?;
-        if purpose.role() != role {
+        self.require_lane_available(lane)?;
+        if purpose.role() != lane.role() {
             return Err(SupervisorError::invalid_event(
-                "turn purpose does not match its role",
+                "turn purpose does not match its lane role",
             ));
         }
-        self.pending_turn_start = Some(ExpectedTurnStart {
-            task_ordinal,
-            role,
-            purpose,
-            session,
-        });
+        let review_generation = lane
+            .reviewer_id()
+            .map(|_| self.tasks[task_ordinal].review_generation);
+        self.pending_turn_starts.insert(
+            lane,
+            ExpectedTurnStart {
+                task_ordinal,
+                lane,
+                review_generation,
+                purpose,
+                session,
+            },
+        );
         Ok(vec![SupervisorEffect::StartTurn {
             task_ordinal,
-            role,
+            lane,
+            review_generation,
             purpose,
             session,
         }])
@@ -1895,12 +2139,51 @@ impl SupervisorCore {
 
     fn require_no_pending_operation(&self) -> Result<(), SupervisorError> {
         if self.pending_runtime_open.is_some()
-            || self.pending_session_open.is_some()
-            || self.pending_turn_start.is_some()
-            || self.active_turn.is_some()
+            || !self.pending_session_opens.is_empty()
+            || !self.pending_turn_starts.is_empty()
+            || !self.active_turns.is_empty()
         {
             return Err(SupervisorError::invariant(
                 "cannot schedule two supervisor operations at once",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_lane_available(&self, lane: WorkerLane) -> Result<(), SupervisorError> {
+        if self.pending_runtime_open.is_some() {
+            return Err(SupervisorError::invariant(
+                "worker lane cannot schedule while task runtime open is pending",
+            ));
+        }
+        if self.pending_session_opens.contains_key(&lane)
+            || self.pending_turn_starts.contains_key(&lane)
+            || self.active_turns.contains_key(&lane)
+        {
+            return Err(SupervisorError::invariant(
+                "worker lane already owns a pending or active operation",
+            ));
+        }
+        if lane == WorkerLane::Developer
+            && (!self.pending_session_opens.is_empty()
+                || !self.pending_turn_starts.is_empty()
+                || !self.active_turns.is_empty())
+        {
+            return Err(SupervisorError::invariant(
+                "Developer cannot schedule with any Reviewer operation",
+            ));
+        }
+        if lane.role() == WorkerRole::Reviewer
+            && (self
+                .pending_session_opens
+                .contains_key(&WorkerLane::Developer)
+                || self
+                    .pending_turn_starts
+                    .contains_key(&WorkerLane::Developer)
+                || self.active_turns.contains_key(&WorkerLane::Developer))
+        {
+            return Err(SupervisorError::invariant(
+                "Reviewer cannot schedule with a Developer operation",
             ));
         }
         Ok(())
@@ -1920,18 +2203,19 @@ impl SupervisorCore {
         Ok(())
     }
 
-    fn session_for(&self, task_ordinal: usize, role: WorkerRole) -> Option<RuntimeSessionKey> {
+    fn session_for(&self, task_ordinal: usize, lane: WorkerLane) -> Option<RuntimeSessionKey> {
         let task = self.tasks.get(task_ordinal)?;
-        match role {
-            WorkerRole::Developer => task.developer_session,
-            WorkerRole::Reviewer => task.reviewer_session,
+        match lane {
+            WorkerLane::Developer => task.developer_session,
+            WorkerLane::Reviewer(reviewer_id) => task.reviewer_sessions.get(&reviewer_id).copied(),
         }
     }
 
     fn take_matching_active(
         &mut self,
         task_ordinal: usize,
-        role: WorkerRole,
+        lane: WorkerLane,
+        review_generation: Option<u32>,
         session: RuntimeSessionKey,
         turn: RuntimeTurnKey,
         completion_token: &str,
@@ -1941,11 +2225,12 @@ impl SupervisorCore {
                 "completion token was already accepted",
             ));
         }
-        let active = self.active_turn.as_ref().ok_or_else(|| {
+        let active = self.active_turns.get(&lane).ok_or_else(|| {
             SupervisorError::invalid_transition("turn completion arrived with no active turn")
         })?;
         if active.task_ordinal != task_ordinal
-            || active.role != role
+            || active.lane != lane
+            || active.review_generation != review_generation
             || active.session != session
             || active.turn != turn
             || active.completion_token != completion_token
@@ -1955,23 +2240,25 @@ impl SupervisorCore {
             ));
         }
         Ok(self
-            .active_turn
-            .take()
+            .active_turns
+            .remove(&lane)
             .expect("active turn was just validated"))
     }
 
-    fn interrupt_active_effect(&mut self) -> Vec<SupervisorEffect> {
-        let Some(active) = self.active_turn.take() else {
-            return Vec::new();
-        };
-        self.accepted_completion_tokens
-            .insert(active.completion_token);
-        vec![SupervisorEffect::InterruptTurn {
-            task_ordinal: active.task_ordinal,
-            role: active.role,
-            session: active.session,
-            turn: active.turn,
-        }]
+    fn interrupt_active_effects(&mut self) -> Vec<SupervisorEffect> {
+        std::mem::take(&mut self.active_turns)
+            .into_values()
+            .map(|active| {
+                self.accepted_completion_tokens
+                    .insert(active.completion_token);
+                SupervisorEffect::InterruptTurn {
+                    task_ordinal: active.task_ordinal,
+                    lane: active.lane,
+                    session: active.session,
+                    turn: active.turn,
+                }
+            })
+            .collect()
     }
 
     fn terminalize_current(
@@ -2001,9 +2288,9 @@ impl SupervisorCore {
         if let Some(task_ordinal) = runtime_task {
             effects.push(SupervisorEffect::CloseTaskRuntime { task_ordinal });
         }
-        self.pending_session_open = None;
-        self.pending_turn_start = None;
-        self.active_turn = None;
+        self.pending_session_opens.clear();
+        self.pending_turn_starts.clear();
+        self.active_turns.clear();
         self.pending_architect_action = None;
         self.session_state = session_state;
         self.terminal_detail = Some(detail.into());
@@ -2017,9 +2304,9 @@ impl SupervisorCore {
     fn clear_runtime_state(&mut self) {
         self.pending_runtime_open = None;
         self.runtime_open = None;
-        self.pending_session_open = None;
-        self.pending_turn_start = None;
-        self.active_turn = None;
+        self.pending_session_opens.clear();
+        self.pending_turn_starts.clear();
+        self.active_turns.clear();
         self.pending_architect_action = None;
         self.used_sessions.clear();
         self.used_turns.clear();
@@ -2031,6 +2318,26 @@ impl SupervisorCore {
             return Err(SupervisorError::invariant(
                 "core contains more than 64 tasks",
             ));
+        }
+        if self.reviewer_bindings.len() != 2
+            || self.reviewer_bindings[0].reviewer_id != ReviewerId::Reviewer1
+            || self.reviewer_bindings[1].reviewer_id != ReviewerId::Reviewer2
+        {
+            return Err(SupervisorError::invariant(
+                "session Reviewer bindings are not the fixed ordered pair",
+            ));
+        }
+        for binding in &self.reviewer_bindings {
+            if !matches!(binding.provider.as_str(), "codex-exec" | "claude-exec")
+                || validate_single_line("Reviewer model", &binding.model, 128).is_err()
+                || validate_single_line("Reviewer reasoning effort", &binding.reasoning_effort, 32)
+                    .is_err()
+                || validate_sha256("Reviewer contract hash", &binding.contract_sha256).is_err()
+            {
+                return Err(SupervisorError::invariant(
+                    "session Reviewer binding metadata is invalid",
+                ));
+            }
         }
         if self.progress_events.len() > MAX_PROGRESS_EVENTS_PER_RUN {
             return Err(SupervisorError::invariant(
@@ -2128,9 +2435,9 @@ impl SupervisorCore {
         if self.session_state.is_terminal()
             && (self.pending_runtime_open.is_some()
                 || self.runtime_open.is_some()
-                || self.pending_session_open.is_some()
-                || self.pending_turn_start.is_some()
-                || self.active_turn.is_some()
+                || !self.pending_session_opens.is_empty()
+                || !self.pending_turn_starts.is_empty()
+                || !self.active_turns.is_empty()
                 || self.pending_architect_action.is_some())
         {
             return Err(SupervisorError::invariant(
@@ -2142,18 +2449,14 @@ impl SupervisorCore {
                 "runtime cannot be pending-open and open simultaneously",
             ));
         }
-        let scheduled_operations = [
-            self.pending_runtime_open.is_some(),
-            self.pending_session_open.is_some(),
-            self.pending_turn_start.is_some(),
-            self.active_turn.is_some(),
-        ]
-        .into_iter()
-        .filter(|present| *present)
-        .count();
-        if scheduled_operations > 1 {
+        let scheduled_operations = self.pending_session_opens.len()
+            + self.pending_turn_starts.len()
+            + self.active_turns.len();
+        if scheduled_operations > 2
+            || (self.pending_runtime_open.is_some() && scheduled_operations != 0)
+        {
             return Err(SupervisorError::invariant(
-                "more than one supervisor operation is active",
+                "worker operation count exceeds the dual-review structural ceiling",
             ));
         }
         if let Some(task_ordinal) = self.pending_runtime_open
@@ -2182,37 +2485,41 @@ impl SupervisorCore {
                 "open runtime is not bound to the current active task",
             ));
         }
-        if let Some(expected) = &self.pending_session_open {
-            let expected_state = match expected.role {
+        for (lane, expected) in &self.pending_session_opens {
+            let expected_state = match lane.role() {
                 WorkerRole::Developer => TaskState::Developing,
                 WorkerRole::Reviewer => TaskState::Reviewing,
             };
-            if self.runtime_open != Some(expected.task_ordinal)
+            if *lane != expected.lane
+                || self.runtime_open != Some(expected.task_ordinal)
                 || self
                     .tasks
                     .get(expected.task_ordinal)
                     .is_none_or(|task| task.state != expected_state)
-                || self
-                    .session_for(expected.task_ordinal, expected.role)
-                    .is_some()
+                || self.session_for(expected.task_ordinal, *lane).is_some()
             {
                 return Err(SupervisorError::invariant(
                     "pending role-session open is not bound to an unbound current role",
                 ));
             }
         }
-        if let Some(expected) = &self.pending_turn_start {
-            let expected_state = match expected.role {
+        for (lane, expected) in &self.pending_turn_starts {
+            let expected_state = match lane.role() {
                 WorkerRole::Developer => TaskState::Developing,
                 WorkerRole::Reviewer => TaskState::Reviewing,
             };
-            if self.runtime_open != Some(expected.task_ordinal)
-                || expected.purpose.role() != expected.role
-                || self.session_for(expected.task_ordinal, expected.role) != Some(expected.session)
+            if *lane != expected.lane
+                || self.runtime_open != Some(expected.task_ordinal)
+                || expected.purpose.role() != lane.role()
+                || self.session_for(expected.task_ordinal, *lane) != Some(expected.session)
                 || self
                     .tasks
                     .get(expected.task_ordinal)
                     .is_none_or(|task| task.state != expected_state)
+                || expected.review_generation
+                    != lane
+                        .reviewer_id()
+                        .map(|_| self.tasks[expected.task_ordinal].review_generation)
             {
                 return Err(SupervisorError::invariant(
                     "pending turn is not bound to the exact current role session",
@@ -2221,9 +2528,14 @@ impl SupervisorCore {
         }
         let mut run_clarification_records = 0usize;
         for task in &self.tasks {
-            if task.review_round > u32::from(task.spec.max_review_rounds) {
+            let max_review_rounds = u32::from(task.spec.max_review_rounds);
+            if task.review_round > max_review_rounds
+                || task.review_generation > max_review_rounds
+                || task.review_round > task.review_generation
+                || task.review_generation > task.review_round.saturating_add(1)
+            {
                 return Err(SupervisorError::invariant(
-                    "task review round exceeds its maximum",
+                    "task review round/generation counters are inconsistent",
                 ));
             }
             if task.clarification_rounds_used > u32::from(task.spec.max_clarification_rounds) {
@@ -2270,31 +2582,89 @@ impl SupervisorCore {
                     &record.architect_clarification_path,
                 )?;
             }
-            if task.state == TaskState::Reviewing
-                && (task.developer_session.is_none()
-                    || task.review_round >= u32::from(task.spec.max_review_rounds))
-            {
-                return Err(SupervisorError::invariant(
-                    "reviewing task lacks a Developer handoff",
-                ));
+            match task.state {
+                TaskState::Pending if task.review_round != 0 || task.review_generation != 0 => {
+                    return Err(SupervisorError::invariant(
+                        "pending task has allocated review counters",
+                    ));
+                }
+                TaskState::Developing | TaskState::AwaitingArchitectAction
+                    if task.review_round == 0 && task.review_generation != 0 =>
+                {
+                    return Err(SupervisorError::invariant(
+                        "initial development has an allocated review generation",
+                    ));
+                }
+                TaskState::Developing | TaskState::AwaitingArchitectAction
+                    if task.review_round > 0
+                        && (task.review_generation != task.review_round
+                            || task.review_round >= max_review_rounds) =>
+                {
+                    return Err(SupervisorError::invariant(
+                        "correction state does not preserve the completed generation",
+                    ));
+                }
+                TaskState::Reviewing
+                    if task.developer_session.is_none()
+                        || task.review_generation == 0
+                        || task.review_generation != task.review_round + 1 =>
+                {
+                    return Err(SupervisorError::invariant(
+                        "reviewing task lacks an exact in-flight generation",
+                    ));
+                }
+                TaskState::Lgtm
+                    if task.review_round == 0 || task.review_generation != task.review_round =>
+                {
+                    return Err(SupervisorError::invariant(
+                        "LGTM task lacks a completed synchronized generation",
+                    ));
+                }
+                TaskState::ReviewExhausted
+                    if task.review_round != max_review_rounds
+                        || task.review_generation != task.review_round =>
+                {
+                    return Err(SupervisorError::invariant(
+                        "review-exhausted task did not reach its exact maximum",
+                    ));
+                }
+                _ => {}
             }
-            if task.reviewer_session.is_some() && task.developer_session.is_none() {
+            if !task.reviewer_sessions.is_empty() && task.developer_session.is_none() {
                 return Err(SupervisorError::invariant(
                     "Reviewer session exists without the task Developer session",
                 ));
             }
-            if matches!(task.state, TaskState::Lgtm | TaskState::ReviewExhausted)
-                && task.review_round == 0
+            if task.reviewer_results.len() > 2
+                || task.reviewer_results.iter().any(|(reviewer_id, result)| {
+                    !reviewer_ids().contains(reviewer_id)
+                        || result.generation != task.review_generation
+                        || result.final_message_paths.is_empty()
+                        || result.final_message_paths.len() > 2
+                })
             {
                 return Err(SupervisorError::invariant(
-                    "terminal review outcome has no accepted review round",
+                    "current Reviewer result set is invalid",
                 ));
             }
-            if task.state == TaskState::ReviewExhausted
-                && task.review_round != u32::from(task.spec.max_review_rounds)
+            if task.historical_reviewer_final_paths.len() != 2
+                || reviewer_ids().into_iter().any(|reviewer_id| {
+                    task.historical_reviewer_final_paths
+                        .get(&reviewer_id)
+                        .is_none_or(|paths| {
+                            paths.len() > usize::from(task.spec.max_review_rounds) * 2
+                                || paths.iter().any(|path| {
+                                    validate_absolute_path(
+                                        "historical Reviewer final message path",
+                                        path,
+                                    )
+                                    .is_err()
+                                })
+                        })
+                })
             {
                 return Err(SupervisorError::invariant(
-                    "review-exhausted task did not reach its exact maximum",
+                    "historical Reviewer evidence index is invalid",
                 ));
             }
             if let Some(session) = task.developer_session
@@ -2304,12 +2674,12 @@ impl SupervisorCore {
                     "Developer session is absent from the global identity set",
                 ));
             }
-            if let Some(session) = task.reviewer_session
-                && !self.used_sessions.contains(&session)
-            {
-                return Err(SupervisorError::invariant(
-                    "Reviewer session is absent from the global identity set",
-                ));
+            for session in task.reviewer_sessions.values() {
+                if !self.used_sessions.contains(session) {
+                    return Err(SupervisorError::invariant(
+                        "Reviewer session is absent from the global identity set",
+                    ));
+                }
             }
         }
         if run_clarification_records > MAX_CLARIFICATION_RECORDS_PER_RUN {
@@ -2345,9 +2715,9 @@ impl SupervisorCore {
                     || (!pending.human_decision_required
                         && task.clarification_rounds_used
                             >= u32::from(task.spec.max_clarification_rounds))
-                    || self.pending_session_open.is_some()
-                    || self.pending_turn_start.is_some()
-                    || self.active_turn.is_some()
+                    || !self.pending_session_opens.is_empty()
+                    || !self.pending_turn_starts.is_empty()
+                    || !self.active_turns.is_empty()
                 {
                     return Err(SupervisorError::invariant(
                         "pending Architect action is not latched to an idle current task",
@@ -2378,8 +2748,7 @@ impl SupervisorCore {
             .tasks
             .iter()
             .map(|task| {
-                usize::from(task.developer_session.is_some())
-                    + usize::from(task.reviewer_session.is_some())
+                usize::from(task.developer_session.is_some()) + task.reviewer_sessions.len()
             })
             .sum::<usize>();
         if session_count != self.used_sessions.len() {
@@ -2387,23 +2756,28 @@ impl SupervisorCore {
                 "logical runtime session key was reused across roles or tasks",
             ));
         }
-        if let Some(active) = &self.active_turn {
+        for (lane, active) in &self.active_turns {
             if self.current_task != Some(active.task_ordinal)
                 || self.runtime_open != Some(active.task_ordinal)
-                || self.session_for(active.task_ordinal, active.role) != Some(active.session)
-                || active.purpose.role() != active.role
+                || *lane != active.lane
+                || self.session_for(active.task_ordinal, *lane) != Some(active.session)
+                || active.purpose.role() != lane.role()
+                || active.review_generation
+                    != lane
+                        .reviewer_id()
+                        .map(|_| self.tasks[active.task_ordinal].review_generation)
             {
                 return Err(SupervisorError::invariant(
                     "active turn is not bound to the exact current role session",
                 ));
             }
-            let expected_state = match active.role {
+            let expected_state = match lane.role() {
                 WorkerRole::Developer => TaskState::Developing,
                 WorkerRole::Reviewer => TaskState::Reviewing,
             };
             if self.tasks[active.task_ordinal].state != expected_state {
                 return Err(SupervisorError::invariant(
-                    "active turn role does not match the task state",
+                    "active turn lane does not match the task state",
                 ));
             }
             if self
@@ -2421,6 +2795,44 @@ impl SupervisorCore {
 
 fn validate_identifier(label: &str, value: &str) -> Result<(), SupervisorError> {
     validate_identifier_with_bound(label, value, 128)
+}
+
+fn reviewer_ids() -> [ReviewerId; 2] {
+    [ReviewerId::Reviewer1, ReviewerId::Reviewer2]
+}
+
+fn default_reviewer_bindings() -> Vec<ReviewerBindingSnapshot> {
+    [
+        (ReviewerId::Reviewer1, RuntimeProfile::codex_exec_default()),
+        (ReviewerId::Reviewer2, RuntimeProfile::claude_exec_default()),
+    ]
+    .into_iter()
+    .map(|(reviewer_id, profile)| ReviewerBindingSnapshot {
+        reviewer_id,
+        provider: profile.provider.as_str().into(),
+        model: profile.model,
+        reasoning_effort: profile.reasoning_effort,
+        contract_sha256: profile.provider.contract_identity().contract_sha256,
+    })
+    .collect()
+}
+
+fn reviewer_result_snapshots(task: &CoreTask) -> Vec<ReviewerResultSnapshot> {
+    reviewer_ids()
+        .into_iter()
+        .map(|reviewer_id| {
+            let result = task.reviewer_results.get(&reviewer_id);
+            ReviewerResultSnapshot {
+                reviewer_id,
+                session_bound: task.reviewer_sessions.contains_key(&reviewer_id),
+                current_generation: result.map(|result| result.generation),
+                current_verdict: result.map(|result| result.verdict),
+                current_final_message_paths: result
+                    .map(|result| result.final_message_paths.clone())
+                    .unwrap_or_default(),
+            }
+        })
+        .collect()
 }
 
 fn validate_identifier_with_bound(
@@ -2512,6 +2924,7 @@ fn canonical_hash(value: &impl Serialize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_api::protocol::MAX_REVIEW_ROUNDS;
     use crate::worker::runtime::DeveloperOutcomeV1;
 
     const PROFILE_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -2588,6 +3001,34 @@ mod tests {
         ))
     }
 
+    fn reviewer_paths(task: &TaskStatusSnapshot) -> Vec<String> {
+        task.reviewers
+            .iter()
+            .flat_map(|reviewer| reviewer.current_final_message_paths.clone())
+            .collect()
+    }
+
+    fn joined_reviewer_verdict(task: &TaskStatusSnapshot) -> Option<ReviewerVerdict> {
+        if task
+            .reviewers
+            .iter()
+            .any(|reviewer| reviewer.current_verdict.is_none())
+        {
+            return None;
+        }
+        Some(
+            if task
+                .reviewers
+                .iter()
+                .all(|reviewer| reviewer.current_verdict == Some(ReviewerVerdict::Lgtm))
+            {
+                ReviewerVerdict::Lgtm
+            } else {
+                ReviewerVerdict::RequestChanges
+            },
+        )
+    }
+
     fn new_core() -> SupervisorCore {
         SupervisorCore::new(
             "run-1".into(),
@@ -2632,10 +3073,24 @@ mod tests {
         role: WorkerRole,
         session: RuntimeSessionKey,
     ) -> Vec<SupervisorEffect> {
+        open_lane_session(
+            core,
+            task_ordinal,
+            WorkerLane::released_for_role(role),
+            session,
+        )
+    }
+
+    fn open_lane_session(
+        core: &mut SupervisorCore,
+        task_ordinal: usize,
+        lane: WorkerLane,
+        session: RuntimeSessionKey,
+    ) -> Vec<SupervisorEffect> {
         core.reduce(SupervisorEvent::RoleSessionOpened {
             expected_version: core.version(),
             task_ordinal,
-            role,
+            lane,
             session,
         })
         .unwrap()
@@ -2650,10 +3105,34 @@ mod tests {
         turn: RuntimeTurnKey,
         completion_token: &str,
     ) -> Vec<SupervisorEffect> {
+        start_lane_turn(
+            core,
+            task_ordinal,
+            WorkerLane::released_for_role(role),
+            purpose,
+            session,
+            turn,
+            completion_token,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_lane_turn(
+        core: &mut SupervisorCore,
+        task_ordinal: usize,
+        lane: WorkerLane,
+        purpose: RuntimeTurnPurpose,
+        session: RuntimeSessionKey,
+        turn: RuntimeTurnKey,
+        completion_token: &str,
+    ) -> Vec<SupervisorEffect> {
         core.reduce(SupervisorEvent::TurnStarted {
             expected_version: core.version(),
             task_ordinal,
-            role,
+            lane,
+            review_generation: lane
+                .reviewer_id()
+                .map(|_| core.tasks[task_ordinal].review_generation),
             purpose,
             session,
             turn,
@@ -2671,15 +3150,39 @@ mod tests {
         completion_token: &str,
         outcome: RuntimeOutcome,
     ) -> Vec<SupervisorEffect> {
+        complete_lane_turn(
+            core,
+            task_ordinal,
+            WorkerLane::released_for_role(role),
+            session,
+            turn,
+            completion_token,
+            outcome,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn complete_lane_turn(
+        core: &mut SupervisorCore,
+        task_ordinal: usize,
+        lane: WorkerLane,
+        session: RuntimeSessionKey,
+        turn: RuntimeTurnKey,
+        completion_token: &str,
+        outcome: RuntimeOutcome,
+    ) -> Vec<SupervisorEffect> {
         core.reduce(SupervisorEvent::TurnCompleted {
             expected_version: core.version(),
             task_ordinal,
-            role,
+            lane,
+            review_generation: lane
+                .reviewer_id()
+                .map(|_| core.tasks[task_ordinal].review_generation),
             session,
             turn,
             completion_token: completion_token.into(),
             outcome,
-            final_message_path: final_message_path(role, turn),
+            final_message_path: final_message_path(lane.role(), turn),
         })
         .unwrap()
     }
@@ -2694,7 +3197,8 @@ mod tests {
         SupervisorEvent::TurnFailed {
             expected_version: core.version(),
             task_ordinal: active.task,
-            role: active.role,
+            lane: active.lane,
+            review_generation: active.review_generation,
             session: active.session,
             turn: active.turn,
             completion_token: active.token.into(),
@@ -2706,6 +3210,8 @@ mod tests {
     struct ActiveIdentity {
         task: usize,
         role: WorkerRole,
+        lane: WorkerLane,
+        review_generation: Option<u32>,
         session: RuntimeSessionKey,
         turn: RuntimeTurnKey,
         token: &'static str,
@@ -2723,7 +3229,7 @@ mod tests {
             vec![
                 SupervisorEffect::OpenRoleSession {
                     task_ordinal,
-                    role: WorkerRole::Developer,
+                    lane: WorkerLane::Developer,
                 },
                 SupervisorEffect::PublishStatus,
             ]
@@ -2734,7 +3240,8 @@ mod tests {
             vec![
                 SupervisorEffect::StartTurn {
                     task_ordinal,
-                    role: WorkerRole::Developer,
+                    lane: WorkerLane::Developer,
+                    review_generation: None,
                     purpose: RuntimeTurnPurpose::InitialDevelopment,
                     session,
                 },
@@ -2757,6 +3264,8 @@ mod tests {
         ActiveIdentity {
             task: task_ordinal,
             role: WorkerRole::Developer,
+            lane: WorkerLane::Developer,
+            review_generation: None,
             session,
             turn,
             token,
@@ -2777,10 +3286,10 @@ mod tests {
             matches!(
                 effects.first(),
                 Some(SupervisorEffect::OpenRoleSession {
-                    role: WorkerRole::Reviewer,
+                    lane: WorkerLane::Reviewer(_),
                     ..
                 }) | Some(SupervisorEffect::StartTurn {
-                    role: WorkerRole::Reviewer,
+                    lane: WorkerLane::Reviewer(_),
                     ..
                 })
             ),
@@ -2798,23 +3307,33 @@ mod tests {
     ) -> ActiveIdentity {
         // The OpenRoleSession / StartTurn effect was already emitted by the
         // developer's completion; this helper only drives what follows.
+        let reviewer1 = ReviewerId::Reviewer1;
+        let reviewer2 = ReviewerId::Reviewer2;
         let session = if first {
             let session = RuntimeSessionKey::from_counter(session_counter).unwrap();
             assert_eq!(
-                open_session(core, task_ordinal, WorkerRole::Reviewer, session),
+                open_lane_session(core, task_ordinal, WorkerLane::Reviewer(reviewer1), session,),
                 vec![
                     SupervisorEffect::StartTurn {
                         task_ordinal,
-                        role: WorkerRole::Reviewer,
+                        lane: WorkerLane::Reviewer(reviewer1),
+                        review_generation: Some(core.tasks[task_ordinal].review_generation),
                         purpose: RuntimeTurnPurpose::InitialReview,
                         session,
                     },
                     SupervisorEffect::PublishStatus,
                 ]
             );
+            let peer_session = RuntimeSessionKey::from_counter(session_counter + 10_000).unwrap();
+            open_lane_session(
+                core,
+                task_ordinal,
+                WorkerLane::Reviewer(reviewer2),
+                peer_session,
+            );
             session
         } else {
-            core.tasks[task_ordinal].reviewer_session.unwrap()
+            core.tasks[task_ordinal].reviewer_sessions[&reviewer1]
         };
         let purpose = if first {
             RuntimeTurnPurpose::InitialReview
@@ -2823,10 +3342,10 @@ mod tests {
         };
         let turn = RuntimeTurnKey::from_counter(turn_counter).unwrap();
         assert_eq!(
-            start_turn(
+            start_lane_turn(
                 core,
                 task_ordinal,
-                WorkerRole::Reviewer,
+                WorkerLane::Reviewer(reviewer1),
                 purpose,
                 session,
                 turn,
@@ -2834,9 +3353,23 @@ mod tests {
             ),
             vec![SupervisorEffect::PublishStatus]
         );
+        let peer_session = core.tasks[task_ordinal].reviewer_sessions[&reviewer2];
+        let peer_turn = RuntimeTurnKey::from_counter(turn_counter + 10_000).unwrap();
+        let peer_token: &'static str = Box::leak(format!("{token}-reviewer2").into_boxed_str());
+        start_lane_turn(
+            core,
+            task_ordinal,
+            WorkerLane::Reviewer(reviewer2),
+            purpose,
+            peer_session,
+            peer_turn,
+            peer_token,
+        );
         ActiveIdentity {
             task: task_ordinal,
             role: WorkerRole::Reviewer,
+            lane: WorkerLane::Reviewer(reviewer1),
+            review_generation: Some(core.tasks[task_ordinal].review_generation),
             session,
             turn,
             token,
@@ -2850,13 +3383,29 @@ mod tests {
         active: ActiveIdentity,
         outcome: RuntimeOutcome,
     ) -> Vec<SupervisorEffect> {
-        complete_turn(
+        let first = complete_lane_turn(
             core,
             active.task,
-            active.role,
+            active.lane,
             active.session,
             active.turn,
             active.token,
+            outcome.clone(),
+        );
+        assert_eq!(first, vec![SupervisorEffect::PublishStatus]);
+        let peer_lane = WorkerLane::Reviewer(ReviewerId::Reviewer2);
+        let peer = core
+            .active_turns
+            .get(&peer_lane)
+            .cloned()
+            .expect("Reviewer2 remains active until the join");
+        complete_lane_turn(
+            core,
+            peer.task_ordinal,
+            peer_lane,
+            peer.session,
+            peer.turn,
+            &peer.completion_token,
             outcome,
         )
     }
@@ -2889,7 +3438,8 @@ mod tests {
             developer_token,
             ready(),
         );
-        let reviewer_session_counter = core.tasks[task_ordinal].reviewer_session.unwrap().counter();
+        let reviewer_session_counter =
+            core.tasks[task_ordinal].reviewer_sessions[&ReviewerId::Reviewer1].counter();
         start_reviewer(
             core,
             task_ordinal,
@@ -2968,7 +3518,8 @@ mod tests {
         core.reduce(SupervisorEvent::TurnFailed {
             expected_version: core.version(),
             task_ordinal: developer.task,
-            role: developer.role,
+            lane: developer.lane,
+            review_generation: developer.review_generation,
             session: developer.session,
             turn: developer.turn,
             completion_token: developer.token.into(),
@@ -2987,7 +3538,8 @@ mod tests {
         core.reduce(SupervisorEvent::TurnFailed {
             expected_version: core.version(),
             task_ordinal: 0,
-            role: WorkerRole::Developer,
+            lane: WorkerLane::Developer,
+            review_generation: None,
             session: developer.session,
             turn: developer.turn,
             completion_token: developer.token.into(),
@@ -3093,13 +3645,14 @@ mod tests {
             SupervisorEventKind::RoleSessionOpened => SupervisorEvent::RoleSessionOpened {
                 expected_version: core.version(),
                 task_ordinal: 0,
-                role: WorkerRole::Developer,
+                lane: WorkerLane::Developer,
                 session: RuntimeSessionKey::from_counter(1).unwrap(),
             },
             SupervisorEventKind::TurnStarted => SupervisorEvent::TurnStarted {
                 expected_version: core.version(),
                 task_ordinal: 0,
-                role: WorkerRole::Developer,
+                lane: WorkerLane::Developer,
+                review_generation: None,
                 purpose: RuntimeTurnPurpose::InitialDevelopment,
                 session: RuntimeSessionKey::from_counter(1).unwrap(),
                 turn: RuntimeTurnKey::from_counter(1).unwrap(),
@@ -3108,7 +3661,8 @@ mod tests {
             SupervisorEventKind::TurnCompleted => SupervisorEvent::TurnCompleted {
                 expected_version: core.version(),
                 task_ordinal: 0,
-                role: WorkerRole::Developer,
+                lane: WorkerLane::Developer,
+                review_generation: None,
                 session: RuntimeSessionKey::from_counter(1).unwrap(),
                 turn: RuntimeTurnKey::from_counter(1).unwrap(),
                 completion_token: "active".into(),
@@ -3168,7 +3722,8 @@ mod tests {
             SupervisorEventKind::TurnFailed => SupervisorEvent::TurnFailed {
                 expected_version: core.version(),
                 task_ordinal: 0,
-                role: WorkerRole::Developer,
+                lane: WorkerLane::Developer,
+                review_generation: None,
                 session: RuntimeSessionKey::from_counter(1).unwrap(),
                 turn: RuntimeTurnKey::from_counter(1).unwrap(),
                 completion_token: "active".into(),
@@ -3185,7 +3740,8 @@ mod tests {
             SupervisorEventKind::Timeout => SupervisorEvent::Timeout {
                 expected_version: core.version(),
                 task_ordinal: 0,
-                role: WorkerRole::Developer,
+                lane: WorkerLane::Developer,
+                review_generation: None,
                 session: RuntimeSessionKey::from_counter(1).unwrap(),
                 turn: RuntimeTurnKey::from_counter(1).unwrap(),
                 completion_token: "active".into(),
@@ -3304,7 +3860,7 @@ mod tests {
                         let event = SupervisorEvent::RoleSessionOpened {
                             expected_version: core.version(),
                             task_ordinal: 0,
-                            role: WorkerRole::Reviewer,
+                            lane: WorkerLane::Reviewer(ReviewerId::Reviewer1),
                             session: RuntimeSessionKey::from_counter(2).unwrap(),
                         };
                         (core, event)
@@ -3314,7 +3870,8 @@ mod tests {
                         let event = SupervisorEvent::TurnStarted {
                             expected_version: core.version(),
                             task_ordinal: 0,
-                            role: WorkerRole::Reviewer,
+                            lane: WorkerLane::Reviewer(ReviewerId::Reviewer1),
+                            review_generation: Some(core.tasks[0].review_generation),
                             purpose: RuntimeTurnPurpose::InitialReview,
                             session: RuntimeSessionKey::from_counter(2).unwrap(),
                             turn: RuntimeTurnKey::from_counter(2).unwrap(),
@@ -3330,7 +3887,8 @@ mod tests {
                             SupervisorEventKind::TurnCompleted => SupervisorEvent::TurnCompleted {
                                 expected_version: core.version(),
                                 task_ordinal: 0,
-                                role: WorkerRole::Reviewer,
+                                lane: WorkerLane::Reviewer(ReviewerId::Reviewer1),
+                                review_generation: Some(core.tasks[0].review_generation),
                                 session: RuntimeSessionKey::from_counter(2).unwrap(),
                                 turn: RuntimeTurnKey::from_counter(2).unwrap(),
                                 completion_token: "reviewer".into(),
@@ -3340,7 +3898,8 @@ mod tests {
                             SupervisorEventKind::TurnFailed => SupervisorEvent::TurnFailed {
                                 expected_version: core.version(),
                                 task_ordinal: 0,
-                                role: WorkerRole::Reviewer,
+                                lane: WorkerLane::Reviewer(ReviewerId::Reviewer1),
+                                review_generation: Some(core.tasks[0].review_generation),
                                 session: RuntimeSessionKey::from_counter(2).unwrap(),
                                 turn: RuntimeTurnKey::from_counter(2).unwrap(),
                                 completion_token: "reviewer".into(),
@@ -3353,7 +3912,8 @@ mod tests {
                             SupervisorEventKind::Timeout => SupervisorEvent::Timeout {
                                 expected_version: core.version(),
                                 task_ordinal: 0,
-                                role: WorkerRole::Reviewer,
+                                lane: WorkerLane::Reviewer(ReviewerId::Reviewer1),
+                                review_generation: Some(core.tasks[0].review_generation),
                                 session: RuntimeSessionKey::from_counter(2).unwrap(),
                                 turn: RuntimeTurnKey::from_counter(2).unwrap(),
                                 completion_token: "reviewer".into(),
@@ -3620,7 +4180,8 @@ mod tests {
             core.reduce(SupervisorEvent::Timeout {
                 expected_version: core.version(),
                 task_ordinal: 0,
-                role: WorkerRole::Developer,
+                lane: WorkerLane::Developer,
+                review_generation: None,
                 session,
                 turn,
                 completion_token: "effect-inventory".into(),
@@ -3733,7 +4294,8 @@ mod tests {
             .reduce(SupervisorEvent::TurnFailed {
                 expected_version: blocked_core.version(),
                 task_ordinal: 0,
-                role: WorkerRole::Developer,
+                lane: WorkerLane::Developer,
+                review_generation: None,
                 session: active.session,
                 turn: active.turn,
                 completion_token: active.token.into(),
@@ -4103,50 +4665,39 @@ mod tests {
         );
 
         let snapshot = core.snapshot();
+        assert_eq!(snapshot.run_id, "run-1");
+        assert_eq!(snapshot.state, SessionState::Completed);
+        assert_eq!(snapshot.version, 12);
+        assert_eq!(snapshot.project_root, "/project");
+        assert_eq!(snapshot.plan_version, Some(1));
+        assert_eq!(snapshot.plan_hash, core.plan_hash);
+        assert_eq!(snapshot.current_task_ordinal, Some(0));
+        assert!(snapshot.active_workers.is_empty());
+        assert_eq!(snapshot.reviewer_bindings, core.reviewer_bindings);
+        assert!(snapshot.pending_architect_action.is_none());
         assert_eq!(
-            snapshot,
-            SessionStatusSnapshot {
-                run_id: "run-1".into(),
-                state: SessionState::Completed,
-                version: 9,
-                project_root: "/project".into(),
-                plan_version: Some(1),
-                plan_hash: core.plan_hash.clone(),
-                current_task_ordinal: Some(0),
-                active_worker: None,
-                pending_architect_action: None,
-                terminal_detail: Some("all ordered tasks reached a terminal review outcome".into()),
-                tasks: vec![TaskStatusSnapshot {
-                    task_key: "one".into(),
-                    ordinal: 0,
-                    state: TaskState::Lgtm,
-                    repository_root: "/repo".into(),
-                    task_document_path: "/project/tasks/one.md".into(),
-                    design_document_paths: vec!["/project/design.md".into()],
-                    task_selector: "one".into(),
-                    // hcom no longer observes Git, so the snapshot carries no
-                    // branch or revision evidence at all.
-                    branch: None,
-                    review_round: 1,
-                    max_review_rounds: 3,
-                    clarification_rounds_used: 0,
-                    max_clarification_rounds: 2,
-                    clarification_record_count: 0,
-                    base_revision: None,
-                    head_revision: None,
-                    developer_session_bound: true,
-                    reviewer_session_bound: true,
-                    outcome_detail: Some("Reviewer returned LGTM".into()),
-                    latest_developer_final_path: Some(
-                        "/artifacts/developer/turn-1/native-final.partial".into(),
-                    ),
-                    final_reviewer_message_paths: vec![
-                        "/artifacts/reviewer/turn-2/native-final.partial".into(),
-                    ],
-                    reviewer_verdict: Some(ReviewerVerdict::Lgtm),
-                }],
-            }
+            snapshot.terminal_detail.as_deref(),
+            Some("all ordered tasks reached a terminal review outcome")
         );
+        let task = &snapshot.tasks[0];
+        assert_eq!(task.state, TaskState::Lgtm);
+        assert_eq!(task.review_round, 1);
+        assert_eq!(task.review_generation, 1);
+        assert!(task.developer_session_bound);
+        assert_eq!(
+            task.latest_developer_final_path.as_deref(),
+            Some("/artifacts/developer/turn-1/native-final.partial")
+        );
+        assert_eq!(
+            reviewer_paths(task),
+            vec![
+                "/artifacts/reviewer/turn-2/native-final.partial",
+                "/artifacts/reviewer/turn-10002/native-final.partial",
+            ]
+        );
+        assert!(task.reviewers.iter().all(|reviewer| reviewer.session_bound
+            && reviewer.current_generation == Some(1)
+            && reviewer.current_verdict == Some(ReviewerVerdict::Lgtm)));
         let before = core.clone();
         assert_eq!(
             core.reduce(SupervisorEvent::StatusRequested).unwrap(),
@@ -4160,105 +4711,390 @@ mod tests {
         let mut core = authorized_core();
         let developer = start_first_developer(&mut core, 0, 1, 1, "developer-1");
         complete_developer_ready(&mut core, developer);
-
-        assert_eq!(
-            core.progress_event_after("run-1", 0).unwrap(),
-            Some(SessionProgressEvent::ReviewRequested {
-                sequence: 1,
-                task_ordinal: 0,
-                task_key: "one".into(),
-                completed_tasks: 0,
-                total_tasks: 1,
-                review_round: 1,
-                max_review_rounds: 3,
-                developer_final_path: "/artifacts/developer/turn-1/native-final.partial".into(),
-                task_document_path: "/project/tasks/one.md".into(),
-                design_document_paths: vec!["/project/design.md".into()],
-                task_selector: "one".into(),
-                clarification_record_count: 0,
-            })
-        );
-        assert!(core.progress_event_after("run-1", 1).unwrap().is_none());
-
         let reviewer = start_reviewer(&mut core, 0, 2, 2, "reviewer-1", true);
+        let requested = core.progress_event_after("run-1", 0).unwrap().unwrap();
+        assert!(matches!(
+            requested,
+            SessionProgressEvent::ReviewRequested {
+                sequence: 1,
+                review_round: 0,
+                review_generation: 1,
+                reviewer_bindings,
+                ..
+            } if reviewer_bindings.len() == 2
+        ));
         complete_review(&mut core, reviewer, request_changes());
-        assert_eq!(
-            core.progress_event_after("run-1", 1).unwrap(),
-            Some(SessionProgressEvent::ReviewResponded {
-                sequence: 2,
-                task_ordinal: 0,
-                task_key: "one".into(),
-                completed_tasks: 0,
-                total_tasks: 1,
-                review_round: 1,
-                max_review_rounds: 3,
-                reviewer_verdict: ReviewerVerdict::RequestChanges,
-                developer_final_path: "/artifacts/developer/turn-1/native-final.partial".into(),
-                reviewer_final_message_paths: vec![
-                    "/artifacts/reviewer/turn-2/native-final.partial".into(),
-                ],
-            })
-        );
+        for (sequence, reviewer_id, review_round, responses_received) in [
+            (2, ReviewerId::Reviewer1, 0, 1),
+            (3, ReviewerId::Reviewer2, 1, 2),
+        ] {
+            assert!(matches!(
+                core.progress_event_after("run-1", sequence - 1)
+                    .unwrap()
+                    .unwrap(),
+                SessionProgressEvent::ReviewResponded {
+                    sequence: actual_sequence,
+                    review_round: actual_review_round,
+                    review_generation: 1,
+                    reviewer_id: actual_reviewer_id,
+                    reviewer_verdict: ReviewerVerdict::RequestChanges,
+                    responses_received: actual_responses_received,
+                    responses_expected: 2,
+                    ..
+                } if actual_sequence == sequence
+                    && actual_reviewer_id == reviewer_id
+                    && actual_review_round == review_round
+                    && actual_responses_received == responses_received
+            ));
+        }
 
         let reviewer = correct_and_start_rereview(&mut core, 0, 3, 4, "developer-2", "reviewer-2");
-        assert_eq!(
-            core.progress_event_after("run-1", 2).unwrap(),
-            Some(SessionProgressEvent::ReviewRequested {
-                sequence: 3,
-                task_ordinal: 0,
-                task_key: "one".into(),
-                completed_tasks: 0,
-                total_tasks: 1,
-                review_round: 2,
-                max_review_rounds: 3,
-                developer_final_path: "/artifacts/developer/turn-3/native-final.partial".into(),
-                task_document_path: "/project/tasks/one.md".into(),
-                design_document_paths: vec!["/project/design.md".into()],
-                task_selector: "one".into(),
-                clarification_record_count: 0,
-            })
-        );
+        assert!(matches!(
+            core.progress_event_after("run-1", 3).unwrap().unwrap(),
+            SessionProgressEvent::ReviewRequested {
+                sequence: 4,
+                review_round: 1,
+                review_generation: 2,
+                ..
+            }
+        ));
 
         complete_review(&mut core, reviewer, lgtm());
         assert_eq!(core.session_state(), SessionState::Completed);
-        assert_eq!(
-            core.progress_event_after("run-1", 3).unwrap(),
-            Some(SessionProgressEvent::ReviewResponded {
-                sequence: 4,
-                task_ordinal: 0,
-                task_key: "one".into(),
-                completed_tasks: 1,
-                total_tasks: 1,
+        for (sequence, reviewer_id, review_round, responses_received) in [
+            (5, ReviewerId::Reviewer1, 1, 1),
+            (6, ReviewerId::Reviewer2, 2, 2),
+        ] {
+            assert!(matches!(
+                core.progress_event_after("run-1", sequence - 1)
+                    .unwrap()
+                    .unwrap(),
+                SessionProgressEvent::ReviewResponded {
+                    sequence: actual_sequence,
+                    review_round: actual_review_round,
+                    review_generation: 2,
+                    reviewer_id: actual_reviewer_id,
+                    reviewer_verdict: ReviewerVerdict::Lgtm,
+                    responses_received: actual_responses_received,
+                    responses_expected: 2,
+                    ..
+                } if actual_sequence == sequence
+                    && actual_reviewer_id == reviewer_id
+                    && actual_review_round == review_round
+                    && actual_responses_received == responses_received
+            ));
+        }
+        assert!(matches!(
+            core.progress_event_after("run-1", 6).unwrap().unwrap(),
+            SessionProgressEvent::TaskCompleted {
+                sequence: 7,
                 review_round: 2,
-                max_review_rounds: 3,
-                reviewer_verdict: ReviewerVerdict::Lgtm,
-                developer_final_path: "/artifacts/developer/turn-3/native-final.partial".into(),
-                reviewer_final_message_paths: vec![
-                    "/artifacts/reviewer/turn-4/native-final.partial".into(),
-                ],
-            })
-        );
-        assert_eq!(
-            core.progress_event_after("run-1", 4).unwrap(),
-            Some(SessionProgressEvent::TaskCompleted {
-                sequence: 5,
-                task_ordinal: 0,
-                task_key: "one".into(),
-                completed_tasks: 1,
-                total_tasks: 1,
-                review_round: 2,
-                max_review_rounds: 3,
+                review_generation: 2,
                 outcome: TaskCompletionOutcome::Lgtm,
-                reviewer_verdict: ReviewerVerdict::Lgtm,
-                developer_final_path: "/artifacts/developer/turn-3/native-final.partial".into(),
-                reviewer_final_message_paths: vec![
-                    "/artifacts/reviewer/turn-4/native-final.partial".into(),
-                ],
-            })
-        );
-        assert!(core.progress_event_after("run-1", 5).unwrap().is_none());
+                reviewers,
+                ..
+            } if reviewers.len() == 2
+                && reviewers.iter().all(|reviewer| {
+                    reviewer.current_generation == Some(2)
+                        && reviewer.current_verdict == Some(ReviewerVerdict::Lgtm)
+                })
+        ));
+        assert!(core.progress_event_after("run-1", 7).unwrap().is_none());
         assert!(core.progress_event_after("run-2", 0).is_err());
-        assert!(core.progress_event_after("run-1", 6).is_err());
+        assert!(core.progress_event_after("run-1", 8).is_err());
+    }
+
+    #[test]
+    fn reviewer_arrival_order_does_not_change_join_order_or_cross_the_barrier() {
+        let (mut core, reviewer1) = active_reviewer_core(3);
+        let reviewer2_lane = WorkerLane::Reviewer(ReviewerId::Reviewer2);
+        let reviewer2 = core.active_turns[&reviewer2_lane].clone();
+        assert_eq!(
+            complete_lane_turn(
+                &mut core,
+                reviewer2.task_ordinal,
+                reviewer2_lane,
+                reviewer2.session,
+                reviewer2.turn,
+                &reviewer2.completion_token,
+                lgtm(),
+            ),
+            vec![SupervisorEffect::PublishStatus]
+        );
+        assert_eq!(core.tasks[0].state, TaskState::Reviewing);
+        assert_eq!(core.tasks[0].review_round, 0);
+        assert_eq!(core.tasks[0].review_generation, 1);
+        assert!(!core.active_turns.contains_key(&WorkerLane::Developer));
+        assert!(
+            !core
+                .pending_turn_starts
+                .contains_key(&WorkerLane::Developer)
+        );
+
+        let effects = complete_lane_turn(
+            &mut core,
+            reviewer1.task,
+            reviewer1.lane,
+            reviewer1.session,
+            reviewer1.turn,
+            reviewer1.token,
+            request_changes(),
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                SupervisorEffect::StartTurn {
+                    lane: WorkerLane::Developer,
+                    purpose: RuntimeTurnPurpose::DeveloperCorrection,
+                    ..
+                },
+                SupervisorEffect::PublishStatus,
+            ]
+        ));
+        assert_eq!(core.tasks[0].state, TaskState::Developing);
+        assert_eq!(core.tasks[0].review_round, 1);
+        assert_eq!(
+            core.tasks[0].latest_reviewer_final_paths(),
+            [
+                "/artifacts/reviewer/turn-2/native-final.partial",
+                "/artifacts/reviewer/turn-10002/native-final.partial",
+            ],
+            "Developer correction paths remain Reviewer1 then Reviewer2 regardless of arrival"
+        );
+    }
+
+    #[test]
+    fn reviewer_open_and_start_acknowledgements_can_interleave_by_lane() {
+        let mut core = authorized_core();
+        let developer = start_first_developer(&mut core, 0, 1, 1, "developer");
+        complete_developer_ready(&mut core, developer);
+        assert!(core.progress_events.is_empty());
+
+        let reviewer1_lane = WorkerLane::Reviewer(ReviewerId::Reviewer1);
+        let reviewer2_lane = WorkerLane::Reviewer(ReviewerId::Reviewer2);
+        let reviewer2_session = RuntimeSessionKey::from_counter(3).unwrap();
+        let reviewer1_session = RuntimeSessionKey::from_counter(2).unwrap();
+        assert!(matches!(
+            open_lane_session(&mut core, 0, reviewer2_lane, reviewer2_session).as_slice(),
+            [
+                SupervisorEffect::StartTurn {
+                    lane: WorkerLane::Reviewer(ReviewerId::Reviewer2),
+                    ..
+                },
+                SupervisorEffect::PublishStatus,
+            ]
+        ));
+        assert!(matches!(
+            open_lane_session(&mut core, 0, reviewer1_lane, reviewer1_session).as_slice(),
+            [
+                SupervisorEffect::StartTurn {
+                    lane: WorkerLane::Reviewer(ReviewerId::Reviewer1),
+                    ..
+                },
+                SupervisorEffect::PublishStatus,
+            ]
+        ));
+        start_lane_turn(
+            &mut core,
+            0,
+            reviewer1_lane,
+            RuntimeTurnPurpose::InitialReview,
+            reviewer1_session,
+            RuntimeTurnKey::from_counter(2).unwrap(),
+            "reviewer1",
+        );
+        assert!(core.progress_events.is_empty());
+        start_lane_turn(
+            &mut core,
+            0,
+            reviewer2_lane,
+            RuntimeTurnPurpose::InitialReview,
+            reviewer2_session,
+            RuntimeTurnKey::from_counter(3).unwrap(),
+            "reviewer2",
+        );
+        assert_eq!(core.active_turns.len(), 2);
+        assert!(matches!(
+            core.progress_events.as_slice(),
+            [SessionProgressEvent::ReviewRequested {
+                sequence: 1,
+                review_generation: 1,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn peer_failure_preserves_first_response_without_aggregating_it() {
+        let (mut core, reviewer1) = active_reviewer_core(3);
+        complete_lane_turn(
+            &mut core,
+            reviewer1.task,
+            reviewer1.lane,
+            reviewer1.session,
+            reviewer1.turn,
+            reviewer1.token,
+            lgtm(),
+        );
+        let reviewer2_lane = WorkerLane::Reviewer(ReviewerId::Reviewer2);
+        let reviewer2 = core.active_turns[&reviewer2_lane].clone();
+        core.reduce(SupervisorEvent::TurnFailed {
+            expected_version: core.version(),
+            task_ordinal: reviewer2.task_ordinal,
+            lane: reviewer2_lane,
+            review_generation: reviewer2.review_generation,
+            session: reviewer2.session,
+            turn: reviewer2.turn,
+            completion_token: reviewer2.completion_token,
+            failure: runtime_failure(
+                RuntimeFailureClass::Process,
+                false,
+                "Reviewer2 exited before a durable response",
+            ),
+        })
+        .unwrap();
+
+        let snapshot = core.snapshot();
+        assert_eq!(snapshot.state, SessionState::NeedsHuman);
+        assert_eq!(snapshot.tasks[0].review_round, 0);
+        assert_eq!(snapshot.tasks[0].review_generation, 1);
+        assert_eq!(
+            snapshot.tasks[0].reviewers[0].current_verdict,
+            Some(ReviewerVerdict::Lgtm)
+        );
+        assert_eq!(snapshot.tasks[0].reviewers[1].current_verdict, None);
+        assert!(
+            core.progress_events
+                .iter()
+                .all(|event| !matches!(event, SessionProgressEvent::TaskCompleted { .. }))
+        );
+    }
+
+    #[test]
+    fn full_dual_review_progress_capacity_retains_exactly_3904_events() {
+        let mut core = new_core();
+        let tasks = (0..MAX_TASKS)
+            .map(|ordinal| task(&format!("task-{ordinal}"), "/repo", MAX_REVIEW_ROUNDS))
+            .collect();
+        bind(&mut core, tasks);
+
+        let mut sequence = 0u32;
+        for task_ordinal in 0..MAX_TASKS {
+            let task_key = core.tasks[task_ordinal].spec.task_key.clone();
+            for review_generation in 1..=u32::from(MAX_REVIEW_ROUNDS) {
+                sequence += 1;
+                core.progress_events
+                    .push(SessionProgressEvent::ReviewRequested {
+                        sequence,
+                        task_ordinal: u32::try_from(task_ordinal).unwrap(),
+                        task_key: task_key.clone(),
+                        completed_tasks: u32::try_from(task_ordinal).unwrap(),
+                        total_tasks: u32::try_from(MAX_TASKS).unwrap(),
+                        review_round: review_generation - 1,
+                        review_generation,
+                        max_review_rounds: MAX_REVIEW_ROUNDS,
+                        developer_final_path: "/artifacts/developer/final.md".into(),
+                        task_document_path: core.tasks[task_ordinal]
+                            .spec
+                            .task_document_path
+                            .clone(),
+                        design_document_paths: core.tasks[task_ordinal]
+                            .spec
+                            .design_document_paths
+                            .clone(),
+                        task_selector: task_key.clone(),
+                        clarification_record_count: 0,
+                        reviewer_bindings: core.reviewer_bindings.clone(),
+                    });
+                for (response_index, reviewer_id) in reviewer_ids().into_iter().enumerate() {
+                    sequence += 1;
+                    core.progress_events
+                        .push(SessionProgressEvent::ReviewResponded {
+                            sequence,
+                            task_ordinal: u32::try_from(task_ordinal).unwrap(),
+                            task_key: task_key.clone(),
+                            completed_tasks: u32::try_from(task_ordinal).unwrap(),
+                            total_tasks: u32::try_from(MAX_TASKS).unwrap(),
+                            review_round: if response_index == 0 {
+                                review_generation - 1
+                            } else {
+                                review_generation
+                            },
+                            review_generation,
+                            max_review_rounds: MAX_REVIEW_ROUNDS,
+                            reviewer_id,
+                            reviewer_verdict: ReviewerVerdict::RequestChanges,
+                            developer_final_path: "/artifacts/developer/final.md".into(),
+                            reviewer_final_message_paths: vec![
+                                "/artifacts/reviewer/final.md".into(),
+                            ],
+                            responses_received: u8::try_from(response_index + 1).unwrap(),
+                            responses_expected: 2,
+                        });
+                }
+            }
+            sequence += 1;
+            core.progress_events
+                .push(SessionProgressEvent::TaskCompleted {
+                    sequence,
+                    task_ordinal: u32::try_from(task_ordinal).unwrap(),
+                    task_key,
+                    completed_tasks: u32::try_from(task_ordinal + 1).unwrap(),
+                    total_tasks: u32::try_from(MAX_TASKS).unwrap(),
+                    review_round: u32::from(MAX_REVIEW_ROUNDS),
+                    review_generation: u32::from(MAX_REVIEW_ROUNDS),
+                    max_review_rounds: MAX_REVIEW_ROUNDS,
+                    outcome: TaskCompletionOutcome::ReviewExhausted,
+                    developer_final_path: "/artifacts/developer/final.md".into(),
+                    reviewers: reviewer_ids()
+                        .into_iter()
+                        .map(|reviewer_id| ReviewerResultSnapshot {
+                            reviewer_id,
+                            session_bound: true,
+                            current_generation: Some(u32::from(MAX_REVIEW_ROUNDS)),
+                            current_verdict: Some(ReviewerVerdict::RequestChanges),
+                            current_final_message_paths: vec![
+                                "/artifacts/reviewer/final.md".into(),
+                            ],
+                        })
+                        .collect(),
+                });
+        }
+
+        assert_eq!(MAX_PROGRESS_EVENTS_PER_RUN, 3904);
+        assert_eq!(
+            usize::try_from(sequence).unwrap(),
+            MAX_PROGRESS_EVENTS_PER_RUN
+        );
+        core.assert_invariants().unwrap();
+        assert_eq!(
+            core.progress_event_after("run-1", sequence - 1)
+                .unwrap()
+                .unwrap()
+                .sequence(),
+            sequence
+        );
+        assert!(
+            core.progress_event_after("run-1", sequence)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut overflow = core.clone();
+        let mut impossible = overflow.progress_events.last().unwrap().clone();
+        let SessionProgressEvent::TaskCompleted {
+            sequence: impossible_sequence,
+            ..
+        } = &mut impossible
+        else {
+            unreachable!()
+        };
+        *impossible_sequence += 1;
+        overflow.progress_events.push(impossible);
+        assert_eq!(
+            overflow.assert_invariants().unwrap_err().code,
+            SupervisorErrorCode::InvariantViolation
+        );
     }
 
     #[test]
@@ -4278,16 +5114,31 @@ mod tests {
                 )],
             }),
         );
+        let peer_lane = WorkerLane::Reviewer(ReviewerId::Reviewer2);
+        let peer = core.active_turns[&peer_lane].clone();
+        complete_lane_turn(
+            &mut core,
+            peer.task_ordinal,
+            peer_lane,
+            peer.session,
+            peer.turn,
+            &peer.completion_token,
+            request_changes(),
+        );
         let task = &core.snapshot().tasks[0];
         assert_eq!(task.state, TaskState::Developing);
         assert_eq!(
-            task.final_reviewer_message_paths,
+            reviewer_paths(task),
             vec![
                 "/artifacts/reviewer/original/native-final.partial",
                 "/artifacts/reviewer/turn-2/native-final.partial",
+                "/artifacts/reviewer/turn-10002/native-final.partial",
             ]
         );
-        assert_eq!(task.reviewer_verdict, Some(ReviewerVerdict::RequestChanges));
+        assert_eq!(
+            joined_reviewer_verdict(task),
+            Some(ReviewerVerdict::RequestChanges)
+        );
     }
 
     #[test]
@@ -4297,7 +5148,8 @@ mod tests {
             .reduce(SupervisorEvent::TurnFailed {
                 expected_version: before_review.version(),
                 task_ordinal: developer.task,
-                role: developer.role,
+                lane: developer.lane,
+                review_generation: developer.review_generation,
                 session: developer.session,
                 turn: developer.turn,
                 completion_token: developer.token.into(),
@@ -4310,15 +5162,16 @@ mod tests {
             .unwrap();
         let before_review_task = &before_review.snapshot().tasks[0];
         assert!(before_review_task.latest_developer_final_path.is_none());
-        assert!(before_review_task.final_reviewer_message_paths.is_empty());
-        assert_eq!(before_review_task.reviewer_verdict, None);
+        assert!(reviewer_paths(before_review_task).is_empty());
+        assert_eq!(joined_reviewer_verdict(before_review_task), None);
 
         let (mut during_review, reviewer) = active_reviewer_core(2);
         during_review
             .reduce(SupervisorEvent::TurnFailed {
                 expected_version: during_review.version(),
                 task_ordinal: reviewer.task,
-                role: reviewer.role,
+                lane: reviewer.lane,
+                review_generation: reviewer.review_generation,
                 session: reviewer.session,
                 turn: reviewer.turn,
                 completion_token: reviewer.token.into(),
@@ -4334,8 +5187,8 @@ mod tests {
             during_review_task.latest_developer_final_path.as_deref(),
             Some("/artifacts/developer/turn-1/native-final.partial")
         );
-        assert!(during_review_task.final_reviewer_message_paths.is_empty());
-        assert_eq!(during_review_task.reviewer_verdict, None);
+        assert!(reviewer_paths(during_review_task).is_empty());
+        assert_eq!(joined_reviewer_verdict(during_review_task), None);
 
         let (mut after_review, reviewer) = active_reviewer_core(2);
         complete_review(&mut after_review, reviewer, request_changes());
@@ -4345,11 +5198,14 @@ mod tests {
             Some("/artifacts/developer/turn-1/native-final.partial")
         );
         assert_eq!(
-            before_terminal.final_reviewer_message_paths,
-            ["/artifacts/reviewer/turn-2/native-final.partial"]
+            reviewer_paths(&before_terminal),
+            [
+                "/artifacts/reviewer/turn-2/native-final.partial",
+                "/artifacts/reviewer/turn-10002/native-final.partial",
+            ]
         );
         assert_eq!(
-            before_terminal.reviewer_verdict,
+            joined_reviewer_verdict(&before_terminal),
             Some(ReviewerVerdict::RequestChanges)
         );
 
@@ -4366,12 +5222,12 @@ mod tests {
             before_terminal.latest_developer_final_path
         );
         assert_eq!(
-            canceled_task.final_reviewer_message_paths,
-            before_terminal.final_reviewer_message_paths
+            reviewer_paths(canceled_task),
+            reviewer_paths(&before_terminal)
         );
         assert_eq!(
-            canceled_task.reviewer_verdict,
-            before_terminal.reviewer_verdict
+            joined_reviewer_verdict(canceled_task),
+            joined_reviewer_verdict(&before_terminal)
         );
 
         let developer_session = after_review.tasks[0].developer_session.unwrap();
@@ -4389,7 +5245,8 @@ mod tests {
             .reduce(SupervisorEvent::TurnFailed {
                 expected_version: after_review.version(),
                 task_ordinal: 0,
-                role: WorkerRole::Developer,
+                lane: WorkerLane::Developer,
+                review_generation: None,
                 session: developer_session,
                 turn: developer_turn,
                 completion_token: "failed-correction".into(),
@@ -4406,12 +5263,12 @@ mod tests {
             before_terminal.latest_developer_final_path
         );
         assert_eq!(
-            failed_task.final_reviewer_message_paths,
-            before_terminal.final_reviewer_message_paths
+            reviewer_paths(failed_task),
+            reviewer_paths(&before_terminal)
         );
         assert_eq!(
-            failed_task.reviewer_verdict,
-            before_terminal.reviewer_verdict
+            joined_reviewer_verdict(failed_task),
+            joined_reviewer_verdict(&before_terminal)
         );
     }
 
@@ -4437,9 +5294,9 @@ mod tests {
         );
         assert_eq!(core.current_task(), Some(1));
         assert!(matches!(
-            core.progress_event_after("run-1", 2).unwrap(),
+            core.progress_event_after("run-1", 3).unwrap(),
             Some(SessionProgressEvent::TaskCompleted {
-                sequence: 3,
+                sequence: 4,
                 task_ordinal: 0,
                 completed_tasks: 1,
                 total_tasks: 2,
@@ -4449,17 +5306,17 @@ mod tests {
 
         let developer = start_first_developer(&mut core, 1, 3, 3, "d2");
         complete_developer_ready(&mut core, developer);
+        let reviewer = start_reviewer(&mut core, 1, 4, 4, "r2", true);
         assert!(matches!(
-            core.progress_event_after("run-1", 3).unwrap(),
+            core.progress_event_after("run-1", 4).unwrap(),
             Some(SessionProgressEvent::ReviewRequested {
-                sequence: 4,
+                sequence: 5,
                 task_ordinal: 1,
                 completed_tasks: 1,
                 total_tasks: 2,
                 ..
             })
         ));
-        let reviewer = start_reviewer(&mut core, 1, 4, 4, "r2", true);
         complete_review(&mut core, reviewer, lgtm());
         assert_eq!(core.session_state(), SessionState::Completed);
         assert_eq!(
@@ -4474,18 +5331,24 @@ mod tests {
         assert_eq!(core.tasks[1].developer_session.unwrap().counter(), 3);
         let snapshot = core.snapshot();
         assert_eq!(
-            snapshot.tasks[0].final_reviewer_message_paths,
-            ["/artifacts/reviewer/turn-2/native-final.partial"]
+            reviewer_paths(&snapshot.tasks[0]),
+            [
+                "/artifacts/reviewer/turn-2/native-final.partial",
+                "/artifacts/reviewer/turn-10002/native-final.partial",
+            ]
         );
         assert_eq!(
-            snapshot.tasks[1].final_reviewer_message_paths,
-            ["/artifacts/reviewer/turn-4/native-final.partial"]
+            reviewer_paths(&snapshot.tasks[1]),
+            [
+                "/artifacts/reviewer/turn-4/native-final.partial",
+                "/artifacts/reviewer/turn-10004/native-final.partial",
+            ]
         );
         assert!(
             snapshot
                 .tasks
                 .iter()
-                .all(|task| task.reviewer_verdict == Some(ReviewerVerdict::Lgtm))
+                .all(|task| joined_reviewer_verdict(task) == Some(ReviewerVerdict::Lgtm))
         );
     }
 
@@ -4502,7 +5365,8 @@ mod tests {
             vec![
                 SupervisorEffect::StartTurn {
                     task_ordinal: 0,
-                    role: WorkerRole::Developer,
+                    lane: WorkerLane::Developer,
+                    review_generation: None,
                     purpose: RuntimeTurnPurpose::DeveloperCorrection,
                     session: RuntimeSessionKey::from_counter(1).unwrap(),
                 },
@@ -4539,7 +5403,7 @@ mod tests {
             "Developer correction must use the first logical session"
         );
         assert_eq!(
-            core.tasks[0].reviewer_session.unwrap().counter(),
+            core.tasks[0].reviewer_sessions[&ReviewerId::Reviewer1].counter(),
             2,
             "Reviewer re-review must use the first logical session"
         );
@@ -4549,11 +5413,25 @@ mod tests {
             Some("/artifacts/developer/turn-3/native-final.partial")
         );
         assert_eq!(
-            task.final_reviewer_message_paths,
-            ["/artifacts/reviewer/turn-4/native-final.partial"],
+            reviewer_paths(task),
+            [
+                "/artifacts/reviewer/turn-4/native-final.partial",
+                "/artifacts/reviewer/turn-10004/native-final.partial",
+            ],
             "the Architect handoff carries only the final review round"
         );
-        assert_eq!(task.reviewer_verdict, Some(ReviewerVerdict::Lgtm));
+        assert_eq!(joined_reviewer_verdict(task), Some(ReviewerVerdict::Lgtm));
+        assert!(reviewer_ids().into_iter().all(|reviewer_id| {
+            core.tasks[0].historical_reviewer_final_paths[&reviewer_id].len() == 1
+        }));
+        assert_eq!(
+            task.reviewers
+                .iter()
+                .flat_map(|reviewer| &reviewer.current_final_message_paths)
+                .count(),
+            2,
+            "status exposes only the current generation, not historical Reviewer paths"
+        );
     }
 
     #[test]
@@ -4605,24 +5483,29 @@ mod tests {
             Some("/artifacts/developer/turn-3/native-final.partial")
         );
         assert_eq!(
-            exhausted.final_reviewer_message_paths,
-            ["/artifacts/reviewer/turn-4/native-final.partial"],
+            reviewer_paths(exhausted),
+            [
+                "/artifacts/reviewer/turn-4/native-final.partial",
+                "/artifacts/reviewer/turn-10004/native-final.partial",
+            ],
             "review exhaustion carries only the last REQUEST_CHANGES round"
         );
         assert_eq!(
-            exhausted.reviewer_verdict,
+            joined_reviewer_verdict(exhausted),
             Some(ReviewerVerdict::RequestChanges)
         );
         assert!(matches!(
-            core.progress_event_after("run-1", 4).unwrap(),
+            core.progress_event_after("run-1", 6).unwrap(),
             Some(SessionProgressEvent::TaskCompleted {
-                sequence: 5,
+                sequence: 7,
                 task_ordinal: 0,
                 completed_tasks: 1,
                 total_tasks: 2,
                 outcome: TaskCompletionOutcome::ReviewExhausted,
-                reviewer_verdict: ReviewerVerdict::RequestChanges,
+                reviewers,
                 ..
+            }) if reviewers.iter().all(|reviewer| {
+                reviewer.current_verdict == Some(ReviewerVerdict::RequestChanges)
             })
         ));
         assert_eq!(core.current_task(), Some(1));
@@ -4678,17 +5561,28 @@ mod tests {
             // role.
             let expected_detail =
                 "worker runtime contract failed: typed final outcome was missing or invalid";
-            assert_eq!(
-                effects,
-                vec![
-                    SupervisorEffect::CloseTaskRuntime { task_ordinal: 0 },
-                    SupervisorEffect::FinishSession {
-                        state: SessionState::NeedsHuman,
-                        detail: expected_detail.into(),
-                    },
-                    SupervisorEffect::PublishStatus,
-                ]
-            );
+            let mut expected = Vec::new();
+            if role == WorkerRole::Reviewer {
+                let peer = before
+                    .active_turns
+                    .get(&WorkerLane::Reviewer(ReviewerId::Reviewer2))
+                    .expect("Reviewer failure has a live peer");
+                expected.push(SupervisorEffect::InterruptTurn {
+                    task_ordinal: peer.task_ordinal,
+                    lane: peer.lane,
+                    session: peer.session,
+                    turn: peer.turn,
+                });
+            }
+            expected.extend([
+                SupervisorEffect::CloseTaskRuntime { task_ordinal: 0 },
+                SupervisorEffect::FinishSession {
+                    state: SessionState::NeedsHuman,
+                    detail: expected_detail.into(),
+                },
+                SupervisorEffect::PublishStatus,
+            ]);
+            assert_eq!(effects, expected);
             let snapshot = core.snapshot();
             assert_eq!(snapshot.state, SessionState::NeedsHuman);
             assert_eq!(snapshot.terminal_detail.as_deref(), Some(expected_detail));
@@ -4703,64 +5597,81 @@ mod tests {
     fn completion_identity_ordering_and_at_most_once_are_transactional() {
         let (core, active) = active_core();
         let wrong_events = [
-            SupervisorEvent::TurnCompleted {
-                expected_version: core.version(),
-                task_ordinal: 1,
-                role: active.role,
-                session: active.session,
-                turn: active.turn,
-                completion_token: active.token.into(),
-                outcome: ready(),
-                final_message_path: PathBuf::from("/artifacts/developer/wrong-task.md"),
-            },
-            SupervisorEvent::TurnCompleted {
-                expected_version: core.version(),
-                task_ordinal: active.task,
-                role: WorkerRole::Reviewer,
-                session: active.session,
-                turn: active.turn,
-                completion_token: active.token.into(),
-                outcome: lgtm(),
-                final_message_path: PathBuf::from("/artifacts/reviewer/wrong-role.md"),
-            },
-            SupervisorEvent::TurnCompleted {
-                expected_version: core.version(),
-                task_ordinal: active.task,
-                role: active.role,
-                session: RuntimeSessionKey::from_counter(99).unwrap(),
-                turn: active.turn,
-                completion_token: active.token.into(),
-                outcome: ready(),
-                final_message_path: PathBuf::from("/artifacts/developer/wrong-session.md"),
-            },
-            SupervisorEvent::TurnCompleted {
-                expected_version: core.version(),
-                task_ordinal: active.task,
-                role: active.role,
-                session: active.session,
-                turn: RuntimeTurnKey::from_counter(99).unwrap(),
-                completion_token: active.token.into(),
-                outcome: ready(),
-                final_message_path: PathBuf::from("/artifacts/developer/wrong-turn.md"),
-            },
-            SupervisorEvent::TurnCompleted {
-                expected_version: core.version(),
-                task_ordinal: active.task,
-                role: active.role,
-                session: active.session,
-                turn: active.turn,
-                completion_token: "wrong-token".into(),
-                outcome: ready(),
-                final_message_path: PathBuf::from("/artifacts/developer/wrong-token.md"),
-            },
+            (
+                SupervisorEvent::TurnCompleted {
+                    expected_version: core.version(),
+                    task_ordinal: 1,
+                    lane: active.lane,
+                    review_generation: active.review_generation,
+                    session: active.session,
+                    turn: active.turn,
+                    completion_token: active.token.into(),
+                    outcome: ready(),
+                    final_message_path: PathBuf::from("/artifacts/developer/wrong-task.md"),
+                },
+                SupervisorErrorCode::InvalidIdentity,
+            ),
+            (
+                SupervisorEvent::TurnCompleted {
+                    expected_version: core.version(),
+                    task_ordinal: active.task,
+                    lane: WorkerLane::Reviewer(ReviewerId::Reviewer1),
+                    review_generation: active.review_generation,
+                    session: active.session,
+                    turn: active.turn,
+                    completion_token: active.token.into(),
+                    outcome: lgtm(),
+                    final_message_path: PathBuf::from("/artifacts/reviewer/wrong-role.md"),
+                },
+                SupervisorErrorCode::InvalidTransition,
+            ),
+            (
+                SupervisorEvent::TurnCompleted {
+                    expected_version: core.version(),
+                    task_ordinal: active.task,
+                    lane: active.lane,
+                    review_generation: active.review_generation,
+                    session: RuntimeSessionKey::from_counter(99).unwrap(),
+                    turn: active.turn,
+                    completion_token: active.token.into(),
+                    outcome: ready(),
+                    final_message_path: PathBuf::from("/artifacts/developer/wrong-session.md"),
+                },
+                SupervisorErrorCode::InvalidIdentity,
+            ),
+            (
+                SupervisorEvent::TurnCompleted {
+                    expected_version: core.version(),
+                    task_ordinal: active.task,
+                    lane: active.lane,
+                    review_generation: active.review_generation,
+                    session: active.session,
+                    turn: RuntimeTurnKey::from_counter(99).unwrap(),
+                    completion_token: active.token.into(),
+                    outcome: ready(),
+                    final_message_path: PathBuf::from("/artifacts/developer/wrong-turn.md"),
+                },
+                SupervisorErrorCode::InvalidIdentity,
+            ),
+            (
+                SupervisorEvent::TurnCompleted {
+                    expected_version: core.version(),
+                    task_ordinal: active.task,
+                    lane: active.lane,
+                    review_generation: active.review_generation,
+                    session: active.session,
+                    turn: active.turn,
+                    completion_token: "wrong-token".into(),
+                    outcome: ready(),
+                    final_message_path: PathBuf::from("/artifacts/developer/wrong-token.md"),
+                },
+                SupervisorErrorCode::InvalidIdentity,
+            ),
         ];
-        for event in wrong_events {
+        for (event, expected_code) in wrong_events {
             let mut candidate = core.clone();
             let before = candidate.clone();
-            assert_eq!(
-                candidate.reduce(event).unwrap_err().code,
-                SupervisorErrorCode::InvalidIdentity
-            );
+            assert_eq!(candidate.reduce(event).unwrap_err().code, expected_code);
             assert_eq!(candidate, before);
         }
 
@@ -4770,7 +5681,8 @@ mod tests {
             .reduce(SupervisorEvent::TurnCompleted {
                 expected_version: before_start.version(),
                 task_ordinal: 0,
-                role: WorkerRole::Developer,
+                lane: WorkerLane::Developer,
+                review_generation: None,
                 session: RuntimeSessionKey::from_counter(1).unwrap(),
                 turn: RuntimeTurnKey::from_counter(1).unwrap(),
                 completion_token: "not-started".into(),
@@ -4785,7 +5697,8 @@ mod tests {
         let event = SupervisorEvent::TurnCompleted {
             expected_version: accepted.version(),
             task_ordinal: active.task,
-            role: active.role,
+            lane: active.lane,
+            review_generation: active.review_generation,
             session: active.session,
             turn: active.turn,
             completion_token: active.token.into(),
@@ -4812,7 +5725,8 @@ mod tests {
             .reduce(SupervisorEvent::TurnCompleted {
                 expected_version: wrong_role.version(),
                 task_ordinal: 0,
-                role: WorkerRole::Developer,
+                lane: WorkerLane::Developer,
+                review_generation: None,
                 session: active.session,
                 turn: active.turn,
                 completion_token: active.token.into(),
@@ -4832,7 +5746,8 @@ mod tests {
             .reduce(SupervisorEvent::TurnStarted {
                 expected_version: active_core.version(),
                 task_ordinal: 0,
-                role: WorkerRole::Developer,
+                lane: WorkerLane::Developer,
+                review_generation: None,
                 purpose: RuntimeTurnPurpose::InitialDevelopment,
                 session: RuntimeSessionKey::from_counter(1).unwrap(),
                 turn: RuntimeTurnKey::from_counter(2).unwrap(),
@@ -4858,7 +5773,7 @@ mod tests {
             .reduce(SupervisorEvent::RoleSessionOpened {
                 expected_version: core.version(),
                 task_ordinal: 1,
-                role: WorkerRole::Developer,
+                lane: WorkerLane::Developer,
                 session: RuntimeSessionKey::from_counter(1).unwrap(),
             })
             .unwrap_err();
@@ -4879,7 +5794,7 @@ mod tests {
             vec![
                 SupervisorEffect::InterruptTurn {
                     task_ordinal: 0,
-                    role: WorkerRole::Developer,
+                    lane: WorkerLane::Developer,
                     session: active.session,
                     turn: active.turn,
                 },
@@ -4895,7 +5810,8 @@ mod tests {
             .reduce(SupervisorEvent::TurnCompleted {
                 expected_version: cancel_first.version(),
                 task_ordinal: 0,
-                role: WorkerRole::Developer,
+                lane: WorkerLane::Developer,
+                review_generation: None,
                 session: active.session,
                 turn: active.turn,
                 completion_token: active.token.into(),
@@ -4934,7 +5850,8 @@ mod tests {
                 .reduce(SupervisorEvent::TurnFailed {
                     expected_version: parent_first.version(),
                     task_ordinal: 0,
-                    role: WorkerRole::Developer,
+                    lane: WorkerLane::Developer,
+                    review_generation: None,
                     session: active.session,
                     turn: active.turn,
                     completion_token: active.token.into(),
@@ -4950,7 +5867,8 @@ mod tests {
             .reduce(SupervisorEvent::TurnFailed {
                 expected_version: failure_first.version(),
                 task_ordinal: 0,
-                role: WorkerRole::Developer,
+                lane: WorkerLane::Developer,
+                review_generation: None,
                 session: active.session,
                 turn: active.turn,
                 completion_token: active.token.into(),
@@ -5203,7 +6121,8 @@ mod tests {
                 .reduce(SupervisorEvent::TurnCompleted {
                     expected_version: core.version(),
                     task_ordinal: 0,
-                    role: WorkerRole::Reviewer,
+                    lane: active.lane,
+                    review_generation: active.review_generation,
                     session: active.session,
                     turn: active.turn,
                     completion_token: active.token.into(),
@@ -5225,7 +6144,8 @@ mod tests {
             .reduce(SupervisorEvent::Timeout {
                 expected_version: timed_out.version(),
                 task_ordinal: 0,
-                role: WorkerRole::Developer,
+                lane: WorkerLane::Developer,
+                review_generation: None,
                 session: active.session,
                 turn: active.turn,
                 completion_token: active.token.into(),
@@ -5236,7 +6156,7 @@ mod tests {
             vec![
                 SupervisorEffect::InterruptTurn {
                     task_ordinal: 0,
-                    role: WorkerRole::Developer,
+                    lane: WorkerLane::Developer,
                     session: active.session,
                     turn: active.turn,
                 },
@@ -5281,7 +6201,8 @@ mod tests {
             core.reduce(SupervisorEvent::TurnFailed {
                 expected_version: core.version(),
                 task_ordinal: 0,
-                role: WorkerRole::Developer,
+                lane: WorkerLane::Developer,
+                review_generation: None,
                 session: active.session,
                 turn: active.turn,
                 completion_token: active.token.into(),
@@ -5460,7 +6381,8 @@ mod tests {
             .reduce(SupervisorEvent::TurnCompleted {
                 expected_version: core.version(),
                 task_ordinal: 1,
-                role: WorkerRole::Developer,
+                lane: WorkerLane::Developer,
+                review_generation: None,
                 session: developer.session,
                 turn: developer.turn,
                 completion_token: developer.token.into(),
@@ -5487,7 +6409,8 @@ mod tests {
             .reduce(SupervisorEvent::TurnStarted {
                 expected_version: core.version(),
                 task_ordinal: 0,
-                role: WorkerRole::Reviewer,
+                lane: WorkerLane::Reviewer(ReviewerId::Reviewer1),
+                review_generation: Some(core.tasks[0].review_generation),
                 purpose: RuntimeTurnPurpose::InitialReview,
                 session: RuntimeSessionKey::from_counter(2).unwrap(),
                 turn: RuntimeTurnKey::from_counter(2).unwrap(),
@@ -5537,7 +6460,8 @@ mod tests {
             let event = SupervisorEvent::TurnStarted {
                 expected_version: core.version(),
                 task_ordinal: 0,
-                role: WorkerRole::Developer,
+                lane: WorkerLane::Developer,
+                review_generation: None,
                 purpose: RuntimeTurnPurpose::InitialDevelopment,
                 session: RuntimeSessionKey::from_counter(1).unwrap(),
                 turn: RuntimeTurnKey::from_counter(1).unwrap(),
@@ -5643,7 +6567,9 @@ mod tests {
         let mut duplicate_session = bound_core();
         let session = RuntimeSessionKey::from_counter(1).unwrap();
         duplicate_session.tasks[0].developer_session = Some(session);
-        duplicate_session.tasks[0].reviewer_session = Some(session);
+        duplicate_session.tasks[0]
+            .reviewer_sessions
+            .insert(ReviewerId::Reviewer1, session);
         duplicate_session.used_sessions.insert(session);
         cases.push(("same logical session for two roles", duplicate_session));
 

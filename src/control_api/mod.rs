@@ -20,6 +20,7 @@ pub use protocol::{
     ControlRequest, ControlResponse, ControlResult, MAX_CLARIFICATION_PAGE_RECORDS,
     MAX_CLARIFICATION_RECORDS_PER_RUN, MAX_CLARIFICATION_RECORDS_PER_TASK,
     MAX_PROGRESS_EVENTS_PER_RUN, NativeSessionMode, PendingArchitectActionSnapshot,
-    ReviewerVerdict, SessionProgressEvent, SessionState, SessionStatusSnapshot,
-    TaskCompletionOutcome, TaskDraft, TaskState, TaskStatusSnapshot, WorkerRole,
+    ReviewerBindingSnapshot, ReviewerResultSnapshot, ReviewerVerdict, SessionProgressEvent,
+    SessionState, SessionStatusSnapshot, TaskCompletionOutcome, TaskDraft, TaskState,
+    TaskStatusSnapshot, WorkerRole,
 };

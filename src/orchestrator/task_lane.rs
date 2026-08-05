@@ -8,7 +8,9 @@ use super::core::{
 };
 use super::workspace::{ProjectTasksWorkspace, TasksWorkspace};
 use super::{SessionRuntimeSources, SessionStartup, ensure_private_directory, sha256_hex};
-use crate::control_api::{SessionState, SessionStatusSnapshot, TaskDraft, TaskState, WorkerRole};
+use crate::control_api::{
+    ReviewerBindingSnapshot, SessionState, SessionStatusSnapshot, TaskDraft, TaskState, WorkerRole,
+};
 use crate::worker::claude_exec_runtime::{ClaudeExecRuntimeConfig, ClaudeExecTaskWorkerRuntime};
 use crate::worker::environment::{
     EnvironmentPolicy, ExecutionEnvironmentLease, MaterializedWorkerEnvironment, ParentEnvironment,
@@ -133,6 +135,7 @@ impl RuntimeFactory for ProductionRuntimeFactory {
                         artifact_root_path: artifact_root.clone(),
                         run_id: run_id.clone(),
                         task_id: task_key.clone(),
+                        reviewer_id: lane.reviewer_id(),
                     })?)
                 }
                 RuntimeProvider::ClaudeExec => Box::new(ClaudeExecTaskWorkerRuntime::open(
@@ -147,6 +150,7 @@ impl RuntimeFactory for ProductionRuntimeFactory {
                         artifact_root_path: artifact_root.clone(),
                         run_id: run_id.clone(),
                         task_id: task_key.clone(),
+                        reviewer_id: lane.reviewer_id(),
                         cleanup_registry: cleanup_registry.clone(),
                     },
                 )?),
@@ -262,6 +266,7 @@ struct LocalSession {
 struct ActiveTurn {
     task_ordinal: usize,
     lane: WorkerLane,
+    review_generation: Option<u32>,
     logical_session: RuntimeSessionKey,
     logical_turn: RuntimeTurnKey,
     local_turn: RuntimeTurnKey,
@@ -279,7 +284,7 @@ pub(crate) struct TaskLaneSupervisor {
     reviewer_adapter: String,
     factory: Box<dyn RuntimeFactory>,
     task_runtime: Option<OpenTaskRuntime>,
-    active: Option<ActiveTurn>,
+    active: BTreeMap<WorkerLane, ActiveTurn>,
     next_session: u64,
     next_turn: u64,
     project_tasks_workspace: Option<ProjectTasksWorkspace>,
@@ -333,8 +338,24 @@ impl TaskLaneSupervisor {
             project_root: project_root.clone(),
             session_binding_hash: binding_hash.clone(),
         };
-        let core = SupervisorCore::new(run_id, project_root, binding_hash)
-            .map_err(|error| anyhow!(error.to_string()))?;
+        let reviewer_bindings = profiles
+            .reviewers
+            .iter()
+            .map(|binding| ReviewerBindingSnapshot {
+                reviewer_id: binding.reviewer_id,
+                provider: binding.profile.provider.as_str().into(),
+                model: binding.profile.model.clone(),
+                reasoning_effort: binding.profile.reasoning_effort.clone(),
+                contract_sha256: binding.profile.provider.contract_identity().contract_sha256,
+            })
+            .collect();
+        let core = SupervisorCore::new_with_reviewer_bindings(
+            run_id,
+            project_root,
+            binding_hash,
+            reviewer_bindings,
+        )
+        .map_err(|error| anyhow!(error.to_string()))?;
         let developer_adapter = profiles.developer.provider.as_str().into();
         let reviewer_adapter = profiles.reviewer1().provider.as_str().into();
         Ok(Self {
@@ -348,7 +369,7 @@ impl TaskLaneSupervisor {
             reviewer_adapter,
             factory,
             task_runtime: None,
-            active: None,
+            active: BTreeMap::new(),
             next_session: 1,
             next_turn: 1,
             project_tasks_workspace: None,
@@ -385,7 +406,7 @@ impl TaskLaneSupervisor {
         if !self.core.session_state().is_terminal() {
             bail!("a new run requires a terminal current run");
         }
-        if self.task_runtime.is_some() || self.active.is_some() {
+        if self.task_runtime.is_some() || !self.active.is_empty() {
             bail!("terminal run retained a live task runtime");
         }
         self.cleanup_registry.ensure_available()?;
@@ -714,7 +735,11 @@ impl TaskLaneSupervisor {
 
     pub(crate) fn poll_once(&mut self) -> Result<()> {
         let _ = self.cleanup_registry.retry_pending();
-        let fallback_task_ordinal = self.active.as_ref().map(|active| active.task_ordinal);
+        let fallback_task_ordinal = self
+            .active
+            .values()
+            .next()
+            .map(|active| active.task_ordinal);
         let result = self.poll_once_inner();
         if result.is_ok() || self.core.session_state().is_terminal() {
             return result;
@@ -731,79 +756,83 @@ impl TaskLaneSupervisor {
     }
 
     fn poll_once_inner(&mut self) -> Result<()> {
-        if self.core.session_state() != SessionState::Running || self.active.is_none() {
+        if self.core.session_state() != SessionState::Running || self.active.is_empty() {
             return Ok(());
         }
-        let active = self
-            .active
-            .clone()
-            .ok_or_else(|| anyhow!("active exec worker turn disappeared"))?;
-        let polled = {
-            let task_runtime = self.require_task_runtime_mut(active.task_ordinal)?;
-            task_runtime
-                .runtime
-                .poll_turn(active.lane, active.local_turn)
-        };
-        let poll = polled.and_then(|polled| {
-            if polled.lane != active.lane || polled.turn != active.local_turn {
-                return Err(RuntimeError::invalid_identity(
-                    "task runtime returned a poll for another lane or turn",
-                ));
+        let lanes = self.active.keys().copied().collect::<Vec<_>>();
+        for lane in lanes {
+            let Some(active) = self.active.get(&lane).cloned() else {
+                continue;
+            };
+            let polled = {
+                let task_runtime = self.require_task_runtime_mut(active.task_ordinal)?;
+                task_runtime
+                    .runtime
+                    .poll_turn(active.lane, active.local_turn)
+            };
+            let poll = polled.and_then(|polled| {
+                if polled.lane != active.lane || polled.turn != active.local_turn {
+                    return Err(RuntimeError::invalid_identity(
+                        "task runtime returned a poll for another lane or turn",
+                    ));
+                }
+                Ok(polled.poll)
+            });
+            let event = match poll {
+                Ok(RuntimeTurnPoll::Pending { .. }) => continue,
+                Ok(RuntimeTurnPoll::Completed {
+                    outcome,
+                    final_message_path,
+                    ..
+                }) => SupervisorEvent::TurnCompleted {
+                    expected_version: self.core.version(),
+                    task_ordinal: active.task_ordinal,
+                    lane,
+                    review_generation: active.review_generation,
+                    session: active.logical_session,
+                    turn: active.logical_turn,
+                    completion_token: active.completion_token.clone(),
+                    outcome,
+                    final_message_path,
+                },
+                Ok(RuntimeTurnPoll::Failed { failure, .. }) => SupervisorEvent::TurnFailed {
+                    expected_version: self.core.version(),
+                    task_ordinal: active.task_ordinal,
+                    lane,
+                    review_generation: active.review_generation,
+                    session: active.logical_session,
+                    turn: active.logical_turn,
+                    completion_token: active.completion_token.clone(),
+                    failure,
+                },
+                Err(error) => SupervisorEvent::TurnFailed {
+                    expected_version: self.core.version(),
+                    task_ordinal: active.task_ordinal,
+                    lane,
+                    review_generation: active.review_generation,
+                    session: active.logical_session,
+                    turn: active.logical_turn,
+                    completion_token: active.completion_token.clone(),
+                    failure: runtime_error_failure(error)?,
+                },
+            };
+            let mut next_core = self.core.clone();
+            let effects = next_core
+                .reduce(event)
+                .map_err(|error| anyhow!(error.to_string()))?;
+            self.active.remove(&lane);
+            if let Some(task_ordinal) = successful_task_close(&next_core, &effects)
+                && let Err(error) = self.close_task_runtime(task_ordinal)
+            {
+                return self.fail_driver_effect(task_ordinal, DriverFailureClass::Cleanup, error);
             }
-            Ok(polled.poll)
-        });
-        let role = active.lane.role();
-        let event = match poll {
-            Ok(RuntimeTurnPoll::Pending { .. }) => return Ok(()),
-            Ok(RuntimeTurnPoll::Completed {
-                outcome,
-                final_message_path,
-                ..
-            }) => SupervisorEvent::TurnCompleted {
-                expected_version: self.core.version(),
-                task_ordinal: active.task_ordinal,
-                role,
-                session: active.logical_session,
-                turn: active.logical_turn,
-                completion_token: active.completion_token.clone(),
-                outcome,
-                final_message_path,
-            },
-            Ok(RuntimeTurnPoll::Failed { failure, .. }) => SupervisorEvent::TurnFailed {
-                expected_version: self.core.version(),
-                task_ordinal: active.task_ordinal,
-                role,
-                session: active.logical_session,
-                turn: active.logical_turn,
-                completion_token: active.completion_token.clone(),
-                failure,
-            },
-            Err(error) => SupervisorEvent::TurnFailed {
-                expected_version: self.core.version(),
-                task_ordinal: active.task_ordinal,
-                role,
-                session: active.logical_session,
-                turn: active.logical_turn,
-                completion_token: active.completion_token.clone(),
-                failure: runtime_error_failure(error)?,
-            },
-        };
-        // Two-phase commit, same as `execute_effects`: a verdict that closes a
-        // task must not be committed unless the runtime actually closes. The
-        // reviewer's verdict now lands here directly, so the guard has to live
-        // here too.
-        let mut next_core = self.core.clone();
-        let effects = next_core
-            .reduce(event)
-            .map_err(|error| anyhow!(error.to_string()))?;
-        self.active = None;
-        if let Some(task_ordinal) = successful_task_close(&next_core, &effects)
-            && let Err(error) = self.close_task_runtime(task_ordinal)
-        {
-            return self.fail_driver_effect(task_ordinal, DriverFailureClass::Cleanup, error);
+            self.core = next_core;
+            self.execute_effects(effects)?;
+            if self.core.session_state().is_terminal() {
+                break;
+            }
         }
-        self.core = next_core;
-        self.execute_effects(effects)
+        Ok(())
     }
 
     pub(crate) fn shutdown(&mut self) -> Result<()> {
@@ -844,8 +873,8 @@ impl TaskLaneSupervisor {
                         task_ordinal,
                     }
                 }
-                SupervisorEffect::OpenRoleSession { task_ordinal, role } => {
-                    let logical = match self.open_role_session(task_ordinal, role) {
+                SupervisorEffect::OpenRoleSession { task_ordinal, lane } => {
+                    let logical = match self.open_role_session(task_ordinal, lane) {
                         Ok(session) => session,
                         Err(error) => {
                             return self.fail_driver_effect(
@@ -858,34 +887,42 @@ impl TaskLaneSupervisor {
                     SupervisorEvent::RoleSessionOpened {
                         expected_version: self.core.version(),
                         task_ordinal,
-                        role,
+                        lane,
                         session: logical,
                     }
                 }
                 SupervisorEffect::StartTurn {
                     task_ordinal,
-                    role,
+                    lane,
+                    review_generation,
                     purpose,
                     session,
                 } => {
-                    let (logical_turn, completion_token) =
-                        match self.start_turn(task_ordinal, role, purpose, session) {
-                            Ok(started) => started,
-                            Err(error) => {
-                                return self.fail_driver_effect(
-                                    task_ordinal,
-                                    DriverFailureClass::Runtime,
-                                    error,
-                                );
-                            }
-                        };
+                    let (logical_turn, completion_token) = match self.start_turn(
+                        task_ordinal,
+                        lane,
+                        review_generation,
+                        purpose,
+                        session,
+                    ) {
+                        Ok(started) => started,
+                        Err(error) => {
+                            return self.fail_driver_effect(
+                                task_ordinal,
+                                DriverFailureClass::Runtime,
+                                error,
+                            );
+                        }
+                    };
                     self.note(&format!(
-                        "task {task_ordinal}: started {role:?} turn ({purpose:?})"
+                        "task {task_ordinal}: started {} turn ({purpose:?})",
+                        lane.as_str()
                     ));
                     SupervisorEvent::TurnStarted {
                         expected_version: self.core.version(),
                         task_ordinal,
-                        role,
+                        lane,
+                        review_generation,
                         purpose,
                         session,
                         turn: logical_turn,
@@ -893,9 +930,12 @@ impl TaskLaneSupervisor {
                     }
                 }
                 SupervisorEffect::InterruptTurn {
-                    task_ordinal, turn, ..
+                    task_ordinal,
+                    lane,
+                    turn,
+                    ..
                 } => {
-                    self.interrupt_turn(task_ordinal, turn);
+                    self.interrupt_turn(task_ordinal, lane, turn);
                     continue;
                 }
                 SupervisorEffect::CloseTaskRuntime { task_ordinal } => {
@@ -1000,7 +1040,7 @@ impl TaskLaneSupervisor {
         self.cleanup_registry
             .ensure_available()
             .map_err(|error| RuntimeOpenFailure::new(DriverFailureClass::Cleanup, error))?;
-        if self.task_runtime.is_some() || self.active.is_some() {
+        if self.task_runtime.is_some() || !self.active.is_empty() {
             return Err(RuntimeOpenFailure::new(
                 DriverFailureClass::Contract,
                 anyhow!("a task-local exec worker runtime is already open"),
@@ -1070,7 +1110,7 @@ impl TaskLaneSupervisor {
     fn open_role_session(
         &mut self,
         task_ordinal: usize,
-        role: WorkerRole,
+        lane: WorkerLane,
     ) -> Result<RuntimeSessionKey> {
         self.cleanup_registry.ensure_available()?;
         let task = self
@@ -1081,8 +1121,8 @@ impl TaskLaneSupervisor {
         let task_key = task.spec.task_key.clone();
         let repository_root = PathBuf::from(&task.spec.repository_root);
         let project_root = self.startup.project_root.clone();
-        let lane = WorkerLane::released_for_role(role);
-        let profile = self.profile(role).clone();
+        let role = lane.role();
+        let profile = self.profile(lane).clone();
         let instructions = role_instructions(role).to_owned();
         let local = self
             .require_task_runtime_mut(task_ordinal)?
@@ -1114,12 +1154,17 @@ impl TaskLaneSupervisor {
     fn start_turn(
         &mut self,
         task_ordinal: usize,
-        role: WorkerRole,
+        lane: WorkerLane,
+        review_generation: Option<u32>,
         purpose: RuntimeTurnPurpose,
         logical_session: RuntimeSessionKey,
     ) -> Result<(RuntimeTurnKey, String)> {
-        if self.active.is_some() {
-            bail!("a second exec worker turn cannot start");
+        if self.active.contains_key(&lane)
+            || (lane == WorkerLane::Developer && !self.active.is_empty())
+            || (lane.role() == WorkerRole::Reviewer
+                && self.active.contains_key(&WorkerLane::Developer))
+        {
+            bail!("worker lane conflicts with an active exec worker turn");
         }
         self.cleanup_registry.ensure_available()?;
         let task = self
@@ -1129,9 +1174,9 @@ impl TaskLaneSupervisor {
             .ok_or_else(|| anyhow!("turn task ordinal is out of range"))?;
         let task_key = task.spec.task_key.clone();
         let repository_root = PathBuf::from(&task.spec.repository_root);
-        let prompt = self.build_turn_prompt(task_ordinal, role, purpose)?;
-        let profile = self.profile(role).clone();
-        let lane = WorkerLane::released_for_role(role);
+        let role = lane.role();
+        let prompt = self.build_turn_prompt(task_ordinal, lane, purpose)?;
+        let profile = self.profile(lane).clone();
         let local_session = self
             .require_task_runtime_mut(task_ordinal)?
             .sessions
@@ -1166,19 +1211,28 @@ impl TaskLaneSupervisor {
             .map_err(|error| anyhow!(error.detail))?;
         let logical_turn = self.allocate_turn_key()?;
         let completion_token = format!("exec-turn-{}", Uuid::new_v4());
-        self.active = Some(ActiveTurn {
-            task_ordinal,
+        self.active.insert(
             lane,
-            logical_session,
-            logical_turn,
-            local_turn,
-            completion_token: completion_token.clone(),
-        });
+            ActiveTurn {
+                task_ordinal,
+                lane,
+                review_generation,
+                logical_session,
+                logical_turn,
+                local_turn,
+                completion_token: completion_token.clone(),
+            },
+        );
         Ok((logical_turn, completion_token))
     }
 
-    fn interrupt_turn(&mut self, task_ordinal: usize, logical_turn: RuntimeTurnKey) {
-        let Some(active) = self.active.take() else {
+    fn interrupt_turn(
+        &mut self,
+        task_ordinal: usize,
+        lane: WorkerLane,
+        logical_turn: RuntimeTurnKey,
+    ) {
+        let Some(active) = self.active.remove(&lane) else {
             return;
         };
         if active.task_ordinal != task_ordinal || active.logical_turn != logical_turn {
@@ -1187,7 +1241,7 @@ impl TaskLaneSupervisor {
                 (task_ordinal, logical_turn),
                 "SupervisorCore emitted an interrupt for a different active exec worker turn"
             );
-            self.active = Some(active);
+            self.active.insert(lane, active);
             return;
         }
         if let Some(runtime) = self.task_runtime.as_mut()
@@ -1211,7 +1265,7 @@ impl TaskLaneSupervisor {
             self.task_runtime = Some(runtime);
             bail!("close effect referenced the wrong task-local runtime");
         }
-        self.active = None;
+        self.active.clear();
         runtime
             .runtime
             .shutdown()
@@ -1219,7 +1273,7 @@ impl TaskLaneSupervisor {
     }
 
     fn close_runtime_best_effort(&mut self) {
-        self.active = None;
+        self.active.clear();
         if let Some(mut runtime) = self.task_runtime.take() {
             let _ = runtime.runtime.shutdown();
         }
@@ -1241,7 +1295,7 @@ impl TaskLaneSupervisor {
     fn build_turn_prompt(
         &self,
         task_ordinal: usize,
-        role: WorkerRole,
+        lane: WorkerLane,
         purpose: RuntimeTurnPurpose,
     ) -> Result<String> {
         let task = self
@@ -1251,9 +1305,10 @@ impl TaskLaneSupervisor {
             .ok_or_else(|| anyhow!("turn prompt task ordinal is out of range"))?;
         let spec = &task.spec;
         let mut prompt = String::new();
+        let role = lane.role();
         let role_name = match role {
             WorkerRole::Developer => "Developer",
-            WorkerRole::Reviewer => "Reviewer",
+            WorkerRole::Reviewer => lane.as_str(),
         };
         prompt.push_str(&format!(
             "You are the task {role_name}.\n\nRepository:\n{}\n\nTask file:\n{}\n\nDesign files:\n",
@@ -1300,16 +1355,30 @@ impl TaskLaneSupervisor {
             WorkerRole::Developer => {
                 match purpose {
                     RuntimeTurnPurpose::DeveloperCorrection => {
-                        let paths = task.latest_reviewer_final_paths();
-                        if paths.is_empty() {
+                        if task.latest_reviewer_final_paths().is_empty() {
                             bail!("developer correction has no reviewer final message path");
                         }
-                        prompt.push_str("\nReviewer final messages, in order:\n");
-                        for path in paths {
-                            prompt.push_str(&format!("- {path}\n"));
+                        prompt.push_str(&format!(
+                            "\nReview generation {} responses, in fixed Reviewer order:\n",
+                            task.review_generation
+                        ));
+                        for reviewer_id in [
+                            crate::worker::profile::ReviewerId::Reviewer1,
+                            crate::worker::profile::ReviewerId::Reviewer2,
+                        ] {
+                            let paths = task.reviewer_final_paths(reviewer_id);
+                            if paths.is_empty() {
+                                bail!("developer correction lacks one Reviewer response");
+                            }
+                            prompt.push_str(&format!("- {}:\n", reviewer_id.as_str()));
+                            for path in paths {
+                                prompt.push_str(&format!("  - {path}\n"));
+                            }
                         }
                         prompt.push_str(
-                            "\nRead every Reviewer final file and address the requested changes. \
+                            "\nRead and synthesize both Reviewer responses. Resolve conflicting \
+                             suggestions against the approved task and disclose the choice in your \
+                             final. Address valid requested changes from either response. \
                              If an explicit human, task, design, or applicable instruction still \
                              requires this run to remain uncommitted, do not modify or amend \
                              anything: return `STATUS: CLARIFICATION_REQUIRED` for a human \
@@ -1355,6 +1424,9 @@ impl TaskLaneSupervisor {
                 prompt.push_str(DEVELOPER_OUTPUT_CONTRACT);
             }
             WorkerRole::Reviewer => {
+                let reviewer_id = lane
+                    .reviewer_id()
+                    .ok_or_else(|| anyhow!("Reviewer prompt omitted its lane identity"))?;
                 let developer_path = task
                     .latest_developer_final_path()
                     .ok_or_else(|| anyhow!("reviewer turn has no Developer final message path"))?;
@@ -1364,7 +1436,7 @@ impl TaskLaneSupervisor {
                     "Developer final message"
                 };
                 prompt.push_str(&format!(
-                    "\n{label}:\n{developer_path}\n\nRead the Developer final file and \
+                    "\nReviewer identity: {}\nReview generation: {}\n\n{label}:\n{developer_path}\n\nRead the Developer final file and \
                      independently review the selected task. Check every `ASSUMPTION:` the \
                      Developer reported against the approved task, design, and clarification \
                      records. Confirm the task is represented by one task commit and that no \
@@ -1372,8 +1444,18 @@ impl TaskLaneSupervisor {
                      applicable clarification, do not report a defect merely because the original \
                      task or design wording was ambiguous. If a finding comes from unresolved \
                      task/design ambiguity rather than an implementation defect, label that \
-                     finding `REQUIREMENT_AMBIGUITY:` while still returning the normal verdict.\n"
+                     finding `REQUIREMENT_AMBIGUITY:` while still returning the normal verdict.\n",
+                    reviewer_id.as_str(),
+                    task.review_generation,
                 ));
+                if purpose == RuntimeTurnPurpose::ReviewerRereview {
+                    prompt.push_str(
+                        "\nThe candidate was amended because of the previous review generation \
+                         for this task. Independently and completely review the current exact \
+                         candidate range again. Do not assume any finding was covered by the peer \
+                         Reviewer, and do not depend on or guess the peer response.\n",
+                    );
+                }
                 prompt.push_str(REVIEWER_OUTPUT_CONTRACT);
             }
         }
@@ -1384,8 +1466,10 @@ impl TaskLaneSupervisor {
         Ok(prompt)
     }
 
-    fn profile(&self, role: WorkerRole) -> &RuntimeProfile {
-        self.profiles.profile(role)
+    fn profile(&self, lane: WorkerLane) -> &RuntimeProfile {
+        self.profiles
+            .profile_for_lane(lane)
+            .expect("validated task lane profile exists")
     }
 
     fn require_task_runtime_mut(&mut self, task_ordinal: usize) -> Result<&mut OpenTaskRuntime> {
@@ -1530,7 +1614,7 @@ fn role_instructions(role: WorkerRole) -> &'static str {
             "You are the task Developer: execute the concrete approved task; do not redesign its product scope. First seek answers in the task file, design and clarification files, applicable instructions, existing implementation, and tests. Make ordinary local implementation decisions yourself. If an uncertain choice has a defensible candidate, is consistent with the approved behavior and scope, and can be corrected in review, choose the smallest-impact option, continue, and disclose it as `ASSUMPTION:` in your final. Ask for clarification only when you cannot derive any defensible candidate or the choice would decide material externally visible behavior, acceptance, or scope. Report BLOCKED only after actual attempts establish an external or mechanical obstacle; include concrete observations. Work directly in the exact repository and complete the bounded task. The human's execution approval for this standard hcom lane authorizes exactly one signed-off local candidate commit for this task; a general instruction that commits require human authorization is satisfied by that run approval. If an explicit human, task, design, or applicable instruction instead requires this run to remain uncommitted, do not modify or commit the repository: return `STATUS: CLARIFICATION_REQUIRED` because that requirement is incompatible with the standard review lane and requires an explicit human resolution. Otherwise run the required checks, then commit the complete work as ONE NEW commit whose message describes this task as a whole and whose `Signed-off-by` trailer matches the committing identity (for example, create it with `git commit --signoff`). Never amend, squash, reword, or otherwise rewrite a commit that existed when your first task turn began. On correction or clarification resume, amend your existing task commit if it exists and ensure that it retains a valid matching `Signed-off-by` trailer; if no task commit exists yet, create the one signed-off task commit only after the implementation is complete. Never create a second task commit. Do not create a commit merely to pause. If a pause is necessary after your task commit already exists, leave that commit unchanged and report the exact repository state. Never add any `hcom-tasks` artifact to the task commit. This local candidate commit and its same-task amendments do not authorize push, install, or release. Do not push, install, wait for interactive input, or modify the task/design/clarification source files."
         }
         WorkerRole::Reviewer => {
-            "You are the task Reviewer. Independently inspect the committed task range and decide whether it is sound against the approved task, design files, and every ordered clarification record. The human's execution approval for this standard hcom lane includes exactly one signed-off local Developer candidate commit and same-commit amendments during correction; it never includes push, install, or release. Review disclosed Developer assumptions rather than accepting them automatically. Confirm the developer left the work committed as a single commit for this task, with a message covering it, a valid `Signed-off-by` trailer matching the committing identity, and no `hcom-tasks` artifact; uncommitted work, a missing or mismatched sign-off, or a task split across several commits is a reason to request changes. If an explicit human, task, design, or applicable instruction requires the run to remain uncommitted, return `VERDICT: REQUEST_CHANGES` and label the incompatible workflow requirement `REQUIREMENT_AMBIGUITY:` instead of accepting either side of the contradiction. Distinguish other requirement ambiguity from implementation defects and label the former `REQUIREMENT_AMBIGUITY:` in findings. An LGTM applies to the exact final candidate range already committed; it does not call for another post-LGTM commit or a human decision about retaining that reviewed commit. You must not edit reviewed source, stage, commit, change branch or HEAD, push, or install; verifying by copying the tree into your own writable sandbox is allowed and encouraged when it helps."
+            "You are the task Reviewer. Independently inspect the committed task range and decide whether it is sound against the approved task, design files, and every ordered clarification record. The human's execution approval for this standard hcom lane includes exactly one signed-off local Developer candidate commit and same-commit amendments during correction; it never includes push, install, or release. Review disclosed Developer assumptions rather than accepting them automatically. Confirm the developer left the work committed as a single commit for this task, with a message covering it, a valid `Signed-off-by` trailer matching the committing identity, and no `hcom-tasks` artifact; uncommitted work, a missing or mismatched sign-off, or a task split across several commits is a reason to request changes. If an explicit human, task, design, or applicable instruction requires the run to remain uncommitted, return `VERDICT: REQUEST_CHANGES` and label the incompatible workflow requirement `REQUIREMENT_AMBIGUITY:` instead of accepting either side of the contradiction. Distinguish other requirement ambiguity from implementation defects and label the former `REQUIREMENT_AMBIGUITY:` in findings. An LGTM applies to the exact final candidate range already committed; it does not call for another post-LGTM commit or a human decision about retaining that reviewed commit. You must not edit reviewed source, the Git index or refs, the candidate commit, stage, commit, change branch or HEAD, push, or install. The two Reviewer turns run concurrently with independent six-hour turn timeouts and no extra join deadline, cgroup, CPU, memory, or Cargo concurrency cap. Do not clean or mutate a shared Cargo target directory; for checks that write build artifacts, copy the tree into your own writable sandbox and use an isolated target directory."
         }
     }
 }
@@ -1566,7 +1650,8 @@ mod tests {
     use crate::worker::fake_runtime::{FakeTaskWorkerRuntime, FakeTurnScript};
     use crate::worker::profile::{
         ArchitectAdapter, ClaudeInvocationProfile, CodexInvocationProfile,
-        DeveloperInvocationProfile, ReviewerInvocationProfile, SessionInvocationProfiles,
+        DeveloperInvocationProfile, ReviewerId, ReviewerInvocationProfile,
+        SessionInvocationProfiles,
     };
     use crate::worker::runtime::{
         CODEX_TASK_WORKER_ADAPTER, DeveloperOutcomeStatus, DeveloperOutcomeV1, ReviewerOutcomeV1,
@@ -1582,7 +1667,40 @@ mod tests {
         *profiles.reviewer1_mut() = ReviewerInvocationProfile::Codex {
             profile: CodexInvocationProfile::reviewer_default(),
         };
+        *profiles.reviewer2_mut() = ReviewerInvocationProfile::Codex {
+            profile: CodexInvocationProfile::reviewer_default(),
+        };
         profiles
+    }
+
+    fn reviewer_paths(task: &crate::control_api::TaskStatusSnapshot) -> Vec<String> {
+        task.reviewers
+            .iter()
+            .flat_map(|reviewer| reviewer.current_final_message_paths.clone())
+            .collect()
+    }
+
+    fn joined_reviewer_verdict(
+        task: &crate::control_api::TaskStatusSnapshot,
+    ) -> Option<ReviewerVerdict> {
+        if task
+            .reviewers
+            .iter()
+            .any(|reviewer| reviewer.current_verdict.is_none())
+        {
+            return None;
+        }
+        Some(
+            if task
+                .reviewers
+                .iter()
+                .all(|reviewer| reviewer.current_verdict == Some(ReviewerVerdict::Lgtm))
+            {
+                ReviewerVerdict::Lgtm
+            } else {
+                ReviewerVerdict::RequestChanges
+            },
+        )
     }
 
     fn binding_hash(profiles: &SessionInvocationProfiles, roots: &[PathBuf]) -> String {
@@ -1613,9 +1731,18 @@ mod tests {
 
         let mut reviewer = base.clone();
         *reviewer.reviewer1_mut() = ReviewerInvocationProfile::Codex {
-            profile: CodexInvocationProfile::reviewer_default(),
+            profile: CodexInvocationProfile {
+                model: "reviewer-one-override".into(),
+                ..CodexInvocationProfile::reviewer_default()
+            },
         };
         assert_ne!(base_hash, binding_hash(&reviewer, &[]));
+
+        let mut reviewer2 = base.clone();
+        *reviewer2.reviewer2_mut() = ReviewerInvocationProfile::Codex {
+            profile: CodexInvocationProfile::reviewer_default(),
+        };
+        assert_ne!(base_hash, binding_hash(&reviewer2, &[]));
 
         let roots = [PathBuf::from("/source/one"), PathBuf::from("/source/two")];
         assert_ne!(base_hash, binding_hash(&base, &roots));
@@ -1650,6 +1777,10 @@ mod tests {
             "valid `Signed-off-by` trailer matching the committing identity",
             "exact final candidate range already committed",
             "does not call for another post-LGTM commit",
+            "must not edit reviewed source, the Git index or refs, the candidate commit",
+            "two Reviewer turns run concurrently with independent six-hour turn timeouts",
+            "no extra join deadline, cgroup, CPU, memory, or Cargo concurrency cap",
+            "use an isolated target directory",
         ] {
             assert!(
                 reviewer.contains(required),
@@ -1712,11 +1843,19 @@ mod tests {
     struct Audit {
         opens: Vec<String>,
         sessions: Vec<(String, WorkerRole, u64)>,
+        lane_sessions: Vec<(String, WorkerLane, u64)>,
         turns: Vec<(String, WorkerRole, RuntimeTurnPurpose, u64)>,
+        lane_events: Vec<ScriptedLaneEvent>,
         prompts: Vec<(WorkerRole, RuntimeTurnPurpose, String)>,
         shutdowns: Vec<String>,
         environments: Vec<Vec<(OsString, OsString)>>,
         profiles: Vec<(String, WorkerRole, RuntimeProfile)>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ScriptedLaneEvent {
+        TurnStarted(WorkerLane),
+        TurnPolled(WorkerLane),
     }
 
     struct ScriptedFactory {
@@ -1793,6 +1932,9 @@ mod tests {
             audit
                 .sessions
                 .push((self.task_key.clone(), role, session.counter()));
+            audit
+                .lane_sessions
+                .push((self.task_key.clone(), lane, session.counter()));
             audit.profiles.push((self.task_key.clone(), role, profile));
             Ok(session)
         }
@@ -1817,6 +1959,7 @@ mod tests {
             audit
                 .turns
                 .push((self.task_key.clone(), role, purpose, session.counter()));
+            audit.lane_events.push(ScriptedLaneEvent::TurnStarted(lane));
             audit.prompts.push((role, purpose, prompt));
             drop(audit);
             Ok(turn)
@@ -1833,6 +1976,11 @@ mod tests {
                 ));
             }
             let poll = self.inner.poll_turn(turn)?;
+            self.audit
+                .lock()
+                .unwrap()
+                .lane_events
+                .push(ScriptedLaneEvent::TurnPolled(lane));
             if poll.is_terminal() {
                 self.turns.remove(&turn);
                 let mutation = self.mutations.pop_front().ok_or_else(|| {
@@ -2160,6 +2308,14 @@ mod tests {
                     },
                 };
                 *profiles.reviewer1_mut() = match reviewer {
+                    RuntimeProvider::CodexExec => ReviewerInvocationProfile::Codex {
+                        profile: cheap_codex.clone(),
+                    },
+                    RuntimeProvider::ClaudeExec => ReviewerInvocationProfile::Claude {
+                        profile: cheap_claude.clone(),
+                    },
+                };
+                *profiles.reviewer2_mut() = match reviewer {
                     RuntimeProvider::CodexExec => ReviewerInvocationProfile::Codex {
                         profile: cheap_codex,
                     },
@@ -2505,12 +2661,44 @@ mod tests {
         mutations: Vec<Mutation>,
     ) -> TaskScript {
         assert_eq!(turns.len(), mutations.len());
+        let mut dual_turns = Vec::with_capacity(turns.len().saturating_mul(2));
+        let mut dual_mutations = VecDeque::with_capacity(mutations.len().saturating_mul(2));
+        for (turn, mutation) in turns.into_iter().zip(mutations) {
+            let reviewer2_turn =
+                (turn.role == WorkerRole::Reviewer).then(|| reviewer2_script(turn.clone()));
+            dual_turns.push(turn);
+            dual_mutations.push_back(mutation);
+            if let Some(reviewer2_turn) = reviewer2_turn {
+                dual_turns.push(reviewer2_turn);
+                dual_mutations.push_back(Mutation::None);
+            }
+        }
         TaskScript {
             task_key: task_key.into(),
-            turns,
-            mutations: mutations.into(),
+            turns: dual_turns,
+            mutations: dual_mutations,
             shutdown_failure: false,
         }
+    }
+
+    fn reviewer2_script(mut script: FakeTurnScript) -> FakeTurnScript {
+        for poll in &mut script.polls {
+            if let RuntimeTurnPoll::Completed {
+                final_message_path, ..
+            } = poll
+            {
+                *final_message_path = reviewer2_final_path(final_message_path);
+            }
+        }
+        script
+    }
+
+    fn reviewer2_final_path(path: &Path) -> PathBuf {
+        let parent = path.parent().expect("scripted final path has a parent");
+        let file_name = path
+            .file_name()
+            .expect("scripted final path has a file name");
+        parent.join("reviewer2").join(file_name)
     }
 
     fn task_script_with_shutdown_failure(
@@ -2756,7 +2944,8 @@ mod tests {
         let fixture = Fixture::new();
         let lanes = [
             WorkerLane::Developer,
-            WorkerLane::released_for_role(WorkerRole::Reviewer),
+            WorkerLane::Reviewer(ReviewerId::Reviewer1),
+            WorkerLane::Reviewer(ReviewerId::Reviewer2),
         ];
         let (root, paths) =
             TaskRuntimePaths::create(&fixture.run_root, 0, "config", &fixture.repository, lanes)
@@ -2817,7 +3006,12 @@ mod tests {
         assert_eq!(snapshot.tasks[0].state, crate::control_api::TaskState::Lgtm);
         assert_eq!(snapshot.tasks[0].review_round, 1);
         assert!(snapshot.tasks[0].developer_session_bound);
-        assert!(snapshot.tasks[0].reviewer_session_bound);
+        assert!(
+            snapshot.tasks[0]
+                .reviewers
+                .iter()
+                .all(|reviewer| reviewer.session_bound)
+        );
         let audit = audit.lock().unwrap();
         assert_eq!(audit.opens, ["one"]);
         assert_eq!(audit.shutdowns, ["one"]);
@@ -2827,7 +3021,44 @@ mod tests {
                 .iter()
                 .map(|(_, role, key)| (*role, *key))
                 .collect::<Vec<_>>(),
-            [(WorkerRole::Developer, 1), (WorkerRole::Reviewer, 2)]
+            [
+                (WorkerRole::Developer, 1),
+                (WorkerRole::Reviewer, 2),
+                (WorkerRole::Reviewer, 3),
+            ]
+        );
+        assert_eq!(
+            audit
+                .lane_sessions
+                .iter()
+                .map(|(_, lane, _)| *lane)
+                .collect::<Vec<_>>(),
+            [
+                WorkerLane::Developer,
+                WorkerLane::Reviewer(ReviewerId::Reviewer1),
+                WorkerLane::Reviewer(ReviewerId::Reviewer2),
+            ]
+        );
+        assert_eq!(
+            audit
+                .lane_events
+                .iter()
+                .copied()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        ScriptedLaneEvent::TurnStarted(WorkerLane::Reviewer(_))
+                            | ScriptedLaneEvent::TurnPolled(WorkerLane::Reviewer(_))
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [
+                ScriptedLaneEvent::TurnStarted(WorkerLane::Reviewer(ReviewerId::Reviewer1)),
+                ScriptedLaneEvent::TurnStarted(WorkerLane::Reviewer(ReviewerId::Reviewer2)),
+                ScriptedLaneEvent::TurnPolled(WorkerLane::Reviewer(ReviewerId::Reviewer1)),
+                ScriptedLaneEvent::TurnPolled(WorkerLane::Reviewer(ReviewerId::Reviewer2)),
+            ],
+            "both Reviewer lanes must start before either lane is polled"
         );
         assert!(
             audit
@@ -3007,8 +3238,10 @@ mod tests {
             [
                 ("first", WorkerRole::Developer, 1),
                 ("first", WorkerRole::Reviewer, 2),
+                ("first", WorkerRole::Reviewer, 3),
                 ("second", WorkerRole::Developer, 1),
                 ("second", WorkerRole::Reviewer, 2),
+                ("second", WorkerRole::Reviewer, 3),
             ]
         );
     }
@@ -3157,7 +3390,7 @@ mod tests {
         assert_eq!(snapshot.state, SessionState::Completed);
         assert_eq!(snapshot.tasks[0].review_round, 2);
         let audit = audit.lock().unwrap();
-        assert_eq!(audit.sessions.len(), 2);
+        assert_eq!(audit.sessions.len(), 3);
         assert_eq!(
             audit
                 .turns
@@ -3171,6 +3404,7 @@ mod tests {
                     1
                 ),
                 (WorkerRole::Reviewer, RuntimeTurnPurpose::InitialReview, 2),
+                (WorkerRole::Reviewer, RuntimeTurnPurpose::InitialReview, 3),
                 (
                     WorkerRole::Developer,
                     RuntimeTurnPurpose::DeveloperCorrection,
@@ -3180,6 +3414,11 @@ mod tests {
                     WorkerRole::Reviewer,
                     RuntimeTurnPurpose::ReviewerRereview,
                     2
+                ),
+                (
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::ReviewerRereview,
+                    3
                 ),
             ]
         );
@@ -3236,7 +3475,7 @@ mod tests {
                 .iter()
                 .filter(|(_, role, _)| *role == WorkerRole::Reviewer)
                 .count(),
-            1
+            2
         );
     }
 
@@ -3488,7 +3727,7 @@ mod tests {
         assert_eq!(snapshot.tasks[0].review_round, 2);
 
         let audit = audit.lock().unwrap();
-        // One developer session and one reviewer session, each resumed.
+        // One Developer session and two fixed Reviewer sessions, each resumed.
         assert_eq!(
             audit
                 .sessions
@@ -3503,7 +3742,7 @@ mod tests {
                 .iter()
                 .filter(|(_, role, _)| *role == WorkerRole::Reviewer)
                 .count(),
-            1
+            2
         );
         // Each role receives the peer's durable path, never the peer body.
         let review_prompt = audit
@@ -3590,11 +3829,17 @@ mod tests {
             message_path(WorkerRole::Developer, "second attempt: handled overflow").to_str()
         );
         assert_eq!(
-            snapshot.tasks[0].final_reviewer_message_paths,
+            reviewer_paths(&snapshot.tasks[0]),
             vec![
                 message_path(WorkerRole::Reviewer, "overflow handling is correct now")
                     .to_string_lossy()
-                    .into_owned()
+                    .into_owned(),
+                reviewer2_final_path(&message_path(
+                    WorkerRole::Reviewer,
+                    "overflow handling is correct now",
+                ))
+                .to_string_lossy()
+                .into_owned(),
             ]
         );
 
@@ -3684,7 +3929,7 @@ mod tests {
         );
 
         let audit = audit.lock().unwrap();
-        assert_eq!(audit.prompts.len(), 4);
+        assert_eq!(audit.prompts.len(), 6);
         for (_, _, prompt) in &audit.prompts {
             assert!(prompt.len() < crate::worker::runtime::MAX_RUNTIME_PROMPT_BYTES);
             assert!(!prompt.contains(large_task_marker));
@@ -3757,15 +4002,18 @@ mod tests {
         assert_eq!(snapshot.state, SessionState::Completed);
         assert_eq!(snapshot.tasks[0].state, TaskState::ReviewExhausted);
         assert_eq!(
-            snapshot.tasks[0].final_reviewer_message_paths,
+            reviewer_paths(&snapshot.tasks[0]),
             vec![
                 message_path(WorkerRole::Reviewer, "still wrong")
                     .to_string_lossy()
-                    .into_owned()
+                    .into_owned(),
+                reviewer2_final_path(&message_path(WorkerRole::Reviewer, "still wrong"))
+                    .to_string_lossy()
+                    .into_owned(),
             ]
         );
         assert_eq!(
-            snapshot.tasks[0].reviewer_verdict,
+            joined_reviewer_verdict(&snapshot.tasks[0]),
             Some(ReviewerVerdict::RequestChanges)
         );
         assert!(
@@ -3823,9 +4071,9 @@ mod tests {
         let audit = audit.lock().unwrap();
         assert_eq!(audit.opens, ["task-one", "task-two"]);
         assert_eq!(audit.shutdowns, ["task-one", "task-two"]);
-        // Four sessions total, two per task, each opened against that task's
+        // Six sessions total, three per task, each opened against that task's
         // own fresh runtime — nothing is carried across the task boundary.
-        assert_eq!(audit.sessions.len(), 4);
+        assert_eq!(audit.sessions.len(), 6);
         for task in ["task-one", "task-two"] {
             let roles: BTreeSet<WorkerRole> = audit
                 .sessions
@@ -3836,7 +4084,7 @@ mod tests {
             assert_eq!(
                 roles,
                 BTreeSet::from([WorkerRole::Developer, WorkerRole::Reviewer]),
-                "{task} must open exactly one developer and one reviewer session"
+                "{task} must open exactly one Developer and two Reviewer sessions"
             );
         }
     }
@@ -3983,8 +4231,10 @@ mod tests {
             [
                 ("one", WorkerRole::Developer, 1),
                 ("one", WorkerRole::Reviewer, 2),
+                ("one", WorkerRole::Reviewer, 3),
                 ("two", WorkerRole::Developer, 1),
                 ("two", WorkerRole::Reviewer, 2),
+                ("two", WorkerRole::Reviewer, 3),
             ]
         );
         let first = supervisor.core.tasks()[0].developer_session.unwrap();
@@ -4234,8 +4484,14 @@ mod tests {
         else {
             unreachable!()
         };
-        reviewer.model = "reviewer-override".into();
+        reviewer.model = "reviewer1-override".into();
         reviewer.reasoning_effort = "max".into();
+        let ReviewerInvocationProfile::Codex { profile: reviewer } = profiles.reviewer2_mut()
+        else {
+            unreachable!()
+        };
+        reviewer.model = "reviewer2-override".into();
+        reviewer.reasoning_effort = "medium".into();
 
         let audit = Arc::new(Mutex::new(Audit::default()));
         let script = task_script(
@@ -4271,8 +4527,11 @@ mod tests {
         assert_eq!(profiles[0].2.model, "developer-override");
         assert_eq!(profiles[0].2.reasoning_effort, "high");
         assert_eq!(profiles[1].1, WorkerRole::Reviewer);
-        assert_eq!(profiles[1].2.model, "reviewer-override");
+        assert_eq!(profiles[1].2.model, "reviewer1-override");
         assert_eq!(profiles[1].2.reasoning_effort, "max");
+        assert_eq!(profiles[2].1, WorkerRole::Reviewer);
+        assert_eq!(profiles[2].2.model, "reviewer2-override");
+        assert_eq!(profiles[2].2.reasoning_effort, "medium");
     }
 
     #[test]
@@ -4438,7 +4697,7 @@ mod tests {
                 .iter()
                 .filter(|(_, role, _)| *role == WorkerRole::Reviewer)
                 .count(),
-            1
+            2
         );
     }
 
@@ -4712,7 +4971,7 @@ mod tests {
         );
         let snapshot = supervisor.snapshot();
         assert_eq!(snapshot.state, SessionState::NeedsHuman);
-        assert!(snapshot.active_worker.is_none());
+        assert!(snapshot.active_workers.is_empty());
         assert_eq!(
             snapshot.terminal_detail.as_deref(),
             Some("task worker runtime operation failed")
@@ -4874,7 +5133,7 @@ mod tests {
         supervisor.poll_once().unwrap();
         let action_snapshot = supervisor.snapshot();
         assert_eq!(action_snapshot.state, SessionState::Running);
-        assert!(action_snapshot.active_worker.is_none());
+        assert!(action_snapshot.active_workers.is_empty());
         let pending = action_snapshot
             .pending_architect_action
             .clone()
@@ -4909,13 +5168,16 @@ mod tests {
         let resumed = supervisor.snapshot();
         assert!(resumed.pending_architect_action.is_none());
         assert_eq!(
-            resumed.active_worker.as_ref().map(|worker| worker.role),
+            resumed
+                .active_workers
+                .first()
+                .map(|worker| worker.worker_lane.role()),
             Some(WorkerRole::Developer)
         );
         assert_eq!(
             resumed
-                .active_worker
-                .as_ref()
+                .active_workers
+                .first()
                 .map(|worker| worker.purpose.as_str()),
             Some("developer_clarification_resume")
         );
@@ -5011,8 +5273,8 @@ mod tests {
             Some("session runtime contract failed")
         );
         assert!(snapshot.pending_architect_action.is_none());
-        assert!(snapshot.active_worker.is_none());
-        assert!(supervisor.active.is_none());
+        assert!(snapshot.active_workers.is_empty());
+        assert!(supervisor.active.is_empty());
         assert!(supervisor.task_runtime.is_none());
         assert_eq!(audit.lock().unwrap().shutdowns, [task_key]);
         let decisions = fs::read_to_string(
@@ -5295,6 +5557,36 @@ mod real_exec_tests {
     use crate::worker::profile::ArchitectAdapter;
     use crate::worker::runtime::RuntimeProvider;
 
+    fn reviewer_paths(task: &crate::control_api::TaskStatusSnapshot) -> Vec<String> {
+        task.reviewers
+            .iter()
+            .flat_map(|reviewer| reviewer.current_final_message_paths.clone())
+            .collect()
+    }
+
+    fn joined_reviewer_verdict(
+        task: &crate::control_api::TaskStatusSnapshot,
+    ) -> Option<ReviewerVerdict> {
+        if task
+            .reviewers
+            .iter()
+            .any(|reviewer| reviewer.current_verdict.is_none())
+        {
+            return None;
+        }
+        Some(
+            if task
+                .reviewers
+                .iter()
+                .all(|reviewer| reviewer.current_verdict == Some(ReviewerVerdict::Lgtm))
+            {
+                ReviewerVerdict::Lgtm
+            } else {
+                ReviewerVerdict::RequestChanges
+            },
+        )
+    }
+
     fn real_claude_fixture(
         label: &str,
         developer: RuntimeProvider,
@@ -5556,7 +5848,7 @@ if {foreground_hang}:
         assert_eq!(exhausted.state, TaskState::ReviewExhausted);
         assert_eq!(exhausted.review_round, 1);
         assert_eq!(
-            exhausted.reviewer_verdict,
+            joined_reviewer_verdict(exhausted),
             Some(ReviewerVerdict::RequestChanges)
         );
         assert_eq!(
@@ -5567,8 +5859,8 @@ if {foreground_hang}:
         assert_eq!(fixture.thread_ids("exhausted", "reviewer").len(), 1);
         assert_eq!(snapshot.tasks[1].state, TaskState::Lgtm);
         assert!(fixture.repository.join("recovery.txt").is_file());
-        for path in &exhausted.final_reviewer_message_paths {
-            assert!(Path::new(path).is_file(), "missing reviewer final: {path}");
+        for path in reviewer_paths(exhausted) {
+            assert!(Path::new(&path).is_file(), "missing reviewer final: {path}");
         }
         fixture.assert_artifacts("exhausted", &["developer", "reviewer"]);
         fixture.assert_artifacts("after-exhaustion", &["developer", "reviewer"]);
@@ -5631,8 +5923,8 @@ if {foreground_hang}:
             snapshot.terminal_detail
         );
         assert!(snapshot.tasks[0].latest_developer_final_path.is_none());
-        assert!(snapshot.tasks[0].final_reviewer_message_paths.is_empty());
-        assert_eq!(snapshot.tasks[0].reviewer_verdict, None);
+        assert!(reviewer_paths(&snapshot.tasks[0]).is_empty());
+        assert_eq!(joined_reviewer_verdict(&snapshot.tasks[0]), None);
         assert!(
             fixture.thread_ids("killed-worker", "reviewer").is_empty(),
             "reviewer must not start after a killed developer"
@@ -5803,7 +6095,7 @@ if {foreground_hang}:
         assert_eq!(snapshot.tasks[0].state, TaskState::ReviewExhausted);
         assert_eq!(snapshot.tasks[0].review_round, 1);
         assert_eq!(
-            snapshot.tasks[0].reviewer_verdict,
+            joined_reviewer_verdict(&snapshot.tasks[0]),
             Some(ReviewerVerdict::RequestChanges)
         );
         assert_eq!(snapshot.tasks[1].state, TaskState::Lgtm);
@@ -5852,7 +6144,7 @@ if {foreground_hang}:
         assert_eq!(snapshot.state, SessionState::NeedsHuman);
         assert_eq!(snapshot.tasks[0].state, TaskState::NeedsHuman);
         assert!(snapshot.tasks[0].latest_developer_final_path.is_none());
-        assert!(snapshot.tasks[0].final_reviewer_message_paths.is_empty());
+        assert!(reviewer_paths(&snapshot.tasks[0]).is_empty());
         assert!(
             fixture
                 .native_session_ids("killed-claude-worker", "reviewer")

@@ -21,6 +21,7 @@ use super::runtime::{
 use super::verdict::{Verdict, VerdictClassification, classify_verdict};
 use crate::artifact::{ArtifactAttempt, ArtifactKind, ArtifactRoot, ArtifactScope};
 use crate::control_api::WorkerRole;
+use crate::worker::profile::ReviewerId;
 use crate::worker::runtime::RuntimeFailureClass;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
@@ -64,6 +65,7 @@ pub struct ExecRuntimeConfig {
     pub artifact_root_path: PathBuf,
     pub run_id: String,
     pub task_id: String,
+    pub reviewer_id: Option<ReviewerId>,
 }
 
 pub fn codex_exec_contract_identity() -> RuntimeContractIdentity {
@@ -243,6 +245,8 @@ impl ExecTaskWorkerRuntime {
             run_id: self.config.run_id.clone(),
             task_id: self.config.task_id.clone(),
             role: session.role,
+            reviewer_id: (session.role == WorkerRole::Reviewer)
+                .then_some(self.config.reviewer_id.unwrap_or(ReviewerId::Reviewer1)),
             logical_session_id: session.label.clone(),
             turn_sequence: session.turn_sequence,
             attempt: attempt_no,
@@ -1253,6 +1257,7 @@ echo ===STDIN-END=== >> "$CAPTURE/stdin.log"
             artifact_root_path: artifacts.clone(),
             run_id: "run-1".into(),
             task_id: "task-1".into(),
+            reviewer_id: None,
         };
         let runtime = ExecTaskWorkerRuntime::open(config).expect("open runtime");
         Fixture {
@@ -1896,7 +1901,7 @@ fi
         assert_eq!(outcome.verdict, ReviewerVerdict::Lgtm);
         let turn_dir = fixture
             .artifacts
-            .join("run-1/task-1/reviewer/session-1/turn-1");
+            .join("run-1/task-1/reviewer/reviewer1/session-1/turn-1");
         let original = turn_dir.join("attempt-1/native-final.partial");
         assert_eq!(
             outcome.preceding_final_message_paths,

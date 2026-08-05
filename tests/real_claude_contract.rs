@@ -89,6 +89,7 @@ impl RealClaudeFixture {
             artifact_root_path: artifacts.clone(),
             run_id: "run-real-claude-contract".into(),
             task_id: "task-real-claude-contract".into(),
+            reviewer_id: None,
             cleanup_registry: registry.clone(),
         })
         .unwrap();

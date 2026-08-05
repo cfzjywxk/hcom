@@ -3,6 +3,7 @@
 use crate::control_api::WorkerRole;
 use crate::worker::contract::{MAX_PROMPT_BYTES, validate_native_session_id};
 use crate::worker::environment::{ExecutionEnvironmentLease, SecretRedactor};
+use crate::worker::profile::ReviewerId;
 use crate::worker::result::{DeveloperResult, ReviewerResult};
 use crate::worker::validation::{
     validate_git_oid, validate_opaque_id, validate_relative_path, validate_sha256, validate_text,
@@ -66,6 +67,7 @@ pub struct ArtifactScope {
     pub run_id: String,
     pub task_id: String,
     pub role: WorkerRole,
+    pub reviewer_id: Option<ReviewerId>,
     pub logical_session_id: String,
     pub turn_sequence: u32,
     pub attempt: u32,
@@ -76,6 +78,9 @@ impl ArtifactScope {
         validate_opaque_id("artifact run id", &self.run_id)?;
         validate_opaque_id("artifact task id", &self.task_id)?;
         validate_opaque_id("artifact logical session id", &self.logical_session_id)?;
+        if self.reviewer_id.is_some() != (self.role == WorkerRole::Reviewer) {
+            bail!("artifact Reviewer identity does not match its worker role");
+        }
         if self.turn_sequence == 0 || self.attempt == 0 {
             bail!("artifact turn sequence and attempt must be positive");
         }
@@ -83,11 +88,15 @@ impl ArtifactScope {
     }
 
     pub fn relative_path(&self) -> String {
+        let role_path = match self.reviewer_id {
+            Some(reviewer_id) => format!("reviewer/{}", reviewer_id.as_str()),
+            None => role_name(self.role).into(),
+        };
         format!(
             "{}/{}/{}/{}/turn-{}/attempt-{}",
             self.run_id,
             self.task_id,
-            role_name(self.role),
+            role_path,
             self.logical_session_id,
             self.turn_sequence,
             self.attempt
@@ -171,6 +180,7 @@ impl ArtifactRoot {
         if manifest.run_id != scope.run_id
             || manifest.task_id != scope.task_id
             || manifest.role != scope.role
+            || manifest.reviewer_id != scope.reviewer_id
             || manifest.logical_session_id != scope.logical_session_id
             || manifest.turn_sequence != scope.turn_sequence
             || manifest.attempt != scope.attempt
@@ -473,6 +483,7 @@ impl ArtifactAttempt {
             run_id: self.scope.run_id.clone(),
             task_id: self.scope.task_id.clone(),
             role: self.scope.role,
+            reviewer_id: self.scope.reviewer_id,
             logical_session_id: self.scope.logical_session_id.clone(),
             native_session_id: metadata.native_session_id,
             turn_sequence: self.scope.turn_sequence,
@@ -842,6 +853,7 @@ pub struct TurnManifest {
     pub run_id: String,
     pub task_id: String,
     pub role: WorkerRole,
+    pub reviewer_id: Option<ReviewerId>,
     pub logical_session_id: String,
     pub native_session_id: String,
     pub turn_sequence: u32,
@@ -870,6 +882,7 @@ impl TurnManifest {
             run_id: self.run_id.clone(),
             task_id: self.task_id.clone(),
             role: self.role,
+            reviewer_id: self.reviewer_id,
             logical_session_id: self.logical_session_id.clone(),
             turn_sequence: self.turn_sequence,
             attempt: self.attempt,
@@ -1365,6 +1378,7 @@ mod tests {
             run_id: "run-1".into(),
             task_id: "task-1".into(),
             role: WorkerRole::Developer,
+            reviewer_id: None,
             logical_session_id: "session-1".into(),
             turn_sequence: 1,
             attempt: 1,
@@ -1428,6 +1442,23 @@ mod tests {
         let metadata = fs::metadata(attempt.directory_path()).unwrap();
         assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
         assert_eq!(metadata.uid(), effective_uid());
+
+        let mut reviewer1 = scope();
+        reviewer1.role = WorkerRole::Reviewer;
+        reviewer1.reviewer_id = Some(ReviewerId::Reviewer1);
+        let mut reviewer2 = reviewer1.clone();
+        reviewer2.reviewer_id = Some(ReviewerId::Reviewer2);
+        reviewer1.validate().unwrap();
+        reviewer2.validate().unwrap();
+        assert_eq!(
+            reviewer1.relative_path(),
+            "run-1/task-1/reviewer/reviewer1/session-1/turn-1/attempt-1"
+        );
+        assert_eq!(
+            reviewer2.relative_path(),
+            "run-1/task-1/reviewer/reviewer2/session-1/turn-1/attempt-1"
+        );
+        assert_ne!(reviewer1.relative_path(), reviewer2.relative_path());
 
         let mut traversal = scope();
         traversal.run_id = "..".into();
@@ -1845,6 +1876,7 @@ mod tests {
         .unwrap();
         let mut reviewer_scope = scope();
         reviewer_scope.role = WorkerRole::Reviewer;
+        reviewer_scope.reviewer_id = Some(ReviewerId::Reviewer1);
         let attempt =
             ArtifactAttempt::create(&root, reviewer_scope, &environment, TEST_PROMPT).unwrap();
 

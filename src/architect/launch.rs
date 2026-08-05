@@ -99,6 +99,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
             profiles: SessionInvocationProfiles::for_task_lane(architect_adapter)?,
             config_path: PathBuf::from("<built-in defaults>"),
             loaded_from_file: false,
+            legacy_reviewer_migrated: false,
         },
     };
     apply_architect_cli_overrides(&args, &mut loaded.profiles)?;
@@ -167,6 +168,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
             startup.session_binding_hash
         )?;
         write_profile_summary(&mut stdout, &loaded.profiles)?;
+        write_legacy_reviewer_notice(&mut stdout, loaded.legacy_reviewer_migrated)?;
         if loaded.profiles.uses_claude() {
             write_claude_startup_summary(
                 &mut stdout,
@@ -174,17 +176,10 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
                 &architect_additional_directories,
             )?;
         }
-        if developer_adapter == "codex-exec" && reviewer_adapter == "codex-exec" {
-            writeln!(
-                stdout,
-                "worker runtime: codex-exec (one native process per turn)"
-            )?;
-        } else {
-            writeln!(
-                stdout,
-                "worker runtime: role-router (one native provider process per turn; unavailable providers fail closed)"
-            )?;
-        }
+        writeln!(
+            stdout,
+            "worker runtime: lane-router (one native provider runtime per worker lane; reviewer turns fan out concurrently)"
+        )?;
         writeln!(
             stdout,
             "task repositories: discovered from project documentation and bound only after explicit execution authorization; each developer commits directly there"
@@ -554,10 +549,30 @@ fn write_profile_summary(
             profile.model, profile.effort, profile.dangerously_skip_permissions
         )?,
     }
-    match profiles.reviewer1() {
+    write_reviewer_profile(output, "reviewer1", profiles.reviewer1())?;
+    write_reviewer_profile(output, "reviewer2", profiles.reviewer2())?;
+    Ok(())
+}
+
+fn write_legacy_reviewer_notice(output: &mut impl Write, migrated: bool) -> Result<()> {
+    if migrated {
+        writeln!(
+            output,
+            "deprecated profile config: [architect.reviewer] was resolved once and copied to reviewer1 and reviewer2; declare both canonical tables explicitly"
+        )?;
+    }
+    Ok(())
+}
+
+fn write_reviewer_profile(
+    output: &mut impl Write,
+    label: &str,
+    profile: &ReviewerInvocationProfile,
+) -> Result<()> {
+    match profile {
         ReviewerInvocationProfile::Codex { profile } => writeln!(
             output,
-            "reviewer profile: codex model={} reasoning={} sandbox={} approval={}",
+            "{label} profile: codex model={} reasoning={} sandbox={} approval={}",
             profile.model,
             profile.reasoning_effort,
             profile.sandbox.as_str(),
@@ -565,7 +580,7 @@ fn write_profile_summary(
         )?,
         ReviewerInvocationProfile::Claude { profile } => writeln!(
             output,
-            "reviewer profile: claude model={} effort={} dangerously_skip_permissions={}",
+            "{label} profile: claude model={} effort={} dangerously_skip_permissions={}",
             profile.model, profile.effort, profile.dangerously_skip_permissions
         )?,
     }
@@ -1602,7 +1617,7 @@ mod tests {
             let profiles = SessionInvocationProfiles::for_task_lane(adapter).unwrap();
             assert_eq!(
                 worker_adapter_bindings(adapter, &profiles).unwrap(),
-                ("codex-exec", "claude-exec")
+                ("codex-exec", "codex-exec")
             );
         }
     }
@@ -1669,11 +1684,21 @@ mod tests {
             "developer profile: codex model=gpt-5.6-sol reasoning=xhigh sandbox=danger-full-access approval=never"
         ));
         assert!(output.contains(
-            "reviewer profile: claude model=opus effort=xhigh dangerously_skip_permissions=true"
+            "reviewer1 profile: codex model=gpt-5.6-sol reasoning=xhigh sandbox=danger-full-access approval=never"
+        ));
+        assert!(output.contains(
+            "reviewer2 profile: claude model=opus effort=xhigh dangerously_skip_permissions=true"
         ));
         assert!(output.contains("Linux per-invocation PR_SET_CHILD_SUBREAPER Guardian"));
         assert!(output.contains("external task repositories use native --add-dir"));
         assert!(output.contains("not a filesystem allowlist"));
         assert!(output.contains(GUARDIAN_LIFECYCLE_BOUNDARY));
+
+        let mut notice = Vec::new();
+        write_legacy_reviewer_notice(&mut notice, true).unwrap();
+        assert_eq!(
+            String::from_utf8(notice).unwrap(),
+            "deprecated profile config: [architect.reviewer] was resolved once and copied to reviewer1 and reviewer2; declare both canonical tables explicitly\n"
+        );
     }
 }

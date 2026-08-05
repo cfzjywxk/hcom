@@ -1,8 +1,10 @@
+use crate::worker::profile::ReviewerId;
+use crate::worker::runtime::WorkerLane;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
@@ -10,12 +12,28 @@ const MAX_ID_BYTES: usize = 128;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_TASKS: usize = 64;
 const MAX_LIST_ITEMS: usize = 256;
-const MAX_REVIEW_ROUNDS: u8 = 20;
+pub const MAX_REVIEW_ROUNDS: u8 = 20;
+pub const REVIEWER_COUNT: usize = 2;
 const MAX_CLARIFICATION_ROUNDS: u8 = 20;
 pub const MAX_CLARIFICATION_PAGE_RECORDS: u8 = 8;
 pub const MAX_CLARIFICATION_RECORDS_PER_TASK: usize = 64;
 pub const MAX_CLARIFICATION_RECORDS_PER_RUN: usize = MAX_TASKS * MAX_CLARIFICATION_ROUNDS as usize;
-pub const MAX_PROGRESS_EVENTS_PER_RUN: usize = MAX_TASKS * (MAX_REVIEW_ROUNDS as usize * 2 + 1);
+const fn max_progress_events_per_run() -> usize {
+    let events_per_round = match (MAX_REVIEW_ROUNDS as usize).checked_mul(REVIEWER_COUNT + 1) {
+        Some(value) => value,
+        None => panic!("progress event capacity overflow"),
+    };
+    let events_per_task = match events_per_round.checked_add(1) {
+        Some(value) => value,
+        None => panic!("progress event capacity overflow"),
+    };
+    match MAX_TASKS.checked_mul(events_per_task) {
+        Some(value) => value,
+        None => panic!("progress event capacity overflow"),
+    }
+}
+
+pub const MAX_PROGRESS_EVENTS_PER_RUN: usize = max_progress_events_per_run();
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -441,8 +459,29 @@ pub struct PendingArchitectActionSnapshot {
 pub struct ActiveWorkerSnapshot {
     pub task_ordinal: u32,
     pub task_key: String,
-    pub role: WorkerRole,
+    pub worker_lane: WorkerLane,
+    pub reviewer_id: Option<ReviewerId>,
     pub purpose: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewerBindingSnapshot {
+    pub reviewer_id: ReviewerId,
+    pub provider: String,
+    pub model: String,
+    pub reasoning_effort: String,
+    pub contract_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewerResultSnapshot {
+    pub reviewer_id: ReviewerId,
+    pub session_bound: bool,
+    pub current_generation: Option<u32>,
+    pub current_verdict: Option<ReviewerVerdict>,
+    pub current_final_message_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -469,12 +508,14 @@ pub enum SessionProgressEvent {
         completed_tasks: u32,
         total_tasks: u32,
         review_round: u32,
+        review_generation: u32,
         max_review_rounds: u8,
         developer_final_path: String,
         task_document_path: String,
         design_document_paths: Vec<String>,
         task_selector: String,
         clarification_record_count: u32,
+        reviewer_bindings: Vec<ReviewerBindingSnapshot>,
     },
     ReviewResponded {
         sequence: u32,
@@ -483,10 +524,14 @@ pub enum SessionProgressEvent {
         completed_tasks: u32,
         total_tasks: u32,
         review_round: u32,
+        review_generation: u32,
         max_review_rounds: u8,
+        reviewer_id: ReviewerId,
         reviewer_verdict: ReviewerVerdict,
         developer_final_path: String,
         reviewer_final_message_paths: Vec<String>,
+        responses_received: u8,
+        responses_expected: u8,
     },
     TaskCompleted {
         sequence: u32,
@@ -495,11 +540,11 @@ pub enum SessionProgressEvent {
         completed_tasks: u32,
         total_tasks: u32,
         review_round: u32,
+        review_generation: u32,
         max_review_rounds: u8,
         outcome: TaskCompletionOutcome,
-        reviewer_verdict: ReviewerVerdict,
         developer_final_path: String,
-        reviewer_final_message_paths: Vec<String>,
+        reviewers: Vec<ReviewerResultSnapshot>,
     },
 }
 
@@ -650,7 +695,8 @@ pub struct SessionStatusSnapshot {
     pub plan_version: Option<u64>,
     pub plan_hash: Option<String>,
     pub current_task_ordinal: Option<u32>,
-    pub active_worker: Option<ActiveWorkerSnapshot>,
+    pub active_workers: Vec<ActiveWorkerSnapshot>,
+    pub reviewer_bindings: Vec<ReviewerBindingSnapshot>,
     pub pending_architect_action: Option<PendingArchitectActionSnapshot>,
     pub terminal_detail: Option<String>,
     pub tasks: Vec<TaskStatusSnapshot>,
@@ -668,6 +714,7 @@ pub struct TaskStatusSnapshot {
     pub task_selector: String,
     pub branch: Option<String>,
     pub review_round: u32,
+    pub review_generation: u32,
     pub max_review_rounds: u8,
     pub clarification_rounds_used: u32,
     pub max_clarification_rounds: u8,
@@ -675,11 +722,9 @@ pub struct TaskStatusSnapshot {
     pub base_revision: Option<String>,
     pub head_revision: Option<String>,
     pub developer_session_bound: bool,
-    pub reviewer_session_bound: bool,
+    pub reviewers: Vec<ReviewerResultSnapshot>,
     pub outcome_detail: Option<String>,
     pub latest_developer_final_path: Option<String>,
-    pub final_reviewer_message_paths: Vec<String>,
-    pub reviewer_verdict: Option<ReviewerVerdict>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1058,12 +1103,14 @@ mod tests {
                 completed_tasks: 2,
                 total_tasks: 10,
                 review_round: 2,
+                review_generation: 3,
                 max_review_rounds: 3,
                 developer_final_path: "/run/task-03/developer/final.md".into(),
                 task_document_path: "/project/current_todo.md".into(),
                 design_document_paths: vec!["/project/current_architecture.md".into()],
                 task_selector: "TASK-03".into(),
                 clarification_record_count: 1,
+                reviewer_bindings: Vec::new(),
             },
         };
         let encoded = serde_json::to_value(&result).unwrap();
@@ -1086,10 +1133,10 @@ mod tests {
 
     #[test]
     fn previous_protocol_version_fails_closed() {
-        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(PROTOCOL_VERSION, 8);
         let request = ControlRequest {
-            protocol_version: 6,
-            request_id: "v6-request".into(),
+            protocol_version: 7,
+            request_id: "v7-request".into(),
             caller: CallerAuth::Human {
                 process_birth: "123:456".into(),
             },
@@ -1098,8 +1145,8 @@ mod tests {
         assert!(request.validate().is_err());
 
         let response = ControlResponse {
-            protocol_version: 6,
-            request_id: "v6-response".into(),
+            protocol_version: 7,
+            request_id: "v7-response".into(),
             ok: false,
             result: None,
             error: Some(ControlErrorBody {

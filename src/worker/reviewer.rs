@@ -2476,7 +2476,7 @@ mod tests {
                 base_revision: self.base_revision.clone(),
                 head_revision: Some(head.into()),
                 artifact_dir: format!(
-                    "run-reviewers/{task_id}/reviewer/{logical_session_id}/turn-{sequence}/attempt-1"
+                    "run-reviewers/{task_id}/reviewer/reviewer1/{logical_session_id}/turn-{sequence}/attempt-1"
                 ),
             }
         }
@@ -2643,6 +2643,8 @@ mod tests {
                     run_id: control.run_id.clone(),
                     task_id: control.task_id.clone(),
                     role: control.role,
+                    reviewer_id: (control.role == WorkerRole::Reviewer)
+                        .then_some(crate::worker::profile::ReviewerId::Reviewer1),
                     logical_session_id: control.logical_session_id.clone(),
                     turn_sequence: control.turn_sequence,
                     attempt: control.attempt,
@@ -3567,6 +3569,7 @@ mod tests {
                 run_id: claude_control.run_id.clone(),
                 task_id: claude_control.task_id.clone(),
                 role: WorkerRole::Reviewer,
+                reviewer_id: Some(crate::worker::profile::ReviewerId::Reviewer1),
                 logical_session_id: claude_control.logical_session_id.clone(),
                 turn_sequence: 1,
                 attempt: 1,

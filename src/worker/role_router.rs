@@ -438,6 +438,7 @@ mod tests {
 
     const DEVELOPER: WorkerLane = WorkerLane::Developer;
     const REVIEWER1: WorkerLane = WorkerLane::Reviewer(ReviewerId::Reviewer1);
+    const REVIEWER2: WorkerLane = WorkerLane::Reviewer(ReviewerId::Reviewer2);
 
     fn profile(provider: RuntimeProvider) -> RuntimeProfile {
         match provider {
@@ -457,10 +458,16 @@ mod tests {
     fn profiles(developer: RuntimeProvider, reviewer: RuntimeProvider) -> TaskWorkerProfiles {
         TaskWorkerProfiles {
             developer: profile(developer),
-            reviewers: vec![ReviewerRuntimeProfile {
-                reviewer_id: ReviewerId::Reviewer1,
-                profile: profile(reviewer),
-            }],
+            reviewers: vec![
+                ReviewerRuntimeProfile {
+                    reviewer_id: ReviewerId::Reviewer1,
+                    profile: profile(reviewer),
+                },
+                ReviewerRuntimeProfile {
+                    reviewer_id: ReviewerId::Reviewer2,
+                    profile: profile(reviewer),
+                },
+            ],
         }
     }
 
@@ -540,7 +547,12 @@ mod tests {
             profiles,
             [
                 available_slot(DEVELOPER, profiles.developer.provider, developer_scripts),
-                available_slot(REVIEWER1, profiles.reviewer1().provider, reviewer_scripts),
+                available_slot(
+                    REVIEWER1,
+                    profiles.reviewer1().provider,
+                    reviewer_scripts.clone(),
+                ),
+                available_slot(REVIEWER2, profiles.reviewer2().provider, reviewer_scripts),
             ],
         )
         .unwrap()
@@ -628,6 +640,7 @@ mod tests {
                     RuntimeProvider::ClaudeExec.contract_identity(),
                     "selected Claude task worker executable is unavailable",
                 ),
+                available_slot(REVIEWER2, RuntimeProvider::ClaudeExec, Vec::new()),
             ],
         )
         .unwrap();
@@ -896,11 +909,15 @@ mod tests {
             [
                 slot(DEVELOPER, RuntimeProvider::CodexExec, true),
                 slot(REVIEWER1, RuntimeProvider::ClaudeExec, false),
+                slot(REVIEWER2, RuntimeProvider::ClaudeExec, false),
             ],
         )
         .unwrap();
         let error = runtime.shutdown().unwrap_err();
         assert_eq!(error.detail, "first lane cleanup failed");
-        assert_eq!(*shutdowns.lock().unwrap(), [DEVELOPER, REVIEWER1]);
+        assert_eq!(
+            *shutdowns.lock().unwrap(),
+            [DEVELOPER, REVIEWER1, REVIEWER2]
+        );
     }
 }

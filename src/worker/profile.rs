@@ -370,9 +370,9 @@ pub struct ReviewerInvocationBinding {
 }
 
 impl ReviewerInvocationBinding {
-    fn reviewer1(profile: ReviewerInvocationProfile) -> Self {
+    pub fn new(reviewer_id: ReviewerId, profile: ReviewerInvocationProfile) -> Self {
         Self {
-            reviewer_id: ReviewerId::Reviewer1,
+            reviewer_id,
             profile,
         }
     }
@@ -399,16 +399,14 @@ impl SessionInvocationProfiles {
         Self {
             architect,
             developer: DeveloperInvocationProfile::default(),
-            reviewers: vec![ReviewerInvocationBinding::reviewer1(
-                ReviewerInvocationProfile::default(),
-            )],
+            reviewers: default_reviewer_bindings(),
         }
     }
 
     /// Built-in profiles for the provider-routed task-runtime lane.
     ///
     /// The foreground Architect adapter is selected independently from the
-    /// default Codex Developer + Claude Reviewer worker pair.
+    /// default Codex Developer + Codex Reviewer1 + Claude Reviewer2 workers.
     pub fn for_task_lane(adapter: ArchitectAdapter) -> Result<Self> {
         let architect = match adapter {
             ArchitectAdapter::Codex => ArchitectInvocationProfile::Codex {
@@ -423,46 +421,87 @@ impl SessionInvocationProfiles {
             developer: DeveloperInvocationProfile::Codex {
                 profile: CodexInvocationProfile::developer_default(),
             },
-            reviewers: vec![ReviewerInvocationBinding::reviewer1(
-                ReviewerInvocationProfile::Claude {
-                    profile: ClaudeInvocationProfile::reviewer_default(),
-                },
-            )],
+            reviewers: vec![
+                ReviewerInvocationBinding::new(
+                    ReviewerId::Reviewer1,
+                    ReviewerInvocationProfile::Codex {
+                        profile: CodexInvocationProfile::reviewer_default(),
+                    },
+                ),
+                ReviewerInvocationBinding::new(
+                    ReviewerId::Reviewer2,
+                    ReviewerInvocationProfile::Claude {
+                        profile: ClaudeInvocationProfile::reviewer_default(),
+                    },
+                ),
+            ],
         })
+    }
+
+    pub fn legacy_reviewer_pair(
+        profile: ReviewerInvocationProfile,
+    ) -> Vec<ReviewerInvocationBinding> {
+        vec![
+            ReviewerInvocationBinding::new(ReviewerId::Reviewer1, profile.clone()),
+            ReviewerInvocationBinding::new(ReviewerId::Reviewer2, profile),
+        ]
     }
 
     pub fn validate(&self) -> Result<()> {
         self.architect.validate()?;
         self.developer.validate()?;
-        let [reviewer] = self.reviewers.as_slice() else {
-            bail!("session reviewer collection must contain exactly one Reviewer1 entry");
+        let [reviewer1, reviewer2] = self.reviewers.as_slice() else {
+            bail!(
+                "session reviewer collection must contain ordered Reviewer1 and Reviewer2 entries"
+            );
         };
-        if reviewer.reviewer_id != ReviewerId::Reviewer1 {
-            bail!("session reviewer collection must contain exactly one Reviewer1 entry");
+        if reviewer1.reviewer_id != ReviewerId::Reviewer1
+            || reviewer2.reviewer_id != ReviewerId::Reviewer2
+        {
+            bail!(
+                "session reviewer collection must contain ordered Reviewer1 and Reviewer2 entries"
+            );
         }
-        reviewer.profile.validate()
+        reviewer1.profile.validate()?;
+        reviewer2.profile.validate()
     }
 
     pub fn developer_adapter_name(&self) -> &'static str {
         self.developer.adapter_name()
     }
 
-    pub fn reviewer1(&self) -> &ReviewerInvocationProfile {
+    pub fn reviewer(&self, reviewer_id: ReviewerId) -> &ReviewerInvocationProfile {
         &self
             .reviewers
             .iter()
-            .find(|binding| binding.reviewer_id == ReviewerId::Reviewer1)
-            .expect("validated session profiles contain Reviewer1")
+            .find(|binding| binding.reviewer_id == reviewer_id)
+            .expect("validated session profiles contain both Reviewer lanes")
             .profile
     }
 
-    pub fn reviewer1_mut(&mut self) -> &mut ReviewerInvocationProfile {
+    pub fn reviewer_mut(&mut self, reviewer_id: ReviewerId) -> &mut ReviewerInvocationProfile {
         &mut self
             .reviewers
             .iter_mut()
-            .find(|binding| binding.reviewer_id == ReviewerId::Reviewer1)
-            .expect("built-in session profiles contain Reviewer1")
+            .find(|binding| binding.reviewer_id == reviewer_id)
+            .expect("built-in session profiles contain both Reviewer lanes")
             .profile
+    }
+
+    pub fn reviewer1(&self) -> &ReviewerInvocationProfile {
+        self.reviewer(ReviewerId::Reviewer1)
+    }
+
+    pub fn reviewer2(&self) -> &ReviewerInvocationProfile {
+        self.reviewer(ReviewerId::Reviewer2)
+    }
+
+    pub fn reviewer1_mut(&mut self) -> &mut ReviewerInvocationProfile {
+        self.reviewer_mut(ReviewerId::Reviewer1)
+    }
+
+    pub fn reviewer2_mut(&mut self) -> &mut ReviewerInvocationProfile {
+        self.reviewer_mut(ReviewerId::Reviewer2)
     }
 
     pub fn reviewer_adapter_name(&self) -> &'static str {
@@ -479,7 +518,7 @@ impl SessionInvocationProfiles {
     }
 
     pub fn canonical_hash(&self) -> String {
-        let encoded = serde_json::to_vec(&("hcom-session-invocation-profiles-v4", self))
+        let encoded = serde_json::to_vec(&("hcom-session-invocation-profiles-v5", self))
             .expect("typed invocation profiles are serializable");
         let digest = Sha256::digest(encoded);
         let mut output = String::with_capacity(digest.len() * 2);
@@ -489,6 +528,23 @@ impl SessionInvocationProfiles {
         }
         output
     }
+}
+
+fn default_reviewer_bindings() -> Vec<ReviewerInvocationBinding> {
+    vec![
+        ReviewerInvocationBinding::new(
+            ReviewerId::Reviewer1,
+            ReviewerInvocationProfile::Codex {
+                profile: CodexInvocationProfile::reviewer_default(),
+            },
+        ),
+        ReviewerInvocationBinding::new(
+            ReviewerId::Reviewer2,
+            ReviewerInvocationProfile::Claude {
+                profile: ClaudeInvocationProfile::reviewer_default(),
+            },
+        ),
+    ]
 }
 
 impl Default for SessionInvocationProfiles {
@@ -556,11 +612,15 @@ mod tests {
             "xhigh"
         );
         assert_eq!(profiles.developer_adapter_name(), CODEX_DEVELOPER_ADAPTER);
-        assert_eq!(profiles.reviewer_adapter_name(), CLAUDE_REVIEWER_ADAPTER);
-        let reviewer = profiles.reviewer1().claude().unwrap();
-        assert_eq!(reviewer.model, "opus");
-        assert_eq!(reviewer.effort, "xhigh");
-        assert!(reviewer.dangerously_skip_permissions);
+        assert_eq!(profiles.reviewer_adapter_name(), CODEX_REVIEWER_ADAPTER);
+        assert_eq!(
+            profiles.reviewer1().codex().unwrap(),
+            &CodexInvocationProfile::reviewer_default()
+        );
+        let reviewer2 = profiles.reviewer2().claude().unwrap();
+        assert_eq!(reviewer2.model, "opus");
+        assert_eq!(reviewer2.effort, "xhigh");
+        assert!(reviewer2.dangerously_skip_permissions);
         assert_eq!(profiles.canonical_hash().len(), 64);
     }
 
@@ -569,10 +629,10 @@ mod tests {
         let profiles = SessionInvocationProfiles::for_architect(ArchitectAdapter::Claude);
         profiles.validate().unwrap();
         let architect = profiles.architect.claude().unwrap();
-        let reviewer = profiles.reviewer1().claude().unwrap();
+        let reviewer = profiles.reviewer2().claude().unwrap();
         assert_eq!(architect.model, "opus");
         assert_eq!(architect.effort, "xhigh");
-        assert_eq!(profiles.reviewer_adapter_name(), CLAUDE_REVIEWER_ADAPTER);
+        assert_eq!(profiles.reviewer_adapter_name(), CODEX_REVIEWER_ADAPTER);
         assert_eq!(reviewer.model, "opus");
         assert_eq!(reviewer.effort, "xhigh");
         assert!(reviewer.dangerously_skip_permissions);
@@ -593,11 +653,11 @@ mod tests {
     }
 
     #[test]
-    fn task_lane_defaults_to_codex_developer_and_claude_reviewer() {
+    fn task_lane_defaults_to_codex_developer_codex_reviewer1_and_claude_reviewer2() {
         let profiles = SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Codex).unwrap();
         profiles.validate().unwrap();
         assert_eq!(profiles.developer_adapter_name(), CODEX_DEVELOPER_ADAPTER);
-        assert_eq!(profiles.reviewer_adapter_name(), CLAUDE_REVIEWER_ADAPTER);
+        assert_eq!(profiles.reviewer_adapter_name(), CODEX_REVIEWER_ADAPTER);
         assert_eq!(
             profiles.developer.codex().unwrap(),
             &CodexInvocationProfile {
@@ -608,7 +668,11 @@ mod tests {
             }
         );
         assert_eq!(
-            profiles.reviewer1().claude().unwrap(),
+            profiles.reviewer1().codex().unwrap(),
+            &CodexInvocationProfile::reviewer_default()
+        );
+        assert_eq!(
+            profiles.reviewer2().claude().unwrap(),
             &ClaudeInvocationProfile {
                 model: "opus".into(),
                 effort: "xhigh".into(),
@@ -623,15 +687,12 @@ mod tests {
             ArchitectInvocationProfile::Claude { .. }
         ));
         assert_eq!(claude.developer_adapter_name(), CODEX_DEVELOPER_ADAPTER);
-        assert_eq!(claude.reviewer_adapter_name(), CLAUDE_REVIEWER_ADAPTER);
+        assert_eq!(claude.reviewer_adapter_name(), CODEX_REVIEWER_ADAPTER);
         assert_eq!(
             claude.developer.codex().unwrap(),
             profiles.developer.codex().unwrap()
         );
-        assert_eq!(
-            claude.reviewer1().claude().unwrap(),
-            profiles.reviewer1().claude().unwrap()
-        );
+        assert_eq!(claude.reviewers, profiles.reviewers);
     }
 
     #[test]
@@ -693,11 +754,12 @@ ask_for_approval = "never"
         assert_eq!(codex.adapter_name(), CODEX_REVIEWER_ADAPTER);
         codex.validate().unwrap();
 
-        let left = SessionInvocationProfiles {
+        let mut left = SessionInvocationProfiles {
             developer,
-            reviewers: vec![ReviewerInvocationBinding::reviewer1(claude)],
             ..SessionInvocationProfiles::default()
         };
+        *left.reviewer1_mut() = claude;
+        left.validate().unwrap();
         let mut right = left.clone();
         right.developer = DeveloperInvocationProfile::Codex {
             profile: CodexInvocationProfile::developer_default(),
@@ -709,11 +771,12 @@ ask_for_approval = "never"
     fn reviewer_collection_validation_and_hash_bind_lane_identity_and_order() {
         let profiles = SessionInvocationProfiles::default();
         profiles.validate().unwrap();
-        assert_eq!(profiles.reviewers.len(), 1);
+        assert_eq!(profiles.reviewers.len(), 2);
         assert_eq!(profiles.reviewers[0].reviewer_id, ReviewerId::Reviewer1);
+        assert_eq!(profiles.reviewers[1].reviewer_id, ReviewerId::Reviewer2);
 
         let mut wrong_identity = profiles.clone();
-        wrong_identity.reviewers[0].reviewer_id = ReviewerId::Reviewer2;
+        wrong_identity.reviewers.swap(0, 1);
         assert!(wrong_identity.validate().is_err());
         assert_ne!(
             profiles.canonical_hash(),
@@ -722,7 +785,7 @@ ask_for_approval = "never"
         );
 
         let mut changed_profile = profiles.clone();
-        let ReviewerInvocationProfile::Claude { profile } = changed_profile.reviewer1_mut() else {
+        let ReviewerInvocationProfile::Claude { profile } = changed_profile.reviewer2_mut() else {
             unreachable!()
         };
         profile.effort = "medium".into();
@@ -732,18 +795,14 @@ ask_for_approval = "never"
             "the complete reviewer profile must be hash-bound"
         );
 
-        let reviewer2 = ReviewerInvocationBinding {
-            reviewer_id: ReviewerId::Reviewer2,
-            profile: profiles.reviewer1().clone(),
-        };
-        let mut reviewer1_then_reviewer2 = profiles.clone();
-        reviewer1_then_reviewer2.reviewers.push(reviewer2.clone());
+        let mut missing_reviewer2 = profiles.clone();
+        missing_reviewer2.reviewers.pop();
         let mut reviewer2_then_reviewer1 = profiles.clone();
-        reviewer2_then_reviewer1.reviewers.insert(0, reviewer2);
-        assert!(reviewer1_then_reviewer2.validate().is_err());
+        reviewer2_then_reviewer1.reviewers.swap(0, 1);
+        assert!(missing_reviewer2.validate().is_err());
         assert!(reviewer2_then_reviewer1.validate().is_err());
         assert_ne!(
-            reviewer1_then_reviewer2.canonical_hash(),
+            profiles.canonical_hash(),
             reviewer2_then_reviewer1.canonical_hash(),
             "reviewer lane order must be hash-bound"
         );
