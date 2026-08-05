@@ -48,12 +48,16 @@ Profile configuration is read once from $HCOM_DIR/config.toml (default:
 ~/.hcom/config.toml):
   [architect.profile]    interactive architect selected by the command
   [architect.developer]  fresh per-task developer profile
-  [architect.reviewer]   fresh per-task reviewer profile
+  [architect.reviewer1]  fresh per-task Reviewer1 profile
+  [architect.reviewer2]  fresh per-task Reviewer2 profile
 
 Each table is a partial override: omitted fields keep the built-in role
-default. Codex accepts reasoning_effort or its effort alias. Developer and
-Reviewer adapters are selected independently; their defaults are codex and
-claude respectively.
+default. Codex accepts reasoning_effort or its effort alias. Developer,
+Reviewer1, and Reviewer2 adapters are selected independently; their defaults
+are codex, codex, and claude respectively. A legacy-only
+[architect.reviewer] profile is resolved once and copied to both Reviewer
+lanes with a deprecation notice; mixing it with either canonical Reviewer
+table fails closed.
 
 Architect CLI overrides (higher priority than TOML):
   --model <model>
@@ -67,10 +71,10 @@ Architect CLI overrides (higher priority than TOML):
 Built-in Architect defaults are Codex gpt-5.6-sol/xhigh with
 danger-full-access/never, or Claude opus/xhigh with
 dangerously-skip-permissions. Both entrypoints share one provider-routed worker
-lane. Developer defaults to Codex gpt-5.6-sol/xhigh with
-danger-full-access/never; Reviewer defaults to Claude opus/xhigh with
-dangerously-skip-permissions. Either worker role can explicitly select codex
-or claude. An unavailable selected adapter fails closed without fallback.
+lane bundle. Developer and Reviewer1 default to Codex gpt-5.6-sol/xhigh with
+danger-full-access/never; Reviewer2 defaults to Claude opus/xhigh with
+dangerously-skip-permissions. Any worker lane can explicitly select codex or
+claude. An unavailable selected adapter fails closed without fallback.
 
 The capability-bound session-control MCP tools do not add a second native
 approval prompt. For Codex, hcom adds one exact task-control MCP config leaf.
@@ -93,9 +97,10 @@ revision/hash and confirmation bit, not OS-level keyboard provenance.
 Only typed profile fields are accepted; arbitrary native argv is not. The
 effective sanitized profiles, their SHA-256 hash, and the exact session binding
 hash are printed at startup and frozen for every sequential run in that
-foreground Architect invocation. The private task-control protocol remains v7:
-its plan hash binds that exact session profile/runtime contract, and the closed
-bridge bootstrap carries the same binding hash. A mismatched hcom and
+foreground Architect invocation. The private task-control protocol is v8:
+its plan hash binds the ordered Reviewer identities and exact session
+profile/runtime contract; the closed bridge bootstrap carries the same binding
+hash. A mismatched hcom and
 hcom-architect-mcp pair fails closed rather than weakening the binding.
 
 No prompt argument, stdin payload, terminal injection, or automatic first turn
@@ -134,31 +139,40 @@ the standard lane and must be resolved before start. If that conflict reaches a
 Developer turn, the Developer requests clarification without modifying the
 repository and the Architect must escalate it to the human regardless of
 remaining autonomous clarification budget. The Developer is instructed to add
-and preserve a matching Signed-off-by trailer, and the Reviewer checks it.
+and preserve a matching Signed-off-by trailer, and both Reviewers check it.
 Local candidate commits do not authorize push, install, release, or an extra
 commit after LGTM.
-The Reviewer receives the same native host view; source/Git/install
-non-mutation is a role instruction rather than an OS read-only mount. It reads
-the Developer's exact durable final through its path. Corrections and
-re-reviews also carry only durable final-message paths. hcom never pushes,
+Both Reviewers receive the same native host view; source/Git/install
+non-mutation is a role instruction rather than an OS read-only mount. Each
+independently reads the Developer's exact durable final through its path and
+never receives the peer Reviewer's response. Corrections carry both
+same-generation Reviewer response paths in stable Reviewer1-then-Reviewer2
+order; re-reviews carry only the latest Developer path. hcom never pushes,
 installs, resets, rebases, merges, or applies changes.
 
 The foreground parent owns every worker and task-local exec runtime; it keeps
 state only in memory and performs no daemon, project store, or cross-session
-recovery. Same-task corrections use the exact native Developer/Reviewer thread.
-Different tasks and different runs use fresh workers. After dispatch, the Codex
+recovery. Same-task corrections use the exact native Developer thread and
+re-reviews resume each Reviewer's own exact native thread. Different tasks and
+different runs use fresh workers. Each review generation starts Reviewer1 and
+Reviewer2 concurrently, waits for both logical responses, and completes only
+on same-generation dual LGTM; a Developer amendment invalidates both previous
+verdicts. After dispatch, the Codex
 Architect opens one blocking session_wait MCP call bound to the exact run_id
 and a run-local progress cursor. The foreground supervisor advances Developer
-and Reviewer without Architect model calls and completes that wait for one
+and both Reviewers without Architect model calls and completes that wait for one
 retained progress event, a terminal state, or a latched Developer
 clarification/blocker action. Progress events are emitted for each review
-request, review response, and task completion. They carry task position,
-review round, verdict/outcome where applicable, the exact Developer final path,
-and ordered Reviewer final paths where applicable; review requests also carry
-the task/design paths and selector supplied to the Reviewer. The Architect
-displays each event once, then immediately re-arms session_wait with that
-event's sequence. Worker execution continues while the update is displayed,
-and events produced during the display-to-wait gap remain queued in order.
+generation, each Reviewer response, and task completion. They carry task
+position, completed review round, current generation, Reviewer identity,
+response counts and verdict/outcome where applicable, the exact Developer
+final path, and ordered current-generation Reviewer final paths where
+applicable; review requests also carry the task/design paths, selector, and
+both session-level Reviewer bindings. The Architect displays each event once
+without reading the durable response body, treats the first Reviewer response
+as partial progress, and immediately re-arms session_wait with that event's
+sequence. Worker execution continues while the update is displayed, and
+events produced during the display-to-wait gap remain queued in order.
 The Architect answers a defensible action through the exact new clarification
 document path and immediately re-arms session_wait in the same turn. When a
 material human decision is required, it ends the turn after asking the human
@@ -168,13 +182,18 @@ status polls. Interrupting the wait cancels only that subscription, never the
 run. A still-latched action has priority over queued progress and is
 redelivered only to a wait from a version older than its published_version; a
 same-version repeated wait is rejected until the action is resolved. Queued
-progress is delivered before a retained terminal result. Status snapshots
-carry clarification counts; session_clarifications_list reads the ordered
-records in bounded pages bound to that run_id.
-The terminal snapshot contains each task's latest Developer final path, ordered
-final Reviewer message paths, and Reviewer verdict, never the Reviewer body.
-The Architect reads every final Reviewer file in order and delivers its
-original verdict and findings, distinguishing LGTM, review exhaustion, and
+progress, including both Reviewer response events, is delivered before a
+retained terminal result. Status snapshots expose bounded concurrent
+active_workers, session-level ordered Reviewer bindings, each task's
+review_round/review_generation, and typed current-generation Reviewer results;
+they carry clarification counts rather than record bodies.
+session_clarifications_list reads the ordered records in bounded pages bound
+to that run_id.
+The terminal snapshot contains each task's latest Developer final path and
+Reviewer1/Reviewer2 current-generation identities, verdicts, and final-message
+path chains, never either Reviewer body. Only then does the Architect read
+both final Reviewer evidence chains and deliver their original verdicts and
+findings, distinguishing same-generation dual LGTM, review exhaustion, and
 lifecycle failure. It does not rerun tests, review, or validation unless the
 human explicitly requests that work. An LGTM task's final local candidate
 commit is already reviewed at the reported exact range; the Architect reports

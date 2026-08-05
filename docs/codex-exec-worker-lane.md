@@ -2,9 +2,10 @@
 
 The Codex provider inside hcom's task worker lane: one native `codex exec`
 process per selected Codex turn, no protocol conversation, and a supervisor
-that never judges the work. Developer and Reviewer adapters are independent;
-the built-in pair is Codex Developer + Claude Reviewer, while an explicit
-Codex/Codex override retains this provider for both roles.
+that never judges the work. Developer, Reviewer1, and Reviewer2 adapters are
+independent; the built-in lanes are Codex Developer + Codex Reviewer1 + Claude
+Reviewer2, while explicit canonical overrides can retain this provider for any
+or all worker lanes.
 
 ## The two rules
 
@@ -27,15 +28,16 @@ a review round or a local commit, both cheap and revertible.
 **The approved lane includes its local candidate commit.** Each Developer
 creates exactly one signed-off local task commit before review and amends only
 that commit for corrections. Its create/amend instructions require a matching
-`Signed-off-by` trailer, which the Reviewer checks. A general instruction
+`Signed-off-by` trailer, which both Reviewers check. A general instruction
 requiring human authorization for commits is satisfied by approval of the
 standard run. An explicit no-commit requirement is incompatible and routes to
 clarification instead of being silently ignored. That authority conflict is
 included in the per-turn `CLARIFICATION_REQUIRED` output contract; the Architect
 must escalate it to the human regardless of remaining autonomous clarification
 budget and cannot autonomously override it. Reviewer LGTM applies to the exact
-final candidate range already committed; it does not authorize or require
-another commit. Push, install, and release always remain separate.
+final candidate range already committed only when both Reviewers return LGTM
+for the same generation; it does not authorize or require another commit.
+Push, install, and release always remain separate.
 
 ## Invocation
 
@@ -63,8 +65,8 @@ codex exec
 the process working directory**, so every invocation is launched directly
 from the project directory with `Command::current_dir` — otherwise a resumed
 turn would silently work somewhere else. `--add-dir` belongs to the exec
-parent, ahead of `resume`, and is passed for both Developer and Reviewer when
-the task repository differs from the project directory.
+parent, ahead of `resume`, and is passed for the Developer and either Reviewer
+lane when the task repository differs from the project directory.
 
 hcom does not pass `--strict-config`, `--ignore-user-config`,
 `--ignore-rules`, `mcp_servers={}`, feature-disable flags, or a private
@@ -77,7 +79,7 @@ decides what Codex passes onward to model-started tool commands.
 
 Codex discovers instructions automatically only in its primary project chain.
 An external task repository is a secondary `--add-dir` root, so every hcom
-Developer/Reviewer prompt explicitly requires inspecting applicable
+Codex task-worker prompt explicitly requires inspecting applicable
 AGENTS.md, AGENTS.override.md, and nested instructions in both the project and
 the task repository. hcom forwards the exact paths; it does not parse or
 resolve those instruction files itself.
@@ -155,7 +157,7 @@ stops for a human; its successfully published paths remain in the snapshot.
 hcom checks only that `repository_root` is an existing directory. It never
 opens Git, records a branch or revision, checks cleanliness, or drift-checks
 the bound task/design documents. Source state and the appropriate review range
-are for the Developer, Reviewer, and human to establish from the original
+are for the Developer, both Reviewers, and human to establish from the original
 files and repository.
 
 ## File-backed task and peer routing
@@ -168,15 +170,18 @@ drift-check the task/design files.
 
 Every role reads those original files. Peer handoff is path-only:
 
-- initial review names the latest Developer `native-final.partial`;
-- correction names the current Reviewer final path or ordered
-  original-plus-clarification paths;
-- re-review names the latest corrected Developer final;
-- clarification names the original Reviewer final.
+- both initial reviews name the latest Developer `native-final.partial`;
+- correction names both same-generation Reviewer logical-response path chains
+  in stable Reviewer1-then-Reviewer2 order;
+- both re-reviews name the latest corrected Developer final but no peer
+  Reviewer evidence;
+- clarification names only that Reviewer's original final.
 
 There is no inline summary route, request/response manifest, or copied peer
 body. A successful new role final replaces that role's current task pointer;
-historical attempt artifacts stay on disk.
+historical attempt artifacts stay on disk. The first Reviewer response never
+starts Developer correction; both logical responses must join, and every
+Developer amendment invalidates both prior verdicts.
 
 ## Evidence
 
@@ -201,7 +206,8 @@ finals.
 
 The workspace is handoff material, not a recovery store. A restarted hcom never
 reads it to resume. The live in-memory snapshot carries only the latest
-Developer path and the current ordered Reviewer path or paths for each task.
+Developer path and the current-generation typed result/path chain for each
+ordered Reviewer lane.
 
 ## Failures
 
@@ -400,14 +406,17 @@ A turn is killed after 6 hours of wall clock, monotonic and never reset by
 output. A genuinely slow turn is indistinguishable from a hung one; a wedged
 worker burns up to six hours before the watchdog fires. The foreground
 supervisor reports the resulting terminal state through the pending
-`session_wait`. The same wait returns once for every review request, review
-response, and task completion, so ordinary progress no longer requires an
-interrupt and `session_status` query. It also returns for a latched Developer
-clarification/blocker action. Progress is retained under a run-local sequence
-across the short display/re-wait gap. An action survives an interrupted wait
-and is immediately redelivered when the reconnect uses a version older than
-the action's `published_version`; a same-version repeat is rejected until the
-action is resolved.
+`session_wait`. The same wait returns once for every review-generation request,
+each Reviewer response, and task completion, so ordinary progress no longer
+requires an interrupt and `session_status` query. It exposes Reviewer identity,
+generation, and received/expected response counts. The first response is
+partial progress and the Architect immediately waits for the peer response
+without reading the durable response body. The wait also returns for a latched
+Developer clarification/blocker action. Progress is retained under a run-local
+sequence across the short display/re-wait gap. An action survives an
+interrupted wait and is immediately redelivered when the reconnect uses a
+version older than the action's `published_version`; a same-version repeat is
+rejected until the action is resolved.
 
 The six-hour watchdog applies only to an active Developer or Reviewer turn.
 `AwaitingArchitectAction` has no timeout: it may be waiting for a human
@@ -415,13 +424,14 @@ decision, consumes no resident worker process, and remains owned by the
 foreground in-memory parent. Parent or terminal exit still cancels the run.
 
 At terminal return, every task snapshot exposes
-`latest_developer_final_path`, ordered `final_reviewer_message_paths`, and
-`reviewer_verdict`, plus a bounded clarification record count. Ordered
-clarification records are read separately in pages of at most eight. The
-Architect reads every non-empty Reviewer file in order and reports its
-original verdict/findings, distinguishing LGTM,
+`latest_developer_final_path`, `review_round`, `review_generation`, and ordered
+Reviewer1/Reviewer2 current-generation typed result/path chains, plus a bounded
+clarification record count. Ordered clarification records are read separately
+in pages of at most eight. Only then does the Architect read both Reviewers'
+non-empty current-generation evidence and report their original
+verdicts/findings, distinguishing same-generation dual LGTM,
 `review_exhausted`, and lifecycle failure. Neither MCP response shape embeds
-the Reviewer body, and the Architect does not rerun tests, review, or
+either Reviewer body, and the Architect does not rerun tests, review, or
 validation unless the human asks. For LGTM, it reports the final reviewed local
 candidate without asking whether to retain/revert it or creating a post-LGTM
 commit; push/install/release remain separately authorized.

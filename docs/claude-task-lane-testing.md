@@ -4,6 +4,13 @@ Real Claude tests are explicit, serial, headless opt-ins. Ordinary
 `cargo test` uses fake executables and never makes a provider/network request.
 No test launches the interactive Architect TUI.
 
+The named task-lane scenarios below are the released protocol-v7
+single-Reviewer evidence. They do not constitute protocol-v8 concurrent
+dual-review acceptance, and the former 10/10 result must not be reported as
+v8 evidence. The explicit v8 dual-review E2E definitions are added by the
+separate aggregate test task; until those scenarios are defined and separately
+authorized to run, real-model v8 dual-review E2E is **NOT RUN**.
+
 ## Mandatory caller environment
 
 Every real entry requires the caller to set:
@@ -65,7 +72,7 @@ Coverage:
 
 | Scenario | Contract |
 |---|---|
-| `mixed` | default Codex Developer + Claude Reviewer, REQUEST_CHANGES, correction, exact Reviewer resume |
+| `mixed` | released-v7 Codex Developer + Claude Reviewer default, REQUEST_CHANGES, correction, exact Reviewer resume |
 | `developer-resume` | Claude Developer + Codex Reviewer, exact Developer resume |
 | `claude-pair` | Claude Developer + Claude Reviewer, cross-task fresh sessions |
 | `exhaustion` | Claude rejection reaches `review_exhausted` and advances |
@@ -76,10 +83,10 @@ Coverage:
 | `parent-death` | hcom-parent SIGKILL reaches Guardian PDEATHSIG cleanup |
 | `native-contract` | native instructions/settings/hook/MCP/environment and create/resume transport |
 
-The existing deterministic provider-router test covers all four
-Developer/Reviewer pairs, and the Architect profile/CLI matrix covers both
-Architect adapters across those pairs. Real scenarios add model evidence only
-where native behavior matters.
+These historical real scenarios cover all four released-v7
+Developer/Reviewer pairs. Current deterministic tests cover the v8
+Architect/Developer/Reviewer1/Reviewer2 profile matrix without making provider
+calls. Real scenarios add model evidence only where native behavior matters.
 
 Set `HCOM_REAL_E2E_KEEP=1` to retain a failed disposable fixture and print its
 path. The default removes fixtures automatically after completion. Process

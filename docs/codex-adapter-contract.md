@@ -95,19 +95,21 @@ its first task-control call.
 ## Background Codex workers
 
 Both `hcom arch codex` and `hcom arch claude` bind one provider-routed worker
-lane. The foreground Architect adapter does not change the independently
-configured worker adapters. The default pair is Codex Developer + Claude
-Reviewer; explicitly selecting Codex Reviewer restores the original pure
-Codex/Codex behavior. A selected unavailable provider fails closed without
-fallback.
+lane bundle. The foreground Architect adapter does not change the independently
+configured worker adapters. The defaults are Codex Developer, Codex Reviewer1,
+and Claude Reviewer2. Canonical `[architect.reviewer1]` and
+`[architect.reviewer2]` tables independently select either provider; a
+legacy-only `[architect.reviewer]` profile is copied completely to both lanes
+with a deprecation notice. A selected unavailable provider fails closed
+without fallback.
 
 The exec lane:
 
 - launches directly from the project directory with the complete parent
   environment and real native config;
-- passes `--add-dir <task repository>` to both roles when source is outside the
-  project;
-- tells both roles to inspect applicable project and repository AGENTS.md,
+- passes `--add-dir <task repository>` to every Codex task worker when source
+  is outside the project;
+- tells every task worker to inspect applicable project and repository AGENTS.md,
   AGENTS.override.md, and nested instructions before work;
 - proves create/resume identity from `thread.started.thread_id`;
 - captures final output with `--output-last-message`, validates it, and
@@ -125,49 +127,57 @@ artifact bounds, and contract smokes.
 An approved task binds `repository_root`, `task_document_path`, ordered
 `design_document_paths`, and `task_selector`. The adapter transports those
 exact strings; it does not read, snapshot, hash, lock, or drift-check the
-documents. Developer and Reviewer read the originals.
+documents. Developer and both Reviewers read the originals.
 
-Developer-to-Reviewer, Reviewer-to-correction, correction-to-re-review, and
-verdict-clarification handoffs contain only durable final-message paths. There
-is no peer-body summary or inline/file dual route. The in-memory terminal
-snapshot exposes each task's latest Developer path, ordered final Reviewer
-paths, and Reviewer verdict. Both MCP response representations contain that
-metadata but never the Reviewer body.
+Developer-to-Reviewer fan-out, both Reviewer-to-correction handoffs,
+correction-to-both-reviews, and per-Reviewer verdict clarification contain only
+durable final-message paths. Reviewers never receive peer evidence. There is
+no peer-body summary or inline/file dual route. The in-memory v8 terminal
+snapshot exposes each task's latest Developer path plus ordered Reviewer1 and
+Reviewer2 current-generation identities, verdicts, and path chains. Both MCP
+response representations contain that metadata but never either Reviewer body.
 
 Developer clarification/blocker requests also route only through durable
 paths. Each accepted clarification becomes ordered task runtime evidence and
 is supplied by path to every later Developer and Reviewer turn; it does not
 change the approved plan hash. `session_wait` is bound to the exact current run
 ID and a run-local progress sequence. It returns one retained review-request,
-review-response, or task-completion event, a latched action, or a terminal
-state. Review-request events carry the exact Developer final path read by the
-Reviewer plus the approved task/design paths and selector. Review-response and
-task-completion events carry the exact Developer path and ordered Reviewer
-final paths; no peer body is copied into the event. The Architect displays each
-event once and re-waits with its sequence. Events created between waits are
-retained, and queued progress is delivered before terminal.
+per-Reviewer response, or task-completion event, a latched action, or a
+terminal state. Review-request events carry the exact Developer final path read
+by both Reviewers, the approved task/design paths and selector, current
+generation, and ordered session-level Reviewer bindings. Review-response
+events carry exact Reviewer identity, generation, verdict, response counts,
+Developer path, and that Reviewer's ordered path chain. The first response is
+partial progress and never means the review cycle finished. Task completion
+carries both current-generation typed results; no peer body is copied into any
+event. The Architect displays each event without reading response bodies and
+re-waits with its sequence. Events created between waits are retained, and
+queued progress—including both response events—is delivered before terminal.
 
 Each action has a `published_version`: an interrupted client can recover it by
 waiting from an older version in that run, while a repeated wait at the
 published version is rejected until the action is resolved. A pending action
-takes priority over queued progress. Status snapshots carry only each task's
-clarification count; the ordered records are available through run-bound pages
-of at most eight. The runtime enforces 64 records per task and 1280 per run
+takes priority over queued progress. Status snapshots carry the bounded active
+worker list, session-level Reviewer bindings, and current-generation typed
+Reviewer results; for clarifications they carry only each task's count. The
+ordered clarification records are available through run-bound pages of at most
+eight. The runtime enforces 64 records per task and 1280 per run
 independently of whether an answer is Architect-derived or human-confirmed. At
-terminal return, the Architect reads every non-empty final Reviewer file in
-order and delivers the original verdict and findings. It distinguishes LGTM,
+terminal return, the Architect reads both Reviewers' non-empty
+current-generation final chains in Reviewer order and delivers the original
+verdicts and findings. It distinguishes same-generation dual LGTM,
 `review_exhausted`, and lifecycle failure and does not rerun tests, review, or
 validation unless the human explicitly asks. For LGTM, the final signed-off
 local Developer candidate commit is already approved execution output reviewed
-at its exact range. The Architect reports it without asking whether to retain
-or revert it and without creating a post-LGTM commit. Push, install, and release
-remain separate authorizations.
+at its exact range by both Reviewers. The Architect reports it without asking
+whether to retain or revert it and without creating a post-LGTM commit.
+Push, install, and release remain separate authorizations.
 
 A bare generic implement/proceed/finish/drive request selects delegation but
 does not by itself authorize starting a run; approval is limited to the exact
 displayed-plan, named-plan, and plan-then-execute forms. The fixed Developer
 contract requires the one candidate commit and its amendments to retain a
-matching `Signed-off-by` trailer, which the Reviewer checks. If an explicit
+matching `Signed-off-by` trailer, which both Reviewers check. If an explicit
 no-commit instruction conflicts with that contract after start, the per-turn
 Developer output contract requires `CLARIFICATION_REQUIRED` without repository
 modification. The Architect must call `session_clarification_require_human`

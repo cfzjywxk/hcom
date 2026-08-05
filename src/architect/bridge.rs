@@ -931,11 +931,12 @@ mod tests {
         CONTROL_REFUSAL_TRANSPORT, TOOL_REFUSAL_ACTION, TOOL_REFUSAL_ENVELOPE,
     };
     use crate::control_api::{
-        ActionName, ControlAction, ControlErrorCode, ControlResult, ReviewerResultSnapshot,
-        ReviewerVerdict, SessionProgressEvent, SessionState, SessionStatusSnapshot, TaskState,
-        TaskStatusSnapshot,
+        ActionName, ActiveWorkerSnapshot, ControlAction, ControlErrorCode, ControlResult,
+        ReviewerBindingSnapshot, ReviewerResultSnapshot, ReviewerVerdict, SessionProgressEvent,
+        SessionState, SessionStatusSnapshot, TaskState, TaskStatusSnapshot,
     };
     use crate::worker::profile::ReviewerId;
+    use crate::worker::runtime::WorkerLane;
     use std::process::{Command, Stdio};
     use std::thread::JoinHandle;
     use std::time::Instant;
@@ -1040,6 +1041,25 @@ mod tests {
             terminal_detail: None,
             tasks: Vec::new(),
         }
+    }
+
+    fn reviewer_bindings() -> Vec<ReviewerBindingSnapshot> {
+        vec![
+            ReviewerBindingSnapshot {
+                reviewer_id: ReviewerId::Reviewer1,
+                provider: "codex-exec".into(),
+                model: "gpt-5.6-sol".into(),
+                reasoning_effort: "xhigh".into(),
+                contract_sha256: "1".repeat(64),
+            },
+            ReviewerBindingSnapshot {
+                reviewer_id: ReviewerId::Reviewer2,
+                provider: "claude-exec".into(),
+                model: "opus".into(),
+                reasoning_effort: "xhigh".into(),
+                contract_sha256: "2".repeat(64),
+            },
+        ]
     }
 
     fn reviewed_task_snapshot(reviewer_path: &Path) -> TaskStatusSnapshot {
@@ -1267,7 +1287,7 @@ mod tests {
                     task_key: "task-one".into(),
                     completed_tasks: 0,
                     total_tasks: 1,
-                    review_round: 1,
+                    review_round: 0,
                     review_generation: 1,
                     max_review_rounds: 3,
                     reviewer_id: ReviewerId::Reviewer1,
@@ -1289,6 +1309,114 @@ mod tests {
         assert_eq!(
             structured["result"]["event"]["reviewer_final_message_paths"],
             json!(["/artifacts/reviewer/final.md"])
+        );
+        assert_eq!(structured["result"]["event"]["reviewer_id"], "reviewer1");
+        assert_eq!(structured["result"]["event"]["review_round"], 0);
+        assert_eq!(structured["result"]["event"]["review_generation"], 1);
+        assert_eq!(structured["result"]["event"]["responses_received"], 1);
+        assert_eq!(structured["result"]["event"]["responses_expected"], 2);
+        let content: Value =
+            serde_json::from_str(output["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(content, *structured);
+        assert!(!output.to_string().contains("REVIEWER-BODY"));
+    }
+
+    #[test]
+    fn status_result_preserves_v8_active_bindings_and_current_generation_without_peer_body() {
+        let reviewer1_path = "/artifacts/reviewer/reviewer1/final.md";
+        let mut session = status_snapshot();
+        session.state = SessionState::Running;
+        session.version = 4;
+        session.current_task_ordinal = Some(0);
+        session.active_workers = vec![
+            ActiveWorkerSnapshot {
+                task_ordinal: 0,
+                task_key: "task-one".into(),
+                worker_lane: WorkerLane::Reviewer(ReviewerId::Reviewer1),
+                reviewer_id: Some(ReviewerId::Reviewer1),
+                purpose: "initial_review".into(),
+            },
+            ActiveWorkerSnapshot {
+                task_ordinal: 0,
+                task_key: "task-one".into(),
+                worker_lane: WorkerLane::Reviewer(ReviewerId::Reviewer2),
+                reviewer_id: Some(ReviewerId::Reviewer2),
+                purpose: "initial_review".into(),
+            },
+        ];
+        session.reviewer_bindings = reviewer_bindings();
+        session.tasks = vec![TaskStatusSnapshot {
+            task_key: "task-one".into(),
+            ordinal: 0,
+            state: TaskState::Reviewing,
+            repository_root: "/source".into(),
+            task_document_path: "/project/task.md".into(),
+            design_document_paths: vec!["/project/design.md".into()],
+            task_selector: "TASK-ONE".into(),
+            branch: None,
+            review_round: 0,
+            review_generation: 1,
+            max_review_rounds: 3,
+            clarification_rounds_used: 0,
+            max_clarification_rounds: 2,
+            clarification_record_count: 0,
+            base_revision: None,
+            head_revision: None,
+            developer_session_bound: true,
+            reviewers: vec![
+                ReviewerResultSnapshot {
+                    reviewer_id: ReviewerId::Reviewer1,
+                    session_bound: true,
+                    current_generation: Some(1),
+                    current_verdict: Some(ReviewerVerdict::Lgtm),
+                    current_final_message_paths: vec![reviewer1_path.into()],
+                },
+                ReviewerResultSnapshot {
+                    reviewer_id: ReviewerId::Reviewer2,
+                    session_bound: true,
+                    current_generation: None,
+                    current_verdict: None,
+                    current_final_message_paths: Vec::new(),
+                },
+            ],
+            outcome_detail: None,
+            latest_developer_final_path: Some("/artifacts/developer/final.md".into()),
+        }];
+        let response =
+            ControlResponse::success("status-request", ControlResult::Session { session });
+        let output = complete_tool_call(json!(18), Ok(response));
+        let structured = &output["result"]["structuredContent"];
+        assert_eq!(
+            structured["result"]["session"]["active_workers"][0]["reviewer_id"],
+            "reviewer1"
+        );
+        assert_eq!(
+            structured["result"]["session"]["active_workers"][1]["reviewer_id"],
+            "reviewer2"
+        );
+        assert_eq!(
+            structured["result"]["session"]["reviewer_bindings"][0]["provider"],
+            "codex-exec"
+        );
+        assert_eq!(
+            structured["result"]["session"]["reviewer_bindings"][1]["provider"],
+            "claude-exec"
+        );
+        assert_eq!(
+            structured["result"]["session"]["tasks"][0]["review_round"],
+            0
+        );
+        assert_eq!(
+            structured["result"]["session"]["tasks"][0]["review_generation"],
+            1
+        );
+        assert_eq!(
+            structured["result"]["session"]["tasks"][0]["reviewers"][0]["current_final_message_paths"],
+            json!([reviewer1_path])
+        );
+        assert_eq!(
+            structured["result"]["session"]["tasks"][0]["reviewers"][1]["current_verdict"],
+            Value::Null
         );
         let content: Value =
             serde_json::from_str(output["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
@@ -1319,6 +1447,7 @@ mod tests {
             session.state = SessionState::Completed;
             session.version = 9;
             session.terminal_detail = Some("all tasks completed".into());
+            session.reviewer_bindings = reviewer_bindings();
             session.tasks = vec![reviewed_task_snapshot(&response_reviewer_path)];
             ControlResponse::success(&request.request_id, ControlResult::Session { session })
         });
@@ -1378,6 +1507,22 @@ mod tests {
             9
         );
         let structured = &terminal["result"]["structuredContent"];
+        assert_eq!(
+            structured["result"]["session"]["reviewer_bindings"][0]["reviewer_id"],
+            "reviewer1"
+        );
+        assert_eq!(
+            structured["result"]["session"]["reviewer_bindings"][1]["reviewer_id"],
+            "reviewer2"
+        );
+        assert_eq!(
+            structured["result"]["session"]["tasks"][0]["reviewers"][0]["reviewer_id"],
+            "reviewer1"
+        );
+        assert_eq!(
+            structured["result"]["session"]["tasks"][0]["reviewers"][1]["reviewer_id"],
+            "reviewer2"
+        );
         assert_eq!(
             structured["result"]["session"]["tasks"][0]["reviewers"][0]["current_final_message_paths"],
             json!([reviewer_path_text.clone()])
@@ -1723,6 +1868,19 @@ mod tests {
             responses[0]["result"]["instructions"],
             ARCHITECT_INSTRUCTIONS
         );
+        let initialize_instructions = responses[0]["result"]["instructions"].as_str().unwrap();
+        for required in [
+            "Reviewer1 and Reviewer2 lanes",
+            "review_generation",
+            "responses_received",
+            "first Reviewer response is only partial progress",
+            "Only after terminal",
+        ] {
+            assert!(
+                initialize_instructions.contains(required),
+                "initialize instructions omitted {required}"
+            );
+        }
         assert_eq!(responses[1]["id"], 1);
         assert_eq!(
             responses[1]["result"]["tools"].as_array().unwrap().len(),

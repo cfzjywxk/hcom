@@ -3,10 +3,12 @@
 `hcom arch` starts one blank foreground Codex or Claude Architect plus a
 foreground-local, in-memory task supervisor. One foreground Architect may
 execute multiple sequential runs. After the human authorizes a typed ordered
-plan, the parent starts fresh no-TTY Developer and Reviewer sessions through
-independently selected Codex or Claude adapters for each task. Same-task
-correction/re-review resumes the exact original native role session; a later
-task or later run starts fresh sessions.
+plan, the parent starts fresh no-TTY Developer and two Reviewer sessions through
+independently selected Codex or Claude adapters for each task. Reviewer means
+two fixed ordered lanes, Reviewer1 and Reviewer2, which run concurrently for
+each review generation. Same-task correction resumes the exact Developer
+session and re-review resumes each Reviewer's own exact native session; a
+later task or later run starts fresh sessions.
 
 There is no daemon, Project Store, cross-Architect recovery, final apply, push,
 or install. Parent exit stops the workers and loses the current in-memory
@@ -30,20 +32,20 @@ Enter. The human owns the first and every later interactive input.
 Each task names an absolute, lexically normalized `repository_root` that exists
 as a directory. It may be `/home/user/src/hcom` while the project is
 `/home/user/work/data/hcom-interactive`, or it may be nested below the project.
-hcom passes this source path to both roles; it does not infer it from plan
+hcom passes this source path to every task worker; it does not infer it from plan
 markdown or search the filesystem for a repository.
 
-Both public entrypoints use the same provider-routed worker lane. The command
-selects only the foreground Architect; worker tables remain independent:
+Both public entrypoints use the same provider-routed worker lane bundle. The
+command selects only the foreground Architect; worker tables remain
+independent:
 
-- `hcom arch codex`: Codex foreground Architect, Codex Developer, Claude
-  Reviewer by default.
-- `hcom arch claude`: Claude foreground Architect, Codex Developer, Claude
-  Reviewer by default.
+- `hcom arch codex`: Codex foreground Architect, Codex Developer, Codex
+  Reviewer1, and Claude Reviewer2 by default.
+- `hcom arch claude`: Claude foreground Architect, Codex Developer, Codex
+  Reviewer1, and Claude Reviewer2 by default.
 
-Either worker role may explicitly select Codex or Claude. An unavailable
-selected adapter fails closed; hcom never silently falls back to another
-provider.
+Each worker lane may explicitly select Codex or Claude. An unavailable selected
+adapter fails closed; hcom never silently falls back to another provider.
 
 ## Native Architect projection
 
@@ -99,8 +101,8 @@ process's host capabilities.
 
 The primary project is every worker's native cwd, so provider-global and
 project instruction discovery applies normally. When `repository_root`
-differs, hcom passes `--add-dir <repository_root>` to both Developer and
-Reviewer. Claude workers also receive
+differs, hcom passes `--add-dir <repository_root>` to the Developer and both
+Reviewers. Claude workers also receive
 `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1`, so external-source
 `CLAUDE.md` instructions load alongside project instructions.
 
@@ -114,7 +116,7 @@ allowlist, and hcom neither infers roots from task documents nor restarts the
 Architect.
 
 A secondary `--add-dir` root is not every provider's primary instruction
-discovery chain. Therefore every task prompt explicitly tells both roles to
+discovery chain. Therefore every task prompt explicitly tells every worker to
 inspect and follow applicable AGENTS.md, AGENTS.override.md, and nested
 instructions in:
 
@@ -145,10 +147,10 @@ not change any run in that foreground invocation.
 
 Built-in defaults are:
 
-| Command | Architect | Developer | Reviewer |
-|---|---|---|---|
-| `hcom arch codex` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Claude `opus`, `xhigh`, skip permissions |
-| `hcom arch claude` | Claude `opus`, `xhigh`, skip permissions | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Claude `opus`, `xhigh`, skip permissions |
+| Command | Architect | Developer | Reviewer1 | Reviewer2 |
+|---|---|---|---|---|
+| `hcom arch codex` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Claude `opus`, `xhigh`, skip permissions |
+| `hcom arch claude` | Claude `opus`, `xhigh`, skip permissions | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Claude `opus`, `xhigh`, skip permissions |
 
 Every table is a partial override. Omitted fields retain that role's built-in
 default, so overriding only model/effort is sufficient:
@@ -163,18 +165,29 @@ model = "opus"
 effort = "high"
 dangerously_skip_permissions = true
 
-[architect.reviewer]
+[architect.reviewer1]
 adapter = "codex"
-model = "reviewer-model-override"
+model = "reviewer1-model-override"
 reasoning_effort = "xhigh"
 sandbox = "danger-full-access"
 ask_for_approval = "never"
+
+[architect.reviewer2]
+adapter = "claude"
+model = "opus"
+effort = "xhigh"
+dangerously_skip_permissions = true
 ```
 
-`adapter` is optional in worker tables. Developer defaults to `codex`; Reviewer
-defaults to `claude`. Setting an adapter switches that table to the selected
-role's complete built-in default before applying its remaining partial
-overrides. Codex workers require `sandbox = "danger-full-access"` and
+`adapter` is optional in worker tables. Developer and Reviewer1 default to
+`codex`; Reviewer2 defaults to `claude`. Setting an adapter switches that table
+to the selected role's complete built-in default before applying its remaining
+partial overrides. Canonical configurations use `[architect.reviewer1]` and
+`[architect.reviewer2]`. For migration only, a legacy-only
+`[architect.reviewer]` table is resolved once using the released single-table
+rules and copied completely to both Reviewer lanes; startup prints a
+deprecation notice. Combining the legacy table with either canonical Reviewer
+table fails closed. Codex workers require `sandbox = "danger-full-access"` and
 `ask_for_approval = "never"` because they have no human approval channel.
 Claude accepts `effort` and `dangerously_skip_permissions`; Codex accepts
 either `reasoning_effort` or the shorter `effort` alias, but not both in one
@@ -190,9 +203,9 @@ dangerously_skip_permissions = true
 ```
 
 Explicit `hcom arch` model/reasoning/sandbox/approval options change only the
-foreground Architect. Developer and Reviewer values come from their merged
-TOML tables or the built-in defaults. There is deliberately no arbitrary argv
-field.
+foreground Architect. Developer, Reviewer1, and Reviewer2 values come from
+their merged TOML tables or the built-in defaults. There is deliberately no
+arbitrary argv field.
 
 Precedence is:
 
@@ -212,15 +225,16 @@ The serial, opt-in contract and task-lane entry points are documented in
 explicit Haiku/medium profile and exact inherited proxy gate before every real
 Claude spawn and never run an interactive Architect TUI.
 
-At startup hcom prints all three effective role profiles, the invocation
+At startup hcom prints all four effective role profiles, the invocation
 profile hash, the exact session binding hash, the Guardian platform boundary,
 and the additional-directory instruction policy. The session binding hash
-includes the exact Architect/worker profiles, worker runtime contracts, and
-ordered Claude Architect `--add-dir` roots; the approved plan hash binds it.
-The bridge bootstrap carries the same hash under a closed schema. This profile
-and bridge addition does not change private task-control protocol v7. An old or
-mismatched `hcom`/`hcom-architect-mcp` pair rejects the bootstrap or protocol
-version instead of falling back to weaker/default profiles.
+includes the exact Architect/worker profiles, ordered Reviewer identities,
+worker runtime contracts, and ordered Claude Architect `--add-dir` roots; the
+approved plan hash binds it. The bridge bootstrap carries the same hash under a
+closed schema. Private task-control protocol v8 exposes the dual-Reviewer
+state; an old or mismatched `hcom`/`hcom-architect-mcp` pair rejects the
+bootstrap or protocol version instead of falling back to weaker/default
+profiles.
 
 ## Session identity
 
@@ -271,10 +285,13 @@ session_wait({
 ```
 
 The supervisor validates the exact session version, plan version/hash, frozen
-adapter pair, confirmation bit, field shape, and lexical absolute-path
-syntax. It checks only that `repository_root` is an existing directory. hcom
-does not open, copy, snapshot, hash, lock, or drift-check the task/design
-documents, and it does not parse Markdown to infer a task.
+session worker profiles, confirmation bit, field shape, and lexical
+absolute-path syntax. It checks only that `repository_root` is an existing
+directory. hcom does not open, copy, snapshot, hash, lock, or drift-check the
+task/design documents, and it does not parse Markdown to infer a task.
+`max_review_rounds` is a synchronized generation budget: one generation fans
+out Reviewer1 and Reviewer2 concurrently, then consumes one round only after
+both logical responses join.
 
 A human message explicitly directing the Architect to
 follow/execute/implement a named existing detailed plan, specification, or
@@ -301,22 +318,28 @@ Developer returns `CLARIFICATION_REQUIRED` without modifying the repository,
 and the Architect must call `session_clarification_require_human` regardless of
 remaining autonomous clarification budget. It cannot autonomously reinterpret
 run approval as overriding the explicit instruction. Developer commit and
-amend instructions require a matching `Signed-off-by` trailer; the Reviewer
-checks it. Candidate commits do not authorize push, install, or release.
+amend instructions require a matching `Signed-off-by` trailer; both Reviewers
+check it. Candidate commits do not authorize push, install, or release.
 
-Both role prompts carry the exact project/source paths, task document path,
+All role prompts carry the exact project/source paths, task document path,
 ordered design document paths, selector, instruction-discovery rule, and fixed
 role contract. The workers read the original files. Peer messages use one
 file-only route:
 
-- the initial Reviewer prompt names the Developer's durable final path;
-- a correction prompt names the current ordered Reviewer final path or paths;
-- a re-review prompt names only the latest Developer final path;
-- verdict clarification names the original Reviewer final path.
+- both initial Reviewer prompts name the same Developer durable final path and
+  current generation, but neither names the peer Reviewer;
+- a correction prompt names both same-generation Reviewer logical-response
+  path chains in stable Reviewer1-then-Reviewer2 order;
+- both re-review prompts name only the latest Developer final path and state
+  that the candidate was amended, without peer evidence;
+- verdict clarification names only that Reviewer's original final path.
 
 No peer body, redacted summary, or inline/file alternative enters these
-prompts. Same-task correction and re-review resume the exact respective role
-session.
+prompts. A first Reviewer response never starts the Developer. Same-task
+correction resumes the exact Developer session, and both Reviewer lanes resume
+their own exact sessions after every amendment. Any amendment invalidates both
+previous verdicts; only same-generation Reviewer1 + Reviewer2 LGTM completes
+the task.
 
 After a run reaches a terminal state, the Architect first completes its
 Reviewer and clarification evidence handoff. For LGTM it reports the final
@@ -346,8 +369,11 @@ the project lock. The lock is released only when the foreground parent exits.
 
 ## Worker process and filesystem behavior
 
-Every worker turn is one direct native `codex exec` process selected from the
-session's inherited `PATH`:
+Every worker turn belongs to one exact Developer, Reviewer1, or Reviewer2 lane
+and starts one native process for that lane's selected provider. The three
+lane runtimes are independent even when they use the same provider, which is
+what permits Reviewer1 and Reviewer2 to overlap. A Codex turn uses the bare
+`codex exec` selected from the session's inherited `PATH`:
 
 ```text
 codex exec
@@ -366,15 +392,19 @@ codex exec
 
 Create gets `--cd`; resume inherits the process cwd and does not get `--cd`.
 The task brief is written to stdin and then EOF. Only the documented
-thread-start event and Reviewer verdict line are parsed.
+thread-start event and Reviewer verdict line are parsed. A Claude turn uses
+the native stream-json/in-band UUID contract through its own per-invocation
+Guardian, with exact-cwd resume and the same durable-final routing rules.
 
-There is no outer worker filesystem sandbox. Developer and Reviewer see what a
-native process launched by the same user sees. Reviewer non-mutation is a
-model-facing role contract, not a read-only bind mount. hcom still owns process
-groups, cancellation, timeout, descendant cleanup, exact resume, and the
-private raw-final/evidence transport. Parent `HCOM_DIR` is unchanged; the only
-environment passed to the worker is the byte-for-byte parent environment, with
-no hcom additions or replacements.
+There is no outer worker filesystem sandbox. Developer and both Reviewers see
+what a native process launched by the same user sees. Reviewer non-mutation is
+a model-facing role contract, not a read-only bind mount. hcom still owns
+process groups or Guardians, cancellation, each lane's six-hour timeout,
+descendant cleanup, exact resume, and the private raw-final/evidence transport.
+Parent `HCOM_DIR` is unchanged. Codex receives the byte-for-byte parent
+environment with no hcom additions or replacements; Claude receives that
+environment plus only the two documented policy pins after the exact inherited
+four-proxy gate succeeds.
 
 Native hooks/plugins/MCP can create descendants or alter behavior; that is
 intentional native equivalence. A turn routes only after exit 0, exact session
@@ -400,11 +430,13 @@ evidence directory is human handoff material, not a recovery store or
 tamper-proof security boundary; a native-equivalent worker has ordinary
 same-user host access.
 
-An LGTM or `review_exhausted` closes the current task runtime before advancing.
-Runtime failure, identity mismatch, cleanup failure, or a second
-unclassifiable Reviewer verdict moves the run to a human-visible terminal
-state. Parent exit/cancel stops the active process group. hcom never pushes,
-installs, resets, rebases, or automatically recovers after the parent exits.
+A same-generation dual LGTM or `review_exhausted` closes all three task lane
+runtimes before advancing. Runtime failure, identity mismatch, cleanup failure,
+or a second unclassifiable verdict in either Reviewer lane cancels any live
+peer and moves the run to a human-visible terminal state without aggregating a
+single response. Parent exit/cancel stops every active owned process tree. hcom
+never pushes, installs, resets, rebases, or automatically recovers after the
+parent exits.
 
 After dispatch, the Codex Architect calls `session_wait` with the returned run
 ID and session version and `after_progress_sequence: 0`. This blocking MCP
@@ -412,7 +444,7 @@ subscription completes for one retained `review_requested`,
 `review_responded`, or `task_completed` event; when the run becomes
 `completed`, `needs_human`, `failed`, or `canceled`; or when a Developer
 clarification/blocker action is latched. The local supervisor continues
-lifecycle monitoring and advances Developer-to-Reviewer and correction
+lifecycle monitoring and advances Developer-to-dual-Reviewer and correction
 transitions without Architect model calls. For a progress result, the
 Architect displays one concise update and immediately waits again using the
 returned `session_version` and the event's `sequence`. It does not sleep, poll
@@ -420,14 +452,21 @@ returned `session_version` and the event's `sequence`. It does not sleep, poll
 rejected and can never subscribe to a later run.
 
 Every progress event identifies the task ordinal/key, completed and total task
-counts, and review round. `review_requested` carries the exact
-`developer_final_path` read by the Reviewer plus the approved task document,
-ordered design document paths, selector, and clarification-record count.
-`review_responded` carries the verdict, Developer final path, and ordered
-Reviewer final-message paths. `task_completed` separately records LGTM or
-review exhaustion with the same review evidence paths. The Architect displays
-the paths but does not read or summarize their contents merely to produce a
-progress update.
+counts, completed `review_round`, and current `review_generation`.
+`review_requested` is emitted only after both Reviewer turns have started and
+carries the exact `developer_final_path` they read, the approved task document,
+ordered design document paths, selector, clarification-record count, and
+ordered session-level Reviewer bindings. `review_responded` is emitted once
+per logical Reviewer response and carries `reviewer_id`, verdict, Developer
+final path, that Reviewer's ordered final-message path chain, and
+`responses_received`/`responses_expected`. The first response is partial
+progress: the Architect displays its identity and counts, says that the peer
+response is pending, and immediately waits again; it does not describe the
+review generation as complete or imply that Developer correction has started.
+`task_completed` separately records dual LGTM or review exhaustion with both
+current-generation typed Reviewer results. The Architect displays exact paths
+but does not read or summarize their contents merely to produce a progress
+update.
 
 Esc or MCP cancellation closes only the current wait subscription; it does not
 cancel the supervisor run. A pending Architect action records the session
@@ -438,7 +477,7 @@ run-local ordered event list retains progress produced between wait calls.
 Pending Architect actions take priority; after they are resolved, queued
 progress resumes at the last displayed sequence. Queued progress is drained
 before a retained terminal snapshot, so a run finishing during the gap does
-not hide its final review response or task-completion event.
+not hide either final Reviewer response or the task-completion event.
 
 Task-lane polling is fail-closed at both ownership layers. The driver does not
 drop its active-turn handle until the cloned core accepts the completion
@@ -472,19 +511,25 @@ transition. Cancellation remains available even if no completed replay record
 can be evicted, so replay bookkeeping cannot wedge the run without a
 protocol-level exit.
 
-Every terminal snapshot carries, for every task, its
-`latest_developer_final_path`, ordered `final_reviewer_message_paths`, and
-`reviewer_verdict`. It carries `clarification_record_count` rather than the
-accumulating record vector; the Architect uses `session_clarifications_list`
-with the exact run ID and pages of at most eight to read the ordered chain. The
-Reviewer body is not copied into either the MCP compatibility text or
-`structuredContent`. After a terminal `session_wait` response, the Architect
-reads every non-empty Reviewer path in order and uses the original verdict and
-findings for the human-facing delivery. It distinguishes `lgtm`,
-`review_exhausted`, and lifecycle failure from the typed task/session state; an
-empty list means that no Reviewer final was successfully published. The
-Architect does not rerun tests, perform another review, or repeat validation
-unless the human explicitly requests that extra work.
+Every session snapshot exposes a bounded `active_workers` list (at most the two
+Reviewer lanes during review), ordered session-level `reviewer_bindings`, and
+for every task its `latest_developer_final_path`, `review_round`,
+`review_generation`, and ordered Reviewer1/Reviewer2 typed results. Each typed
+result contains only that Reviewer's session-bound flag, current generation,
+current verdict, and bounded current logical-response path chain; historical
+generation paths and Reviewer bodies are not copied into the response.
+Snapshots carry `clarification_record_count` rather than the accumulating
+record vector; the Architect uses `session_clarifications_list` with the exact
+run ID and pages of at most eight to read the ordered chain. MCP compatibility
+text and `structuredContent` carry the same v8 metadata without either Reviewer
+body. Only after a terminal `session_wait` response does the Architect read
+both Reviewers' non-empty current-generation path chains and use their original
+verdicts and findings for the human-facing delivery. It distinguishes
+same-generation dual `lgtm`, `review_exhausted`, and lifecycle failure from the
+typed task/session state; an empty path chain means that Reviewer did not
+successfully publish a current logical response. The Architect does not rerun
+tests, perform another review, or repeat validation unless the human explicitly
+requests that extra work.
 
 The Architect must finish clarification pagination before
 `session_run_begin`: the old files remain durable, but the in-memory

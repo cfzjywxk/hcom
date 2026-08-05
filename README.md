@@ -83,13 +83,18 @@ hcom
 
 `hcom arch` runs one blank interactive Codex or Claude architect and an
 in-memory, ordered task supervisor. Each approved task gets fresh no-TUI
-Developer and Reviewer sessions routed independently to native Codex or Claude
-workers. The built-in pair is Codex Developer + Claude Reviewer; same-task
-review changes resume the exact native session for that role.
+Developer, Reviewer1, and Reviewer2 sessions routed independently to native
+Codex or Claude workers. The built-in lanes are Codex Developer + Codex
+Reviewer1 + Claude Reviewer2. Each review generation starts both Reviewers
+concurrently and waits for both responses; same-task corrections resume the
+exact Developer session and re-review resumes each Reviewer's own exact native
+session.
 Execution approval for this standard lane includes one signed-off local
 candidate commit per task. Review corrections amend that same commit; LGTM
-applies to the final exact candidate range, so there is no extra post-LGTM
-commit. Push, install, and release remain separately authorized.
+requires Reviewer1 and Reviewer2 to approve the same generation of the final
+exact candidate range, so every amendment invalidates both earlier verdicts
+and there is no extra post-LGTM commit. Push, install, and release remain
+separately authorized.
 If a developer exits with only allowed-path uncommitted changes, the
 supervisor exact-resumes that developer once to finish checks and commit before
 starting the reviewer; it does not terminate the whole run merely because the
@@ -106,8 +111,9 @@ Codex roles default to `gpt-5.6-sol` with `xhigh` reasoning,
 `opus`/`xhigh` with `dangerously-skip-permissions`. These values are explicit
 and therefore do not inherit model/effort defaults from native configuration.
 `hcom arch codex` selects a Codex foreground Architect; `hcom arch claude`
-selects a Claude foreground Architect. Both retain the Codex Developer +
-Claude Reviewer worker default unless their role tables override it. The
+selects a Claude foreground Architect. Both retain the Codex Developer + Codex
+Reviewer1 + Claude Reviewer2 worker defaults unless their role tables override
+them. The
 capability-bound session-control MCP server is additive, so all other native
 MCP servers remain available. A human request that
 explicitly says to follow or execute a named existing detailed plan,
@@ -151,16 +157,20 @@ nested under the project. Task workers keep the project cwd and receive the
 task repository as `--add-dir` when distinct. Their prompts explicitly require
 reading applicable project and source AGENTS.md/AGENTS.override.md plus nested
 instructions; hcom passes paths and does not parse those files. Architect,
-Developer, and Reviewer adapter/model/effort/permission profiles are typed TOML
-settings in `$HCOM_DIR/config.toml` (normally `~/.hcom/config.toml`) and are
-merged independently onto the built-in role defaults, then frozen when the
-command starts. A worker table may select `adapter = "codex"` or
-`adapter = "claude"`; omitted fields keep the selected role defaults. An
-unavailable selected adapter fails closed without fallback. The Reviewer has
-the same native host view as its directly launched provider; source
-non-mutation is a role contract, not an OS read-only mount. See [the Architect
-user guide](docs/architect.md) for the profile schema, parent-terminal
-inheritance, and exact-session invariants.
+Developer, Reviewer1, and Reviewer2 adapter/model/effort/permission profiles
+are typed TOML settings in `$HCOM_DIR/config.toml` (normally
+`~/.hcom/config.toml`) and are merged independently onto the built-in role
+defaults, then frozen when the command starts. Canonical worker tables are
+`[architect.developer]`, `[architect.reviewer1]`, and
+`[architect.reviewer2]`; each may select `adapter = "codex"` or
+`adapter = "claude"`, and omitted fields keep the selected role defaults. A
+legacy-only `[architect.reviewer]` table is copied completely to both Reviewer
+lanes with a deprecation notice, while mixing legacy and canonical Reviewer
+tables fails closed. An unavailable selected adapter fails closed without
+fallback. Both Reviewers have the same native host view as their directly
+launched providers; source non-mutation is a role contract, not an OS
+read-only mount. See [the Architect user guide](docs/architect.md) for the
+profile schema, parent-terminal inheritance, and exact-session invariants.
 
 The Architect and every session task worker inherit the complete environment
 of the process that started `hcom arch`, captured once without a name
@@ -193,8 +203,8 @@ session, generic implementation requests mean planning and delegation through
 the Developer/Reviewer loop; standing alone, they do not authorize starting
 that loop. The standard lane requires one signed-off local task commit before
 review and same-commit amendments during correction. The Developer is
-instructed to add and preserve the matching `Signed-off-by` trailer, and the
-Reviewer checks it.
+instructed to add and preserve the matching `Signed-off-by` trailer, and both
+Reviewers check it.
 An explicit no-commit requirement is incompatible and must be resolved before
 start; a general commit-authorization rule is satisfied by run approval. If an
 explicit no-commit conflict nevertheless reaches a Developer, the Developer
@@ -207,22 +217,32 @@ store is not addressed through the normal CLI.
 
 After dispatch, the Codex Architect makes a blocking `session_wait` call bound
 to the exact current run ID and a run-local progress cursor. The foreground
-supervisor advances Developer and Reviewer without Architect model calls and
-returns one retained review-request, review-response, or task-completion event,
-a latched Developer clarification/blocker action, or a terminal state. The
-Architect displays each progress event and immediately re-arms the wait with
-that event's sequence; worker execution continues and events produced during
-the gap remain queued in order. A defensible clarification is submitted
-through its exact artifact path and the wait is likewise immediately re-armed.
-A material human decision ends the Architect turn until the human answers. No
-timer or status polling is involved. Esc cancels only the wait subscription,
-not the run. A pending action takes priority over queued progress and records
-its `published_version`: an older-version reconnect re-delivers it, while a
-same-version repeat is rejected until the action is resolved. Queued progress
-is delivered before a retained terminal result. `session_status` is for an
-explicit human progress query only and carries clarification counts, not the
-accumulating record list; `session_clarifications_list` reads records for the
-exact run in pages of at most eight.
+supervisor advances Developer and both Reviewers without Architect model calls
+and returns one retained review-request, per-Reviewer response, or
+task-completion event, a latched Developer clarification/blocker action, or a
+terminal state. Progress exposes the completed `review_round`, current
+`review_generation`, Reviewer identity and response counts, exact durable
+paths, and—on review request—the ordered Reviewer bindings. The Architect
+displays each progress event without reading the response body. The first
+Reviewer response is explicitly partial progress, so it continues waiting
+rather than reporting the review cycle complete or implying a Developer
+correction. It immediately re-arms the wait with every event's sequence;
+worker execution continues and events produced during the gap remain queued in
+order. A defensible clarification is submitted through its exact artifact path
+and the wait is likewise immediately re-armed. A material human decision ends
+the Architect turn until the human answers. No timer or status polling is
+involved. Esc cancels only the wait subscription, not the run. A pending action
+takes priority over queued progress and records its `published_version`: an
+older-version reconnect re-delivers it, while a same-version repeat is rejected
+until the action is resolved. Queued progress, including both Reviewer
+response events, is delivered before a retained terminal result.
+`session_status` is for an explicit human progress query only; it exposes the
+bounded concurrent active-worker list, session-level Reviewer bindings,
+current-generation Reviewer results, and clarification counts, not response
+bodies or the accumulating clarification record list.
+`session_clarifications_list` reads records for the exact run in pages of at
+most eight. Only after terminal does the Architect read both Reviewers'
+current-generation evidence chains and report the original verdicts/findings.
 
 A terminal run remains immutable but does not end the foreground Architect.
 After delivering all Reviewer and clarification evidence, a later human

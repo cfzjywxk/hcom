@@ -413,13 +413,13 @@ fn fork_version_help_and_status_use_human_visible_version() {
 
     let (code, stdout, stderr) = h.run(["--version"]);
     assert_eq!(code, 0);
-    assert_eq!(stdout, "hcom 1.0.12\n");
+    assert_eq!(stdout, "hcom 1.0.13\n");
     assert!(stderr.is_empty(), "stderr={stderr}");
 
     let (code, stdout, stderr) = h.run(["--help"]);
     assert_eq!(code, 0, "stderr={stderr}");
     assert!(
-        stdout.starts_with("hcom (hook-comms) v1.0.12 "),
+        stdout.starts_with("hcom (hook-comms) v1.0.13 "),
         "stdout={stdout}"
     );
     assert!(
@@ -430,14 +430,14 @@ fn fork_version_help_and_status_use_human_visible_version() {
 
     let (code, stdout, stderr) = h.run(["status"]);
     assert_eq!(code, 0, "stderr={stderr}");
-    assert_eq!(stdout.lines().next(), Some("hcom 1.0.12"));
+    assert_eq!(stdout.lines().next(), Some("hcom 1.0.13"));
     assert!(stderr.is_empty(), "stderr={stderr}");
 
     let (code, stdout, stderr) = h.run(["status", "--json"]);
     assert_eq!(code, 0, "stderr={stderr}");
     assert!(stderr.is_empty(), "stderr={stderr}");
     let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(status["version"]["current"], "1.0.12");
+    assert_eq!(status["version"]["current"], "1.0.13");
     assert!(status["version"]["latest"].is_null());
     assert_eq!(status["version"]["update_available"], false);
     assert!(status["version"]["update_cmd"].is_null());
@@ -659,11 +659,16 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     assert!(!stdout.contains("hcom architect"), "stdout={stdout}");
     assert!(stdout.contains("gpt-5.6-sol/xhigh"), "stdout={stdout}");
     assert!(stdout.contains("Claude opus/xhigh"), "stdout={stdout}");
-    assert!(stdout.contains("provider-routed worker"), "stdout={stdout}");
+    assert!(
+        stdout.contains("provider-routed worker")
+            && stdout.contains("Each review generation starts Reviewer1")
+            && stdout.contains("Reviewer2 concurrently"),
+        "stdout={stdout}"
+    );
     let normalized_stdout = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
         normalized_stdout.contains(
-            "Developer defaults to Codex gpt-5.6-sol/xhigh with danger-full-access/never; Reviewer defaults to Claude opus/xhigh with dangerously-skip-permissions"
+            "Developer and Reviewer1 default to Codex gpt-5.6-sol/xhigh with danger-full-access/never; Reviewer2 defaults to Claude opus/xhigh with dangerously-skip-permissions"
         ) && normalized_stdout.contains(
             "An unavailable selected adapter fails closed without fallback"
         ),
@@ -677,7 +682,7 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     );
     assert!(
         normalized_stdout.contains(
-            "Reviewer receives the same native host view; source/Git/install non-mutation is a role instruction rather than an OS read-only mount"
+            "Both Reviewers receive the same native host view; source/Git/install non-mutation is a role instruction rather than an OS read-only mount"
         ) && normalized_stdout.contains("hcom has no repository-root allowlist and does not inspect or repair Git"),
         "stdout={stdout}"
     );
@@ -747,15 +752,15 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
         ) && normalized_stdout.contains(
             "Architect must escalate it to the human regardless of remaining autonomous clarification budget"
         ) && normalized_stdout.contains(
-            "Reviewer checks it"
+            "both Reviewers check it"
         ),
         "stdout={stdout}"
     );
     assert!(
         normalized_stdout.contains(
-            "terminal snapshot contains each task's latest Developer final path, ordered final Reviewer message paths, and Reviewer verdict, never the Reviewer body"
+            "terminal snapshot contains each task's latest Developer final path and Reviewer1/Reviewer2 current-generation identities, verdicts, and final-message path chains, never either Reviewer body"
         ) && normalized_stdout.contains(
-            "Architect reads every final Reviewer file in order and delivers its original verdict and findings"
+            "Only then does the Architect read both final Reviewer evidence chains and deliver their original verdicts and findings"
         ) && normalized_stdout.contains(
             "does not rerun tests, review, or validation unless the human explicitly requests that work"
         ) && normalized_stdout.contains(
@@ -766,7 +771,17 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     assert!(stdout.contains("$HCOM_DIR/config.toml"), "stdout={stdout}");
     assert!(stdout.contains("[architect.profile]"), "stdout={stdout}");
     assert!(stdout.contains("[architect.developer]"), "stdout={stdout}");
+    assert!(stdout.contains("[architect.reviewer1]"), "stdout={stdout}");
+    assert!(stdout.contains("[architect.reviewer2]"), "stdout={stdout}");
     assert!(stdout.contains("[architect.reviewer]"), "stdout={stdout}");
+    assert!(
+        normalized_stdout.contains(
+            "first Reviewer response as partial progress, and immediately re-arms session_wait"
+        ) && normalized_stdout.contains(
+            "completed review round, current generation, Reviewer identity, response counts"
+        ),
+        "stdout={stdout}"
+    );
     assert!(stdout.contains("--ask-for-approval"), "stdout={stdout}");
     assert!(
         !db_path.exists(),
