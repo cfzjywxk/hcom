@@ -197,6 +197,55 @@ project lease remains held by the foreground supervisor across every terminal
 run and `session_run_begin`; per-run evidence directories are claimed
 separately, and only the foreground parent exit releases the lease.
 
+## Architect MCP schema compatibility
+
+The MCP `inputSchema` is not sent byte-for-byte to the Responses API. Native
+Codex normalizes it into Codex's supported schema representation first. In the
+Codex 0.145/0.146 implementation, that conversion turns `const` into a
+single-value `enum`, supplies string `items` for arrays that omit `items`, and
+drops range, length, pattern, array-cardinality, and uniqueness keywords that
+its internal representation does not carry.
+
+hcom therefore applies a local fail-closed compatibility policy while the
+bridge is configured, before the foreground Codex process is spawned:
+
+- every schema node has one primitive string `type`;
+- every array has one explicit `items` schema;
+- every object has `additionalProperties=false` and requires every declared
+  property exactly once;
+- `const` and `enum` contain only scalar values compatible with their declared
+  type; object/array-wide constraints are forbidden;
+- refs, composition, tuple arrays, and other unreviewed schema keywords are
+  forbidden;
+- each compact input schema stays below hcom's 4,500-byte limit, leaving margin
+  below the observed 5,000-byte Codex compaction threshold.
+
+This policy is intentionally narrower than general JSON Schema. Exact adapter
+bindings, numeric ranges, string/path validation, and approval authority remain
+hard checks in hcom's typed protocol and Supervisor. Descriptions repeat
+important numeric/cardinality guidance because Codex may discard the
+corresponding JSON Schema keywords. Neither the compatibility check nor its
+test projection parses model prose or turns free-form output into control
+arguments.
+
+The mandatory source gate covers both the generated raw schemas and a
+Codex-0.145/0.146 compatibility projection. A real service can still change
+independently of the client. Before releasing a change to Architect schemas or
+supporting a new Codex schema adapter, separately authorize a minimal real API
+canary in a newly created disposable terminal:
+
+```text
+hcom arch codex --single-review \
+  --model gpt-5.3-codex-spark --reasoning medium \
+  --sandbox read-only --approval never
+```
+
+The human submits the first non-executing prompt and verifies that the first
+response is accepted without a tool-schema 400, then exits without approving a
+plan or starting workers. hcom must never automate, prefill, or submit that
+prompt. The canary is model/network/TUI work and remains outside the normal
+source gate unless the human explicitly authorizes it.
+
 ## Test map
 
 | Contract | Regression |
@@ -204,6 +253,7 @@ separately, and only the foreground parent exit releases the lease.
 | defaults are explicit | `architect::profile::tests::missing_file_uses_reviewed_defaults`, `worker::profile::tests::task_lane_defaults_to_codex_developer_and_claude_reviewer` |
 | no prompt or input injection | `architect::launch::tests::native_profile_has_no_prompt_or_secret_transport`, `blank_codex_launch_keeps_input_empty_and_preserves_native_host_semantics` |
 | native config plus one MCP leaf | `architect::launch::tests::codex_control_server_is_an_additive_cli_overlay_not_a_private_config` |
+| Codex MCP schema compatibility | `architect::tools::tests::generated_tool_schemas_stay_inside_the_codex_compatibility_policy`, `architect::tools::tests::codex_schema_policy_rejects_lossy_or_ambiguous_shapes_before_launch` |
 | native worker argv/config | `worker::exec_runtime::tests::happy_developer_turn_completes_and_captures_thread_id`, `reviewer_registers_the_external_repository_as_a_native_workspace_root` |
 | byte-exact native environment with no additions | `orchestrator::task_lane::tests::complete_parent_environment_is_preserved_byte_for_byte` |
 | path-only peer and terminal handoff | `orchestrator::task_lane::tests::request_changes_round_routes_only_ordered_durable_paths`, `architect::bridge::tests::session_wait_keeps_mcp_responsive_and_returns_terminal_result` |

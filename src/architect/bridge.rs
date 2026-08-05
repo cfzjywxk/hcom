@@ -1,4 +1,6 @@
-use super::tools::{ARCHITECT_INSTRUCTIONS, control_action, tool_definitions};
+use super::tools::{
+    ARCHITECT_INSTRUCTIONS, control_action, tool_definitions, validate_codex_tool_definitions,
+};
 use crate::control_api::client::ControlClient;
 use crate::control_api::codec::{
     read_request_frame, read_response_frame, write_request_frame, write_response_frame,
@@ -288,6 +290,12 @@ fn validate_bridge_configuration(configuration: &BridgeConfiguration) -> Result<
         &configuration.developer_adapter,
         &configuration.reviewer_adapters,
     )?;
+    if architect_adapter == ArchitectAdapter::Codex {
+        validate_codex_tool_definitions(&tool_definitions(
+            &configuration.developer_adapter,
+            &configuration.reviewer_adapters,
+        ))?;
+    }
     let paths = ControlPaths::new(&configuration.run_root)?;
     if paths.socket_path() != configuration.control_socket_path
         || paths.registration_socket_path() != configuration.registration_socket_path

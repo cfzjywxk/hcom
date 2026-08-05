@@ -587,6 +587,15 @@ They must never reuse, focus, type into, signal, or close an existing user
 window/tab/pane. A real blank Architect TUI smoke requires a newly authorized
 disposable terminal because automated submission of its first prompt would
 violate user input ownership.
+When Architect MCP schemas or the supported native Codex schema adapter
+changes, that separately authorized smoke should use
+`gpt-5.3-codex-spark`/`medium`, single-review mode, read-only sandboxing, and a
+human-submitted non-executing first prompt. Its first success criterion is that
+the service accepts every advertised tool schema without a 400; it must exit
+without approving a plan or starting workers. The local source gate already
+checks a narrow fail-closed schema policy and a Codex-0.145/0.146 compatibility
+projection, so this real canary is confirmation of the external service rather
+than the primary regression test.
 The protocol-v9 dual-review runner is separately authorized, serial, and
 Haiku/medium-only for Claude; its definitions are present but have not been run.
 Earlier protocol results are not v9 dual-review evidence.

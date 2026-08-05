@@ -2,6 +2,12 @@ use crate::control_api::protocol::minimum_review_rounds;
 use crate::control_api::{ActionName, ControlAction, ReviewerAdapterBinding};
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
+use std::collections::BTreeSet;
+
+// Codex 0.145/0.146 starts compacting a normalized MCP input schema at 5,000
+// bytes. Keep an explicit margin so hcom's control schemas never depend on that
+// lossy compatibility path.
+const MAX_CODEX_INPUT_SCHEMA_BYTES: usize = 4_500;
 
 pub(crate) const ARCHITECT_INSTRUCTIONS: &str = "\
 You are the foreground hcom Architect. Unless the human explicitly says that \
@@ -99,6 +105,144 @@ pub(crate) fn tool_definitions(
         .collect()
 }
 
+pub(crate) fn validate_codex_tool_definitions(tools: &[Value]) -> Result<()> {
+    for tool in tools {
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Codex Architect tool has no string name"))?;
+        let schema = tool
+            .get("inputSchema")
+            .ok_or_else(|| anyhow::anyhow!("Codex Architect tool {name} has no inputSchema"))?;
+        let schema_len = serde_json::to_vec(schema)
+            .context("Codex Architect tool inputSchema is not serializable")?
+            .len();
+        if schema_len > MAX_CODEX_INPUT_SCHEMA_BYTES {
+            bail!(
+                "Codex Architect tool {name} inputSchema is {schema_len} bytes; the local compatibility limit is {MAX_CODEX_INPUT_SCHEMA_BYTES}"
+            );
+        }
+        validate_codex_schema_node(schema, &format!("{name}.inputSchema"))?;
+    }
+    Ok(())
+}
+
+fn validate_codex_schema_node(schema: &Value, path: &str) -> Result<()> {
+    let object = schema
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("{path} must be a JSON Schema object"))?;
+    let schema_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("{path}.type must be one primitive string"))?;
+    if !matches!(
+        schema_type,
+        "array" | "boolean" | "integer" | "null" | "number" | "object" | "string"
+    ) {
+        bail!("{path}.type uses an unsupported Codex schema type");
+    }
+    for keyword in object.keys() {
+        let common = matches!(keyword.as_str(), "const" | "description" | "enum" | "type");
+        let type_specific = match schema_type {
+            "array" => matches!(
+                keyword.as_str(),
+                "items" | "maxItems" | "minItems" | "uniqueItems"
+            ),
+            "integer" | "number" => matches!(keyword.as_str(), "maximum" | "minimum"),
+            "object" => matches!(
+                keyword.as_str(),
+                "additionalProperties" | "properties" | "required"
+            ),
+            "string" => matches!(keyword.as_str(), "maxLength" | "minLength" | "pattern"),
+            "boolean" | "null" => false,
+            _ => unreachable!("schema type was validated"),
+        };
+        if !(common || type_specific) {
+            bail!("{path} uses unsupported Codex schema keyword {keyword}");
+        }
+    }
+
+    if object.contains_key("const") && object.contains_key("enum") {
+        bail!("{path} cannot combine const and enum");
+    }
+    if let Some(value) = object.get("const") {
+        validate_codex_scalar_constraint(value, schema_type, path, "const")?;
+    }
+    if let Some(values) = object.get("enum") {
+        let values = values
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("{path}.enum must be an array"))?;
+        if values.is_empty() {
+            bail!("{path}.enum must not be empty");
+        }
+        for value in values {
+            validate_codex_scalar_constraint(value, schema_type, path, "enum")?;
+        }
+    }
+
+    match schema_type {
+        "array" => {
+            let items = object
+                .get("items")
+                .ok_or_else(|| anyhow::anyhow!("{path} array schema must define items"))?;
+            validate_codex_schema_node(items, &format!("{path}.items"))?;
+        }
+        "object" => {
+            if object.get("additionalProperties") != Some(&Value::Bool(false)) {
+                bail!("{path} object schema must set additionalProperties=false");
+            }
+            let properties = object
+                .get("properties")
+                .and_then(Value::as_object)
+                .ok_or_else(|| anyhow::anyhow!("{path}.properties must be an object"))?;
+            let required = object
+                .get("required")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("{path}.required must be an array"))?;
+            let required_names: BTreeSet<_> = required
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("{path}.required must contain strings"))
+                })
+                .collect::<Result<_>>()?;
+            let property_names: BTreeSet<_> = properties.keys().map(String::as_str).collect();
+            if required_names.len() != required.len() || required_names != property_names {
+                bail!("{path}.required must contain every property exactly once");
+            }
+            for (name, property) in properties {
+                validate_codex_schema_node(property, &format!("{path}.properties.{name}"))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_codex_scalar_constraint(
+    value: &Value,
+    schema_type: &str,
+    path: &str,
+    keyword: &str,
+) -> Result<()> {
+    let compatible = match schema_type {
+        "boolean" => value.is_boolean(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "null" => value.is_null(),
+        "number" => value.is_number(),
+        "string" => value.is_string(),
+        "array" | "object" => false,
+        _ => unreachable!("schema type was validated"),
+    };
+    if !compatible {
+        bail!(
+            "{path}.{keyword} must be a scalar value compatible with type {schema_type}; complex array/object constraints are forbidden"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn control_action(
     name: &str,
     arguments: Value,
@@ -194,16 +338,13 @@ fn action_schema(
                 ),
                 (
                     "reviewer_adapters",
-                    json!({
-                        "type":"array",
-                        "description":"Exact ordered active Reviewer adapter bindings loaded for this run.",
-                        "const":reviewer_adapters
-                    }),
+                    reviewer_adapter_schema(reviewer_adapters),
                 ),
                 (
                     "tasks",
                     json!({
                         "type":"array",
+                        "description":"One through 64 ordered task bindings. hcom's typed protocol enforces this range before approval or worker start.",
                         "minItems":1,
                         "maxItems":64,
                         "items":task_schema(minimum_review_rounds(reviewer_adapters.len()).expect("validated active Reviewer topology"))
@@ -287,7 +428,15 @@ fn action_schema(
                 ("task_ordinal", uint32_schema()),
                 ("task_key", id_schema()),
                 ("after_sequence", uint32_schema()),
-                ("limit", json!({"type":"integer","minimum":1,"maximum":8})),
+                (
+                    "limit",
+                    json!({
+                        "type":"integer",
+                        "description":"Page size from 1 through 8. hcom's typed protocol enforces this range.",
+                        "minimum":1,
+                        "maximum":8
+                    }),
+                ),
             ],
         ),
         ActionName::SessionWait => object_schema(
@@ -338,14 +487,65 @@ fn task_schema(minimum_review_rounds: u8) -> Value {
             ("task_selector", string_schema(1, 4096)),
             (
                 "max_review_rounds",
-                json!({"type":"integer","minimum":minimum_review_rounds,"maximum":20}),
+                json!({
+                    "type":"integer",
+                    "description":format!(
+                        "Completed review-generation budget from {minimum_review_rounds} through 20 for the active Reviewer topology. hcom's typed protocol enforces this range before approval or worker start."
+                    ),
+                    "minimum":minimum_review_rounds,
+                    "maximum":20
+                }),
             ),
             (
                 "max_clarification_rounds",
-                json!({"type":"integer","minimum":1,"maximum":20}),
+                json!({
+                    "type":"integer",
+                    "description":"Architect-autonomous clarification budget from 1 through 20. hcom's typed protocol enforces this range before approval or worker start.",
+                    "minimum":1,
+                    "maximum":20
+                }),
             ),
         ],
     )
+}
+
+fn reviewer_adapter_schema(reviewer_adapters: &[ReviewerAdapterBinding]) -> Value {
+    // Keep exact binding enforcement in control_action instead of expressing the
+    // entire object array as const. Codex normalizes const to enum and supplies
+    // a default string items schema when an array omits items, which makes that
+    // complex enum impossible before the model can call the tool.
+    let reviewer_ids: BTreeSet<_> = reviewer_adapters
+        .iter()
+        .map(|binding| binding.reviewer_id)
+        .collect();
+    let adapters: BTreeSet<_> = reviewer_adapters
+        .iter()
+        .map(|binding| binding.adapter.as_str())
+        .collect();
+    let exact_bindings =
+        serde_json::to_string(reviewer_adapters).expect("Reviewer adapter bindings serialize");
+    json!({
+        "type":"array",
+        "description":format!(
+            "Must exactly equal the ordered active Reviewer adapter bindings loaded for this run: {exact_bindings}"
+        ),
+        "minItems":reviewer_adapters.len(),
+        "maxItems":reviewer_adapters.len(),
+        "uniqueItems":true,
+        "items":object_schema(
+            &["reviewer_id", "adapter"],
+            [
+                (
+                    "reviewer_id",
+                    json!({"type":"string","enum":reviewer_ids}),
+                ),
+                (
+                    "adapter",
+                    json!({"type":"string","enum":adapters}),
+                ),
+            ],
+        ),
+    })
 }
 
 fn object_schema<const N: usize>(required: &[&str], properties: [(&str, Value); N]) -> Value {
@@ -437,6 +637,50 @@ mod tests {
         ]
     }
 
+    // Codex 0.145/0.146 deserializes MCP schemas into a smaller internal
+    // representation before sending Responses API tools. This fixture models
+    // the transformations relevant to hcom's deliberately narrow schema
+    // policy: scalar const becomes enum and guidance-only range/pattern
+    // keywords disappear. It is a compatibility oracle for generated schemas,
+    // not production argument parsing.
+    fn codex_0145_0146_projection(schema: &Value) -> Value {
+        let source = schema.as_object().unwrap();
+        let mut projected = Map::new();
+        for preserved in [
+            "additionalProperties",
+            "description",
+            "enum",
+            "required",
+            "type",
+        ] {
+            if let Some(value) = source.get(preserved) {
+                projected.insert(preserved.into(), value.clone());
+            }
+        }
+        if let Some(value) = source.get("const") {
+            projected.insert("enum".into(), json!([value]));
+        }
+        if let Some(items) = source.get("items") {
+            projected.insert("items".into(), codex_0145_0146_projection(items));
+        } else if source.get("type") == Some(&Value::String("array".into())) {
+            projected.insert("items".into(), json!({"type":"string"}));
+        }
+        if let Some(properties) = source.get("properties").and_then(Value::as_object) {
+            projected.insert(
+                "properties".into(),
+                Value::Object(
+                    properties
+                        .iter()
+                        .map(|(name, property)| {
+                            (name.clone(), codex_0145_0146_projection(property))
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        Value::Object(projected)
+    }
+
     #[test]
     fn tool_inventory_is_exact_and_contains_no_project_or_generic_authority() {
         let tools = tool_definitions(
@@ -467,6 +711,129 @@ mod tests {
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
             assert!(tool["inputSchema"]["required"].is_array());
         }
+    }
+
+    #[test]
+    fn generated_tool_schemas_stay_inside_the_codex_compatibility_policy() {
+        for reviewers in [
+            vec![ReviewerAdapterBinding {
+                reviewer_id: ReviewerId::Reviewer1,
+                adapter: "codex-reviewer".into(),
+            }],
+            reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
+        ] {
+            let tools = tool_definitions("codex-developer", &reviewers);
+            validate_codex_tool_definitions(&tools).unwrap();
+            for tool in &tools {
+                let projected = codex_0145_0146_projection(&tool["inputSchema"]);
+                validate_codex_schema_node(
+                    &projected,
+                    &format!("{}.projected", tool["name"].as_str().unwrap()),
+                )
+                .unwrap();
+            }
+
+            let plan = tools
+                .iter()
+                .find(|tool| tool["name"] == "session_plan_replace")
+                .unwrap();
+            let projected_plan = codex_0145_0146_projection(&plan["inputSchema"]);
+            let reviewer_schema = &projected_plan["properties"]["reviewer_adapters"];
+            assert_eq!(reviewer_schema["type"], "array");
+            assert_eq!(reviewer_schema["items"]["type"], "object");
+            assert!(reviewer_schema.get("enum").is_none());
+            let rounds =
+                &projected_plan["properties"]["tasks"]["items"]["properties"]["max_review_rounds"];
+            assert!(rounds.get("minimum").is_none());
+            assert!(rounds.get("maximum").is_none());
+            assert!(
+                rounds["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("hcom's typed protocol enforces this range")
+            );
+
+            let approve = tools
+                .iter()
+                .find(|tool| tool["name"] == "session_approve_and_start")
+                .unwrap();
+            let projected_approve = codex_0145_0146_projection(&approve["inputSchema"]);
+            assert_eq!(
+                projected_approve["properties"]["approval_confirmed"]["enum"],
+                json!([true])
+            );
+        }
+    }
+
+    #[test]
+    fn codex_schema_policy_rejects_lossy_or_ambiguous_shapes_before_launch() {
+        let mut tools = tool_definitions(
+            "codex-developer",
+            &reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
+        );
+        let plan = tools
+            .iter_mut()
+            .find(|tool| tool["name"] == "session_plan_replace")
+            .unwrap();
+        plan["inputSchema"]["properties"]["reviewer_adapters"] = json!({
+            "type":"array",
+            "const":[
+                {"reviewer_id":"reviewer1","adapter":"codex-reviewer"},
+                {"reviewer_id":"reviewer2","adapter":"claude-reviewer-2.1.220"}
+            ]
+        });
+        let error = validate_codex_tool_definitions(&tools)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("complex array/object constraints are forbidden"));
+
+        let mut tools = tool_definitions(
+            "codex-developer",
+            &reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
+        );
+        let plan = tools
+            .iter_mut()
+            .find(|tool| tool["name"] == "session_plan_replace")
+            .unwrap();
+        plan["inputSchema"]["properties"]["reviewer_adapters"]
+            .as_object_mut()
+            .unwrap()
+            .remove("items");
+        let error = validate_codex_tool_definitions(&tools)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("array schema must define items"));
+
+        let mut tools = tool_definitions(
+            "codex-developer",
+            &reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
+        );
+        tools[0]["inputSchema"]["required"] = json!([]);
+        let error = validate_codex_tool_definitions(&tools)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("required must contain every property exactly once"));
+
+        let mut tools = tool_definitions(
+            "codex-developer",
+            &reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
+        );
+        tools[0]["inputSchema"]["anyOf"] = json!([]);
+        let error = validate_codex_tool_definitions(&tools)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported Codex schema keyword anyOf"));
+
+        let mut tools = tool_definitions(
+            "codex-developer",
+            &reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
+        );
+        tools[0]["inputSchema"]["description"] =
+            Value::String("x".repeat(MAX_CODEX_INPUT_SCHEMA_BYTES));
+        let error = validate_codex_tool_definitions(&tools)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("local compatibility limit"));
     }
 
     #[test]
@@ -656,9 +1023,30 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "session_plan_replace")
             .unwrap();
+        let reviewer_schema = &plan["inputSchema"]["properties"]["reviewer_adapters"];
+        assert!(reviewer_schema.get("const").is_none());
+        assert_eq!(reviewer_schema["minItems"], 2);
+        assert_eq!(reviewer_schema["maxItems"], 2);
+        assert_eq!(reviewer_schema["uniqueItems"], true);
+        assert_eq!(reviewer_schema["items"]["type"], "object");
+        assert_eq!(reviewer_schema["items"]["additionalProperties"], false);
         assert_eq!(
-            plan["inputSchema"]["properties"]["reviewer_adapters"]["const"],
-            json!(expected_reviewers)
+            reviewer_schema["items"]["required"],
+            json!(["reviewer_id", "adapter"])
+        );
+        assert_eq!(
+            reviewer_schema["items"]["properties"]["reviewer_id"]["enum"],
+            json!(["reviewer1", "reviewer2"])
+        );
+        assert_eq!(
+            reviewer_schema["items"]["properties"]["adapter"]["enum"],
+            json!(["claude-reviewer-2.1.220", "codex-reviewer"])
+        );
+        assert!(
+            reviewer_schema["description"]
+                .as_str()
+                .unwrap()
+                .contains(&serde_json::to_string(&expected_reviewers).unwrap())
         );
         let arguments = json!({
             "expected_session_version":0,
@@ -700,9 +1088,13 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "session_plan_replace")
             .unwrap();
+        let reviewer_schema = &plan["inputSchema"]["properties"]["reviewer_adapters"];
+        assert!(reviewer_schema.get("const").is_none());
+        assert_eq!(reviewer_schema["minItems"], 1);
+        assert_eq!(reviewer_schema["maxItems"], 1);
         assert_eq!(
-            plan["inputSchema"]["properties"]["reviewer_adapters"]["const"],
-            json!(reviewers)
+            reviewer_schema["items"]["properties"]["reviewer_id"]["enum"],
+            json!(["reviewer1"])
         );
         assert_eq!(
             plan["inputSchema"]["properties"]["tasks"]["items"]["properties"]["max_review_rounds"]
