@@ -100,10 +100,16 @@ impl RuntimeFactory for ProductionRuntimeFactory {
             profiles,
             guardian_executable,
         } = request;
-        let uses_codex = [profiles.developer.provider, profiles.reviewer.provider]
-            .contains(&RuntimeProvider::CodexExec);
-        let uses_claude = [profiles.developer.provider, profiles.reviewer.provider]
-            .contains(&RuntimeProvider::ClaudeExec);
+        let mut providers = std::iter::once(profiles.developer.provider).chain(
+            profiles
+                .reviewers
+                .iter()
+                .map(|binding| binding.profile.provider),
+        );
+        let uses_codex = providers
+            .clone()
+            .any(|provider| provider == RuntimeProvider::CodexExec);
+        let uses_claude = providers.any(|provider| provider == RuntimeProvider::ClaudeExec);
 
         let claude_environment = if uses_claude {
             let parent = ParentEnvironment::from_raw_entries(environment.iter().cloned())
@@ -325,7 +331,7 @@ impl TaskLaneSupervisor {
         let core = SupervisorCore::new(run_id, project_root, binding_hash)
             .map_err(|error| anyhow!(error.to_string()))?;
         let developer_adapter = profiles.developer.provider.as_str().into();
-        let reviewer_adapter = profiles.reviewer.provider.as_str().into();
+        let reviewer_adapter = profiles.reviewer1().provider.as_str().into();
         Ok(Self {
             startup,
             epoch: format!("exec-supervisor-{}", Uuid::new_v4()),
@@ -1356,10 +1362,7 @@ impl TaskLaneSupervisor {
     }
 
     fn profile(&self, role: WorkerRole) -> &RuntimeProfile {
-        match role {
-            WorkerRole::Developer => &self.profiles.developer,
-            WorkerRole::Reviewer => &self.profiles.reviewer,
-        }
+        self.profiles.profile(role)
     }
 
     fn require_task_runtime_mut(&mut self, task_ordinal: usize) -> Result<&mut OpenTaskRuntime> {
@@ -1553,7 +1556,7 @@ mod tests {
 
     fn pure_codex_profiles(adapter: ArchitectAdapter) -> SessionInvocationProfiles {
         let mut profiles = SessionInvocationProfiles::for_task_lane(adapter).unwrap();
-        profiles.reviewer = ReviewerInvocationProfile::Codex {
+        *profiles.reviewer1_mut() = ReviewerInvocationProfile::Codex {
             profile: CodexInvocationProfile::reviewer_default(),
         };
         profiles
@@ -1586,7 +1589,7 @@ mod tests {
         assert_ne!(base_hash, binding_hash(&developer, &[]));
 
         let mut reviewer = base.clone();
-        reviewer.reviewer = ReviewerInvocationProfile::Codex {
+        *reviewer.reviewer1_mut() = ReviewerInvocationProfile::Codex {
             profile: CodexInvocationProfile::reviewer_default(),
         };
         assert_ne!(base_hash, binding_hash(&reviewer, &[]));
@@ -2074,7 +2077,7 @@ mod tests {
                         profile: cheap_claude.clone(),
                     },
                 };
-                profiles.reviewer = match reviewer {
+                *profiles.reviewer1_mut() = match reviewer {
                     RuntimeProvider::CodexExec => ReviewerInvocationProfile::Codex {
                         profile: cheap_codex,
                     },
@@ -4138,7 +4141,8 @@ mod tests {
         };
         developer.model = "developer-override".into();
         developer.reasoning_effort = "high".into();
-        let ReviewerInvocationProfile::Codex { profile: reviewer } = &mut profiles.reviewer else {
+        let ReviewerInvocationProfile::Codex { profile: reviewer } = profiles.reviewer1_mut()
+        else {
             unreachable!()
         };
         reviewer.model = "reviewer-override".into();
@@ -4591,7 +4595,7 @@ mod tests {
                 dangerously_skip_permissions: true,
             },
         };
-        profiles.reviewer = ReviewerInvocationProfile::Codex {
+        *profiles.reviewer1_mut() = ReviewerInvocationProfile::Codex {
             profile: CodexInvocationProfile::reviewer_default(),
         };
         sources.set_profiles_for_test(profiles);

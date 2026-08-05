@@ -8,7 +8,7 @@ pub use crate::control_api::ReviewerVerdict;
 use crate::control_api::WorkerRole;
 use crate::worker::profile::{
     ClaudeInvocationProfile, CodexApprovalPolicy, CodexInvocationProfile, CodexSandbox,
-    DeveloperInvocationProfile, ReviewerInvocationProfile, SessionInvocationProfiles,
+    DeveloperInvocationProfile, ReviewerId, ReviewerInvocationProfile, SessionInvocationProfiles,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -293,16 +293,26 @@ impl RuntimeProfile {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct ReviewerRuntimeProfile {
+    pub reviewer_id: ReviewerId,
+    pub profile: RuntimeProfile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TaskWorkerProfiles {
     pub developer: RuntimeProfile,
-    pub reviewer: RuntimeProfile,
+    pub reviewers: Vec<ReviewerRuntimeProfile>,
 }
 
 impl TaskWorkerProfiles {
     pub fn defaults() -> Self {
         Self {
             developer: RuntimeProfile::codex_exec_default(),
-            reviewer: RuntimeProfile::claude_exec_default(),
+            reviewers: vec![ReviewerRuntimeProfile {
+                reviewer_id: ReviewerId::Reviewer1,
+                profile: RuntimeProfile::claude_exec_default(),
+            }],
         }
     }
 
@@ -317,38 +327,77 @@ impl TaskWorkerProfiles {
                 RuntimeProfile::from_claude("Claude developer", profile)?
             }
         };
-        let reviewer = match &profiles.reviewer {
-            ReviewerInvocationProfile::Codex { profile } => {
-                RuntimeProfile::from_codex("Codex reviewer", profile)?
-            }
-            ReviewerInvocationProfile::Claude { profile } => {
-                RuntimeProfile::from_claude("Claude reviewer", profile)?
-            }
-        };
+        profiles
+            .validate()
+            .map_err(|error| RuntimeError::invalid_profile(error.to_string()))?;
+        let reviewers = profiles
+            .reviewers
+            .iter()
+            .map(|binding| {
+                let profile = match &binding.profile {
+                    ReviewerInvocationProfile::Codex { profile } => {
+                        RuntimeProfile::from_codex("Codex reviewer", profile)?
+                    }
+                    ReviewerInvocationProfile::Claude { profile } => {
+                        RuntimeProfile::from_claude("Claude reviewer", profile)?
+                    }
+                };
+                Ok(ReviewerRuntimeProfile {
+                    reviewer_id: binding.reviewer_id,
+                    profile,
+                })
+            })
+            .collect::<Result<Vec<_>, RuntimeError>>()?;
         Ok(Self {
             developer,
-            reviewer,
+            reviewers,
         })
     }
 
     pub fn validate(&self) -> Result<(), RuntimeError> {
         self.developer.validate("developer runtime profile")?;
-        self.reviewer.validate("reviewer runtime profile")
+        let [reviewer] = self.reviewers.as_slice() else {
+            return Err(RuntimeError::invalid_profile(
+                "runtime reviewer collection must contain exactly one Reviewer1 entry",
+            ));
+        };
+        if reviewer.reviewer_id != ReviewerId::Reviewer1 {
+            return Err(RuntimeError::invalid_profile(
+                "runtime reviewer collection must contain exactly one Reviewer1 entry",
+            ));
+        }
+        reviewer.profile.validate("Reviewer1 runtime profile")
     }
 
     pub fn canonical_hash(&self) -> String {
-        canonical_hash(&("hcom-exec-worker-profiles-v1", self))
+        canonical_hash(&("hcom-exec-worker-profiles-v2", self))
     }
 
-    pub fn provider(&self, role: WorkerRole) -> RuntimeProvider {
+    pub fn reviewer1(&self) -> &RuntimeProfile {
+        &self
+            .reviewers
+            .iter()
+            .find(|binding| binding.reviewer_id == ReviewerId::Reviewer1)
+            .expect("validated task worker profiles contain Reviewer1")
+            .profile
+    }
+
+    pub fn profile(&self, role: WorkerRole) -> &RuntimeProfile {
         match role {
-            WorkerRole::Developer => self.developer.provider,
-            WorkerRole::Reviewer => self.reviewer.provider,
+            WorkerRole::Developer => &self.developer,
+            WorkerRole::Reviewer => self.reviewer1(),
         }
     }
 
+    pub fn provider(&self, role: WorkerRole) -> RuntimeProvider {
+        self.profile(role).provider
+    }
+
     pub fn contract_identity(&self) -> RuntimeContractIdentity {
-        RuntimeContractIdentity::for_role_providers(self.developer.provider, self.reviewer.provider)
+        RuntimeContractIdentity::for_role_providers(
+            self.developer.provider,
+            self.reviewer1().provider,
+        )
     }
 }
 
@@ -989,7 +1038,8 @@ fn canonical_hash(value: &impl Serialize) -> String {
 mod tests {
     use super::*;
     use crate::worker::profile::{
-        ClaudeInvocationProfile, DeveloperInvocationProfile, ReviewerInvocationProfile,
+        ClaudeInvocationProfile, DeveloperInvocationProfile, ReviewerInvocationBinding,
+        ReviewerInvocationProfile,
     };
 
     #[test]
@@ -1017,7 +1067,7 @@ mod tests {
             ]
         );
 
-        let reviewer = &profiles.reviewer;
+        let reviewer = profiles.reviewer1();
         assert_eq!(reviewer.provider, RuntimeProvider::ClaudeExec);
         assert_eq!(reviewer.model, "opus");
         assert_eq!(reviewer.reasoning_effort, "xhigh");
@@ -1048,6 +1098,49 @@ mod tests {
     }
 
     #[test]
+    fn reviewer_runtime_collection_is_ordered_identity_bound_and_exactly_reviewer1() {
+        let profiles = TaskWorkerProfiles::defaults();
+        profiles.validate().unwrap();
+        assert_eq!(profiles.reviewers.len(), 1);
+        assert_eq!(profiles.reviewers[0].reviewer_id, ReviewerId::Reviewer1);
+        assert_eq!(profiles.profile(WorkerRole::Developer), &profiles.developer);
+        assert_eq!(profiles.profile(WorkerRole::Reviewer), profiles.reviewer1());
+
+        let mut wrong_identity = profiles.clone();
+        wrong_identity.reviewers[0].reviewer_id = ReviewerId::Reviewer2;
+        assert!(wrong_identity.validate().is_err());
+        assert_ne!(
+            profiles.canonical_hash(),
+            wrong_identity.canonical_hash(),
+            "runtime reviewer lane identity must be hash-bound"
+        );
+
+        let mut changed_profile = profiles.clone();
+        changed_profile.reviewers[0].profile.reasoning_effort = "medium".into();
+        assert_ne!(
+            profiles.canonical_hash(),
+            changed_profile.canonical_hash(),
+            "the complete reviewer runtime profile must be hash-bound"
+        );
+
+        let reviewer2 = ReviewerRuntimeProfile {
+            reviewer_id: ReviewerId::Reviewer2,
+            profile: profiles.reviewer1().clone(),
+        };
+        let mut reviewer1_then_reviewer2 = profiles.clone();
+        reviewer1_then_reviewer2.reviewers.push(reviewer2.clone());
+        let mut reviewer2_then_reviewer1 = profiles.clone();
+        reviewer2_then_reviewer1.reviewers.insert(0, reviewer2);
+        assert!(reviewer1_then_reviewer2.validate().is_err());
+        assert!(reviewer2_then_reviewer1.validate().is_err());
+        assert_ne!(
+            reviewer1_then_reviewer2.canonical_hash(),
+            reviewer2_then_reviewer1.canonical_hash(),
+            "runtime reviewer order must be hash-bound"
+        );
+    }
+
+    #[test]
     fn explicit_role_profiles_preserve_each_selected_provider() {
         let mut profiles = SessionInvocationProfiles {
             developer: DeveloperInvocationProfile::Codex {
@@ -1058,21 +1151,24 @@ mod tests {
                     approval_policy: CodexApprovalPolicy::Never,
                 },
             },
-            reviewer: ReviewerInvocationProfile::Codex {
-                profile: CodexInvocationProfile {
-                    model: "reviewer-override".into(),
-                    reasoning_effort: "high".into(),
-                    sandbox: CodexSandbox::DangerFullAccess,
-                    approval_policy: CodexApprovalPolicy::Never,
+            reviewers: vec![ReviewerInvocationBinding {
+                reviewer_id: ReviewerId::Reviewer1,
+                profile: ReviewerInvocationProfile::Codex {
+                    profile: CodexInvocationProfile {
+                        model: "reviewer-override".into(),
+                        reasoning_effort: "high".into(),
+                        sandbox: CodexSandbox::DangerFullAccess,
+                        approval_policy: CodexApprovalPolicy::Never,
+                    },
                 },
-            },
+            }],
             ..SessionInvocationProfiles::default()
         };
         let resolved = TaskWorkerProfiles::from_session_profiles(&profiles).unwrap();
         assert_eq!(resolved.developer.model, "developer-override");
         assert_eq!(resolved.developer.reasoning_effort, "max");
-        assert_eq!(resolved.reviewer.model, "reviewer-override");
-        assert_eq!(resolved.reviewer.reasoning_effort, "high");
+        assert_eq!(resolved.reviewer1().model, "reviewer-override");
+        assert_eq!(resolved.reviewer1().reasoning_effort, "high");
 
         profiles.developer = DeveloperInvocationProfile::Claude {
             profile: ClaudeInvocationProfile::developer_default(),
@@ -1087,7 +1183,7 @@ mod tests {
                 dangerously_skip_permissions: true,
             })
         );
-        assert_eq!(resolved.reviewer.provider, RuntimeProvider::CodexExec);
+        assert_eq!(resolved.reviewer1().provider, RuntimeProvider::CodexExec);
 
         profiles.developer = DeveloperInvocationProfile::Codex {
             profile: CodexInvocationProfile::developer_default(),

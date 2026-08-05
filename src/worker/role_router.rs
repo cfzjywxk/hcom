@@ -6,8 +6,9 @@
 
 use crate::control_api::WorkerRole;
 use crate::worker::runtime::{
-    RoleSessionSpec, RuntimeContractIdentity, RuntimeError, RuntimeProvider, RuntimeSessionKey,
-    RuntimeTurnKey, RuntimeTurnPoll, RuntimeTurnSpec, TaskWorkerProfiles, TaskWorkerRuntime,
+    RoleSessionSpec, RuntimeContractIdentity, RuntimeError, RuntimeProfile, RuntimeProvider,
+    RuntimeSessionKey, RuntimeTurnKey, RuntimeTurnPoll, RuntimeTurnSpec, TaskWorkerProfiles,
+    TaskWorkerRuntime,
 };
 use std::collections::BTreeMap;
 
@@ -75,8 +76,7 @@ struct RoutedTurn {
 
 pub(crate) struct RoleRoutedTaskWorkerRuntime {
     contract: RuntimeContractIdentity,
-    developer_provider: RuntimeProvider,
-    reviewer_provider: RuntimeProvider,
+    profiles: TaskWorkerProfiles,
     providers: BTreeMap<RuntimeProvider, ProviderRuntimeSlot>,
     sessions: BTreeMap<RuntimeSessionKey, RoutedSession>,
     turns: BTreeMap<RuntimeTurnKey, RoutedTurn>,
@@ -109,7 +109,7 @@ impl RoleRoutedTaskWorkerRuntime {
                 )));
             }
         }
-        for provider in [profiles.developer.provider, profiles.reviewer.provider] {
+        for provider in [profiles.developer.provider, profiles.reviewer1().provider] {
             if !providers.contains_key(&provider) {
                 return Err(RuntimeError::invalid_contract(format!(
                     "{} task runtime route is missing",
@@ -119,8 +119,7 @@ impl RoleRoutedTaskWorkerRuntime {
         }
         Ok(Self {
             contract: profiles.contract_identity(),
-            developer_provider: profiles.developer.provider,
-            reviewer_provider: profiles.reviewer.provider,
+            profiles: profiles.clone(),
             providers,
             sessions: BTreeMap::new(),
             turns: BTreeMap::new(),
@@ -141,10 +140,11 @@ impl RoleRoutedTaskWorkerRuntime {
     }
 
     fn provider_for_role(&self, role: WorkerRole) -> RuntimeProvider {
-        match role {
-            WorkerRole::Developer => self.developer_provider,
-            WorkerRole::Reviewer => self.reviewer_provider,
-        }
+        self.profiles.provider(role)
+    }
+
+    fn profile_for_role(&self, role: WorkerRole) -> &RuntimeProfile {
+        self.profiles.profile(role)
     }
 
     fn provider_mut(
@@ -188,9 +188,9 @@ impl TaskWorkerRuntime for RoleRoutedTaskWorkerRuntime {
         spec.validate()?;
         let role = spec.role;
         let provider = self.provider_for_role(role);
-        if spec.profile.provider != provider {
+        if spec.profile != *self.profile_for_role(role) {
             return Err(RuntimeError::invalid_profile(
-                "role session profile provider differs from the frozen role route",
+                "role session profile differs from the frozen role route",
             ));
         }
         let session = self.allocate_session_key()?;
@@ -231,11 +231,12 @@ impl TaskWorkerRuntime for RoleRoutedTaskWorkerRuntime {
                 "role-routed session belongs to another worker role",
             ));
         }
-        if routed.provider != spec.profile.provider
+        if spec.profile != *self.profile_for_role(spec.role)
+            || routed.provider != spec.profile.provider
             || routed.provider != self.provider_for_role(spec.role)
         {
             return Err(RuntimeError::invalid_identity(
-                "role-routed session belongs to another provider",
+                "role-routed session belongs to another frozen role profile",
             ));
         }
         // Allocate the supervisor-facing key before the child starts. Once a
@@ -333,11 +334,11 @@ impl Drop for RoleRoutedTaskWorkerRuntime {
 mod tests {
     use super::*;
     use crate::worker::fake_runtime::{FakeTaskWorkerRuntime, FakeTurnScript};
-    use crate::worker::profile::ClaudeInvocationProfile;
+    use crate::worker::profile::{ClaudeInvocationProfile, ReviewerId};
     use crate::worker::runtime::{
         DeveloperOutcomeStatus, DeveloperOutcomeV1, OutcomeContract, ReviewerOutcomeV1,
-        ReviewerVerdict, RuntimeErrorCode, RuntimeOutcome, RuntimeProfile, RuntimeTelemetry,
-        RuntimeTurnPurpose,
+        ReviewerRuntimeProfile, ReviewerVerdict, RuntimeErrorCode, RuntimeOutcome, RuntimeProfile,
+        RuntimeTelemetry, RuntimeTurnPurpose,
     };
     use std::path::PathBuf;
     use std::time::Duration;
@@ -360,7 +361,10 @@ mod tests {
     fn profiles(developer: RuntimeProvider, reviewer: RuntimeProvider) -> TaskWorkerProfiles {
         TaskWorkerProfiles {
             developer: profile(developer),
-            reviewer: profile(reviewer),
+            reviewers: vec![ReviewerRuntimeProfile {
+                reviewer_id: ReviewerId::Reviewer1,
+                profile: profile(reviewer),
+            }],
         }
     }
 
@@ -488,7 +492,7 @@ mod tests {
                 let reviewer_session = router
                     .open_session(session_spec(
                         WorkerRole::Reviewer,
-                        profiles.reviewer.clone(),
+                        profiles.reviewer1().clone(),
                     ))
                     .unwrap();
                 assert_ne!(developer_session, reviewer_session);
@@ -498,7 +502,7 @@ mod tests {
                         turn_spec(
                             WorkerRole::Reviewer,
                             RuntimeTurnPurpose::InitialReview,
-                            profiles.reviewer.clone(),
+                            profiles.reviewer1().clone(),
                         ),
                     )
                     .unwrap();
@@ -525,7 +529,7 @@ mod tests {
         let error = router
             .open_session(session_spec(
                 WorkerRole::Reviewer,
-                profiles.reviewer.clone(),
+                profiles.reviewer1().clone(),
             ))
             .unwrap_err();
         assert_eq!(error.code, RuntimeErrorCode::Unsupported);
@@ -533,6 +537,44 @@ mod tests {
             error.detail,
             "selected Claude task worker executable is unavailable"
         );
+    }
+
+    #[test]
+    fn same_provider_roles_cannot_exchange_frozen_profiles() {
+        let mut profiles = profiles(RuntimeProvider::CodexExec, RuntimeProvider::CodexExec);
+        profiles.reviewers[0].profile.model = "reviewer-only-model".into();
+        profiles.validate().unwrap();
+        let mut router = RoleRoutedTaskWorkerRuntime::new(
+            &profiles,
+            [available_slot(RuntimeProvider::CodexExec, Vec::new())],
+        )
+        .unwrap();
+
+        let error = router
+            .open_session(session_spec(
+                WorkerRole::Developer,
+                profiles.reviewer1().clone(),
+            ))
+            .unwrap_err();
+        assert_eq!(error.code, RuntimeErrorCode::InvalidProfile);
+        assert_eq!(
+            error.detail,
+            "role session profile differs from the frozen role route"
+        );
+
+        let developer = router
+            .open_session(session_spec(
+                WorkerRole::Developer,
+                profiles.developer.clone(),
+            ))
+            .unwrap();
+        let reviewer = router
+            .open_session(session_spec(
+                WorkerRole::Reviewer,
+                profiles.reviewer1().clone(),
+            ))
+            .unwrap();
+        assert_ne!(developer, reviewer);
     }
 
     #[test]
@@ -576,7 +618,7 @@ mod tests {
         let wrong_profile = router
             .open_session(session_spec(
                 WorkerRole::Developer,
-                profiles.reviewer.clone(),
+                profiles.reviewer1().clone(),
             ))
             .unwrap_err();
         assert_eq!(wrong_profile.code, RuntimeErrorCode::InvalidProfile);
@@ -590,7 +632,7 @@ mod tests {
         let reviewer_session = router
             .open_session(session_spec(
                 WorkerRole::Reviewer,
-                profiles.reviewer.clone(),
+                profiles.reviewer1().clone(),
             ))
             .unwrap();
         let wrong_role = router
@@ -599,7 +641,7 @@ mod tests {
                 turn_spec(
                     WorkerRole::Reviewer,
                     RuntimeTurnPurpose::InitialReview,
-                    profiles.reviewer.clone(),
+                    profiles.reviewer1().clone(),
                 ),
             )
             .unwrap_err();
@@ -621,7 +663,7 @@ mod tests {
                 turn_spec(
                     WorkerRole::Reviewer,
                     RuntimeTurnPurpose::InitialReview,
-                    profiles.reviewer.clone(),
+                    profiles.reviewer1().clone(),
                 ),
             )
             .unwrap_err();

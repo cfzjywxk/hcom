@@ -1403,7 +1403,7 @@ mod tests {
     fn pure_codex_profiles() -> SessionInvocationProfiles {
         let mut profiles =
             SessionInvocationProfiles::for_task_lane(ArchitectAdapter::Codex).unwrap();
-        profiles.reviewer = ReviewerInvocationProfile::Codex {
+        *profiles.reviewer1_mut() = ReviewerInvocationProfile::Codex {
             profile: CodexInvocationProfile::reviewer_default(),
         };
         profiles

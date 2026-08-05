@@ -554,7 +554,7 @@ fn write_profile_summary(
             profile.model, profile.effort, profile.dangerously_skip_permissions
         )?,
     }
-    match &profiles.reviewer {
+    match profiles.reviewer1() {
         ReviewerInvocationProfile::Codex { profile } => writeln!(
             output,
             "reviewer profile: codex model={} reasoning={} sandbox={} approval={}",
@@ -646,7 +646,7 @@ fn worker_adapter_bindings(
         .map_err(|error| anyhow::anyhow!(error.detail))?;
     Ok((
         profiles.developer.provider.as_str(),
-        profiles.reviewer.provider.as_str(),
+        profiles.reviewer1().provider.as_str(),
     ))
 }
 
@@ -1426,13 +1426,13 @@ mod tests {
         .unwrap();
         let mut profiles = SessionInvocationProfiles::default();
         let developer_before = profiles.developer.clone();
-        let reviewer_before = profiles.reviewer.clone();
+        let reviewers_before = profiles.reviewers.clone();
         apply_architect_cli_overrides(&args, &mut profiles).unwrap();
         let architect = profiles.architect.codex().unwrap();
         assert_eq!(architect.model, "gpt-5.6-sol-cli");
         assert_eq!(architect.reasoning_effort, "max");
         assert_eq!(profiles.developer, developer_before);
-        assert_eq!(profiles.reviewer, reviewer_before);
+        assert_eq!(profiles.reviewers, reviewers_before);
 
         let claude_args = ArchitectArgs::try_parse_from([
             "hcom arch",
@@ -1624,7 +1624,7 @@ mod tests {
                             profile: CodexInvocationProfile::developer_default(),
                         }
                     };
-                    profiles.reviewer = if reviewer_claude {
+                    *profiles.reviewer1_mut() = if reviewer_claude {
                         ReviewerInvocationProfile::Claude {
                             profile:
                                 crate::worker::profile::ClaudeInvocationProfile::reviewer_default(),

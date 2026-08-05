@@ -306,7 +306,7 @@ fn load_invocation_profiles_with_defaults(
                 .context("invalid [architect.developer] configuration")?;
         }
         if let Some(value) = configured.reviewer {
-            apply_reviewer_override(&mut profiles.reviewer, value)
+            apply_reviewer_override(profiles.reviewer1_mut(), value)
                 .context("invalid [architect.reviewer] configuration")?;
         }
     }
@@ -365,7 +365,7 @@ mod tests {
             loaded.profiles.reviewer_adapter_name(),
             CLAUDE_REVIEWER_ADAPTER
         );
-        let reviewer = loaded.profiles.reviewer.claude().unwrap();
+        let reviewer = loaded.profiles.reviewer1().claude().unwrap();
         assert_eq!(reviewer.model, "opus");
         assert_eq!(reviewer.effort, "xhigh");
         assert!(reviewer.dangerously_skip_permissions);
@@ -388,7 +388,7 @@ mod tests {
             loaded.profiles.reviewer_adapter_name(),
             CLAUDE_REVIEWER_ADAPTER
         );
-        assert_eq!(loaded.profiles.reviewer.claude().unwrap().model, "opus");
+        assert_eq!(loaded.profiles.reviewer1().claude().unwrap().model, "opus");
     }
 
     #[test]
@@ -405,7 +405,7 @@ mod tests {
             loaded.profiles.reviewer_adapter_name(),
             CLAUDE_REVIEWER_ADAPTER
         );
-        assert_eq!(loaded.profiles.reviewer.claude().unwrap().model, "opus");
+        assert_eq!(loaded.profiles.reviewer1().claude().unwrap().model, "opus");
     }
 
     #[test]
@@ -424,7 +424,7 @@ dangerously_skip_permissions = true
             loaded.profiles.developer_adapter_name(),
             CODEX_DEVELOPER_ADAPTER
         );
-        assert!(loaded.profiles.reviewer.claude().is_some());
+        assert!(loaded.profiles.reviewer1().claude().is_some());
         let runtime =
             crate::worker::runtime::TaskWorkerProfiles::from_session_profiles(&loaded.profiles)
                 .unwrap();
@@ -433,7 +433,7 @@ dangerously_skip_permissions = true
             crate::worker::runtime::RuntimeProvider::CodexExec
         );
         assert_eq!(
-            runtime.reviewer.provider,
+            runtime.reviewer1().provider,
             crate::worker::runtime::RuntimeProvider::ClaudeExec
         );
     }
@@ -459,7 +459,7 @@ ask_for_approval = "never"
         );
         let loaded = load_task_lane_profiles(&path, ArchitectAdapter::Codex).unwrap();
         let developer = loaded.profiles.developer.codex().unwrap();
-        let reviewer = loaded.profiles.reviewer.codex().unwrap();
+        let reviewer = loaded.profiles.reviewer1().codex().unwrap();
         assert_eq!(developer.model, "developer-override");
         assert_eq!(developer.reasoning_effort, "max");
         assert_eq!(reviewer.model, "reviewer-override");
@@ -493,7 +493,7 @@ effort = "medium"
             loaded.profiles.developer.codex().unwrap().reasoning_effort,
             "xhigh"
         );
-        let reviewer = loaded.profiles.reviewer.claude().unwrap();
+        let reviewer = loaded.profiles.reviewer1().claude().unwrap();
         assert_eq!(reviewer.model, "opus");
         assert_eq!(reviewer.effort, "medium");
         assert!(reviewer.dangerously_skip_permissions);
@@ -517,7 +517,7 @@ reasoning_effort = "high"
         assert_eq!(developer.model, "opus");
         assert_eq!(developer.effort, "medium");
         assert!(developer.dangerously_skip_permissions);
-        let reviewer = loaded.profiles.reviewer.codex().unwrap();
+        let reviewer = loaded.profiles.reviewer1().codex().unwrap();
         assert_eq!(reviewer.model, "gpt-5.6-sol");
         assert_eq!(reviewer.reasoning_effort, "high");
         assert_eq!(reviewer.sandbox, CodexSandbox::DangerFullAccess);
@@ -570,7 +570,7 @@ reasoning_effort = "high"
                         }
                     );
                     assert_eq!(
-                        runtime.reviewer.provider,
+                        runtime.reviewer1().provider,
                         match reviewer {
                             ConfiguredAdapter::Codex => RuntimeProvider::CodexExec,
                             ConfiguredAdapter::Claude => RuntimeProvider::ClaudeExec,
@@ -650,7 +650,7 @@ ask_for_approval = "never"
                 loaded.profiles.reviewer_adapter_name(),
                 CODEX_REVIEWER_ADAPTER
             );
-            let reviewer = loaded.profiles.reviewer.codex().unwrap();
+            let reviewer = loaded.profiles.reviewer1().codex().unwrap();
             assert_eq!(reviewer.reasoning_effort, "max");
             assert_eq!(reviewer.sandbox, CodexSandbox::DangerFullAccess);
         }
@@ -697,5 +697,20 @@ args = ["--resume", "foreign-session"]
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o622)).unwrap();
         assert!(load_task_lane_profiles(&path, ArchitectAdapter::Codex).is_err());
+    }
+
+    #[test]
+    fn unreleased_reviewer_lane_tables_remain_rejected() {
+        for table in ["reviewer1", "reviewer2"] {
+            let (_temp, path) =
+                write_config(&format!("[architect.{table}]\nadapter = \"codex\"\n"));
+            let error = load_task_lane_profiles(&path, ArchitectAdapter::Codex)
+                .err()
+                .expect("unreleased reviewer lane table must remain rejected");
+            assert!(
+                format!("{error:#}").contains("invalid [architect] profile configuration"),
+                "unexpected error for {table}: {error:#}"
+            );
+        }
     }
 }
