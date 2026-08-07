@@ -45,7 +45,8 @@ the project directory as native cwd and receive that directory through
 --add-dir when it is distinct.
 
 Profile configuration is read once from $HCOM_DIR/config.toml (default:
-~/.hcom/config.toml):
+~/.hcom/config.toml), or from the exact file named by
+--config <absolute-file>:
   [architect.profile]    interactive architect selected by the command
   [architect.developer]  fresh per-task developer profile
   [architect.reviewer1]  fresh per-task Reviewer1 profile
@@ -62,6 +63,12 @@ interactive process starts. A legacy-only [architect.reviewer] profile is
 resolved once and applied to Reviewer1 in single mode or copied to both
 Reviewer lanes in dual mode, with a deprecation notice; mixing it with either
 canonical Reviewer table fails closed.
+
+--config selects only the profile configuration source; every other hcom
+setting still comes from $HCOM_DIR/config.toml. It must be a canonical
+absolute regular file that exists, so a mistyped path fails closed instead of
+silently selecting the built-in defaults, while an absent default path still
+selects them. Startup prints the exact loaded path and marks it as --config.
 
 Architect CLI overrides (higher priority than TOML):
   --model <model>

@@ -107,6 +107,8 @@ hcom arch codex
 # single Reviewer1 lane:
 hcom arch codex --single-review
 # or: hcom arch claude
+# profiles from an exact file instead of $HCOM_DIR/config.toml:
+hcom arch codex --config /absolute/path/to/profiles.toml
 ```
 
 Codex roles default to `gpt-5.6-sol` with `xhigh` reasoning,
@@ -165,7 +167,11 @@ instructions; hcom passes paths and does not parse those files. Architect,
 Developer, Reviewer1, and Reviewer2 adapter/model/effort/permission profiles
 are typed TOML settings in `$HCOM_DIR/config.toml` (normally
 `~/.hcom/config.toml`) and are merged independently onto the built-in role
-defaults, then frozen when the command starts. Canonical worker tables are
+defaults, then frozen when the command starts. `--config <absolute-file>`
+swaps that profile source for one invocation without touching any other hcom
+setting; it must be an existing canonical absolute regular file, so a mistyped
+path fails closed rather than silently selecting the built-in defaults.
+Canonical worker tables are
 `[architect.developer]`, `[architect.reviewer1]`, and
 `[architect.reviewer2]`; each may select `adapter = "codex"` or
 `adapter = "claude"`, and omitted fields keep the selected role defaults. A

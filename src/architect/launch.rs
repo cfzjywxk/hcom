@@ -81,6 +81,10 @@ struct ArchitectArgs {
     /// Ordered external repository roots whose native Claude instructions load at startup.
     #[arg(long = "add-dir", value_name = "ABSOLUTE_DIRECTORY")]
     additional_directories: Vec<PathBuf>,
+
+    /// Exact profile configuration file replacing $HCOM_DIR/config.toml.
+    #[arg(long = "config", value_name = "ABSOLUTE_FILE")]
+    profile_config: Option<PathBuf>,
 }
 
 fn create_private_session_runtime() -> Result<tempfile::TempDir> {
@@ -99,8 +103,15 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
     if args.single_review && architect_adapter != ArchitectAdapter::Codex {
         bail!("--single-review is available only with `hcom arch codex`");
     }
+    // An explicit --config replaces only the profile configuration source; every
+    // other hcom setting still comes from $HCOM_DIR/config.toml.
+    let explicit_config = args
+        .profile_config
+        .as_deref()
+        .map(validate_profile_config_path)
+        .transpose()?;
     // Both public entrypoints share the same provider-routed task worker lane.
-    let mut loaded = match config_path {
+    let mut loaded = match explicit_config.as_deref().or(config_path) {
         Some(path) => {
             load_task_lane_profiles_for_mode(path, architect_adapter, args.single_review)?
         }
@@ -118,6 +129,12 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
             }
         }
     };
+    // A default path that is absent selects the built-in profiles. An explicit
+    // --config never degrades to them silently, including when the validated
+    // file disappears before the loader opens it.
+    if explicit_config.is_some() && !loaded.loaded_from_file {
+        bail!("--config profile configuration disappeared before it was loaded");
+    }
     apply_architect_cli_overrides(&args, &mut loaded.profiles)?;
     let (developer_adapter, reviewer_adapters) =
         worker_adapter_bindings(architect_adapter, &loaded.profiles)?;
@@ -167,15 +184,11 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
             "project directory: {}",
             startup.project_root.display()
         )?;
-        writeln!(
-            stdout,
-            "profile config: {} ({})",
-            loaded.config_path.display(),
-            if loaded.loaded_from_file {
-                "loaded once"
-            } else {
-                "not present; built-in defaults"
-            }
+        write_profile_config_line(
+            &mut stdout,
+            &loaded.config_path,
+            loaded.loaded_from_file,
+            explicit_config.is_some(),
         )?;
         writeln!(stdout, "profile hash: {}", loaded.profiles.canonical_hash())?;
         writeln!(
@@ -597,6 +610,28 @@ fn write_legacy_reviewer_notice(
     Ok(())
 }
 
+/// Disclose the exact profile configuration the run froze, and whether an
+/// explicit `--config` rather than `$HCOM_DIR/config.toml` supplied it.
+fn write_profile_config_line(
+    output: &mut impl Write,
+    config_path: &Path,
+    loaded_from_file: bool,
+    explicit: bool,
+) -> Result<()> {
+    writeln!(
+        output,
+        "profile config: {} ({}{})",
+        config_path.display(),
+        if explicit { "--config; " } else { "" },
+        if loaded_from_file {
+            "loaded once"
+        } else {
+            "not present; built-in defaults"
+        }
+    )?;
+    Ok(())
+}
+
 fn write_reviewer_profile(
     output: &mut impl Write,
     label: &str,
@@ -649,6 +684,25 @@ fn write_claude_startup_summary(
         }
     }
     Ok(())
+}
+
+/// Resolve an explicit `--config` path before the profile loader opens it.
+///
+/// The loader already enforces owner, link count, permission, size, and
+/// `O_NOFOLLOW` safety on whatever path it receives. Requiring a canonical
+/// absolute regular file here keeps a symlinked parent component from
+/// redirecting that check, matching the `--add-dir` contract.
+fn validate_profile_config_path(path: &Path) -> Result<PathBuf> {
+    const INVALID: &str = "--config must be an existing canonical absolute regular file";
+    if !path.is_absolute() || path.as_os_str().as_encoded_bytes().len() > 4096 {
+        bail!(INVALID);
+    }
+    let canonical = fs::canonicalize(path).map_err(|_| anyhow::anyhow!(INVALID))?;
+    let metadata = fs::symlink_metadata(path)?;
+    if canonical != *path || metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(INVALID);
+    }
+    Ok(canonical)
 }
 
 fn validate_additional_directories(
@@ -1503,6 +1557,137 @@ mod tests {
         let architect = profiles.architect.claude().unwrap();
         assert_eq!(architect.model, "sonnet");
         assert_eq!(architect.effort, "medium");
+    }
+
+    #[test]
+    fn startup_summary_discloses_the_exact_profile_config_source() {
+        let render = |loaded_from_file, explicit| {
+            let mut output = Vec::new();
+            write_profile_config_line(
+                &mut output,
+                Path::new("/srv/profiles.toml"),
+                loaded_from_file,
+                explicit,
+            )
+            .unwrap();
+            String::from_utf8(output).unwrap()
+        };
+        assert_eq!(
+            render(true, false),
+            "profile config: /srv/profiles.toml (loaded once)\n"
+        );
+        assert_eq!(
+            render(true, true),
+            "profile config: /srv/profiles.toml (--config; loaded once)\n"
+        );
+        assert_eq!(
+            render(false, false),
+            "profile config: /srv/profiles.toml (not present; built-in defaults)\n"
+        );
+    }
+
+    #[test]
+    fn explicit_config_requires_a_canonical_absolute_regular_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let file = root.join("profiles.toml");
+        fs::write(&file, "").unwrap();
+        assert_eq!(validate_profile_config_path(&file).unwrap(), file);
+
+        // `Path` equality ignores `.` segments, so only a component that can
+        // actually redirect the resolved file is rejected as non-canonical.
+        assert!(validate_profile_config_path(&root.join(".").join("profiles.toml")).is_ok());
+        let parent_relative = root
+            .join("..")
+            .join(root.file_name().unwrap())
+            .join("profiles.toml");
+
+        for rejected in [
+            PathBuf::from("profiles.toml"),
+            root.join("missing.toml"),
+            root.clone(),
+            parent_relative,
+        ] {
+            let error = validate_profile_config_path(&rejected).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "--config must be an existing canonical absolute regular file",
+                "path={}",
+                rejected.display()
+            );
+        }
+
+        let file_link = root.join("link.toml");
+        std::os::unix::fs::symlink(&file, &file_link).unwrap();
+        assert!(validate_profile_config_path(&file_link).is_err());
+
+        // A symlinked parent component would otherwise redirect the loader's
+        // own O_NOFOLLOW check, which only covers the final component.
+        let directory_link = root.join("dirlink");
+        std::os::unix::fs::symlink(&root, &directory_link).unwrap();
+        assert!(validate_profile_config_path(&directory_link.join("profiles.toml")).is_err());
+    }
+
+    #[test]
+    fn explicit_config_replaces_the_default_path_and_never_degrades_to_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let write = |name: &str, contents: &str| {
+            let path = root.join(name);
+            fs::write(&path, contents).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            path
+        };
+        // Both sources fail closed with distinguishable messages, so the error
+        // itself proves which file the Architect actually read, and neither
+        // case can reach the foreground terminal preflight.
+        let default_path = write(
+            "config.toml",
+            "[architect.developer]\nmodel = \"bad model\"\n",
+        );
+        let explicit = write(
+            "explicit.toml",
+            "[architect.reviewer1]\nreasoning_effort = \"BOGUS\"\n",
+        );
+
+        let error = run_cli(
+            &[
+                "arch".into(),
+                "codex".into(),
+                "--config".into(),
+                explicit.to_string_lossy().into_owned(),
+            ],
+            Some(&default_path),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("reviewer reasoning_effort"),
+            "explicit --config must win over the default path: {error}"
+        );
+
+        // Without --config the same invocation reads the default path instead.
+        let error = run_cli(&["arch".into(), "codex".into()], Some(&default_path)).unwrap_err();
+        assert!(
+            error.to_string().contains("developer model"),
+            "default path must still be used when --config is absent: {error}"
+        );
+
+        // An absent default path selects the built-in profiles; an absent
+        // --config must not.
+        let error = run_cli(
+            &[
+                "arch".into(),
+                "codex".into(),
+                "--config".into(),
+                root.join("missing.toml").to_string_lossy().into_owned(),
+            ],
+            Some(&default_path),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "--config must be an existing canonical absolute regular file"
+        );
     }
 
     #[test]

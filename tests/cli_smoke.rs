@@ -647,6 +647,33 @@ fn misordered_architect_form_fails_before_opening_state() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn architect_rejects_an_unusable_config_before_opening_state() {
+    let h = Hcom::new();
+    let db_path = h.path().join("hcom.db");
+    assert!(!db_path.exists());
+
+    for argument in [
+        "profiles.toml".to_string(),
+        h.workspace.join("missing.toml").to_string_lossy().into(),
+    ] {
+        let (code, stdout, stderr) = h.run(["arch", "codex", "--config", &argument]);
+        assert_ne!(
+            code, 0,
+            "argument={argument} stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            stderr.contains("--config must be an existing canonical absolute regular file"),
+            "argument={argument} stderr={stderr}"
+        );
+        assert!(
+            !db_path.exists(),
+            "an unusable --config must fail before initializing hcom state"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn architect_help_is_additive_and_does_not_open_v24_state() {
     let h = Hcom::new();
     let db_path = h.path().join("hcom.db");
@@ -678,6 +705,13 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
         normalized_stdout.contains(
             "Each table is a partial override: omitted fields keep the built-in role default"
         ) && normalized_stdout.contains("Codex accepts reasoning_effort or its effort alias"),
+        "stdout={stdout}"
+    );
+    assert!(
+        normalized_stdout.contains("or from the exact file named by --config <absolute-file>")
+            && normalized_stdout.contains(
+                "--config selects only the profile configuration source; every other hcom setting still comes from $HCOM_DIR/config.toml"
+            ),
         "stdout={stdout}"
     );
     assert!(

@@ -25,6 +25,8 @@ hcom arch codex
 hcom arch codex --single-review
 # or
 hcom arch claude [--add-dir /absolute/external/repository]...
+# with an exact profile configuration file instead of $HCOM_DIR/config.toml:
+hcom arch codex --config /absolute/path/to/profiles.toml
 ```
 
 The current directory is the project context. It must be an existing canonical
@@ -152,6 +154,21 @@ the Architect. It prints the effective profiles, their SHA-256 invocation
 profile hash, and the exact session binding hash; editing the file later does
 not change any run in that foreground invocation.
 
+`--config <absolute-file>` replaces that path for this invocation only. It
+selects the profile configuration *source* and nothing else: `terminal`,
+`launch`, `relay`, and `preferences` still come from `$HCOM_DIR/config.toml`,
+and `hcom config` keeps reading and writing that file. The argument must be a
+canonical absolute regular file, so a relative path, a symlinked final
+component, and a symlinked parent component are all rejected before anything
+starts; the loader then applies its usual owner, link-count, permission, size,
+and `O_NOFOLLOW` checks to it. An explicit `--config` must exist: unlike an
+absent `$HCOM_DIR/config.toml`, a missing or vanished `--config` file fails
+closed instead of silently selecting the built-in defaults. The startup summary
+prints the exact loaded path and marks it, for example
+`profile config: /srv/profiles.toml (--config; loaded once)`. The path itself
+is not part of the invocation profile hash or the session binding hash — two
+identical profile sets bind identically no matter which file supplied them.
+
 Built-in defaults are:
 
 | Command | Architect | Developer | Reviewer1 | Reviewer2 |
@@ -222,7 +239,9 @@ arbitrary argv field.
 Precedence is:
 
 ```text
-built-in defaults < $HCOM_DIR/config.toml < explicit Architect CLI options
+built-in defaults
+  < profile configuration file ($HCOM_DIR/config.toml, or --config when given)
+  < explicit Architect CLI options
 ```
 
 The production Codex defaults remain `gpt-5.6-sol`/`xhigh`. Model-backed
