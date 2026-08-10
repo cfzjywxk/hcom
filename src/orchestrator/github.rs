@@ -10,6 +10,8 @@
     reason = "GITHUB-PR-01 defines seams consumed by later auth/API and driver tasks"
 )]
 
+pub(crate) mod git;
+
 use crate::control_api::{
     DeliveryBinding, GITHUB_REVIEW_CHECK_NAME, GitHubAppBinding, GitHubAppRole,
     GitHubInspectionBinding, GitHubPermissionLevel, GitHubPullRequestBinding,

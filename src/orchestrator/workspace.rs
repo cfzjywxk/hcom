@@ -166,6 +166,13 @@ impl TasksWorkspace {
         &self.run_id
     }
 
+    /// Exact path reserved for the GitHub Pull Request lane's linked
+    /// worktree. The managed-Git adapter still requires the path to be absent
+    /// before preparation and never adopts a pre-existing directory.
+    pub(crate) fn repository_path(&self) -> PathBuf {
+        self.run_dir.join("repository")
+    }
+
     /// Reserve the exact path the Architect may use for one clarification.
     ///
     /// The file itself is intentionally not created: the Architect must
