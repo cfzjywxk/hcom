@@ -58,10 +58,6 @@ impl SessionRuntimeSources {
         })
     }
 
-    #[allow(
-        dead_code,
-        reason = "constructed by the later production GitHub preflight driver"
-    )]
     pub(crate) fn capture_with_github(
         parent_environment: impl Into<ParentEnvironment>,
         profiles: SessionInvocationProfiles,

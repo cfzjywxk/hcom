@@ -88,6 +88,11 @@ pub(crate) enum RestEndpoint {
         repository: String,
         branch: String,
     },
+    RepositoryRuleset {
+        owner: String,
+        repository: String,
+        ruleset_id: u64,
+    },
     ListPullRequests {
         owner: String,
         repository: String,
@@ -163,6 +168,7 @@ impl RestEndpoint {
             | Self::BotUser { .. }
             | Self::Reference { .. }
             | Self::RulesForBranch { .. }
+            | Self::RepositoryRuleset { .. }
             | Self::ListPullRequests { .. }
             | Self::PullRequest { .. }
             | Self::ListIssueComments { .. }
@@ -191,6 +197,7 @@ impl RestEndpoint {
             Self::BotUser { .. } => "GET /users/{bot}",
             Self::Reference { .. } => "GET /repos/{owner}/{repo}/git/ref/{ref}",
             Self::RulesForBranch { .. } => "GET /repos/{owner}/{repo}/rules/branches/{branch}",
+            Self::RepositoryRuleset { .. } => "GET /repos/{owner}/{repo}/rulesets/{ruleset_id}",
             Self::ListPullRequests { .. } => "GET /repos/{owner}/{repo}/pulls",
             Self::CreatePullRequest { .. } => "POST /repos/{owner}/{repo}/pulls",
             Self::PullRequest { .. } => "GET /repos/{owner}/{repo}/pulls/{number}",
@@ -226,6 +233,7 @@ impl RestEndpoint {
             | Self::BotUser { .. }
             | Self::Reference { .. }
             | Self::RulesForBranch { .. }
+            | Self::RepositoryRuleset { .. }
             | Self::ListPullRequests { .. }
             | Self::PullRequest { .. }
             | Self::ListIssueComments { .. }
@@ -287,6 +295,14 @@ impl RestEndpoint {
             } => {
                 validate_repo(owner, repository)?;
                 validate_branch(branch)
+            }
+            Self::RepositoryRuleset {
+                owner,
+                repository,
+                ruleset_id,
+            } => {
+                validate_repo(owner, repository)?;
+                validate_number(*ruleset_id)
             }
             Self::ListPullRequests {
                 owner,
@@ -417,6 +433,14 @@ impl RestEndpoint {
                     for part in branch.split('/') {
                         segments.push(part);
                     }
+                }
+                Self::RepositoryRuleset {
+                    owner,
+                    repository,
+                    ruleset_id,
+                } => {
+                    push_repo(owner, repository);
+                    segments.push("rulesets").push(&ruleset_id.to_string());
                 }
                 Self::ListPullRequests {
                     owner, repository, ..
@@ -549,13 +573,17 @@ impl RestEndpoint {
                 O::RepositoryAndRefRead | O::GitFetch | O::GitPush | O::RemoteRefCleanup | O::Merge
             ),
             Self::RulesForBranch { .. } => operation == O::RulesetAttestation,
+            Self::RepositoryRuleset { .. } => operation == O::RulesetAttestation,
             Self::ListPullRequests { .. } | Self::PullRequest { .. } => matches!(
                 operation,
                 O::PullRequestCreate | O::PullRequestRead | O::DeveloperComment | O::Merge
             ),
             Self::CreatePullRequest { .. } => operation == O::PullRequestCreate,
             Self::ListIssueComments { .. } | Self::CreateIssueComment { .. } => {
-                matches!(operation, O::DeveloperComment | O::TerminalComment)
+                matches!(
+                    operation,
+                    O::DeveloperComment | O::DeveloperCommentRead | O::TerminalComment
+                )
             }
             Self::ListReviews { .. } | Self::CreateReview { .. } => {
                 matches!(operation, O::ReviewPublish | O::ReviewRead | O::Merge)
@@ -708,6 +736,28 @@ impl GitHubApiError {
                 ..
             } => (*retry_after_seconds, *rate_limit_reset_unix),
             _ => (None, None),
+        }
+    }
+
+    pub(crate) fn is_retryable_read(&self) -> bool {
+        match self {
+            Self::Transport {
+                method: RestMethod::Get,
+                ambiguous: false,
+                ..
+            } => true,
+            Self::Http {
+                method: RestMethod::Get,
+                status,
+                retry_after_seconds,
+                rate_limit_reset_unix,
+                ..
+            } => {
+                matches!(*status, 408 | 429 | 500..=599)
+                    || (*status == 403
+                        && (retry_after_seconds.is_some() || rate_limit_reset_unix.is_some()))
+            }
+            _ => false,
         }
     }
 }
@@ -1430,5 +1480,31 @@ mod tests {
         };
         assert!(error.requires_mutation_reconciliation());
         assert_eq!(error.http_status(), Some(422));
+    }
+
+    #[test]
+    fn only_transient_get_failures_are_retryable_reads() {
+        let transport = GitHubApiError::Transport {
+            method: RestMethod::Get,
+            endpoint: "GET /repos/{owner}/{repo}",
+            ambiguous: false,
+        };
+        assert!(transport.is_retryable_read());
+        let rate_limited = GitHubApiError::Http {
+            method: RestMethod::Get,
+            endpoint: "GET /repos/{owner}/{repo}",
+            status: 403,
+            request_id: None,
+            retry_after_seconds: Some(1),
+            rate_limit_reset_unix: None,
+            reason: "rate limited".into(),
+        };
+        assert!(rate_limited.is_retryable_read());
+        let invalid = GitHubApiError::InvalidResponse {
+            endpoint: "GET /repos/{owner}/{repo}",
+            reason: "invalid typed response".into(),
+            ambiguous: false,
+        };
+        assert!(!invalid.is_retryable_read());
     }
 }

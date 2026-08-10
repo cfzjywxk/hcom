@@ -622,6 +622,10 @@ pub(crate) struct PullRequestObservation {
     pub(crate) base: GitHubRefObservation,
     #[serde(default)]
     pub(crate) merged: bool,
+    #[serde(default)]
+    pub(crate) mergeable: Option<bool>,
+    #[serde(default)]
+    pub(crate) mergeable_state: Option<String>,
     pub(crate) merge_commit_sha: Option<String>,
     pub(crate) merged_by: Option<GitHubActor>,
 }
@@ -2007,6 +2011,8 @@ mod tests {
                 sha: "a".repeat(40),
             },
             merged: false,
+            mergeable: Some(true),
+            mergeable_state: Some("clean".into()),
             merge_commit_sha: None,
             merged_by: None,
         }

@@ -149,9 +149,12 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         .uses_claude()
         .then(|| parent_environment.materialize_claude())
         .transpose()?;
+    let architect_additional_directories =
+        validate_additional_directories(architect_adapter, &args.additional_directories)?;
 
     let project_root = canonical_project_directory(&std::env::current_dir()?)?;
-    if args.github_pr {
+    let run_id = format!("run-{}", Uuid::new_v4().simple());
+    let github_runtime = if args.github_pr {
         let reviewer_ids = loaded
             .profiles
             .reviewers
@@ -161,30 +164,42 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         let github = loaded.github.take().ok_or_else(|| {
             anyhow::anyhow!("--github-pr requires a closed [architect.github] configuration")
         })?;
-        let _deployment = crate::orchestrator::github::parse_github_deployment_config(
+        let deployment = crate::orchestrator::github::parse_github_deployment_config(
             github,
             &reviewer_ids,
             &project_root,
         )?;
-        // GITHUB-PR-01 deliberately stops at the typed auth/API seam. A
-        // foreground session cannot start until the bounded credential/client
-        // implementation supplies a validated read-only observation.
-        bail!(
-            "--github-pr read-only App/API preflight is unavailable until the GitHub auth/client driver is installed"
-        );
-    }
+        let provider = Arc::new(crate::orchestrator::github::ProductionGitHubProvider::open(
+            deployment.clone(),
+            reviewer_ids.clone(),
+        )?);
+        Some(crate::orchestrator::github::preflight_runtime(
+            provider,
+            &run_id,
+            0,
+            &deployment,
+            &reviewer_ids,
+        )?)
+    } else {
+        None
+    };
     validate_foreground_terminal()?;
-    let architect_additional_directories =
-        validate_additional_directories(architect_adapter, &args.additional_directories)?;
     let session_root = create_private_session_runtime()?;
     let run_root = fs::canonicalize(session_root.path())?;
     let control_paths = ControlPaths::new(&run_root)?;
-    let run_id = format!("run-{}", Uuid::new_v4().simple());
-    let runtime_sources = SessionRuntimeSources::capture(
-        parent_environment.clone(),
-        loaded.profiles.clone(),
-        architect_additional_directories.clone(),
-    )?;
+    let runtime_sources = match github_runtime {
+        Some(github_runtime) => SessionRuntimeSources::capture_with_github(
+            parent_environment.clone(),
+            loaded.profiles.clone(),
+            architect_additional_directories.clone(),
+            github_runtime,
+        )?,
+        None => SessionRuntimeSources::capture(
+            parent_environment.clone(),
+            loaded.profiles.clone(),
+            architect_additional_directories.clone(),
+        )?,
+    };
     let supervisor_endpoint = SessionSupervisorEndpoint::bind(
         control_paths.clone(),
         run_id.clone(),
@@ -1257,10 +1272,13 @@ fn codex_control_mcp_overrides(
     // remains loaded, including every other MCP server, while a stale or
     // user-defined table under the reserved name cannot leave incompatible
     // transport fields merged into the control server.
+    // Keep only these long-lived control calls out of code mode so a direct
+    // session_wait remains owned by one blocking MCP request until the
+    // supervisor returns an actual worker result, action, or terminal state.
     let value = format!(
         "{prefix}={{ command = {command}, args = {args}, startup_timeout_sec = 10, \
          tool_timeout_sec = {CODEX_CONTROL_TOOL_TIMEOUT_SECS}, enabled = true, \
-         default_tools_approval_mode = \"approve\" }}"
+         default_tools_approval_mode = \"approve\", omit_tools_from = [\"code_mode\"] }}"
     );
     Ok(vec!["--config".into(), value])
 }
@@ -1833,9 +1851,11 @@ private_key_file = "/var/lib/hcom-secrets/reviewer1.pem"
             None,
         )
         .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "--github-pr read-only App/API preflight is unavailable until the GitHub auth/client driver is installed"
+        assert!(
+            error
+                .to_string()
+                .contains("failed to open the configured architect GitHub App key"),
+            "GitHub App keys must be opened before foreground terminal validation: {error}"
         );
     }
 
@@ -1881,6 +1901,7 @@ private_key_file = "/var/lib/hcom-secrets/reviewer1.pem"
         let encoded = argv.join("\n");
         assert!(encoded.contains("mcp_servers.hcom_session_task_control={"));
         assert!(encoded.contains("default_tools_approval_mode = \"approve\""));
+        assert!(encoded.contains("omit_tools_from = [\"code_mode\"]"));
         assert!(!argv.iter().any(|argument| argument == "-"));
     }
 

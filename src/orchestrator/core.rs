@@ -7,7 +7,9 @@
 
 use crate::control_api::{
     ActiveWorkerSnapshot, ArchitectActionReason, ClarificationPage, ClarificationRecord,
-    DeliveryBinding, GitHubDeliveryStatusSnapshot, GitHubInspectionBinding, GitHubRunBinding,
+    DeliveryBinding, GitHubCheckSnapshot, GitHubDeliveryOutcome, GitHubDeliveryPhase,
+    GitHubDeliveryStatusSnapshot, GitHubFinalizationSnapshot, GitHubInspectionBinding,
+    GitHubReviewSnapshot, GitHubRunBinding, GitHubTaskProgressSnapshot,
     MAX_CLARIFICATION_PAGE_RECORDS, MAX_CLARIFICATION_RECORDS_PER_RUN,
     MAX_CLARIFICATION_RECORDS_PER_TASK, MAX_PROGRESS_EVENTS_PER_RUN,
     PendingArchitectActionSnapshot, ReviewerBindingSnapshot, ReviewerResultSnapshot,
@@ -26,9 +28,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
-#[cfg(test)]
-use crate::control_api::GitHubTaskProgressSnapshot;
-
 const MAX_CORE_DIAGNOSTIC_BYTES: usize = 1024;
 const MAX_COMPLETION_TOKEN_BYTES: usize = 128;
 const MAX_REPOSITORY_PATH_BYTES: usize = 4096;
@@ -38,6 +37,14 @@ const MAX_TASKS: usize = 64;
 pub enum SupervisorEventKind {
     PlanBound,
     ExecutionAuthorized,
+    RepositoryPrepared,
+    CandidatePublished,
+    ReviewerReviewPublished,
+    ReviewCheckPublished,
+    MergeGateObserved,
+    PullRequestMerged,
+    GitHubRunFinalized,
+    GitHubOperationFailed,
     TaskRuntimeOpened,
     RoleSessionOpened,
     TurnStarted,
@@ -53,9 +60,17 @@ pub enum SupervisorEventKind {
 }
 
 impl SupervisorEventKind {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 22] = [
         Self::PlanBound,
         Self::ExecutionAuthorized,
+        Self::RepositoryPrepared,
+        Self::CandidatePublished,
+        Self::ReviewerReviewPublished,
+        Self::ReviewCheckPublished,
+        Self::MergeGateObserved,
+        Self::PullRequestMerged,
+        Self::GitHubRunFinalized,
+        Self::GitHubOperationFailed,
         Self::TaskRuntimeOpened,
         Self::RoleSessionOpened,
         Self::TurnStarted,
@@ -71,6 +86,214 @@ impl SupervisorEventKind {
     ];
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitHubReviewCheckConclusion {
+    Success,
+    ActionRequired,
+    Cancelled,
+}
+
+impl GitHubReviewCheckConclusion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::ActionRequired => "action_required",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubTaskOutcomeEvidence {
+    pub task_ordinal: usize,
+    pub task_key: String,
+    pub task_title: String,
+    pub task_base_sha: String,
+    pub task_final_head_sha: Option<String>,
+    pub outcome: Option<TaskCompletionOutcome>,
+    pub reviews: Vec<GitHubReviewSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrepareGitHubRunRequest {
+    pub operation_id: String,
+    pub run_id: String,
+    pub plan_hash: String,
+    pub run_binding: GitHubRunBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubPartialRepositoryPreparation {
+    pub base_sha: String,
+    pub branch: String,
+    pub worktree_path: String,
+    pub local_base_ref_created: bool,
+    pub local_branch_created: bool,
+    pub local_worktree_created: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishDeveloperCandidateRequest {
+    pub operation_id: String,
+    pub run_id: String,
+    pub plan_hash: String,
+    pub task_ordinal: usize,
+    pub task_count: usize,
+    pub task_key: String,
+    pub task_title: String,
+    pub generation: u32,
+    pub task_base_sha: String,
+    pub previous_head_sha: String,
+    pub developer_final_path: String,
+    pub correction: bool,
+    pub existing_pr_number: Option<u64>,
+    pub expected_check_run_id: Option<u64>,
+    pub task_outcomes: Vec<GitHubTaskOutcomeEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubPartialCandidatePublication {
+    pub task_ordinal: usize,
+    pub generation: u32,
+    pub previous_head_sha: String,
+    pub head_sha: String,
+    pub pr_number: Option<u64>,
+    pub pr_node_id: Option<String>,
+    pub pr_url: Option<String>,
+    pub pr_actor_bot_user_id: Option<u64>,
+    pub check_run_id: Option<u64>,
+    pub check_url: Option<String>,
+    pub check_actor_app_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubPartialReviewerReview {
+    pub task_ordinal: usize,
+    pub reviewer_id: ReviewerId,
+    pub generation: u32,
+    pub head_sha: String,
+    pub verdict: ReviewerVerdict,
+    pub review_id: u64,
+    pub review_url: String,
+    pub actor_bot_user_id: u64,
+    pub final_artifact_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubPartialReviewCheck {
+    pub task_ordinal: usize,
+    pub generation: u32,
+    pub head_sha: String,
+    pub check_run_id: u64,
+    pub check_url: String,
+    pub state: String,
+    pub actor_app_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubPartialMerge {
+    pub pr_number: u64,
+    pub final_head_sha: String,
+    pub merge_sha: String,
+    pub merge_url: String,
+    pub actor_bot_user_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubPartialFinalization {
+    pub pr_number: u64,
+    pub final_head_sha: String,
+    pub merge_sha: String,
+    pub finalization: GitHubFinalizationSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitHubPartialOperation {
+    RepositoryPreparation(GitHubPartialRepositoryPreparation),
+    Candidate(GitHubPartialCandidatePublication),
+    ReviewerReview(GitHubPartialReviewerReview),
+    ReviewCheck(GitHubPartialReviewCheck),
+    Merge(GitHubPartialMerge),
+    Finalization(GitHubPartialFinalization),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishReviewerReviewRequest {
+    pub operation_id: String,
+    pub run_id: String,
+    pub task_ordinal: usize,
+    pub task_count: usize,
+    pub task_key: String,
+    pub task_title: String,
+    pub generation: u32,
+    pub task_base_sha: String,
+    pub head_sha: String,
+    pub pr_number: u64,
+    pub reviewer_id: ReviewerId,
+    pub verdict: ReviewerVerdict,
+    pub reviewer_final_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishReviewCheckRequest {
+    pub operation_id: String,
+    pub run_id: String,
+    pub task_ordinal: usize,
+    pub task_count: usize,
+    pub task_key: String,
+    pub task_title: String,
+    pub generation: u32,
+    pub task_base_sha: String,
+    pub head_sha: String,
+    pub check_run_id: u64,
+    pub check_url: String,
+    pub ruleset_attestation_sha256: String,
+    pub conclusion: GitHubReviewCheckConclusion,
+    pub task_outcomes: Vec<GitHubTaskOutcomeEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitForMergeGateRequest {
+    pub operation_id: String,
+    pub run_id: String,
+    pub pr_number: u64,
+    pub final_head_sha: String,
+    pub check_run_id: u64,
+    pub ruleset_attestation_sha256: String,
+    pub tasks: Vec<GitHubTaskOutcomeEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergePullRequestRequest {
+    pub operation_id: String,
+    pub run_id: String,
+    pub pr_number: u64,
+    pub final_head_sha: String,
+    pub base_sha: String,
+    pub ruleset_attestation_sha256: String,
+    pub check_run_id: u64,
+    pub tasks: Vec<GitHubTaskOutcomeEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizeGitHubRunRequest {
+    pub operation_id: String,
+    pub run_id: String,
+    pub pr_number: u64,
+    pub final_head_sha: String,
+    pub merge_sha: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishGitHubTerminalRequest {
+    pub run_id: String,
+    pub pr_number: u64,
+    pub head_sha: String,
+    pub check_run_id: Option<u64>,
+    pub outcome: String,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupervisorEvent {
     PlanBound {
@@ -84,6 +307,85 @@ pub enum SupervisorEvent {
         expected_version: u64,
         plan_version: Option<u64>,
         plan_hash: Option<String>,
+    },
+    RepositoryPrepared {
+        expected_version: u64,
+        operation_id: String,
+        base_sha: String,
+        branch: String,
+        worktree_path: String,
+    },
+    CandidatePublished {
+        expected_version: u64,
+        operation_id: String,
+        task_ordinal: usize,
+        generation: u32,
+        previous_head_sha: String,
+        head_sha: String,
+        pr_number: u64,
+        pr_node_id: String,
+        pr_url: String,
+        pr_actor_bot_user_id: u64,
+        check_run_id: u64,
+        check_url: String,
+        check_actor_app_id: u64,
+    },
+    ReviewerReviewPublished {
+        expected_version: u64,
+        operation_id: String,
+        task_ordinal: usize,
+        reviewer_id: ReviewerId,
+        generation: u32,
+        head_sha: String,
+        verdict: ReviewerVerdict,
+        review_id: u64,
+        review_url: String,
+        actor_bot_user_id: u64,
+        final_artifact_sha256: String,
+    },
+    ReviewCheckPublished {
+        expected_version: u64,
+        operation_id: String,
+        task_ordinal: usize,
+        generation: u32,
+        head_sha: String,
+        check_run_id: u64,
+        check_url: String,
+        state: String,
+        actor_app_id: u64,
+    },
+    MergeGateObserved {
+        expected_version: u64,
+        operation_id: String,
+        pr_number: u64,
+        final_head_sha: String,
+        base_sha: String,
+        ruleset_attestation_sha256: String,
+        check_run_id: u64,
+    },
+    PullRequestMerged {
+        expected_version: u64,
+        operation_id: String,
+        pr_number: u64,
+        final_head_sha: String,
+        merge_sha: String,
+        merge_url: String,
+        actor_bot_user_id: u64,
+        merge_evidence_durable: bool,
+    },
+    GitHubRunFinalized {
+        expected_version: u64,
+        operation_id: String,
+        pr_number: u64,
+        final_head_sha: String,
+        merge_sha: String,
+        finalization: GitHubFinalizationSnapshot,
+    },
+    GitHubOperationFailed {
+        expected_version: u64,
+        operation_id: String,
+        detail: String,
+        partial_operation: Option<GitHubPartialOperation>,
     },
     TaskRuntimeOpened {
         expected_version: u64,
@@ -171,6 +473,14 @@ impl SupervisorEvent {
         match self {
             Self::PlanBound { .. } => SupervisorEventKind::PlanBound,
             Self::ExecutionAuthorized { .. } => SupervisorEventKind::ExecutionAuthorized,
+            Self::RepositoryPrepared { .. } => SupervisorEventKind::RepositoryPrepared,
+            Self::CandidatePublished { .. } => SupervisorEventKind::CandidatePublished,
+            Self::ReviewerReviewPublished { .. } => SupervisorEventKind::ReviewerReviewPublished,
+            Self::ReviewCheckPublished { .. } => SupervisorEventKind::ReviewCheckPublished,
+            Self::MergeGateObserved { .. } => SupervisorEventKind::MergeGateObserved,
+            Self::PullRequestMerged { .. } => SupervisorEventKind::PullRequestMerged,
+            Self::GitHubRunFinalized { .. } => SupervisorEventKind::GitHubRunFinalized,
+            Self::GitHubOperationFailed { .. } => SupervisorEventKind::GitHubOperationFailed,
             Self::TaskRuntimeOpened { .. } => SupervisorEventKind::TaskRuntimeOpened,
             Self::RoleSessionOpened { .. } => SupervisorEventKind::RoleSessionOpened,
             Self::TurnStarted { .. } => SupervisorEventKind::TurnStarted,
@@ -194,6 +504,30 @@ impl SupervisorEvent {
                 expected_version, ..
             }
             | Self::ExecutionAuthorized {
+                expected_version, ..
+            }
+            | Self::RepositoryPrepared {
+                expected_version, ..
+            }
+            | Self::CandidatePublished {
+                expected_version, ..
+            }
+            | Self::ReviewerReviewPublished {
+                expected_version, ..
+            }
+            | Self::ReviewCheckPublished {
+                expected_version, ..
+            }
+            | Self::MergeGateObserved {
+                expected_version, ..
+            }
+            | Self::PullRequestMerged {
+                expected_version, ..
+            }
+            | Self::GitHubRunFinalized {
+                expected_version, ..
+            }
+            | Self::GitHubOperationFailed {
                 expected_version, ..
             }
             | Self::TaskRuntimeOpened {
@@ -251,6 +585,14 @@ pub struct DriverFailure {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupervisorEffect {
+    PrepareGitHubRunRepository(PrepareGitHubRunRequest),
+    PublishDeveloperCandidate(PublishDeveloperCandidateRequest),
+    PublishReviewerReview(PublishReviewerReviewRequest),
+    OpenOrUpdateReviewCheck(PublishReviewCheckRequest),
+    WaitForMergeGate(WaitForMergeGateRequest),
+    MergePullRequest(MergePullRequestRequest),
+    FinalizeGitHubRun(FinalizeGitHubRunRequest),
+    PublishGitHubTerminal(PublishGitHubTerminalRequest),
     OpenTaskRuntime {
         task_ordinal: usize,
     },
@@ -290,6 +632,14 @@ pub enum SupervisorEffect {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SupervisorEffectKind {
+    PrepareGitHubRunRepository,
+    PublishDeveloperCandidate,
+    PublishReviewerReview,
+    OpenOrUpdateReviewCheck,
+    WaitForMergeGate,
+    MergePullRequest,
+    FinalizeGitHubRun,
+    PublishGitHubTerminal,
     OpenTaskRuntime,
     OpenRoleSession,
     StartTurn,
@@ -302,7 +652,15 @@ enum SupervisorEffectKind {
 
 #[cfg(test)]
 impl SupervisorEffectKind {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 16] = [
+        Self::PrepareGitHubRunRepository,
+        Self::PublishDeveloperCandidate,
+        Self::PublishReviewerReview,
+        Self::OpenOrUpdateReviewCheck,
+        Self::WaitForMergeGate,
+        Self::MergePullRequest,
+        Self::FinalizeGitHubRun,
+        Self::PublishGitHubTerminal,
         Self::OpenTaskRuntime,
         Self::OpenRoleSession,
         Self::StartTurn,
@@ -318,6 +676,14 @@ impl SupervisorEffectKind {
 impl SupervisorEffect {
     fn kind(&self) -> SupervisorEffectKind {
         match self {
+            Self::PrepareGitHubRunRepository(_) => SupervisorEffectKind::PrepareGitHubRunRepository,
+            Self::PublishDeveloperCandidate(_) => SupervisorEffectKind::PublishDeveloperCandidate,
+            Self::PublishReviewerReview(_) => SupervisorEffectKind::PublishReviewerReview,
+            Self::OpenOrUpdateReviewCheck(_) => SupervisorEffectKind::OpenOrUpdateReviewCheck,
+            Self::WaitForMergeGate(_) => SupervisorEffectKind::WaitForMergeGate,
+            Self::MergePullRequest(_) => SupervisorEffectKind::MergePullRequest,
+            Self::FinalizeGitHubRun(_) => SupervisorEffectKind::FinalizeGitHubRun,
+            Self::PublishGitHubTerminal(_) => SupervisorEffectKind::PublishGitHubTerminal,
             Self::OpenTaskRuntime { .. } => SupervisorEffectKind::OpenTaskRuntime,
             Self::OpenRoleSession { .. } => SupervisorEffectKind::OpenRoleSession,
             Self::StartTurn { .. } => SupervisorEffectKind::StartTurn,
@@ -417,6 +783,11 @@ pub struct CoreTask {
     historical_reviewer_final_paths: BTreeMap<ReviewerId, Vec<String>>,
     review_requested_generation: Option<u32>,
     clarification_records: Vec<ClarificationRecord>,
+    github_base_sha: Option<String>,
+    github_final_head_sha: Option<String>,
+    github_reviews: BTreeMap<ReviewerId, GitHubReviewSnapshot>,
+    github_check: Option<GitHubCheckSnapshot>,
+    pending_native_reviews: BTreeMap<ReviewerId, CorePendingNativeReview>,
 }
 
 impl CoreTask {
@@ -440,6 +811,11 @@ impl CoreTask {
                 .collect(),
             review_requested_generation: None,
             clarification_records: Vec::new(),
+            github_base_sha: None,
+            github_final_head_sha: None,
+            github_reviews: BTreeMap::new(),
+            github_check: None,
+            pending_native_reviews: BTreeMap::new(),
         }
     }
 
@@ -468,6 +844,91 @@ struct CoreReviewerResult {
     generation: u32,
     verdict: ReviewerVerdict,
     final_message_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CorePendingNativeReview {
+    generation: u32,
+    verdict: ReviewerVerdict,
+    final_message_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostCheckTransition {
+    Correction,
+    Lgtm,
+    ReviewExhausted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingGitHubOperation {
+    Prepare(PrepareGitHubRunRequest),
+    Candidate(PublishDeveloperCandidateRequest),
+    Review(PublishReviewerReviewRequest),
+    Check {
+        request: PublishReviewCheckRequest,
+        transition: PostCheckTransition,
+    },
+    MergeGate(WaitForMergeGateRequest),
+    Merge(MergePullRequestRequest),
+    Finalize(FinalizeGitHubRunRequest),
+}
+
+impl PendingGitHubOperation {
+    fn operation_id(&self) -> &str {
+        match self {
+            Self::Prepare(request) => &request.operation_id,
+            Self::Candidate(request) => &request.operation_id,
+            Self::Review(request) => &request.operation_id,
+            Self::Check { request, .. } => &request.operation_id,
+            Self::MergeGate(request) => &request.operation_id,
+            Self::Merge(request) => &request.operation_id,
+            Self::Finalize(request) => &request.operation_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CoreGitHubRunState {
+    phase: GitHubDeliveryPhase,
+    local_base_ref_present: bool,
+    local_branch_present: bool,
+    worktree_path: Option<String>,
+    published_head_sha: Option<String>,
+    pr_number: Option<u64>,
+    pr_node_id: Option<String>,
+    pr_url: Option<String>,
+    current_check: Option<GitHubCheckSnapshot>,
+    outcome: Option<GitHubDeliveryOutcome>,
+    final_base_sha: Option<String>,
+    final_ruleset_attestation_sha256: Option<String>,
+    merge_sha: Option<String>,
+    merge_url: Option<String>,
+    finalization: Option<GitHubFinalizationSnapshot>,
+    pending_operations: BTreeMap<String, PendingGitHubOperation>,
+}
+
+impl CoreGitHubRunState {
+    fn new() -> Self {
+        Self {
+            phase: GitHubDeliveryPhase::PreparingRepository,
+            local_base_ref_present: false,
+            local_branch_present: false,
+            worktree_path: None,
+            published_head_sha: None,
+            pr_number: None,
+            pr_node_id: None,
+            pr_url: None,
+            current_check: None,
+            outcome: None,
+            final_base_sha: None,
+            final_ruleset_attestation_sha256: None,
+            merge_sha: None,
+            merge_url: None,
+            finalization: None,
+            pending_operations: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -503,6 +964,7 @@ pub struct SupervisorCore {
     profile_hash: String,
     delivery_binding: DeliveryBinding,
     github_run_binding: Option<GitHubRunBinding>,
+    github_state: Option<CoreGitHubRunState>,
     reviewer_bindings: Vec<ReviewerBindingSnapshot>,
     session_state: SessionState,
     version: u64,
@@ -601,6 +1063,7 @@ impl SupervisorCore {
             profile_hash,
             delivery_binding,
             github_run_binding: None,
+            github_state: None,
             reviewer_bindings,
             session_state: SessionState::AwaitingPlan,
             version,
@@ -734,7 +1197,85 @@ impl SupervisorCore {
                 .is_github()
                 .then(|| GitHubDeliveryStatusSnapshot {
                     run_binding: self.github_run_binding.clone(),
-                    ..GitHubDeliveryStatusSnapshot::default()
+                    worktree_path: self
+                        .github_state
+                        .as_ref()
+                        .and_then(|state| state.worktree_path.clone()),
+                    pr_number: self.github_state.as_ref().and_then(|state| state.pr_number),
+                    pr_url: self
+                        .github_state
+                        .as_ref()
+                        .and_then(|state| state.pr_url.clone()),
+                    published_head_sha: self
+                        .github_state
+                        .as_ref()
+                        .and_then(|state| state.published_head_sha.clone()),
+                    current_check: self
+                        .github_state
+                        .as_ref()
+                        .and_then(|state| state.current_check.clone()),
+                    phase: self.github_state.as_ref().map(|state| state.phase),
+                    outcome: self.github_state.as_ref().and_then(|state| state.outcome),
+                    final_base_sha: self
+                        .github_state
+                        .as_ref()
+                        .and_then(|state| state.final_base_sha.clone()),
+                    final_ruleset_attestation_sha256: self
+                        .github_state
+                        .as_ref()
+                        .and_then(|state| state.final_ruleset_attestation_sha256.clone()),
+                    merge_already_confirmed: self
+                        .github_state
+                        .as_ref()
+                        .is_some_and(|state| state.merge_sha.is_some()),
+                    merge_sha: self
+                        .github_state
+                        .as_ref()
+                        .and_then(|state| state.merge_sha.clone()),
+                    merge_url: self
+                        .github_state
+                        .as_ref()
+                        .and_then(|state| state.merge_url.clone()),
+                    finalization: self
+                        .github_state
+                        .as_ref()
+                        .and_then(|state| state.finalization.clone()),
+                    preserved_branch: self.github_state.as_ref().and_then(|state| {
+                        let branch_remains = state.finalization.as_ref().map_or(
+                            state.local_branch_present,
+                            |finalization| {
+                                !finalization.local_ref_removed
+                                    || !matches!(
+                                        finalization.remote_ref_outcome.as_deref(),
+                                        Some("deleted" | "already_absent")
+                                    )
+                            },
+                        );
+                        (matches!(
+                            state.phase,
+                            GitHubDeliveryPhase::PreservedUnmerged
+                                | GitHubDeliveryPhase::PreparingRepository
+                                | GitHubDeliveryPhase::TasksRunning
+                                | GitHubDeliveryPhase::AwaitingMerge
+                                | GitHubDeliveryPhase::Finalizing
+                        ) && branch_remains)
+                            .then(|| {
+                                self.github_run_binding
+                                    .as_ref()
+                                    .map(|run| run.generated_run_branch.clone())
+                            })
+                            .flatten()
+                    }),
+                    preserved_worktree: self.github_state.as_ref().and_then(|state| {
+                        (state.phase != GitHubDeliveryPhase::Delivered
+                            && state
+                                .finalization
+                                .as_ref()
+                                .is_none_or(|finalization| !finalization.local_worktree_removed))
+                        .then(|| state.worktree_path.clone())
+                        .flatten()
+                    }),
+                    latest_inspection: None,
                 }),
             plan_version: self.plan_version,
             plan_hash: self.plan_hash.clone(),
@@ -778,16 +1319,26 @@ impl SupervisorCore {
                     max_clarification_rounds: task.spec.max_clarification_rounds,
                     clarification_record_count: u32::try_from(task.clarification_records.len())
                         .unwrap_or(u32::MAX),
-                    base_revision: (index == 0)
-                        .then(|| {
-                            self.github_run_binding
-                                .as_ref()
-                                .map(|binding| binding.expected_base_sha.clone())
-                        })
-                        .flatten(),
-                    head_revision: None,
-                    github_reviews: Vec::new(),
-                    github_check: None,
+                    base_revision: task.github_base_sha.clone().or_else(|| {
+                        (index == 0)
+                            .then(|| {
+                                self.github_run_binding
+                                    .as_ref()
+                                    .map(|binding| binding.expected_base_sha.clone())
+                            })
+                            .flatten()
+                    }),
+                    head_revision: task.github_final_head_sha.clone().or_else(|| {
+                        (self.current_task == Some(index))
+                            .then(|| {
+                                self.github_state
+                                    .as_ref()
+                                    .and_then(|state| state.published_head_sha.clone())
+                            })
+                            .flatten()
+                    }),
+                    github_reviews: task.github_reviews.values().cloned().collect(),
+                    github_check: task.github_check.clone(),
                     developer_session_bound: task.developer_session.is_some(),
                     reviewers: self
                         .reviewer_ids()
@@ -954,6 +1505,139 @@ impl SupervisorCore {
                 plan_hash,
                 ..
             } => self.authorize(plan_version, plan_hash),
+            SupervisorEvent::RepositoryPrepared {
+                operation_id,
+                base_sha,
+                branch,
+                worktree_path,
+                ..
+            } => self.repository_prepared(&operation_id, &base_sha, &branch, &worktree_path),
+            SupervisorEvent::CandidatePublished {
+                operation_id,
+                task_ordinal,
+                generation,
+                previous_head_sha,
+                head_sha,
+                pr_number,
+                pr_node_id,
+                pr_url,
+                pr_actor_bot_user_id,
+                check_run_id,
+                check_url,
+                check_actor_app_id,
+                ..
+            } => self.candidate_published(
+                &operation_id,
+                task_ordinal,
+                generation,
+                &previous_head_sha,
+                &head_sha,
+                pr_number,
+                &pr_node_id,
+                &pr_url,
+                pr_actor_bot_user_id,
+                check_run_id,
+                &check_url,
+                check_actor_app_id,
+            ),
+            SupervisorEvent::ReviewerReviewPublished {
+                operation_id,
+                task_ordinal,
+                reviewer_id,
+                generation,
+                head_sha,
+                verdict,
+                review_id,
+                review_url,
+                actor_bot_user_id,
+                final_artifact_sha256,
+                ..
+            } => self.reviewer_review_published(
+                &operation_id,
+                task_ordinal,
+                reviewer_id,
+                generation,
+                &head_sha,
+                verdict,
+                review_id,
+                &review_url,
+                actor_bot_user_id,
+                &final_artifact_sha256,
+            ),
+            SupervisorEvent::ReviewCheckPublished {
+                operation_id,
+                task_ordinal,
+                generation,
+                head_sha,
+                check_run_id,
+                check_url,
+                state,
+                actor_app_id,
+                ..
+            } => self.review_check_published(
+                &operation_id,
+                task_ordinal,
+                generation,
+                &head_sha,
+                check_run_id,
+                &check_url,
+                &state,
+                actor_app_id,
+            ),
+            SupervisorEvent::MergeGateObserved {
+                operation_id,
+                pr_number,
+                final_head_sha,
+                base_sha,
+                ruleset_attestation_sha256,
+                check_run_id,
+                ..
+            } => self.merge_gate_observed(
+                &operation_id,
+                pr_number,
+                &final_head_sha,
+                &base_sha,
+                &ruleset_attestation_sha256,
+                check_run_id,
+            ),
+            SupervisorEvent::PullRequestMerged {
+                operation_id,
+                pr_number,
+                final_head_sha,
+                merge_sha,
+                merge_url,
+                actor_bot_user_id,
+                merge_evidence_durable,
+                ..
+            } => self.pull_request_merged(
+                &operation_id,
+                pr_number,
+                &final_head_sha,
+                &merge_sha,
+                &merge_url,
+                actor_bot_user_id,
+                merge_evidence_durable,
+            ),
+            SupervisorEvent::GitHubRunFinalized {
+                operation_id,
+                pr_number,
+                final_head_sha,
+                merge_sha,
+                finalization,
+                ..
+            } => self.github_run_finalized(
+                &operation_id,
+                pr_number,
+                &final_head_sha,
+                &merge_sha,
+                finalization,
+            ),
+            SupervisorEvent::GitHubOperationFailed {
+                operation_id,
+                detail,
+                partial_operation,
+                ..
+            } => self.github_operation_failed(&operation_id, &detail, partial_operation),
             SupervisorEvent::TaskRuntimeOpened { task_ordinal, .. } => {
                 self.task_runtime_opened(task_ordinal)
             }
@@ -1183,6 +1867,7 @@ impl SupervisorCore {
         self.plan_version = Some(plan_version);
         self.plan_hash = Some(plan_hash);
         self.github_run_binding = github_run_binding;
+        self.github_state = None;
         self.next_plan_version = next_plan_version;
         self.current_task = None;
         self.terminal_detail = None;
@@ -1224,7 +1909,320 @@ impl SupervisorCore {
 
         self.session_state = SessionState::Running;
         self.current_task = Some(0);
+        if self.delivery_binding.is_github() {
+            let run_binding = self.github_run_binding.clone().ok_or_else(|| {
+                SupervisorError::invariant("GitHub authorization lost its run binding")
+            })?;
+            let plan_hash = self
+                .plan_hash
+                .clone()
+                .ok_or_else(|| SupervisorError::invariant("authorized plan lost its hash"))?;
+            let request = PrepareGitHubRunRequest {
+                operation_id: self.github_operation_id("prepare", None, None, None)?,
+                run_id: self.run_id.clone(),
+                plan_hash,
+                run_binding,
+            };
+            let mut state = CoreGitHubRunState::new();
+            state.pending_operations.insert(
+                request.operation_id.clone(),
+                PendingGitHubOperation::Prepare(request.clone()),
+            );
+            self.github_state = Some(state);
+            Ok(vec![SupervisorEffect::PrepareGitHubRunRepository(request)])
+        } else {
+            self.schedule_runtime_open(0)
+        }
+    }
+
+    fn github_operation_id(
+        &self,
+        kind: &str,
+        task_ordinal: Option<usize>,
+        generation: Option<u32>,
+        lane: Option<ReviewerId>,
+    ) -> Result<String, SupervisorError> {
+        validate_identifier("GitHub operation kind", kind)?;
+        let task = task_ordinal
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "run".into());
+        let generation = generation
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "0".into());
+        let lane = lane.map(ReviewerId::as_str).unwrap_or("supervisor");
+        let operation_id = format!("github.{kind}.{task}.{generation}.{lane}");
+        validate_identifier("GitHub operation ID", &operation_id)?;
+        Ok(operation_id)
+    }
+
+    fn github_state(&self) -> Result<&CoreGitHubRunState, SupervisorError> {
+        self.github_state
+            .as_ref()
+            .ok_or_else(|| SupervisorError::invariant("GitHub run state is missing"))
+    }
+
+    fn github_state_mut(&mut self) -> Result<&mut CoreGitHubRunState, SupervisorError> {
+        self.github_state
+            .as_mut()
+            .ok_or_else(|| SupervisorError::invariant("GitHub run state is missing"))
+    }
+
+    fn take_github_operation(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<PendingGitHubOperation, SupervisorError> {
+        validate_identifier("GitHub operation ID", operation_id)?;
+        self.github_state_mut()?
+            .pending_operations
+            .remove(operation_id)
+            .ok_or_else(|| {
+                SupervisorError::invalid_identity(
+                    "GitHub observation does not match a pending exact operation",
+                )
+            })
+    }
+
+    fn repository_prepared(
+        &mut self,
+        operation_id: &str,
+        base_sha: &str,
+        branch: &str,
+        worktree_path: &str,
+    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        self.require_running_task(0)?;
+        let pending = self.take_github_operation(operation_id)?;
+        let PendingGitHubOperation::Prepare(request) = pending else {
+            return Err(SupervisorError::invalid_identity(
+                "repository preparation observation matched another operation kind",
+            ));
+        };
+        if request.operation_id != operation_id
+            || request.run_binding.expected_base_sha != base_sha
+            || request.run_binding.generated_run_branch != branch
+        {
+            return Err(SupervisorError::invalid_identity(
+                "prepared repository differs from the exact approved run binding",
+            ));
+        }
+        validate_git_sha("prepared GitHub base SHA", base_sha)?;
+        let expected_worktree = self
+            .project_root
+            .join("hcom-tasks")
+            .join(&self.run_id)
+            .join("repository");
+        if expected_worktree.to_str() != Some(worktree_path) {
+            return Err(SupervisorError::invalid_repository(
+                "prepared GitHub worktree path differs from the run-owned path",
+            ));
+        }
+        validate_absolute_path("prepared GitHub worktree path", worktree_path)?;
+        let state = self.github_state_mut()?;
+        if state.phase != GitHubDeliveryPhase::PreparingRepository
+            || state.worktree_path.is_some()
+            || state.local_base_ref_present
+            || state.local_branch_present
+            || state.published_head_sha.is_some()
+        {
+            return Err(SupervisorError::invalid_transition(
+                "repository preparation arrived outside the preparing phase",
+            ));
+        }
+        state.local_base_ref_present = true;
+        state.local_branch_present = true;
+        state.worktree_path = Some(worktree_path.into());
+        state.phase = GitHubDeliveryPhase::TasksRunning;
         self.schedule_runtime_open(0)
+    }
+
+    fn task_outcome_evidence(
+        &self,
+        current_override: Option<(usize, TaskCompletionOutcome)>,
+    ) -> Vec<GitHubTaskOutcomeEvidence> {
+        self.tasks
+            .iter()
+            .enumerate()
+            .map(|(task_ordinal, task)| GitHubTaskOutcomeEvidence {
+                task_ordinal,
+                task_key: task.spec.task_key.clone(),
+                task_title: task.spec.title.clone(),
+                task_base_sha: task.github_base_sha.clone().unwrap_or_default(),
+                task_final_head_sha: task.github_final_head_sha.clone(),
+                outcome: current_override
+                    .filter(|(ordinal, _)| *ordinal == task_ordinal)
+                    .map(|(_, outcome)| outcome)
+                    .or(match task.state {
+                        TaskState::Lgtm => Some(TaskCompletionOutcome::Lgtm),
+                        TaskState::ReviewExhausted => Some(TaskCompletionOutcome::ReviewExhausted),
+                        _ => None,
+                    }),
+                reviews: task.github_reviews.values().cloned().collect(),
+            })
+            .collect()
+    }
+
+    fn publish_developer_candidate(
+        &mut self,
+        task_ordinal: usize,
+        developer_final_path: String,
+    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        self.begin_review_generation(task_ordinal, developer_final_path.clone())?;
+        let (previous_head_sha, pr_number, check_run_id) = {
+            let state = self.github_state()?;
+            if state.phase != GitHubDeliveryPhase::TasksRunning
+                || !state.pending_operations.is_empty()
+            {
+                return Err(SupervisorError::invalid_transition(
+                    "Developer candidate publication requires an idle task-running GitHub phase",
+                ));
+            }
+            (
+                state.published_head_sha.clone().unwrap_or_else(|| {
+                    self.github_run_binding
+                        .as_ref()
+                        .expect("GitHub run state has a run binding")
+                        .expected_base_sha
+                        .clone()
+                }),
+                state.pr_number,
+                state.current_check.as_ref().map(|check| check.check_run_id),
+            )
+        };
+        let (task_base_sha, correction, generation, task_key, task_title) = {
+            let task = &mut self.tasks[task_ordinal];
+            let task_base_sha = task
+                .github_base_sha
+                .get_or_insert_with(|| previous_head_sha.clone())
+                .clone();
+            task.state = TaskState::PublishingCandidate;
+            (
+                task_base_sha,
+                task.review_round > 0,
+                task.review_generation,
+                task.spec.task_key.clone(),
+                task.spec.title.clone(),
+            )
+        };
+        let request = PublishDeveloperCandidateRequest {
+            operation_id: self.github_operation_id(
+                "candidate",
+                Some(task_ordinal),
+                Some(generation),
+                None,
+            )?,
+            run_id: self.run_id.clone(),
+            plan_hash: self
+                .plan_hash
+                .clone()
+                .ok_or_else(|| SupervisorError::invariant("GitHub plan hash is missing"))?,
+            task_ordinal,
+            task_count: self.tasks.len(),
+            task_key,
+            task_title,
+            generation,
+            task_base_sha,
+            previous_head_sha,
+            developer_final_path,
+            correction,
+            existing_pr_number: pr_number,
+            expected_check_run_id: check_run_id,
+            task_outcomes: self.task_outcome_evidence(None),
+        };
+        self.github_state_mut()?.pending_operations.insert(
+            request.operation_id.clone(),
+            PendingGitHubOperation::Candidate(request.clone()),
+        );
+        Ok(vec![SupervisorEffect::PublishDeveloperCandidate(request)])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn candidate_published(
+        &mut self,
+        operation_id: &str,
+        task_ordinal: usize,
+        generation: u32,
+        previous_head_sha: &str,
+        head_sha: &str,
+        pr_number: u64,
+        pr_node_id: &str,
+        pr_url: &str,
+        pr_actor_bot_user_id: u64,
+        check_run_id: u64,
+        check_url: &str,
+        check_actor_app_id: u64,
+    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        self.require_running_task(task_ordinal)?;
+        let pending = self.take_github_operation(operation_id)?;
+        let PendingGitHubOperation::Candidate(request) = pending else {
+            return Err(SupervisorError::invalid_identity(
+                "candidate publication observation matched another operation kind",
+            ));
+        };
+        let binding = self
+            .delivery_binding
+            .github()
+            .ok_or_else(|| SupervisorError::invariant("GitHub delivery binding is missing"))?;
+        if request.operation_id != operation_id
+            || request.task_ordinal != task_ordinal
+            || request.generation != generation
+            || request.previous_head_sha != previous_head_sha
+            || self.tasks[task_ordinal].state != TaskState::PublishingCandidate
+            || self.tasks[task_ordinal].review_generation != generation
+            || pr_number == 0
+            || check_run_id == 0
+            || pr_actor_bot_user_id != binding.developer_app.bot_user_id
+            || check_actor_app_id != binding.architect_app.app_id
+        {
+            return Err(SupervisorError::invalid_identity(
+                "candidate publication differs from the exact task/head/actor operation",
+            ));
+        }
+        validate_git_sha("published GitHub previous head", previous_head_sha)?;
+        validate_git_sha("published GitHub candidate head", head_sha)?;
+        if head_sha == previous_head_sha {
+            return Err(SupervisorError::invalid_event(
+                "published GitHub candidate did not advance the head",
+            ));
+        }
+        validate_identifier("GitHub Pull Request node ID", pr_node_id)?;
+        validate_github_url("GitHub Pull Request URL", pr_url)?;
+        validate_github_url("GitHub Check URL", check_url)?;
+        {
+            let state = self.github_state()?;
+            if state.phase != GitHubDeliveryPhase::TasksRunning
+                || state
+                    .published_head_sha
+                    .as_deref()
+                    .unwrap_or(previous_head_sha)
+                    != previous_head_sha
+                || state.pr_number.is_some_and(|number| number != pr_number)
+                || state
+                    .pr_node_id
+                    .as_deref()
+                    .is_some_and(|node| node != pr_node_id)
+                || state.pr_url.as_deref().is_some_and(|url| url != pr_url)
+            {
+                return Err(SupervisorError::invalid_identity(
+                    "candidate publication conflicts with retained GitHub run evidence",
+                ));
+            }
+        }
+        let check = GitHubCheckSnapshot {
+            check_run_id,
+            check_url: check_url.into(),
+            state: "in_progress".into(),
+            head_sha: head_sha.into(),
+        };
+        let state = self.github_state_mut()?;
+        state.published_head_sha = Some(head_sha.into());
+        state.pr_number = Some(pr_number);
+        state.pr_node_id = Some(pr_node_id.into());
+        state.pr_url = Some(pr_url.into());
+        state.current_check = Some(check.clone());
+        let task = &mut self.tasks[task_ordinal];
+        task.state = TaskState::Reviewing;
+        task.github_check = Some(check);
+        self.push_candidate_published(task_ordinal)?;
+        self.start_reviewers(task_ordinal)
     }
 
     /// Open the task's worker runtime. There is no Git observation before it:
@@ -1456,8 +2454,12 @@ impl SupervisorCore {
                             "developer completion requires a developing task",
                         ));
                     }
-                    self.begin_review_generation(task_ordinal, final_message_path)?;
-                    self.start_reviewers(task_ordinal)
+                    if self.delivery_binding.is_github() {
+                        self.publish_developer_candidate(task_ordinal, final_message_path)
+                    } else {
+                        self.begin_review_generation(task_ordinal, final_message_path)?;
+                        self.start_reviewers(task_ordinal)
+                    }
                 }
                 DeveloperOutcomeStatus::ClarificationRequired => self.await_architect_action(
                     task_ordinal,
@@ -1481,21 +2483,31 @@ impl SupervisorCore {
                         "Reviewer completion omitted its review generation",
                     )
                 })?;
-                let effects = self.handle_reviewer_verdict(
-                    task_ordinal,
-                    reviewer_id,
-                    generation,
-                    reviewer,
-                    final_message_path,
-                )?;
-                self.push_review_responded(task_ordinal, reviewer_id)?;
-                if matches!(
-                    self.tasks[task_ordinal].state,
-                    TaskState::Lgtm | TaskState::ReviewExhausted
-                ) {
-                    self.push_task_completed(task_ordinal)?;
+                if self.delivery_binding.is_github() {
+                    self.publish_native_reviewer_result(
+                        task_ordinal,
+                        reviewer_id,
+                        generation,
+                        reviewer,
+                        final_message_path,
+                    )
+                } else {
+                    let effects = self.handle_reviewer_verdict(
+                        task_ordinal,
+                        reviewer_id,
+                        generation,
+                        reviewer,
+                        final_message_path,
+                    )?;
+                    self.push_review_responded(task_ordinal, reviewer_id)?;
+                    if matches!(
+                        self.tasks[task_ordinal].state,
+                        TaskState::Lgtm | TaskState::ReviewExhausted
+                    ) {
+                        self.push_task_completed(task_ordinal)?;
+                    }
+                    Ok(effects)
                 }
-                Ok(effects)
             }
         }
     }
@@ -1851,9 +2863,31 @@ impl SupervisorCore {
         )
     }
 
+    fn github_terminal_request(
+        &self,
+        outcome: &str,
+        detail: &str,
+    ) -> Option<PublishGitHubTerminalRequest> {
+        let state = self.github_state.as_ref()?;
+        Some(PublishGitHubTerminalRequest {
+            run_id: self.run_id.clone(),
+            pr_number: state.pr_number?,
+            head_sha: state.published_head_sha.clone()?,
+            check_run_id: state.current_check.as_ref().map(|check| check.check_run_id),
+            outcome: outcome.into(),
+            detail: detail.into(),
+        })
+    }
+
     fn cancel(&mut self, reason: &str) -> Result<Vec<SupervisorEffect>, SupervisorError> {
         validate_single_line("cancel reason", reason, 4096)?;
-        let effects = self.interrupt_active_effects();
+        let mut effects = self.interrupt_active_effects();
+        if let Some(terminal) = self.github_terminal_request(
+            "cancelled",
+            "canceled by explicit Architect-session request",
+        ) {
+            effects.push(SupervisorEffect::PublishGitHubTerminal(terminal));
+        }
         self.terminalize_current(
             SessionState::Canceled,
             TaskState::Canceled,
@@ -1863,7 +2897,12 @@ impl SupervisorCore {
     }
 
     fn parent_stopping(&mut self) -> Result<Vec<SupervisorEffect>, SupervisorError> {
-        let effects = self.interrupt_active_effects();
+        let mut effects = self.interrupt_active_effects();
+        if let Some(terminal) =
+            self.github_terminal_request("cancelled", "foreground Architect parent stopped")
+        {
+            effects.push(SupervisorEffect::PublishGitHubTerminal(terminal));
+        }
         self.terminalize_current(
             SessionState::Canceled,
             TaskState::Canceled,
@@ -1897,6 +2936,8 @@ impl SupervisorCore {
             }
         }
         task.latest_reviewer_final_paths.clear();
+        task.github_reviews.clear();
+        task.pending_native_reviews.clear();
         task.review_requested_generation = None;
         task.latest_developer_final_path = Some(developer_final_path);
         task.state = TaskState::Reviewing;
@@ -1934,6 +2975,387 @@ impl SupervisorCore {
             }
         }
         Ok(effects)
+    }
+
+    fn publish_native_reviewer_result(
+        &mut self,
+        task_ordinal: usize,
+        reviewer_id: ReviewerId,
+        generation: u32,
+        outcome: ReviewerOutcomeV1,
+        final_message_path: String,
+    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        let reviewer_ids = self.reviewer_ids();
+        let task = &self.tasks[task_ordinal];
+        if !reviewer_ids.contains(&reviewer_id)
+            || !matches!(
+                task.state,
+                TaskState::Reviewing | TaskState::PublishingReview
+            )
+            || generation != task.review_generation
+            || generation != task.review_round.saturating_add(1)
+            || task.reviewer_results.contains_key(&reviewer_id)
+            || task.pending_native_reviews.contains_key(&reviewer_id)
+        {
+            return Err(SupervisorError::invalid_identity(
+                "native Reviewer result is stale, duplicate, or outside the current GitHub generation",
+            ));
+        }
+        let mut paths = Vec::with_capacity(
+            outcome
+                .preceding_final_message_paths
+                .len()
+                .saturating_add(1),
+        );
+        for path in &outcome.preceding_final_message_paths {
+            let path = path.to_str().ok_or_else(|| {
+                SupervisorError::invalid_event(
+                    "preceding reviewer final message path must be UTF-8",
+                )
+            })?;
+            validate_absolute_path("preceding reviewer final message path", path)?;
+            paths.push(path.to_owned());
+        }
+        paths.push(final_message_path.clone());
+        let (task_key, task_title, task_base_sha) = {
+            let task = &mut self.tasks[task_ordinal];
+            task.pending_native_reviews.insert(
+                reviewer_id,
+                CorePendingNativeReview {
+                    generation,
+                    verdict: outcome.verdict,
+                    final_message_paths: paths,
+                },
+            );
+            task.state = TaskState::PublishingReview;
+            (
+                task.spec.task_key.clone(),
+                task.spec.title.clone(),
+                task.github_base_sha.clone().ok_or_else(|| {
+                    SupervisorError::invariant("GitHub Reviewer task base is missing")
+                })?,
+            )
+        };
+        let (head_sha, pr_number) = {
+            let state = self.github_state()?;
+            (
+                state.published_head_sha.clone().ok_or_else(|| {
+                    SupervisorError::invariant("GitHub Reviewer published head is missing")
+                })?,
+                state.pr_number.ok_or_else(|| {
+                    SupervisorError::invariant("GitHub Reviewer Pull Request is missing")
+                })?,
+            )
+        };
+        let request = PublishReviewerReviewRequest {
+            operation_id: self.github_operation_id(
+                "review",
+                Some(task_ordinal),
+                Some(generation),
+                Some(reviewer_id),
+            )?,
+            run_id: self.run_id.clone(),
+            task_ordinal,
+            task_count: self.tasks.len(),
+            task_key,
+            task_title,
+            generation,
+            task_base_sha,
+            head_sha,
+            pr_number,
+            reviewer_id,
+            verdict: outcome.verdict,
+            reviewer_final_path: final_message_path,
+        };
+        self.github_state_mut()?.pending_operations.insert(
+            request.operation_id.clone(),
+            PendingGitHubOperation::Review(request.clone()),
+        );
+        Ok(vec![SupervisorEffect::PublishReviewerReview(request)])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reviewer_review_published(
+        &mut self,
+        operation_id: &str,
+        task_ordinal: usize,
+        reviewer_id: ReviewerId,
+        generation: u32,
+        head_sha: &str,
+        verdict: ReviewerVerdict,
+        review_id: u64,
+        review_url: &str,
+        actor_bot_user_id: u64,
+        final_artifact_sha256: &str,
+    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        self.require_running_task(task_ordinal)?;
+        let pending = self.take_github_operation(operation_id)?;
+        let PendingGitHubOperation::Review(request) = pending else {
+            return Err(SupervisorError::invalid_identity(
+                "Reviewer publication observation matched another operation kind",
+            ));
+        };
+        let expected_actor = self
+            .delivery_binding
+            .github()
+            .and_then(|binding| {
+                binding
+                    .reviewer_apps
+                    .iter()
+                    .find(|binding| binding.reviewer_id == reviewer_id)
+            })
+            .map(|binding| binding.app.bot_user_id)
+            .ok_or_else(|| SupervisorError::invariant("Reviewer App binding is missing"))?;
+        if request.operation_id != operation_id
+            || request.task_ordinal != task_ordinal
+            || request.reviewer_id != reviewer_id
+            || request.generation != generation
+            || request.head_sha != head_sha
+            || request.verdict != verdict
+            || review_id == 0
+            || actor_bot_user_id != expected_actor
+        {
+            return Err(SupervisorError::invalid_identity(
+                "published Reviewer review differs from the exact lane/generation/head/actor",
+            ));
+        }
+        validate_git_sha("published Reviewer head", head_sha)?;
+        validate_github_url("GitHub review URL", review_url)?;
+        validate_sha256("Reviewer final artifact SHA-256", final_artifact_sha256)?;
+        let pending_native = self.tasks[task_ordinal]
+            .pending_native_reviews
+            .remove(&reviewer_id)
+            .ok_or_else(|| {
+                SupervisorError::invariant("published Reviewer review lost its native final")
+            })?;
+        if pending_native.generation != generation || pending_native.verdict != verdict {
+            return Err(SupervisorError::invalid_identity(
+                "published Reviewer review differs from its retained native result",
+            ));
+        }
+        self.tasks[task_ordinal].reviewer_results.insert(
+            reviewer_id,
+            CoreReviewerResult {
+                generation,
+                verdict,
+                final_message_paths: pending_native.final_message_paths,
+            },
+        );
+        self.tasks[task_ordinal].github_reviews.insert(
+            reviewer_id,
+            GitHubReviewSnapshot {
+                reviewer_id,
+                generation,
+                head_sha: head_sha.into(),
+                verdict,
+                review_id,
+                review_url: review_url.into(),
+                final_artifact_sha256: final_artifact_sha256.into(),
+            },
+        );
+        self.push_review_responded(task_ordinal, reviewer_id)?;
+
+        let reviewer_ids = self.reviewer_ids();
+        if self.tasks[task_ordinal].reviewer_results.len() < reviewer_ids.len() {
+            self.tasks[task_ordinal].state = TaskState::PublishingReview;
+            return Ok(Vec::new());
+        }
+        if reviewer_ids.iter().any(|id| {
+            self.tasks[task_ordinal]
+                .reviewer_results
+                .get(id)
+                .is_none_or(|result| result.generation != generation)
+                || self.tasks[task_ordinal]
+                    .github_reviews
+                    .get(id)
+                    .is_none_or(|review| {
+                        review.generation != generation || review.head_sha != head_sha
+                    })
+        }) {
+            return Err(SupervisorError::invariant(
+                "joined published Reviewer results do not share one exact generation and head",
+            ));
+        }
+        {
+            let task = &mut self.tasks[task_ordinal];
+            task.review_round = generation;
+            task.latest_reviewer_final_paths = reviewer_ids
+                .iter()
+                .flat_map(|id| {
+                    task.reviewer_results
+                        .get(id)
+                        .expect("joined Reviewer result exists")
+                        .final_message_paths
+                        .clone()
+                })
+                .collect();
+        }
+        let all_lgtm = reviewer_ids.iter().all(|id| {
+            self.tasks[task_ordinal].reviewer_results[id].verdict == ReviewerVerdict::Lgtm
+        });
+        let maximum = u32::from(self.tasks[task_ordinal].spec.max_review_rounds);
+        let transition = if all_lgtm {
+            PostCheckTransition::Lgtm
+        } else if generation >= maximum {
+            PostCheckTransition::ReviewExhausted
+        } else {
+            PostCheckTransition::Correction
+        };
+        self.schedule_review_check(task_ordinal, transition)
+    }
+
+    fn schedule_review_check(
+        &mut self,
+        task_ordinal: usize,
+        transition: PostCheckTransition,
+    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        let task = &self.tasks[task_ordinal];
+        let intended_outcome = match transition {
+            PostCheckTransition::Lgtm => Some(TaskCompletionOutcome::Lgtm),
+            PostCheckTransition::ReviewExhausted => Some(TaskCompletionOutcome::ReviewExhausted),
+            PostCheckTransition::Correction => None,
+        };
+        let earlier_exhausted = self
+            .tasks
+            .iter()
+            .take(task_ordinal)
+            .any(|task| task.state == TaskState::ReviewExhausted);
+        let conclusion = match transition {
+            PostCheckTransition::Lgtm if !earlier_exhausted => GitHubReviewCheckConclusion::Success,
+            _ => GitHubReviewCheckConclusion::ActionRequired,
+        };
+        let current_check = task.github_check.clone().ok_or_else(|| {
+            SupervisorError::invariant("joined GitHub review has no in-progress Check")
+        })?;
+        let state = self.github_state()?;
+        let request = PublishReviewCheckRequest {
+            operation_id: self.github_operation_id(
+                "check",
+                Some(task_ordinal),
+                Some(task.review_generation),
+                None,
+            )?,
+            run_id: self.run_id.clone(),
+            task_ordinal,
+            task_count: self.tasks.len(),
+            task_key: task.spec.task_key.clone(),
+            task_title: task.spec.title.clone(),
+            generation: task.review_generation,
+            task_base_sha: task
+                .github_base_sha
+                .clone()
+                .ok_or_else(|| SupervisorError::invariant("GitHub Check task base is missing"))?,
+            head_sha: state.published_head_sha.clone().ok_or_else(|| {
+                SupervisorError::invariant("GitHub Check published head is missing")
+            })?,
+            check_run_id: current_check.check_run_id,
+            check_url: current_check.check_url,
+            ruleset_attestation_sha256: self
+                .github_run_binding
+                .as_ref()
+                .ok_or_else(|| SupervisorError::invariant("GitHub Check run binding is missing"))?
+                .ruleset_attestation_sha256
+                .clone(),
+            conclusion,
+            task_outcomes: self
+                .task_outcome_evidence(intended_outcome.map(|outcome| (task_ordinal, outcome))),
+        };
+        self.github_state_mut()?.pending_operations.insert(
+            request.operation_id.clone(),
+            PendingGitHubOperation::Check {
+                request: request.clone(),
+                transition,
+            },
+        );
+        self.tasks[task_ordinal].state = TaskState::PublishingReview;
+        Ok(vec![SupervisorEffect::OpenOrUpdateReviewCheck(request)])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn review_check_published(
+        &mut self,
+        operation_id: &str,
+        task_ordinal: usize,
+        generation: u32,
+        head_sha: &str,
+        check_run_id: u64,
+        check_url: &str,
+        state_value: &str,
+        actor_app_id: u64,
+    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        self.require_running_task(task_ordinal)?;
+        let pending = self.take_github_operation(operation_id)?;
+        let PendingGitHubOperation::Check {
+            request,
+            transition,
+        } = pending
+        else {
+            return Err(SupervisorError::invalid_identity(
+                "Check publication observation matched another operation kind",
+            ));
+        };
+        let expected_architect = self
+            .delivery_binding
+            .github()
+            .map(|binding| binding.architect_app.app_id)
+            .ok_or_else(|| SupervisorError::invariant("Architect App binding is missing"))?;
+        if request.operation_id != operation_id
+            || request.task_ordinal != task_ordinal
+            || request.generation != generation
+            || request.head_sha != head_sha
+            || request.check_run_id != check_run_id
+            || request.check_url != check_url
+            || request.conclusion.as_str() != state_value
+            || actor_app_id != expected_architect
+        {
+            return Err(SupervisorError::invalid_identity(
+                "published Check differs from the exact generation/head/conclusion/actor",
+            ));
+        }
+        validate_github_url("GitHub Check URL", check_url)?;
+        let check = GitHubCheckSnapshot {
+            check_run_id,
+            check_url: check_url.into(),
+            state: state_value.into(),
+            head_sha: head_sha.into(),
+        };
+        self.github_state_mut()?.current_check = Some(check.clone());
+        self.tasks[task_ordinal].github_check = Some(check);
+        match transition {
+            PostCheckTransition::Correction => {
+                let session = self.tasks[task_ordinal]
+                    .developer_session
+                    .ok_or_else(|| SupervisorError::invariant("developer session disappeared"))?;
+                self.tasks[task_ordinal].state = TaskState::Developing;
+                self.tasks[task_ordinal].outcome_detail =
+                    Some("published same-head review requested changes".into());
+                self.schedule_turn(
+                    task_ordinal,
+                    WorkerLane::Developer,
+                    RuntimeTurnPurpose::DeveloperCorrection,
+                    session,
+                )
+            }
+            PostCheckTransition::Lgtm => {
+                let task = &mut self.tasks[task_ordinal];
+                task.state = TaskState::Lgtm;
+                task.github_final_head_sha = Some(head_sha.into());
+                task.outcome_detail =
+                    Some("all active same-generation GitHub reviews were published as LGTM".into());
+                self.push_task_completed(task_ordinal)?;
+                self.complete_current_task(task_ordinal)
+            }
+            PostCheckTransition::ReviewExhausted => {
+                let task = &mut self.tasks[task_ordinal];
+                task.state = TaskState::ReviewExhausted;
+                task.github_final_head_sha = Some(head_sha.into());
+                task.outcome_detail = Some(
+                    "maximum published review generations exhausted; advancing by policy".into(),
+                );
+                self.push_task_completed(task_ordinal)?;
+                self.complete_current_task(task_ordinal)
+            }
+        }
     }
 
     fn handle_reviewer_verdict(
@@ -2073,6 +3495,68 @@ impl SupervisorCore {
             let next = task_ordinal + 1;
             self.current_task = Some(next);
             effects.extend(self.schedule_runtime_open(next)?);
+        } else if self.delivery_binding.is_github() {
+            if self
+                .tasks
+                .iter()
+                .any(|task| task.state == TaskState::ReviewExhausted)
+            {
+                let state = self.github_state_mut()?;
+                state.phase = GitHubDeliveryPhase::PreservedUnmerged;
+                state.outcome = Some(GitHubDeliveryOutcome::UnmergedReviewExhausted);
+                self.session_state = SessionState::Completed;
+                self.terminal_detail = Some(
+                    "ordered tasks completed with review exhaustion; GitHub Pull Request preserved unmerged"
+                        .into(),
+                );
+                effects.push(SupervisorEffect::FinishSession {
+                    state: SessionState::Completed,
+                    detail: self
+                        .terminal_detail
+                        .clone()
+                        .expect("completed session has terminal detail"),
+                });
+            } else {
+                let state = self.github_state()?;
+                let final_head_sha = state.published_head_sha.clone().ok_or_else(|| {
+                    SupervisorError::invariant("all-LGTM GitHub run has no published final head")
+                })?;
+                let pr_number = state.pr_number.ok_or_else(|| {
+                    SupervisorError::invariant("all-LGTM GitHub run has no Pull Request")
+                })?;
+                let check = state.current_check.clone().ok_or_else(|| {
+                    SupervisorError::invariant("all-LGTM GitHub run has no final Check")
+                })?;
+                if check.state != GitHubReviewCheckConclusion::Success.as_str()
+                    || check.head_sha != final_head_sha
+                {
+                    return Err(SupervisorError::invariant(
+                        "all-LGTM GitHub run lacks a successful exact-final-head Check",
+                    ));
+                }
+                let request = WaitForMergeGateRequest {
+                    operation_id: self.github_operation_id("merge_gate", None, None, None)?,
+                    run_id: self.run_id.clone(),
+                    pr_number,
+                    final_head_sha: final_head_sha.clone(),
+                    check_run_id: check.check_run_id,
+                    ruleset_attestation_sha256: self
+                        .github_run_binding
+                        .as_ref()
+                        .ok_or_else(|| SupervisorError::invariant("GitHub run binding is missing"))?
+                        .ruleset_attestation_sha256
+                        .clone(),
+                    tasks: self.task_outcome_evidence(None),
+                };
+                let state = self.github_state_mut()?;
+                state.phase = GitHubDeliveryPhase::AwaitingMerge;
+                state.pending_operations.insert(
+                    request.operation_id.clone(),
+                    PendingGitHubOperation::MergeGate(request.clone()),
+                );
+                self.push_merge_waiting(&request, &check)?;
+                effects.push(SupervisorEffect::WaitForMergeGate(request));
+            }
         } else {
             self.session_state = SessionState::Completed;
             self.terminal_detail =
@@ -2086,6 +3570,567 @@ impl SupervisorCore {
             });
         }
         Ok(effects)
+    }
+
+    fn merge_gate_observed(
+        &mut self,
+        operation_id: &str,
+        pr_number: u64,
+        final_head_sha: &str,
+        base_sha: &str,
+        ruleset_attestation_sha256: &str,
+        check_run_id: u64,
+    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        let pending = self.take_github_operation(operation_id)?;
+        let PendingGitHubOperation::MergeGate(request) = pending else {
+            return Err(SupervisorError::invalid_identity(
+                "merge-gate observation matched another operation kind",
+            ));
+        };
+        let run = self
+            .github_run_binding
+            .as_ref()
+            .ok_or_else(|| SupervisorError::invariant("GitHub run binding is missing"))?;
+        if request.operation_id != operation_id
+            || request.pr_number != pr_number
+            || request.final_head_sha != final_head_sha
+            || request.check_run_id != check_run_id
+            || run.expected_base_sha != base_sha
+            || run.ruleset_attestation_sha256 != ruleset_attestation_sha256
+            || self.github_state()?.phase != GitHubDeliveryPhase::AwaitingMerge
+            || self.tasks.iter().any(|task| task.state != TaskState::Lgtm)
+        {
+            return Err(SupervisorError::invalid_identity(
+                "merge-gate observation differs from the exact all-task LGTM binding",
+            ));
+        }
+        validate_git_sha("merge-gate final head", final_head_sha)?;
+        validate_sha256("merge-gate ruleset attestation", ruleset_attestation_sha256)?;
+        let merge = MergePullRequestRequest {
+            operation_id: self.github_operation_id("merge", None, None, None)?,
+            run_id: self.run_id.clone(),
+            pr_number,
+            final_head_sha: final_head_sha.into(),
+            base_sha: base_sha.into(),
+            ruleset_attestation_sha256: ruleset_attestation_sha256.into(),
+            check_run_id,
+            tasks: request.tasks,
+        };
+        let state = self.github_state_mut()?;
+        state.final_base_sha = Some(base_sha.into());
+        state.final_ruleset_attestation_sha256 = Some(ruleset_attestation_sha256.into());
+        state.pending_operations.insert(
+            merge.operation_id.clone(),
+            PendingGitHubOperation::Merge(merge.clone()),
+        );
+        Ok(vec![SupervisorEffect::MergePullRequest(merge)])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pull_request_merged(
+        &mut self,
+        operation_id: &str,
+        pr_number: u64,
+        final_head_sha: &str,
+        merge_sha: &str,
+        merge_url: &str,
+        actor_bot_user_id: u64,
+        merge_evidence_durable: bool,
+    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        let pending = self.take_github_operation(operation_id)?;
+        let PendingGitHubOperation::Merge(request) = pending else {
+            return Err(SupervisorError::invalid_identity(
+                "merge observation matched another operation kind",
+            ));
+        };
+        let expected_architect = self
+            .delivery_binding
+            .github()
+            .map(|binding| binding.architect_app.bot_user_id)
+            .ok_or_else(|| SupervisorError::invariant("Architect App binding is missing"))?;
+        if request.operation_id != operation_id
+            || request.pr_number != pr_number
+            || request.final_head_sha != final_head_sha
+            || actor_bot_user_id != expected_architect
+            || !merge_evidence_durable
+            || self.github_state()?.phase != GitHubDeliveryPhase::AwaitingMerge
+        {
+            return Err(SupervisorError::invalid_identity(
+                "confirmed merge differs from the exact final head, actor, or durable evidence",
+            ));
+        }
+        validate_git_sha("GitHub final head", final_head_sha)?;
+        validate_git_sha("GitHub merge SHA", merge_sha)?;
+        validate_github_url("GitHub merge URL", merge_url)?;
+        let finalize = FinalizeGitHubRunRequest {
+            operation_id: self.github_operation_id("finalize", None, None, None)?,
+            run_id: self.run_id.clone(),
+            pr_number,
+            final_head_sha: final_head_sha.into(),
+            merge_sha: merge_sha.into(),
+        };
+        let state = self.github_state_mut()?;
+        state.phase = GitHubDeliveryPhase::Finalizing;
+        state.merge_sha = Some(merge_sha.into());
+        state.merge_url = Some(merge_url.into());
+        state.pending_operations.insert(
+            finalize.operation_id.clone(),
+            PendingGitHubOperation::Finalize(finalize.clone()),
+        );
+        self.push_run_finalizing(&finalize)?;
+        Ok(vec![SupervisorEffect::FinalizeGitHubRun(finalize)])
+    }
+
+    fn github_run_finalized(
+        &mut self,
+        operation_id: &str,
+        pr_number: u64,
+        final_head_sha: &str,
+        merge_sha: &str,
+        finalization: GitHubFinalizationSnapshot,
+    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        let pending = self.take_github_operation(operation_id)?;
+        let PendingGitHubOperation::Finalize(request) = pending else {
+            return Err(SupervisorError::invalid_identity(
+                "finalization observation matched another operation kind",
+            ));
+        };
+        if request.operation_id != operation_id
+            || request.pr_number != pr_number
+            || request.final_head_sha != final_head_sha
+            || request.merge_sha != merge_sha
+            || !finalization.local_worktree_removed
+            || !finalization.local_ref_removed
+            || self.github_state()?.phase != GitHubDeliveryPhase::Finalizing
+            || self.runtime_open.is_some()
+            || !self.active_turns.is_empty()
+        {
+            return Err(SupervisorError::invalid_identity(
+                "GitHub finalization did not prove required exact-run cleanup",
+            ));
+        }
+        let state = self.github_state_mut()?;
+        state.phase = GitHubDeliveryPhase::Delivered;
+        state.outcome = Some(GitHubDeliveryOutcome::Delivered);
+        state.finalization = Some(finalization);
+        self.session_state = SessionState::Completed;
+        self.terminal_detail =
+            Some("GitHub Pull Request exact-head merge and required finalization completed".into());
+        Ok(vec![SupervisorEffect::FinishSession {
+            state: SessionState::Completed,
+            detail: self
+                .terminal_detail
+                .clone()
+                .expect("delivered session has terminal detail"),
+        }])
+    }
+
+    fn github_operation_failed(
+        &mut self,
+        operation_id: &str,
+        detail: &str,
+        partial_operation: Option<GitHubPartialOperation>,
+    ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        validate_single_line(
+            "GitHub operation failure",
+            detail,
+            MAX_CORE_DIAGNOSTIC_BYTES,
+        )?;
+        let pending = self.take_github_operation(operation_id)?;
+        if pending.operation_id() != operation_id {
+            return Err(SupervisorError::invalid_identity(
+                "GitHub failure identity differs from the pending operation",
+            ));
+        }
+        if let Some(partial) = partial_operation {
+            self.retain_partial_github_operation(&pending, partial)?;
+        }
+        let mut terminal_detail = format!("GitHub operation {operation_id} failed: {detail}");
+        truncate_utf8(&mut terminal_detail, MAX_CORE_DIAGNOSTIC_BYTES);
+        let mut effects = self.interrupt_active_effects();
+        if let Some(terminal) = self.github_terminal_request("needs_human", &terminal_detail) {
+            effects.push(SupervisorEffect::PublishGitHubTerminal(terminal));
+        }
+        self.terminalize_current(
+            SessionState::NeedsHuman,
+            TaskState::NeedsHuman,
+            &terminal_detail,
+            effects,
+        )
+    }
+
+    fn retain_partial_github_operation(
+        &mut self,
+        pending: &PendingGitHubOperation,
+        partial: GitHubPartialOperation,
+    ) -> Result<(), SupervisorError> {
+        match partial {
+            GitHubPartialOperation::RepositoryPreparation(partial) => {
+                self.retain_partial_repository_preparation(pending, partial)
+            }
+            GitHubPartialOperation::Candidate(partial) => {
+                self.retain_partial_candidate_publication(pending, partial)
+            }
+            GitHubPartialOperation::ReviewerReview(partial) => {
+                self.retain_partial_reviewer_review(pending, partial)
+            }
+            GitHubPartialOperation::ReviewCheck(partial) => {
+                self.retain_partial_review_check(pending, partial)
+            }
+            GitHubPartialOperation::Merge(partial) => self.retain_partial_merge(pending, partial),
+            GitHubPartialOperation::Finalization(partial) => {
+                self.retain_partial_finalization(pending, partial)
+            }
+        }
+    }
+
+    fn retain_partial_repository_preparation(
+        &mut self,
+        pending: &PendingGitHubOperation,
+        partial: GitHubPartialRepositoryPreparation,
+    ) -> Result<(), SupervisorError> {
+        let PendingGitHubOperation::Prepare(request) = pending else {
+            return Err(SupervisorError::invalid_event(
+                "partial repository preparation accompanied another GitHub operation kind",
+            ));
+        };
+        validate_git_sha("partial GitHub preparation base SHA", &partial.base_sha)?;
+        validate_absolute_path(
+            "partial GitHub preparation worktree path",
+            &partial.worktree_path,
+        )?;
+        let expected_worktree = self
+            .project_root
+            .join("hcom-tasks")
+            .join(&self.run_id)
+            .join("repository");
+        if request.run_binding.expected_base_sha != partial.base_sha
+            || request.run_binding.generated_run_branch != partial.branch
+            || expected_worktree.to_str() != Some(partial.worktree_path.as_str())
+            || (partial.local_branch_created && !partial.local_base_ref_created)
+            || (partial.local_worktree_created && !partial.local_branch_created)
+            || (!partial.local_base_ref_created
+                && !partial.local_branch_created
+                && !partial.local_worktree_created)
+            || self.github_state()?.phase != GitHubDeliveryPhase::PreparingRepository
+        {
+            return Err(SupervisorError::invalid_identity(
+                "partial repository preparation differs from the exact approved run binding",
+            ));
+        }
+        let state = self.github_state_mut()?;
+        state.local_base_ref_present = partial.local_base_ref_created;
+        state.local_branch_present = partial.local_branch_created;
+        state.worktree_path = partial
+            .local_worktree_created
+            .then_some(partial.worktree_path);
+        Ok(())
+    }
+
+    fn retain_partial_candidate_publication(
+        &mut self,
+        pending: &PendingGitHubOperation,
+        partial: GitHubPartialCandidatePublication,
+    ) -> Result<(), SupervisorError> {
+        let PendingGitHubOperation::Candidate(request) = pending else {
+            return Err(SupervisorError::invalid_event(
+                "partial candidate evidence accompanied another GitHub operation kind",
+            ));
+        };
+        if request.task_ordinal != partial.task_ordinal
+            || request.generation != partial.generation
+            || request.previous_head_sha != partial.previous_head_sha
+            || self.tasks[partial.task_ordinal].state != TaskState::PublishingCandidate
+        {
+            return Err(SupervisorError::invalid_identity(
+                "partial candidate evidence differs from the pending publication",
+            ));
+        }
+        validate_git_sha(
+            "partial GitHub candidate previous head",
+            &partial.previous_head_sha,
+        )?;
+        validate_git_sha("partial GitHub candidate head", &partial.head_sha)?;
+        if partial.head_sha == partial.previous_head_sha {
+            return Err(SupervisorError::invalid_event(
+                "partial GitHub candidate did not advance the published head",
+            ));
+        }
+
+        let binding = self
+            .delivery_binding
+            .github()
+            .ok_or_else(|| SupervisorError::invariant("GitHub delivery binding is missing"))?;
+        let pr = match (
+            partial.pr_number,
+            partial.pr_node_id.as_deref(),
+            partial.pr_url.as_deref(),
+            partial.pr_actor_bot_user_id,
+        ) {
+            (None, None, None, None) => None,
+            (Some(number), Some(node_id), Some(url), Some(actor))
+                if number > 0 && actor == binding.developer_app.bot_user_id =>
+            {
+                validate_identifier("partial GitHub Pull Request node ID", node_id)?;
+                validate_github_url("partial GitHub Pull Request URL", url)?;
+                Some((number, node_id.to_owned(), url.to_owned()))
+            }
+            _ => {
+                return Err(SupervisorError::invalid_identity(
+                    "partial GitHub Pull Request coordinates are incomplete or actor-mismatched",
+                ));
+            }
+        };
+        let check = match (
+            partial.check_run_id,
+            partial.check_url.as_deref(),
+            partial.check_actor_app_id,
+        ) {
+            (None, None, None) => None,
+            (Some(id), Some(url), Some(actor))
+                if id > 0 && actor == binding.architect_app.app_id && pr.is_some() =>
+            {
+                validate_github_url("partial GitHub Check URL", url)?;
+                Some(GitHubCheckSnapshot {
+                    check_run_id: id,
+                    check_url: url.into(),
+                    state: "in_progress".into(),
+                    head_sha: partial.head_sha.clone(),
+                })
+            }
+            _ => {
+                return Err(SupervisorError::invalid_identity(
+                    "partial GitHub Check coordinates are incomplete or actor-mismatched",
+                ));
+            }
+        };
+        let state = self.github_state_mut()?;
+        if state
+            .published_head_sha
+            .as_deref()
+            .is_some_and(|head| head != partial.previous_head_sha)
+        {
+            return Err(SupervisorError::invalid_identity(
+                "partial GitHub candidate conflicts with the retained published head",
+            ));
+        }
+        state.published_head_sha = Some(partial.head_sha);
+        if let Some((number, node_id, url)) = pr {
+            if state.pr_number.is_some_and(|retained| retained != number)
+                || state
+                    .pr_node_id
+                    .as_deref()
+                    .is_some_and(|retained| retained != node_id)
+                || state
+                    .pr_url
+                    .as_deref()
+                    .is_some_and(|retained| retained != url)
+            {
+                return Err(SupervisorError::invalid_identity(
+                    "partial GitHub Pull Request conflicts with retained run evidence",
+                ));
+            }
+            state.pr_number = Some(number);
+            state.pr_node_id = Some(node_id);
+            state.pr_url = Some(url);
+        }
+        state.current_check = check.clone();
+        self.tasks[partial.task_ordinal].github_check = check;
+        Ok(())
+    }
+
+    fn retain_partial_reviewer_review(
+        &mut self,
+        pending: &PendingGitHubOperation,
+        partial: GitHubPartialReviewerReview,
+    ) -> Result<(), SupervisorError> {
+        let PendingGitHubOperation::Review(request) = pending else {
+            return Err(SupervisorError::invalid_event(
+                "partial Reviewer evidence accompanied another GitHub operation kind",
+            ));
+        };
+        self.require_running_task(partial.task_ordinal)?;
+        let expected_actor = self
+            .delivery_binding
+            .github()
+            .and_then(|binding| {
+                binding
+                    .reviewer_apps
+                    .iter()
+                    .find(|binding| binding.reviewer_id == partial.reviewer_id)
+            })
+            .map(|binding| binding.app.bot_user_id)
+            .ok_or_else(|| SupervisorError::invariant("Reviewer App binding is missing"))?;
+        if request.task_ordinal != partial.task_ordinal
+            || request.reviewer_id != partial.reviewer_id
+            || request.generation != partial.generation
+            || request.head_sha != partial.head_sha
+            || request.verdict != partial.verdict
+            || partial.review_id == 0
+            || partial.actor_bot_user_id != expected_actor
+        {
+            return Err(SupervisorError::invalid_identity(
+                "partial Reviewer review differs from the pending lane/generation/head/actor",
+            ));
+        }
+        validate_git_sha("partial Reviewer head", &partial.head_sha)?;
+        validate_github_url("partial GitHub review URL", &partial.review_url)?;
+        validate_sha256(
+            "partial Reviewer final artifact SHA-256",
+            &partial.final_artifact_sha256,
+        )?;
+        let pending_native = self.tasks[partial.task_ordinal]
+            .pending_native_reviews
+            .remove(&partial.reviewer_id)
+            .ok_or_else(|| {
+                SupervisorError::invariant("partial Reviewer review lost its native final")
+            })?;
+        if pending_native.generation != partial.generation
+            || pending_native.verdict != partial.verdict
+        {
+            return Err(SupervisorError::invalid_identity(
+                "partial Reviewer review differs from its retained native result",
+            ));
+        }
+        self.tasks[partial.task_ordinal].reviewer_results.insert(
+            partial.reviewer_id,
+            CoreReviewerResult {
+                generation: partial.generation,
+                verdict: partial.verdict,
+                final_message_paths: pending_native.final_message_paths,
+            },
+        );
+        self.tasks[partial.task_ordinal].github_reviews.insert(
+            partial.reviewer_id,
+            GitHubReviewSnapshot {
+                reviewer_id: partial.reviewer_id,
+                generation: partial.generation,
+                head_sha: partial.head_sha,
+                verdict: partial.verdict,
+                review_id: partial.review_id,
+                review_url: partial.review_url,
+                final_artifact_sha256: partial.final_artifact_sha256,
+            },
+        );
+        self.push_review_responded(partial.task_ordinal, partial.reviewer_id)
+    }
+
+    fn retain_partial_review_check(
+        &mut self,
+        pending: &PendingGitHubOperation,
+        partial: GitHubPartialReviewCheck,
+    ) -> Result<(), SupervisorError> {
+        let PendingGitHubOperation::Check { request, .. } = pending else {
+            return Err(SupervisorError::invalid_event(
+                "partial Check evidence accompanied another GitHub operation kind",
+            ));
+        };
+        self.require_running_task(partial.task_ordinal)?;
+        let expected_architect = self
+            .delivery_binding
+            .github()
+            .map(|binding| binding.architect_app.app_id)
+            .ok_or_else(|| SupervisorError::invariant("Architect App binding is missing"))?;
+        if request.task_ordinal != partial.task_ordinal
+            || request.generation != partial.generation
+            || request.head_sha != partial.head_sha
+            || request.check_run_id != partial.check_run_id
+            || request.check_url != partial.check_url
+            || request.conclusion.as_str() != partial.state
+            || partial.actor_app_id != expected_architect
+        {
+            return Err(SupervisorError::invalid_identity(
+                "partial Check differs from the pending generation/head/conclusion/actor",
+            ));
+        }
+        validate_github_url("partial GitHub Check URL", &partial.check_url)?;
+        let check = GitHubCheckSnapshot {
+            check_run_id: partial.check_run_id,
+            check_url: partial.check_url,
+            state: partial.state,
+            head_sha: partial.head_sha,
+        };
+        self.github_state_mut()?.current_check = Some(check.clone());
+        self.tasks[partial.task_ordinal].github_check = Some(check);
+        Ok(())
+    }
+
+    fn retain_partial_merge(
+        &mut self,
+        pending: &PendingGitHubOperation,
+        partial: GitHubPartialMerge,
+    ) -> Result<(), SupervisorError> {
+        let PendingGitHubOperation::Merge(request) = pending else {
+            return Err(SupervisorError::invalid_event(
+                "partial merge evidence accompanied another GitHub operation kind",
+            ));
+        };
+        let expected_architect = self
+            .delivery_binding
+            .github()
+            .map(|binding| binding.architect_app.bot_user_id)
+            .ok_or_else(|| SupervisorError::invariant("Architect App binding is missing"))?;
+        if request.pr_number != partial.pr_number
+            || request.final_head_sha != partial.final_head_sha
+            || partial.actor_bot_user_id != expected_architect
+            || self.github_state()?.phase != GitHubDeliveryPhase::AwaitingMerge
+        {
+            return Err(SupervisorError::invalid_identity(
+                "partial merge differs from the pending exact final head or actor",
+            ));
+        }
+        validate_git_sha("partial GitHub final head", &partial.final_head_sha)?;
+        validate_git_sha("partial GitHub merge SHA", &partial.merge_sha)?;
+        validate_github_url("partial GitHub merge URL", &partial.merge_url)?;
+        let state = self.github_state_mut()?;
+        state.phase = GitHubDeliveryPhase::Finalizing;
+        state.merge_sha = Some(partial.merge_sha);
+        state.merge_url = Some(partial.merge_url);
+        Ok(())
+    }
+
+    fn retain_partial_finalization(
+        &mut self,
+        pending: &PendingGitHubOperation,
+        partial: GitHubPartialFinalization,
+    ) -> Result<(), SupervisorError> {
+        let PendingGitHubOperation::Finalize(request) = pending else {
+            return Err(SupervisorError::invalid_event(
+                "partial finalization evidence accompanied another GitHub operation kind",
+            ));
+        };
+        if request.pr_number != partial.pr_number
+            || request.final_head_sha != partial.final_head_sha
+            || request.merge_sha != partial.merge_sha
+            || (partial.finalization.local_ref_removed
+                && !partial.finalization.local_worktree_removed)
+            || partial
+                .finalization
+                .remote_ref_outcome
+                .as_deref()
+                .is_some_and(|outcome| {
+                    !matches!(
+                        outcome,
+                        "deleted"
+                            | "already_absent"
+                            | "preserved_by_policy"
+                            | "preserved_after_delete_failure"
+                            | "preserved_after_mutation"
+                    )
+                })
+            || (!partial.finalization.local_worktree_removed
+                && !partial.finalization.local_ref_removed
+                && partial.finalization.remote_ref_outcome.as_deref()
+                    != Some("preserved_after_mutation"))
+            || self.github_state()?.phase != GitHubDeliveryPhase::Finalizing
+            || self.github_state()?.merge_sha.as_deref() != Some(partial.merge_sha.as_str())
+        {
+            return Err(SupervisorError::invalid_identity(
+                "partial finalization differs from the confirmed merge binding",
+            ));
+        }
+        self.github_state_mut()?.finalization = Some(partial.finalization);
+        Ok(())
     }
 
     fn next_progress_sequence(&self) -> Result<u32, SupervisorError> {
@@ -2116,6 +4161,109 @@ impl SupervisorCore {
     fn progress_task_ordinal(&self, task_ordinal: usize) -> Result<u32, SupervisorError> {
         u32::try_from(task_ordinal)
             .map_err(|_| SupervisorError::overflow("progress task ordinal overflow"))
+    }
+
+    fn github_task_progress(
+        &self,
+        task_ordinal: usize,
+    ) -> Result<GitHubTaskProgressSnapshot, SupervisorError> {
+        let task = self
+            .tasks
+            .get(task_ordinal)
+            .ok_or_else(|| SupervisorError::invariant("GitHub progress task is missing"))?;
+        let state = self.github_state()?;
+        let check = task.github_check.as_ref().or(state.current_check.as_ref());
+        Ok(GitHubTaskProgressSnapshot {
+            pr_number: state
+                .pr_number
+                .ok_or_else(|| SupervisorError::invariant("GitHub progress PR is missing"))?,
+            pr_url: state
+                .pr_url
+                .clone()
+                .ok_or_else(|| SupervisorError::invariant("GitHub progress PR URL is missing"))?,
+            task_base_sha: task.github_base_sha.clone().ok_or_else(|| {
+                SupervisorError::invariant("GitHub progress task base is missing")
+            })?,
+            published_head_sha: state.published_head_sha.clone().ok_or_else(|| {
+                SupervisorError::invariant("GitHub progress published head is missing")
+            })?,
+            check_run_id: check.map(|check| check.check_run_id),
+            check_url: check.map(|check| check.check_url.clone()),
+        })
+    }
+
+    fn push_candidate_published(&mut self, task_ordinal: usize) -> Result<(), SupervisorError> {
+        let sequence = self.next_progress_sequence()?;
+        let (completed_tasks, total_tasks) = self.progress_task_counts()?;
+        let task_ordinal_value = self.progress_task_ordinal(task_ordinal)?;
+        let task = self
+            .tasks
+            .get(task_ordinal)
+            .ok_or_else(|| SupervisorError::invariant("candidate progress task is missing"))?;
+        let developer_final_path = task.latest_developer_final_path.clone().ok_or_else(|| {
+            SupervisorError::invariant("candidate progress lacks a Developer final path")
+        })?;
+        let github = self.github_task_progress(task_ordinal)?;
+        self.progress_events
+            .push(SessionProgressEvent::CandidatePublished {
+                sequence,
+                task_ordinal: task_ordinal_value,
+                task_key: task.spec.task_key.clone(),
+                completed_tasks,
+                total_tasks,
+                review_generation: task.review_generation,
+                developer_final_path,
+                github,
+            });
+        Ok(())
+    }
+
+    fn push_merge_waiting(
+        &mut self,
+        request: &WaitForMergeGateRequest,
+        check: &GitHubCheckSnapshot,
+    ) -> Result<(), SupervisorError> {
+        let sequence = self.next_progress_sequence()?;
+        let (completed_tasks, total_tasks) = self.progress_task_counts()?;
+        let pr_url =
+            self.github_state()?.pr_url.clone().ok_or_else(|| {
+                SupervisorError::invariant("merge-wait progress PR URL is missing")
+            })?;
+        self.progress_events
+            .push(SessionProgressEvent::MergeWaiting {
+                sequence,
+                completed_tasks,
+                total_tasks,
+                pr_number: request.pr_number,
+                pr_url,
+                final_head_sha: request.final_head_sha.clone(),
+                check_run_id: check.check_run_id,
+                check_url: check.check_url.clone(),
+            });
+        Ok(())
+    }
+
+    fn push_run_finalizing(
+        &mut self,
+        request: &FinalizeGitHubRunRequest,
+    ) -> Result<(), SupervisorError> {
+        let sequence = self.next_progress_sequence()?;
+        let (completed_tasks, total_tasks) = self.progress_task_counts()?;
+        let pr_url =
+            self.github_state()?.pr_url.clone().ok_or_else(|| {
+                SupervisorError::invariant("finalizing progress PR URL is missing")
+            })?;
+        self.progress_events
+            .push(SessionProgressEvent::RunFinalizing {
+                sequence,
+                completed_tasks,
+                total_tasks,
+                pr_number: request.pr_number,
+                pr_url,
+                final_head_sha: request.final_head_sha.clone(),
+                merge_sha: request.merge_sha.clone(),
+            });
+        Ok(())
     }
 
     fn push_review_requested(&mut self, task_ordinal: usize) -> Result<(), SupervisorError> {
@@ -2149,7 +4297,11 @@ impl SupervisorCore {
                 task_selector: task.spec.task_selector.clone(),
                 clarification_record_count,
                 reviewer_bindings: self.reviewer_bindings.clone(),
-                github: None,
+                github: self
+                    .delivery_binding
+                    .is_github()
+                    .then(|| self.github_task_progress(task_ordinal))
+                    .transpose()?,
             });
         Ok(())
     }
@@ -2194,7 +4346,11 @@ impl SupervisorCore {
                     .map_err(|_| SupervisorError::overflow("Reviewer response count overflow"))?,
                 responses_expected: u8::try_from(self.reviewer_bindings.len())
                     .map_err(|_| SupervisorError::overflow("Reviewer binding count overflow"))?,
-                github: None,
+                github: self
+                    .delivery_binding
+                    .is_github()
+                    .then(|| self.github_task_progress(task_ordinal))
+                    .transpose()?,
             });
         Ok(())
     }
@@ -2237,7 +4393,11 @@ impl SupervisorCore {
                 outcome,
                 developer_final_path,
                 reviewers: reviewer_result_snapshots(task, &self.reviewer_ids()),
-                github: None,
+                github: self
+                    .delivery_binding
+                    .is_github()
+                    .then(|| self.github_task_progress(task_ordinal))
+                    .transpose()?,
             });
         Ok(())
     }
@@ -2446,6 +4606,9 @@ impl SupervisorCore {
         self.pending_turn_starts.clear();
         self.active_turns.clear();
         self.pending_architect_action = None;
+        if let Some(github) = self.github_state.as_mut() {
+            github.pending_operations.clear();
+        }
         self.session_state = session_state;
         self.terminal_detail = Some(detail.into());
         effects.push(SupervisorEffect::FinishSession {
@@ -2654,7 +4817,9 @@ impl SupervisorCore {
                         task.state,
                         TaskState::Developing
                             | TaskState::AwaitingArchitectAction
+                            | TaskState::PublishingCandidate
                             | TaskState::Reviewing
+                            | TaskState::PublishingReview
                     )
                 }))
         {
@@ -2663,9 +4828,11 @@ impl SupervisorCore {
             ));
         }
         for (lane, expected) in &self.pending_session_opens {
-            let expected_state = match lane.role() {
-                WorkerRole::Developer => TaskState::Developing,
-                WorkerRole::Reviewer => TaskState::Reviewing,
+            let state_matches = |state: TaskState| match lane.role() {
+                WorkerRole::Developer => state == TaskState::Developing,
+                WorkerRole::Reviewer => {
+                    matches!(state, TaskState::Reviewing | TaskState::PublishingReview)
+                }
             };
             if lane
                 .reviewer_id()
@@ -2675,7 +4842,7 @@ impl SupervisorCore {
                 || self
                     .tasks
                     .get(expected.task_ordinal)
-                    .is_none_or(|task| task.state != expected_state)
+                    .is_none_or(|task| !state_matches(task.state))
                 || self.session_for(expected.task_ordinal, *lane).is_some()
             {
                 return Err(SupervisorError::invariant(
@@ -2684,9 +4851,11 @@ impl SupervisorCore {
             }
         }
         for (lane, expected) in &self.pending_turn_starts {
-            let expected_state = match lane.role() {
-                WorkerRole::Developer => TaskState::Developing,
-                WorkerRole::Reviewer => TaskState::Reviewing,
+            let state_matches = |state: TaskState| match lane.role() {
+                WorkerRole::Developer => state == TaskState::Developing,
+                WorkerRole::Reviewer => {
+                    matches!(state, TaskState::Reviewing | TaskState::PublishingReview)
+                }
             };
             if lane
                 .reviewer_id()
@@ -2698,7 +4867,7 @@ impl SupervisorCore {
                 || self
                     .tasks
                     .get(expected.task_ordinal)
-                    .is_none_or(|task| task.state != expected_state)
+                    .is_none_or(|task| !state_matches(task.state))
                 || expected.review_generation
                     != lane
                         .reviewer_id()
@@ -2796,6 +4965,25 @@ impl SupervisorCore {
                         "reviewing task lacks an exact in-flight generation",
                     ));
                 }
+                TaskState::PublishingCandidate
+                    if task.developer_session.is_none()
+                        || task.review_generation == 0
+                        || task.review_generation != task.review_round + 1 =>
+                {
+                    return Err(SupervisorError::invariant(
+                        "publishing-candidate task lacks an exact in-flight generation",
+                    ));
+                }
+                TaskState::PublishingReview
+                    if task.developer_session.is_none()
+                        || task.review_generation == 0
+                        || (task.review_generation != task.review_round + 1
+                            && task.review_generation != task.review_round) =>
+                {
+                    return Err(SupervisorError::invariant(
+                        "publishing-review task lacks a current or just-joined generation",
+                    ));
+                }
                 TaskState::Lgtm
                     if task.review_round == 0 || task.review_generation != task.review_round =>
                 {
@@ -2855,6 +5043,66 @@ impl SupervisorCore {
                     "historical Reviewer evidence index is invalid",
                 ));
             }
+            if task
+                .pending_native_reviews
+                .iter()
+                .any(|(reviewer_id, result)| {
+                    !self.reviewer_ids().contains(reviewer_id)
+                        || result.generation != task.review_generation
+                        || result.final_message_paths.is_empty()
+                        || result.final_message_paths.len() > 2
+                })
+                || task.github_reviews.iter().any(|(reviewer_id, review)| {
+                    *reviewer_id != review.reviewer_id
+                        || !self.reviewer_ids().contains(reviewer_id)
+                        || review.generation != task.review_generation
+                        || validate_git_sha("GitHub review head", &review.head_sha).is_err()
+                        || review.review_id == 0
+                        || validate_github_url("GitHub review URL", &review.review_url).is_err()
+                        || validate_sha256(
+                            "GitHub review artifact SHA-256",
+                            &review.final_artifact_sha256,
+                        )
+                        .is_err()
+                })
+            {
+                return Err(SupervisorError::invariant(
+                    "GitHub Reviewer publication evidence is invalid",
+                ));
+            }
+            if self.delivery_binding.is_github() {
+                if task
+                    .github_base_sha
+                    .as_deref()
+                    .is_some_and(|sha| validate_git_sha("GitHub task base", sha).is_err())
+                    || task
+                        .github_final_head_sha
+                        .as_deref()
+                        .is_some_and(|sha| validate_git_sha("GitHub task final head", sha).is_err())
+                    || task.github_check.as_ref().is_some_and(|check| {
+                        check.check_run_id == 0
+                            || validate_github_url("GitHub Check URL", &check.check_url).is_err()
+                            || validate_git_sha("GitHub Check head", &check.head_sha).is_err()
+                            || !matches!(
+                                check.state.as_str(),
+                                "in_progress" | "success" | "action_required" | "cancelled"
+                            )
+                    })
+                {
+                    return Err(SupervisorError::invariant(
+                        "GitHub task range or Check evidence is invalid",
+                    ));
+                }
+            } else if task.github_base_sha.is_some()
+                || task.github_final_head_sha.is_some()
+                || !task.github_reviews.is_empty()
+                || task.github_check.is_some()
+                || !task.pending_native_reviews.is_empty()
+            {
+                return Err(SupervisorError::invariant(
+                    "local candidate task contains GitHub publication state",
+                ));
+            }
             if let Some(session) = task.developer_session
                 && !self.used_sessions.contains(&session)
             {
@@ -2874,6 +5122,120 @@ impl SupervisorCore {
             return Err(SupervisorError::invariant(
                 "run clarification record capacity was exceeded",
             ));
+        }
+        match (&self.delivery_binding, &self.github_state) {
+            (DeliveryBinding::LocalCandidate, None) => {}
+            (DeliveryBinding::LocalCandidate, Some(_)) => {
+                return Err(SupervisorError::invariant(
+                    "local candidate session contains GitHub run state",
+                ));
+            }
+            (DeliveryBinding::GitHubPullRequest { .. }, None)
+                if matches!(
+                    self.session_state,
+                    SessionState::AwaitingPlan | SessionState::AwaitingApproval
+                ) || (self.session_state == SessionState::Canceled
+                    && self.current_task.is_none()) => {}
+            (DeliveryBinding::GitHubPullRequest { .. }, None) => {
+                return Err(SupervisorError::invariant(
+                    "started GitHub session lost its run state",
+                ));
+            }
+            (DeliveryBinding::GitHubPullRequest { .. }, Some(state)) => {
+                for (operation_id, operation) in &state.pending_operations {
+                    if operation_id != operation.operation_id()
+                        || validate_identifier("GitHub operation ID", operation_id).is_err()
+                    {
+                        return Err(SupervisorError::invariant(
+                            "pending GitHub operation identity is invalid",
+                        ));
+                    }
+                }
+                if state.worktree_path.as_deref().is_some_and(|path| {
+                    validate_absolute_path("GitHub worktree path", path).is_err()
+                }) || state
+                    .published_head_sha
+                    .as_deref()
+                    .is_some_and(|sha| validate_git_sha("GitHub published head", sha).is_err())
+                    || state.pr_number == Some(0)
+                    || state.pr_url.as_deref().is_some_and(|url| {
+                        validate_github_url("GitHub Pull Request URL", url).is_err()
+                    })
+                    || state
+                        .merge_sha
+                        .as_deref()
+                        .is_some_and(|sha| validate_git_sha("GitHub merge SHA", sha).is_err())
+                    || state
+                        .merge_url
+                        .as_deref()
+                        .is_some_and(|url| validate_github_url("GitHub merge URL", url).is_err())
+                {
+                    return Err(SupervisorError::invariant("GitHub run evidence is invalid"));
+                }
+                if self.session_state.is_terminal() && !state.pending_operations.is_empty() {
+                    return Err(SupervisorError::invariant(
+                        "terminal GitHub session retains a pending external operation",
+                    ));
+                }
+                if (state.local_branch_present && !state.local_base_ref_present)
+                    || (state.worktree_path.is_some() && !state.local_branch_present)
+                {
+                    return Err(SupervisorError::invariant(
+                        "GitHub repository preparation state is not monotonic",
+                    ));
+                }
+                match state.phase {
+                    GitHubDeliveryPhase::PreparingRepository
+                        if self.session_state == SessionState::Running
+                            && (state.local_base_ref_present
+                                || state.local_branch_present
+                                || state.worktree_path.is_some()
+                                || self.runtime_open.is_some()
+                                || self.pending_runtime_open.is_some()) =>
+                    {
+                        return Err(SupervisorError::invariant(
+                            "preparing GitHub phase already owns a worktree or worker runtime",
+                        ));
+                    }
+                    GitHubDeliveryPhase::AwaitingMerge | GitHubDeliveryPhase::Finalizing
+                        if self.runtime_open.is_some()
+                            || self.pending_runtime_open.is_some()
+                            || !self.active_turns.is_empty()
+                            || self.tasks.iter().any(|task| task.state != TaskState::Lgtm) =>
+                    {
+                        return Err(SupervisorError::invariant(
+                            "GitHub merge phase retains a worker or non-LGTM task",
+                        ));
+                    }
+                    GitHubDeliveryPhase::PreservedUnmerged
+                        if self.session_state != SessionState::Completed
+                            || state.outcome
+                                != Some(GitHubDeliveryOutcome::UnmergedReviewExhausted)
+                            || !self
+                                .tasks
+                                .iter()
+                                .any(|task| task.state == TaskState::ReviewExhausted) =>
+                    {
+                        return Err(SupervisorError::invariant(
+                            "preserved GitHub run lacks completed review-exhausted evidence",
+                        ));
+                    }
+                    GitHubDeliveryPhase::Delivered
+                        if self.session_state != SessionState::Completed
+                            || state.outcome != Some(GitHubDeliveryOutcome::Delivered)
+                            || state.merge_sha.is_none()
+                            || state.finalization.as_ref().is_none_or(|finalization| {
+                                !finalization.local_worktree_removed
+                                    || !finalization.local_ref_removed
+                            }) =>
+                    {
+                        return Err(SupervisorError::invariant(
+                            "delivered GitHub run lacks confirmed merge/finalization evidence",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
         }
         match &self.pending_architect_action {
             Some(pending) => {
@@ -2962,11 +5324,16 @@ impl SupervisorCore {
                     "active turn is not bound to the exact current role session",
                 ));
             }
-            let expected_state = match lane.role() {
-                WorkerRole::Developer => TaskState::Developing,
-                WorkerRole::Reviewer => TaskState::Reviewing,
+            let state_matches = match lane.role() {
+                WorkerRole::Developer => {
+                    self.tasks[active.task_ordinal].state == TaskState::Developing
+                }
+                WorkerRole::Reviewer => matches!(
+                    self.tasks[active.task_ordinal].state,
+                    TaskState::Reviewing | TaskState::PublishingReview
+                ),
             };
-            if self.tasks[active.task_ordinal].state != expected_state {
+            if !state_matches {
                 return Err(SupervisorError::invariant(
                     "active turn lane does not match the task state",
                 ));
@@ -3083,6 +5450,29 @@ fn validate_sha256(label: &str, value: &str) -> Result<(), SupervisorError> {
     Ok(())
 }
 
+fn validate_git_sha(label: &str, value: &str) -> Result<(), SupervisorError> {
+    if value.len() != 40
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(SupervisorError::invalid_event(format!(
+            "{label} must be a lowercase 40-hex Git object ID"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_github_url(label: &str, value: &str) -> Result<(), SupervisorError> {
+    validate_single_line(label, value, 2048)?;
+    if !value.starts_with("https://github.com/") {
+        return Err(SupervisorError::invalid_event(format!(
+            "{label} is not a bounded github.com URL"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_absolute_path(label: &str, value: &str) -> Result<(), SupervisorError> {
     if value.is_empty() || value.len() > MAX_REPOSITORY_PATH_BYTES {
         return Err(SupervisorError::invalid_repository(format!(
@@ -3130,6 +5520,7 @@ mod tests {
     use crate::control_api::protocol::{
         GitHubAppBinding, GitHubPermissionLevel, GitHubPullRequestBinding,
         GitHubReviewerAppBinding, MAX_REVIEW_ROUNDS, MIN_DUAL_REVIEW_ROUNDS,
+        MIN_SINGLE_REVIEW_ROUNDS,
     };
     use crate::worker::runtime::DeveloperOutcomeV1;
 
@@ -3902,6 +6293,91 @@ mod tests {
                 plan_version: core.plan_version().or(Some(1)),
                 plan_hash: core.plan_hash().map(str::to_owned).or(Some("a".repeat(64))),
             },
+            SupervisorEventKind::RepositoryPrepared => SupervisorEvent::RepositoryPrepared {
+                expected_version: core.version(),
+                operation_id: "github.prepare.run.0.supervisor".into(),
+                base_sha: "a".repeat(40),
+                branch: "hcom/run-test-aaaaaaaaaaaa".into(),
+                worktree_path: "/project/hcom-tasks/run-1/repository".into(),
+            },
+            SupervisorEventKind::CandidatePublished => SupervisorEvent::CandidatePublished {
+                expected_version: core.version(),
+                operation_id: "github.candidate.0.1.supervisor".into(),
+                task_ordinal: 0,
+                generation: 1,
+                previous_head_sha: "a".repeat(40),
+                head_sha: "b".repeat(40),
+                pr_number: 1,
+                pr_node_id: "PR_node".into(),
+                pr_url: "https://github.com/owner/repo/pull/1".into(),
+                pr_actor_bot_user_id: 2,
+                check_run_id: 1,
+                check_url: "https://github.com/owner/repo/runs/1".into(),
+                check_actor_app_id: 1,
+            },
+            SupervisorEventKind::ReviewerReviewPublished => {
+                SupervisorEvent::ReviewerReviewPublished {
+                    expected_version: core.version(),
+                    operation_id: "github.review.0.1.reviewer1".into(),
+                    task_ordinal: 0,
+                    reviewer_id: ReviewerId::Reviewer1,
+                    generation: 1,
+                    head_sha: "b".repeat(40),
+                    verdict: ReviewerVerdict::Lgtm,
+                    review_id: 1,
+                    review_url: "https://github.com/owner/repo/pull/1#review-1".into(),
+                    actor_bot_user_id: 3,
+                    final_artifact_sha256: "c".repeat(64),
+                }
+            }
+            SupervisorEventKind::ReviewCheckPublished => SupervisorEvent::ReviewCheckPublished {
+                expected_version: core.version(),
+                operation_id: "github.check.0.1.supervisor".into(),
+                task_ordinal: 0,
+                generation: 1,
+                head_sha: "b".repeat(40),
+                check_run_id: 1,
+                check_url: "https://github.com/owner/repo/runs/1".into(),
+                state: "success".into(),
+                actor_app_id: 1,
+            },
+            SupervisorEventKind::MergeGateObserved => SupervisorEvent::MergeGateObserved {
+                expected_version: core.version(),
+                operation_id: "github.merge_gate.run.0.supervisor".into(),
+                pr_number: 1,
+                final_head_sha: "b".repeat(40),
+                base_sha: "a".repeat(40),
+                ruleset_attestation_sha256: "d".repeat(64),
+                check_run_id: 1,
+            },
+            SupervisorEventKind::PullRequestMerged => SupervisorEvent::PullRequestMerged {
+                expected_version: core.version(),
+                operation_id: "github.merge.run.0.supervisor".into(),
+                pr_number: 1,
+                final_head_sha: "b".repeat(40),
+                merge_sha: "e".repeat(40),
+                merge_url: "https://github.com/owner/repo/commit/merge".into(),
+                actor_bot_user_id: 1,
+                merge_evidence_durable: true,
+            },
+            SupervisorEventKind::GitHubRunFinalized => SupervisorEvent::GitHubRunFinalized {
+                expected_version: core.version(),
+                operation_id: "github.finalize.run.0.supervisor".into(),
+                pr_number: 1,
+                final_head_sha: "b".repeat(40),
+                merge_sha: "e".repeat(40),
+                finalization: GitHubFinalizationSnapshot {
+                    local_worktree_removed: true,
+                    local_ref_removed: true,
+                    remote_ref_outcome: Some("deleted".into()),
+                },
+            },
+            SupervisorEventKind::GitHubOperationFailed => SupervisorEvent::GitHubOperationFailed {
+                expected_version: core.version(),
+                operation_id: "github.prepare.run.0.supervisor".into(),
+                detail: "bounded failure".into(),
+                partial_operation: None,
+            },
             SupervisorEventKind::TaskRuntimeOpened => SupervisorEvent::TaskRuntimeOpened {
                 expected_version: core.version(),
                 task_ordinal: 0,
@@ -4114,6 +6590,11 @@ mod tests {
             }
             TaskState::AwaitingArchitectAction => {
                 let core = awaiting_architect_core();
+                let event = generic_event(&core, kind);
+                (core, event, false)
+            }
+            TaskState::PublishingCandidate | TaskState::PublishingReview => {
+                let core = active_core().0;
                 let event = generic_event(&core, kind);
                 (core, event, false)
             }
@@ -4365,6 +6846,274 @@ mod tests {
         }
     }
 
+    fn github_core(tasks: Vec<TaskDraft>, single_review: bool) -> SupervisorCore {
+        let mut reviewer_bindings = default_reviewer_bindings();
+        let mut delivery = github_delivery_binding();
+        if single_review {
+            reviewer_bindings.truncate(1);
+            let DeliveryBinding::GitHubPullRequest { binding } = &mut delivery else {
+                unreachable!()
+            };
+            binding.reviewer_apps.truncate(1);
+        }
+        let mut core = SupervisorCore::new_with_delivery_binding(
+            "run-github".into(),
+            PathBuf::from("/project"),
+            PROFILE_HASH.into(),
+            reviewer_bindings,
+            delivery,
+        )
+        .unwrap();
+        let inspection = GitHubInspectionBinding {
+            inspected_repository_id: 99,
+            expected_base_ref: "refs/heads/master".into(),
+            expected_base_sha: "a".repeat(40),
+            ruleset_attestation_sha256: "d".repeat(64),
+            inspection_id: "inspect-github".into(),
+        };
+        let plan_hash = core.expected_plan_hash_for_inspection(1, &tasks, Some(&inspection));
+        let run_binding = GitHubRunBinding {
+            inspected_repository_id: inspection.inspected_repository_id,
+            expected_base_ref: inspection.expected_base_ref,
+            expected_base_sha: inspection.expected_base_sha,
+            ruleset_attestation_sha256: inspection.ruleset_attestation_sha256,
+            inspection_id: inspection.inspection_id,
+            generated_run_branch: format!("hcom/run-github-{}", &plan_hash[..12]),
+        };
+        core.reduce(SupervisorEvent::PlanBound {
+            expected_version: core.version(),
+            plan_version: 1,
+            plan_hash,
+            tasks,
+            github_run_binding: Some(run_binding),
+        })
+        .unwrap();
+        core
+    }
+
+    fn prepare_github(core: &mut SupervisorCore) -> Vec<SupervisorEffect> {
+        let effects = authorize(core);
+        let request = effects
+            .iter()
+            .find_map(|effect| match effect {
+                SupervisorEffect::PrepareGitHubRunRepository(request) => Some(request.clone()),
+                _ => None,
+            })
+            .expect("GitHub authorization prepares the repository");
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, SupervisorEffect::OpenTaskRuntime { .. })),
+            "no worker may open before repository preparation"
+        );
+        let mut observed = effects;
+        observed.extend(
+            core.reduce(SupervisorEvent::RepositoryPrepared {
+                expected_version: core.version(),
+                operation_id: request.operation_id,
+                base_sha: request.run_binding.expected_base_sha,
+                branch: request.run_binding.generated_run_branch,
+                worktree_path: "/project/hcom-tasks/run-github/repository".into(),
+            })
+            .unwrap(),
+        );
+        observed
+    }
+
+    fn publish_github_candidate(
+        core: &mut SupervisorCore,
+        active: ActiveIdentity,
+        head_sha: &str,
+    ) -> Vec<SupervisorEffect> {
+        let mut effects = complete_lane_turn(
+            core,
+            active.task,
+            active.lane,
+            active.session,
+            active.turn,
+            active.token,
+            ready(),
+        );
+        let request = effects
+            .iter()
+            .find_map(|effect| match effect {
+                SupervisorEffect::PublishDeveloperCandidate(request) => Some(request.clone()),
+                _ => None,
+            })
+            .expect("Developer READY publishes before review");
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                SupervisorEffect::OpenRoleSession {
+                    lane: WorkerLane::Reviewer(_),
+                    ..
+                } | SupervisorEffect::StartTurn {
+                    lane: WorkerLane::Reviewer(_),
+                    ..
+                }
+            )),
+            "Reviewer cannot start before exact candidate publication"
+        );
+        let pr_number = request.existing_pr_number.unwrap_or(7);
+        effects.extend(
+            core.reduce(SupervisorEvent::CandidatePublished {
+                expected_version: core.version(),
+                operation_id: request.operation_id,
+                task_ordinal: request.task_ordinal,
+                generation: request.generation,
+                previous_head_sha: request.previous_head_sha,
+                head_sha: head_sha.into(),
+                pr_number,
+                pr_node_id: "PR_kwDOhcom".into(),
+                pr_url: "https://github.com/owner/repo/pull/7".into(),
+                pr_actor_bot_user_id: 22,
+                check_run_id: 1000
+                    + u64::try_from(request.task_ordinal).unwrap() * 100
+                    + u64::from(request.generation),
+                check_url: format!(
+                    "https://github.com/owner/repo/runs/{}",
+                    1000 + u64::try_from(request.task_ordinal).unwrap() * 100
+                        + u64::from(request.generation)
+                ),
+                check_actor_app_id: 1,
+            })
+            .unwrap(),
+        );
+        effects
+    }
+
+    fn start_github_reviewers(
+        core: &mut SupervisorCore,
+        task_ordinal: usize,
+        session_seed: u64,
+        turn_seed: u64,
+        first: bool,
+    ) {
+        let generation = core.tasks[task_ordinal].review_generation;
+        for (offset, reviewer_id) in core.reviewer_ids().into_iter().enumerate() {
+            let lane = WorkerLane::Reviewer(reviewer_id);
+            let session = if first {
+                let session =
+                    RuntimeSessionKey::from_counter(session_seed + u64::try_from(offset).unwrap())
+                        .unwrap();
+                open_lane_session(core, task_ordinal, lane, session);
+                session
+            } else {
+                core.tasks[task_ordinal].reviewer_sessions[&reviewer_id]
+            };
+            start_lane_turn(
+                core,
+                task_ordinal,
+                lane,
+                if first {
+                    RuntimeTurnPurpose::InitialReview
+                } else {
+                    RuntimeTurnPurpose::ReviewerRereview
+                },
+                session,
+                RuntimeTurnKey::from_counter(turn_seed + u64::try_from(offset).unwrap()).unwrap(),
+                &format!("github-review-{task_ordinal}-{generation}-{offset}"),
+            );
+        }
+    }
+
+    fn publish_github_reviews(
+        core: &mut SupervisorCore,
+        outcomes: &[(ReviewerId, ReviewerVerdict)],
+    ) -> Vec<SupervisorEffect> {
+        let task_ordinal = core.current_task.unwrap();
+        let generation = core.tasks[task_ordinal].review_generation;
+        let mut requests = Vec::new();
+        let mut observed = Vec::new();
+        for (reviewer_id, verdict) in outcomes {
+            let lane = WorkerLane::Reviewer(*reviewer_id);
+            let active = core
+                .active_turns
+                .get(&lane)
+                .cloned()
+                .expect("active same-generation Reviewer exists");
+            let outcome = match verdict {
+                ReviewerVerdict::Lgtm => lgtm(),
+                ReviewerVerdict::RequestChanges => request_changes(),
+            };
+            let effects = complete_lane_turn(
+                core,
+                task_ordinal,
+                lane,
+                active.session,
+                active.turn,
+                &active.completion_token,
+                outcome,
+            );
+            requests.push(
+                effects
+                    .iter()
+                    .find_map(|effect| match effect {
+                        SupervisorEffect::PublishReviewerReview(request) => Some(request.clone()),
+                        _ => None,
+                    })
+                    .expect("native Reviewer final requires publication"),
+            );
+            observed.extend(effects);
+        }
+        assert_eq!(
+            core.tasks[task_ordinal].review_round,
+            generation - 1,
+            "native results do not cross the published-review barrier"
+        );
+        for (index, request) in requests.into_iter().rev().enumerate() {
+            let actor_bot_user_id = match request.reviewer_id {
+                ReviewerId::Reviewer1 => 23,
+                ReviewerId::Reviewer2 => 24,
+            };
+            observed.extend(
+                core.reduce(SupervisorEvent::ReviewerReviewPublished {
+                    expected_version: core.version(),
+                    operation_id: request.operation_id,
+                    task_ordinal: request.task_ordinal,
+                    reviewer_id: request.reviewer_id,
+                    generation: request.generation,
+                    head_sha: request.head_sha,
+                    verdict: request.verdict,
+                    review_id: 2000 + u64::from(generation) * 10 + u64::try_from(index).unwrap(),
+                    review_url: format!(
+                        "https://github.com/owner/repo/pull/7#pullrequestreview-{}",
+                        2000 + u64::from(generation) * 10 + u64::try_from(index).unwrap()
+                    ),
+                    actor_bot_user_id,
+                    final_artifact_sha256: format!("{:064x}", 3000 + index),
+                })
+                .unwrap(),
+            );
+        }
+        observed
+    }
+
+    fn publish_github_check(
+        core: &mut SupervisorCore,
+        effects: &[SupervisorEffect],
+    ) -> Vec<SupervisorEffect> {
+        let request = effects
+            .iter()
+            .find_map(|effect| match effect {
+                SupervisorEffect::OpenOrUpdateReviewCheck(request) => Some(request.clone()),
+                _ => None,
+            })
+            .expect("joined published reviews conclude the exact-head Check");
+        core.reduce(SupervisorEvent::ReviewCheckPublished {
+            expected_version: core.version(),
+            operation_id: request.operation_id,
+            task_ordinal: request.task_ordinal,
+            generation: request.generation,
+            head_sha: request.head_sha,
+            check_run_id: request.check_run_id,
+            check_url: request.check_url,
+            state: request.conclusion.as_str().into(),
+            actor_app_id: 1,
+        })
+        .unwrap()
+    }
+
     #[test]
     fn github_plan_hash_binds_delivery_inspection_and_cycle_free_branch() {
         let tasks = vec![task("one", "/repo", MIN_DUAL_REVIEW_ROUNDS)];
@@ -4453,6 +7202,844 @@ mod tests {
     }
 
     #[test]
+    fn github_dual_review_correction_multi_task_chain_merges_only_after_finalization() {
+        let mut core = github_core(
+            vec![
+                task("one", "/repo", MIN_DUAL_REVIEW_ROUNDS),
+                task("two", "/repo", MIN_DUAL_REVIEW_ROUNDS),
+            ],
+            false,
+        );
+        let mut observed = BTreeSet::new();
+        let mut record = |effects: &[SupervisorEffect]| {
+            observed.extend(effects.iter().map(SupervisorEffect::kind));
+        };
+
+        let effects = prepare_github(&mut core);
+        record(&effects);
+        let developer = start_first_developer(&mut core, 0, 1, 1, "github-dev-one");
+        let effects = publish_github_candidate(&mut core, developer, &"b".repeat(40));
+        record(&effects);
+        assert_eq!(core.snapshot().tasks[0].base_revision, Some("a".repeat(40)));
+        start_github_reviewers(&mut core, 0, 10, 20, true);
+
+        let effects = publish_github_reviews(
+            &mut core,
+            &[
+                (ReviewerId::Reviewer1, ReviewerVerdict::RequestChanges),
+                (ReviewerId::Reviewer2, ReviewerVerdict::Lgtm),
+            ],
+        );
+        record(&effects);
+        let check = effects
+            .iter()
+            .find_map(|effect| match effect {
+                SupervisorEffect::OpenOrUpdateReviewCheck(request) => Some(request),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            check.conclusion,
+            GitHubReviewCheckConclusion::ActionRequired
+        );
+        assert_eq!(check.ruleset_attestation_sha256, "d".repeat(64));
+        let effects = publish_github_check(&mut core, &effects);
+        record(&effects);
+        let developer_session = core.tasks[0].developer_session.unwrap();
+        let correction = ActiveIdentity {
+            task: 0,
+            role: WorkerRole::Developer,
+            lane: WorkerLane::Developer,
+            review_generation: None,
+            session: developer_session,
+            turn: RuntimeTurnKey::from_counter(30).unwrap(),
+            token: "github-dev-correction",
+        };
+        start_lane_turn(
+            &mut core,
+            0,
+            correction.lane,
+            RuntimeTurnPurpose::DeveloperCorrection,
+            correction.session,
+            correction.turn,
+            correction.token,
+        );
+        let effects = publish_github_candidate(&mut core, correction, &"c".repeat(40));
+        record(&effects);
+        start_github_reviewers(&mut core, 0, 10, 40, false);
+        let effects = publish_github_reviews(
+            &mut core,
+            &[
+                (ReviewerId::Reviewer1, ReviewerVerdict::Lgtm),
+                (ReviewerId::Reviewer2, ReviewerVerdict::Lgtm),
+            ],
+        );
+        record(&effects);
+        let effects = publish_github_check(&mut core, &effects);
+        record(&effects);
+        assert_eq!(core.tasks[0].github_final_head_sha, Some("c".repeat(40)));
+
+        let developer = start_first_developer(&mut core, 1, 50, 50, "github-dev-two");
+        let effects = publish_github_candidate(&mut core, developer, &"e".repeat(40));
+        record(&effects);
+        assert_eq!(core.snapshot().tasks[1].base_revision, Some("c".repeat(40)));
+        assert_eq!(core.snapshot().github.unwrap().pr_number, Some(7));
+        start_github_reviewers(&mut core, 1, 60, 60, true);
+        let effects = publish_github_reviews(
+            &mut core,
+            &[
+                (ReviewerId::Reviewer1, ReviewerVerdict::Lgtm),
+                (ReviewerId::Reviewer2, ReviewerVerdict::Lgtm),
+            ],
+        );
+        record(&effects);
+        let effects = publish_github_check(&mut core, &effects);
+        record(&effects);
+        assert_eq!(core.session_state(), SessionState::Running);
+        assert_eq!(
+            core.snapshot().github.unwrap().phase,
+            Some(GitHubDeliveryPhase::AwaitingMerge)
+        );
+        let gate = effects
+            .iter()
+            .find_map(|effect| match effect {
+                SupervisorEffect::WaitForMergeGate(request) => Some(request.clone()),
+                _ => None,
+            })
+            .expect("all-task LGTM waits on the exact final head");
+        assert_eq!(gate.final_head_sha, "e".repeat(40));
+        assert!(gate.tasks.iter().all(|task| {
+            task.outcome == Some(TaskCompletionOutcome::Lgtm) && task.task_final_head_sha.is_some()
+        }));
+
+        let effects = core
+            .reduce(SupervisorEvent::MergeGateObserved {
+                expected_version: core.version(),
+                operation_id: gate.operation_id,
+                pr_number: gate.pr_number,
+                final_head_sha: gate.final_head_sha,
+                base_sha: "a".repeat(40),
+                ruleset_attestation_sha256: "d".repeat(64),
+                check_run_id: gate.check_run_id,
+            })
+            .unwrap();
+        record(&effects);
+        let merge = effects
+            .iter()
+            .find_map(|effect| match effect {
+                SupervisorEffect::MergePullRequest(request) => Some(request.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let effects = core
+            .reduce(SupervisorEvent::PullRequestMerged {
+                expected_version: core.version(),
+                operation_id: merge.operation_id,
+                pr_number: merge.pr_number,
+                final_head_sha: merge.final_head_sha,
+                merge_sha: "f".repeat(40),
+                merge_url: "https://github.com/owner/repo/commit/final".into(),
+                actor_bot_user_id: 21,
+                merge_evidence_durable: true,
+            })
+            .unwrap();
+        record(&effects);
+        assert_eq!(core.session_state(), SessionState::Running);
+        assert_eq!(
+            core.snapshot().github.unwrap().phase,
+            Some(GitHubDeliveryPhase::Finalizing)
+        );
+        let finalize = effects
+            .iter()
+            .find_map(|effect| match effect {
+                SupervisorEffect::FinalizeGitHubRun(request) => Some(request.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let mut finalization_failed = core.clone();
+        let failure_effects = finalization_failed
+            .reduce(SupervisorEvent::GitHubOperationFailed {
+                expected_version: finalization_failed.version(),
+                operation_id: finalize.operation_id.clone(),
+                detail: "required local cleanup could not be confirmed".into(),
+                partial_operation: None,
+            })
+            .unwrap();
+        assert!(failure_effects.iter().all(|effect| {
+            !matches!(
+                effect,
+                SupervisorEffect::WaitForMergeGate(_)
+                    | SupervisorEffect::MergePullRequest(_)
+                    | SupervisorEffect::FinalizeGitHubRun(_)
+            )
+        }));
+        let failed_snapshot = finalization_failed.snapshot();
+        assert_eq!(failed_snapshot.state, SessionState::NeedsHuman);
+        let failed_github = failed_snapshot.github.unwrap();
+        assert!(failed_github.merge_already_confirmed);
+        assert_eq!(failed_github.merge_sha, Some("f".repeat(40)));
+        assert_eq!(failed_github.phase, Some(GitHubDeliveryPhase::Finalizing));
+        assert!(failed_github.finalization.is_none());
+        assert!(failed_github.preserved_branch.is_some());
+        assert!(failed_github.preserved_worktree.is_some());
+
+        let fresh = finalization_failed
+            .next_run("run-fresh-after-merge".into())
+            .unwrap();
+        let fresh_snapshot = fresh.snapshot();
+        assert_eq!(fresh_snapshot.state, SessionState::AwaitingPlan);
+        assert_eq!(fresh_snapshot.run_id, "run-fresh-after-merge");
+        let fresh_github = fresh_snapshot.github.unwrap();
+        assert!(!fresh_github.merge_already_confirmed);
+        assert!(fresh_github.run_binding.is_none());
+        assert!(fresh_github.pr_number.is_none());
+        assert!(fresh_github.worktree_path.is_none());
+        assert!(fresh_github.merge_sha.is_none());
+
+        let effects = core
+            .reduce(SupervisorEvent::GitHubRunFinalized {
+                expected_version: core.version(),
+                operation_id: finalize.operation_id,
+                pr_number: finalize.pr_number,
+                final_head_sha: finalize.final_head_sha,
+                merge_sha: finalize.merge_sha,
+                finalization: GitHubFinalizationSnapshot {
+                    local_worktree_removed: true,
+                    local_ref_removed: true,
+                    remote_ref_outcome: Some("deleted".into()),
+                },
+            })
+            .unwrap();
+        record(&effects);
+        assert_eq!(core.session_state(), SessionState::Completed);
+        let github = core.snapshot().github.unwrap();
+        assert_eq!(github.phase, Some(GitHubDeliveryPhase::Delivered));
+        assert_eq!(github.outcome, Some(GitHubDeliveryOutcome::Delivered));
+
+        let mut failed = github_core(vec![task("failure", "/repo", 2)], false);
+        prepare_github(&mut failed);
+        let developer = start_first_developer(&mut failed, 0, 1, 1, "failed-dev");
+        publish_github_candidate(&mut failed, developer, &"b".repeat(40));
+        start_github_reviewers(&mut failed, 0, 10, 20, true);
+        let reviewer = failed
+            .active_turns
+            .get(&WorkerLane::Reviewer(ReviewerId::Reviewer1))
+            .cloned()
+            .unwrap();
+        let failure_effects = complete_lane_turn(
+            &mut failed,
+            0,
+            WorkerLane::Reviewer(ReviewerId::Reviewer1),
+            reviewer.session,
+            reviewer.turn,
+            &reviewer.completion_token,
+            lgtm(),
+        );
+        let operation_id = failure_effects
+            .iter()
+            .find_map(|effect| match effect {
+                SupervisorEffect::PublishReviewerReview(request) => {
+                    Some(request.operation_id.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let failure_effects = failed
+            .reduce(SupervisorEvent::GitHubOperationFailed {
+                expected_version: failed.version(),
+                operation_id,
+                detail: "remote observation could not be proved".into(),
+                partial_operation: None,
+            })
+            .unwrap();
+        record(&failure_effects);
+        assert_eq!(failed.session_state(), SessionState::NeedsHuman);
+
+        for required in [
+            SupervisorEffectKind::PrepareGitHubRunRepository,
+            SupervisorEffectKind::PublishDeveloperCandidate,
+            SupervisorEffectKind::PublishReviewerReview,
+            SupervisorEffectKind::OpenOrUpdateReviewCheck,
+            SupervisorEffectKind::WaitForMergeGate,
+            SupervisorEffectKind::MergePullRequest,
+            SupervisorEffectKind::FinalizeGitHubRun,
+            SupervisorEffectKind::PublishGitHubTerminal,
+        ] {
+            assert!(observed.contains(&required), "missing {required:?}");
+        }
+    }
+
+    #[test]
+    fn failed_candidate_publication_retains_confirmed_remote_coordinates() {
+        let mut core = github_core(vec![task("partial", "/repo", 2)], false);
+        prepare_github(&mut core);
+        let developer = start_first_developer(&mut core, 0, 1, 1, "partial-developer");
+        let effects = complete_lane_turn(
+            &mut core,
+            developer.task,
+            developer.lane,
+            developer.session,
+            developer.turn,
+            developer.token,
+            ready(),
+        );
+        let request = effects
+            .iter()
+            .find_map(|effect| match effect {
+                SupervisorEffect::PublishDeveloperCandidate(request) => Some(request.clone()),
+                _ => None,
+            })
+            .unwrap();
+        core.reduce(SupervisorEvent::GitHubOperationFailed {
+            expected_version: core.version(),
+            operation_id: request.operation_id,
+            detail: "Check creation remained unavailable".into(),
+            partial_operation: Some(GitHubPartialOperation::Candidate(
+                GitHubPartialCandidatePublication {
+                    task_ordinal: request.task_ordinal,
+                    generation: request.generation,
+                    previous_head_sha: request.previous_head_sha,
+                    head_sha: "b".repeat(40),
+                    pr_number: Some(7),
+                    pr_node_id: Some("PR_kwDOhcom".into()),
+                    pr_url: Some("https://github.com/owner/repo/pull/7".into()),
+                    pr_actor_bot_user_id: Some(22),
+                    check_run_id: None,
+                    check_url: None,
+                    check_actor_app_id: None,
+                },
+            )),
+        })
+        .unwrap();
+        let snapshot = core.snapshot();
+        assert_eq!(snapshot.state, SessionState::NeedsHuman);
+        let github = snapshot.github.unwrap();
+        assert_eq!(github.published_head_sha, Some("b".repeat(40)));
+        assert_eq!(github.pr_number, Some(7));
+        assert_eq!(
+            github.pr_url.as_deref(),
+            Some("https://github.com/owner/repo/pull/7")
+        );
+        assert!(github.current_check.is_none());
+    }
+
+    #[test]
+    fn failed_repository_preparation_reports_only_confirmed_managed_artifacts() {
+        let mut core = github_core(vec![task("prepare-partial", "/repo", 2)], false);
+        let effects = authorize(&mut core);
+        let request = effects
+            .iter()
+            .find_map(|effect| match effect {
+                SupervisorEffect::PrepareGitHubRunRepository(request) => Some(request.clone()),
+                _ => None,
+            })
+            .unwrap();
+
+        let mut before_effect = core.clone();
+        before_effect
+            .reduce(SupervisorEvent::GitHubOperationFailed {
+                expected_version: before_effect.version(),
+                operation_id: request.operation_id.clone(),
+                detail: "preparation failed before creating managed artifacts".into(),
+                partial_operation: None,
+            })
+            .unwrap();
+        let github = before_effect.snapshot().github.unwrap();
+        assert!(github.preserved_branch.is_none());
+        assert!(github.preserved_worktree.is_none());
+
+        let mut after_base_fetch = core.clone();
+        after_base_fetch
+            .reduce(SupervisorEvent::GitHubOperationFailed {
+                expected_version: after_base_fetch.version(),
+                operation_id: request.operation_id,
+                detail: "preparation validation failed after fetching the base".into(),
+                partial_operation: Some(GitHubPartialOperation::RepositoryPreparation(
+                    GitHubPartialRepositoryPreparation {
+                        base_sha: request.run_binding.expected_base_sha,
+                        branch: request.run_binding.generated_run_branch,
+                        worktree_path: "/project/hcom-tasks/run-github/repository".into(),
+                        local_base_ref_created: true,
+                        local_branch_created: false,
+                        local_worktree_created: false,
+                    },
+                )),
+            })
+            .unwrap();
+        let github = after_base_fetch.snapshot().github.unwrap();
+        assert!(github.preserved_branch.is_none());
+        assert!(github.preserved_worktree.is_none());
+    }
+
+    #[test]
+    fn failed_evidence_writes_retain_confirmed_review_check_merge_and_cleanup() {
+        let mut core = github_core(vec![task("partial", "/repo", 2)], true);
+        prepare_github(&mut core);
+        let developer = start_first_developer(&mut core, 0, 1, 1, "partial-developer");
+        publish_github_candidate(&mut core, developer, &"b".repeat(40));
+        start_github_reviewers(&mut core, 0, 10, 20, true);
+
+        let mut review_failed = core.clone();
+        let reviewer = review_failed
+            .active_turns
+            .get(&WorkerLane::Reviewer(ReviewerId::Reviewer1))
+            .cloned()
+            .unwrap();
+        let review_effects = complete_lane_turn(
+            &mut review_failed,
+            0,
+            WorkerLane::Reviewer(ReviewerId::Reviewer1),
+            reviewer.session,
+            reviewer.turn,
+            &reviewer.completion_token,
+            lgtm(),
+        );
+        let review_request = review_effects
+            .iter()
+            .find_map(|effect| match effect {
+                SupervisorEffect::PublishReviewerReview(request) => Some(request.clone()),
+                _ => None,
+            })
+            .unwrap();
+        review_failed
+            .reduce(SupervisorEvent::GitHubOperationFailed {
+                expected_version: review_failed.version(),
+                operation_id: review_request.operation_id,
+                detail: "review evidence write failed after confirmation".into(),
+                partial_operation: Some(GitHubPartialOperation::ReviewerReview(
+                    GitHubPartialReviewerReview {
+                        task_ordinal: review_request.task_ordinal,
+                        reviewer_id: review_request.reviewer_id,
+                        generation: review_request.generation,
+                        head_sha: review_request.head_sha,
+                        verdict: review_request.verdict,
+                        review_id: 2001,
+                        review_url: "https://github.com/owner/repo/pull/7#pullrequestreview-2001"
+                            .into(),
+                        actor_bot_user_id: 23,
+                        final_artifact_sha256: "e".repeat(64),
+                    },
+                )),
+            })
+            .unwrap();
+        let review_snapshot = review_failed.snapshot();
+        assert_eq!(review_snapshot.state, SessionState::NeedsHuman);
+        assert_eq!(review_snapshot.tasks[0].github_reviews.len(), 1);
+        assert_eq!(
+            review_snapshot.tasks[0].reviewers[0].current_verdict,
+            Some(ReviewerVerdict::Lgtm)
+        );
+
+        let review_effects =
+            publish_github_reviews(&mut core, &[(ReviewerId::Reviewer1, ReviewerVerdict::Lgtm)]);
+        let check_request = review_effects
+            .iter()
+            .find_map(|effect| match effect {
+                SupervisorEffect::OpenOrUpdateReviewCheck(request) => Some(request.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let mut check_failed = core.clone();
+        check_failed
+            .reduce(SupervisorEvent::GitHubOperationFailed {
+                expected_version: check_failed.version(),
+                operation_id: check_request.operation_id.clone(),
+                detail: "Check evidence write failed after confirmation".into(),
+                partial_operation: Some(GitHubPartialOperation::ReviewCheck(
+                    GitHubPartialReviewCheck {
+                        task_ordinal: check_request.task_ordinal,
+                        generation: check_request.generation,
+                        head_sha: check_request.head_sha.clone(),
+                        check_run_id: check_request.check_run_id,
+                        check_url: check_request.check_url.clone(),
+                        state: check_request.conclusion.as_str().into(),
+                        actor_app_id: 1,
+                    },
+                )),
+            })
+            .unwrap();
+        let check_snapshot = check_failed.snapshot();
+        assert_eq!(check_snapshot.state, SessionState::NeedsHuman);
+        assert_eq!(
+            check_snapshot
+                .github
+                .as_ref()
+                .and_then(|github| github.current_check.as_ref())
+                .map(|check| check.state.as_str()),
+            Some("success")
+        );
+        assert_eq!(
+            check_snapshot.tasks[0]
+                .github_check
+                .as_ref()
+                .map(|check| check.state.as_str()),
+            Some("success")
+        );
+
+        let merge_wait_effects = publish_github_check(&mut core, &review_effects);
+        let gate = merge_wait_effects
+            .iter()
+            .find_map(|effect| match effect {
+                SupervisorEffect::WaitForMergeGate(request) => Some(request.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let merge_effects = core
+            .reduce(SupervisorEvent::MergeGateObserved {
+                expected_version: core.version(),
+                operation_id: gate.operation_id,
+                pr_number: gate.pr_number,
+                final_head_sha: gate.final_head_sha,
+                base_sha: "a".repeat(40),
+                ruleset_attestation_sha256: "d".repeat(64),
+                check_run_id: gate.check_run_id,
+            })
+            .unwrap();
+        let merge_request = merge_effects
+            .iter()
+            .find_map(|effect| match effect {
+                SupervisorEffect::MergePullRequest(request) => Some(request.clone()),
+                _ => None,
+            })
+            .unwrap();
+
+        let mut merge_failed = core.clone();
+        let failure_effects = merge_failed
+            .reduce(SupervisorEvent::GitHubOperationFailed {
+                expected_version: merge_failed.version(),
+                operation_id: merge_request.operation_id.clone(),
+                detail: "merge evidence write failed after confirmation".into(),
+                partial_operation: Some(GitHubPartialOperation::Merge(GitHubPartialMerge {
+                    pr_number: merge_request.pr_number,
+                    final_head_sha: merge_request.final_head_sha.clone(),
+                    merge_sha: "f".repeat(40),
+                    merge_url: "https://github.com/owner/repo/commit/final".into(),
+                    actor_bot_user_id: 21,
+                })),
+            })
+            .unwrap();
+        assert!(failure_effects.iter().all(|effect| !matches!(
+            effect,
+            SupervisorEffect::WaitForMergeGate(_)
+                | SupervisorEffect::MergePullRequest(_)
+                | SupervisorEffect::FinalizeGitHubRun(_)
+        )));
+        let merge_snapshot = merge_failed.snapshot();
+        assert_eq!(merge_snapshot.state, SessionState::NeedsHuman);
+        let merge_github = merge_snapshot.github.unwrap();
+        assert!(merge_github.merge_already_confirmed);
+        assert_eq!(merge_github.merge_sha, Some("f".repeat(40)));
+        assert_eq!(
+            merge_github.merge_url.as_deref(),
+            Some("https://github.com/owner/repo/commit/final")
+        );
+        assert_eq!(merge_github.phase, Some(GitHubDeliveryPhase::Finalizing));
+
+        let finalize_effects = core
+            .reduce(SupervisorEvent::PullRequestMerged {
+                expected_version: core.version(),
+                operation_id: merge_request.operation_id,
+                pr_number: merge_request.pr_number,
+                final_head_sha: merge_request.final_head_sha,
+                merge_sha: "f".repeat(40),
+                merge_url: "https://github.com/owner/repo/commit/final".into(),
+                actor_bot_user_id: 21,
+                merge_evidence_durable: true,
+            })
+            .unwrap();
+        let finalize_request = finalize_effects
+            .iter()
+            .find_map(|effect| match effect {
+                SupervisorEffect::FinalizeGitHubRun(request) => Some(request.clone()),
+                _ => None,
+            })
+            .unwrap();
+
+        let mut remote_mutation_failed = core.clone();
+        remote_mutation_failed
+            .reduce(SupervisorEvent::GitHubOperationFailed {
+                expected_version: remote_mutation_failed.version(),
+                operation_id: finalize_request.operation_id.clone(),
+                detail: "remote branch changed before cleanup".into(),
+                partial_operation: Some(GitHubPartialOperation::Finalization(
+                    GitHubPartialFinalization {
+                        pr_number: finalize_request.pr_number,
+                        final_head_sha: finalize_request.final_head_sha.clone(),
+                        merge_sha: finalize_request.merge_sha.clone(),
+                        finalization: GitHubFinalizationSnapshot {
+                            local_worktree_removed: false,
+                            local_ref_removed: false,
+                            remote_ref_outcome: Some("preserved_after_mutation".into()),
+                        },
+                    },
+                )),
+            })
+            .unwrap();
+        let remote_mutation_snapshot = remote_mutation_failed.snapshot();
+        assert_eq!(remote_mutation_snapshot.state, SessionState::NeedsHuman);
+        let remote_mutation_github = remote_mutation_snapshot.github.unwrap();
+        assert_eq!(
+            remote_mutation_github.finalization,
+            Some(GitHubFinalizationSnapshot {
+                local_worktree_removed: false,
+                local_ref_removed: false,
+                remote_ref_outcome: Some("preserved_after_mutation".into()),
+            })
+        );
+        assert!(remote_mutation_github.preserved_branch.is_some());
+        assert!(remote_mutation_github.preserved_worktree.is_some());
+
+        let mut progressive_cleanup_failed = core.clone();
+        progressive_cleanup_failed
+            .reduce(SupervisorEvent::GitHubOperationFailed {
+                expected_version: progressive_cleanup_failed.version(),
+                operation_id: finalize_request.operation_id.clone(),
+                detail: "local ref changed after worktree cleanup".into(),
+                partial_operation: Some(GitHubPartialOperation::Finalization(
+                    GitHubPartialFinalization {
+                        pr_number: finalize_request.pr_number,
+                        final_head_sha: finalize_request.final_head_sha.clone(),
+                        merge_sha: finalize_request.merge_sha.clone(),
+                        finalization: GitHubFinalizationSnapshot {
+                            local_worktree_removed: true,
+                            local_ref_removed: false,
+                            remote_ref_outcome: None,
+                        },
+                    },
+                )),
+            })
+            .unwrap();
+        let progressive_snapshot = progressive_cleanup_failed.snapshot();
+        assert_eq!(progressive_snapshot.state, SessionState::NeedsHuman);
+        let progressive_github = progressive_snapshot.github.unwrap();
+        assert_eq!(
+            progressive_github.finalization,
+            Some(GitHubFinalizationSnapshot {
+                local_worktree_removed: true,
+                local_ref_removed: false,
+                remote_ref_outcome: None,
+            })
+        );
+        assert!(progressive_github.preserved_branch.is_some());
+        assert!(progressive_github.preserved_worktree.is_none());
+
+        let failure_effects = core
+            .reduce(SupervisorEvent::GitHubOperationFailed {
+                expected_version: core.version(),
+                operation_id: finalize_request.operation_id,
+                detail: "finalization evidence write failed after cleanup".into(),
+                partial_operation: Some(GitHubPartialOperation::Finalization(
+                    GitHubPartialFinalization {
+                        pr_number: finalize_request.pr_number,
+                        final_head_sha: finalize_request.final_head_sha,
+                        merge_sha: finalize_request.merge_sha,
+                        finalization: GitHubFinalizationSnapshot {
+                            local_worktree_removed: true,
+                            local_ref_removed: true,
+                            remote_ref_outcome: Some("deleted".into()),
+                        },
+                    },
+                )),
+            })
+            .unwrap();
+        assert!(failure_effects.iter().all(|effect| !matches!(
+            effect,
+            SupervisorEffect::WaitForMergeGate(_)
+                | SupervisorEffect::MergePullRequest(_)
+                | SupervisorEffect::FinalizeGitHubRun(_)
+        )));
+        let finalization_snapshot = core.snapshot();
+        assert_eq!(finalization_snapshot.state, SessionState::NeedsHuman);
+        let finalization_github = finalization_snapshot.github.unwrap();
+        assert!(finalization_github.merge_already_confirmed);
+        assert_eq!(
+            finalization_github.finalization,
+            Some(GitHubFinalizationSnapshot {
+                local_worktree_removed: true,
+                local_ref_removed: true,
+                remote_ref_outcome: Some("deleted".into()),
+            })
+        );
+        assert!(finalization_github.preserved_branch.is_none());
+        assert!(finalization_github.preserved_worktree.is_none());
+    }
+
+    #[test]
+    fn github_review_exhaustion_advances_and_preserves_one_pr_with_aggregate_block() {
+        let mut one = task("one", "/repo", MIN_SINGLE_REVIEW_ROUNDS);
+        let mut two = task("two", "/repo", MIN_SINGLE_REVIEW_ROUNDS);
+        one.max_review_rounds = MIN_SINGLE_REVIEW_ROUNDS;
+        two.max_review_rounds = MIN_SINGLE_REVIEW_ROUNDS;
+        let mut core = github_core(vec![one, two], true);
+        prepare_github(&mut core);
+        let developer = start_first_developer(&mut core, 0, 1, 1, "exhaust-dev-one");
+        publish_github_candidate(&mut core, developer, &"b".repeat(40));
+        start_github_reviewers(&mut core, 0, 10, 20, true);
+        let maximum = core.tasks[0].spec.max_review_rounds;
+        let correction_heads = ['c', 'e', 'f', '1'];
+        let mut effects = Vec::new();
+        for generation in 1..=maximum {
+            effects = publish_github_reviews(
+                &mut core,
+                &[(ReviewerId::Reviewer1, ReviewerVerdict::RequestChanges)],
+            );
+            effects = publish_github_check(&mut core, &effects);
+            if generation == maximum {
+                break;
+            }
+            let session = core.tasks[0].developer_session.unwrap();
+            let token: &'static str =
+                Box::leak(format!("exhaust-correction-{generation}").into_boxed_str());
+            let correction = ActiveIdentity {
+                task: 0,
+                role: WorkerRole::Developer,
+                lane: WorkerLane::Developer,
+                review_generation: None,
+                session,
+                turn: RuntimeTurnKey::from_counter(30 + u64::from(generation)).unwrap(),
+                token,
+            };
+            start_lane_turn(
+                &mut core,
+                0,
+                correction.lane,
+                RuntimeTurnPurpose::DeveloperCorrection,
+                session,
+                correction.turn,
+                correction.token,
+            );
+            publish_github_candidate(
+                &mut core,
+                correction,
+                &correction_heads[usize::from(generation - 1)]
+                    .to_string()
+                    .repeat(40),
+            );
+            start_github_reviewers(&mut core, 0, 10, 40 + u64::from(generation), false);
+        }
+        assert_eq!(core.tasks[0].state, TaskState::ReviewExhausted);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            SupervisorEffect::OpenTaskRuntime { task_ordinal: 1 }
+        )));
+
+        let developer = start_first_developer(&mut core, 1, 50, 50, "exhaust-dev-two");
+        publish_github_candidate(&mut core, developer, &"2".repeat(40));
+        start_github_reviewers(&mut core, 1, 60, 60, true);
+        let effects =
+            publish_github_reviews(&mut core, &[(ReviewerId::Reviewer1, ReviewerVerdict::Lgtm)]);
+        let check = effects
+            .iter()
+            .find_map(|effect| match effect {
+                SupervisorEffect::OpenOrUpdateReviewCheck(request) => Some(request),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            check.conclusion,
+            GitHubReviewCheckConclusion::ActionRequired
+        );
+        assert_eq!(
+            check.task_outcomes[0].outcome,
+            Some(TaskCompletionOutcome::ReviewExhausted)
+        );
+        let effects = publish_github_check(&mut core, &effects);
+        assert_eq!(core.session_state(), SessionState::Completed);
+        let github = core.snapshot().github.unwrap();
+        assert_eq!(github.pr_number, Some(7));
+        assert_eq!(github.phase, Some(GitHubDeliveryPhase::PreservedUnmerged));
+        assert_eq!(
+            github.outcome,
+            Some(GitHubDeliveryOutcome::UnmergedReviewExhausted)
+        );
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            SupervisorEffect::WaitForMergeGate(_)
+                | SupervisorEffect::MergePullRequest(_)
+                | SupervisorEffect::FinalizeGitHubRun(_)
+        )));
+    }
+
+    #[test]
+    fn github_single_review_has_no_peer_and_stale_publication_is_transactional() {
+        let mut core = github_core(vec![task("one", "/repo", 2)], true);
+        prepare_github(&mut core);
+        let developer = start_first_developer(&mut core, 0, 1, 1, "single-github-dev");
+        let effects = complete_lane_turn(
+            &mut core,
+            developer.task,
+            developer.lane,
+            developer.session,
+            developer.turn,
+            developer.token,
+            ready(),
+        );
+        let candidate = effects
+            .iter()
+            .find_map(|effect| match effect {
+                SupervisorEffect::PublishDeveloperCandidate(request) => Some(request.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let before = core.clone();
+        let error = core
+            .reduce(SupervisorEvent::CandidatePublished {
+                expected_version: core.version(),
+                operation_id: candidate.operation_id.clone(),
+                task_ordinal: 0,
+                generation: 1,
+                previous_head_sha: "f".repeat(40),
+                head_sha: "b".repeat(40),
+                pr_number: 7,
+                pr_node_id: "PR_kwDOhcom".into(),
+                pr_url: "https://github.com/owner/repo/pull/7".into(),
+                pr_actor_bot_user_id: 22,
+                check_run_id: 1001,
+                check_url: "https://github.com/owner/repo/runs/1001".into(),
+                check_actor_app_id: 1,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, SupervisorErrorCode::InvalidIdentity);
+        assert_eq!(core, before);
+        let effects = core
+            .reduce(SupervisorEvent::CandidatePublished {
+                expected_version: core.version(),
+                operation_id: candidate.operation_id,
+                task_ordinal: candidate.task_ordinal,
+                generation: candidate.generation,
+                previous_head_sha: candidate.previous_head_sha,
+                head_sha: "b".repeat(40),
+                pr_number: 7,
+                pr_node_id: "PR_kwDOhcom".into(),
+                pr_url: "https://github.com/owner/repo/pull/7".into(),
+                pr_actor_bot_user_id: 22,
+                check_run_id: 1001,
+                check_url: "https://github.com/owner/repo/runs/1001".into(),
+                check_actor_app_id: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(
+                    effect,
+                    SupervisorEffect::OpenRoleSession {
+                        lane: WorkerLane::Reviewer(_),
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            !core.snapshot().tasks[0]
+                .reviewers
+                .iter()
+                .any(|reviewer| reviewer.reviewer_id == ReviewerId::Reviewer2)
+        );
+    }
+
+    #[test]
     fn provider_transport_types_do_not_leak_into_the_core_source() {
         let source = include_str!("core.rs");
         let implementation = source
@@ -4529,6 +8116,14 @@ mod tests {
                             kind,
                             SupervisorEventKind::PlanBound
                                 | SupervisorEventKind::ExecutionAuthorized
+                                | SupervisorEventKind::RepositoryPrepared
+                                | SupervisorEventKind::CandidatePublished
+                                | SupervisorEventKind::ReviewerReviewPublished
+                                | SupervisorEventKind::ReviewCheckPublished
+                                | SupervisorEventKind::MergeGateObserved
+                                | SupervisorEventKind::PullRequestMerged
+                                | SupervisorEventKind::GitHubRunFinalized
+                                | SupervisorEventKind::GitHubOperationFailed
                         );
                         (core, event, should_accept)
                     }
@@ -4578,11 +8173,11 @@ mod tests {
 
         assert_eq!(rows, 7 * SupervisorEventKind::ALL.len());
         assert_eq!(accepted, 25);
-        assert_eq!(rejected, 73);
+        assert_eq!(rejected, 129);
     }
 
     #[test]
-    fn every_effect_kind_has_a_real_core_production_path() {
+    fn every_local_effect_kind_has_a_real_core_production_path() {
         let mut observed = BTreeSet::new();
         let mut record = |effects: Vec<SupervisorEffect>| {
             observed.extend(effects.iter().map(SupervisorEffect::kind));
@@ -4627,10 +8222,23 @@ mod tests {
             clarification_required(),
         ));
 
+        let github_effects = BTreeSet::from([
+            SupervisorEffectKind::PrepareGitHubRunRepository,
+            SupervisorEffectKind::PublishDeveloperCandidate,
+            SupervisorEffectKind::PublishReviewerReview,
+            SupervisorEffectKind::OpenOrUpdateReviewCheck,
+            SupervisorEffectKind::WaitForMergeGate,
+            SupervisorEffectKind::MergePullRequest,
+            SupervisorEffectKind::FinalizeGitHubRun,
+            SupervisorEffectKind::PublishGitHubTerminal,
+        ]);
         assert_eq!(
             observed,
-            BTreeSet::from(SupervisorEffectKind::ALL),
-            "every effect variant must have an exercised production path"
+            SupervisorEffectKind::ALL
+                .into_iter()
+                .filter(|kind| !github_effects.contains(kind))
+                .collect(),
+            "every local effect variant must have an exercised production path"
         );
     }
 
@@ -4642,7 +8250,9 @@ mod tests {
             TaskState::Pending => "pending",
             TaskState::Developing => "developing",
             TaskState::AwaitingArchitectAction => "awaiting_architect_action",
+            TaskState::PublishingCandidate => "publishing_candidate",
             TaskState::Reviewing => "reviewing",
+            TaskState::PublishingReview => "publishing_review",
             TaskState::Lgtm => "lgtm",
             TaskState::ReviewExhausted => "review_exhausted",
             TaskState::NeedsHuman => "needs_human",

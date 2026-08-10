@@ -1189,7 +1189,7 @@ mod tests {
 
     #[test]
     fn help_text_contains_version() {
-        assert!(get_help_text().starts_with("hcom (hook-comms) v1.0.18 "));
+        assert!(get_help_text().starts_with("hcom (hook-comms) v1.0.19 "));
     }
 
     #[test]

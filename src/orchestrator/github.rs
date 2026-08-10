@@ -15,12 +15,21 @@ pub(crate) mod client;
 pub(crate) mod evidence;
 pub(crate) mod git;
 pub(crate) mod publication;
+pub(crate) mod workflow;
+
+pub(crate) use workflow::ProductionGitHubProvider;
 
 use crate::control_api::{
     DeliveryBinding, GITHUB_REVIEW_CHECK_NAME, GitHubAppBinding, GitHubAppRole,
     GitHubInspectionBinding, GitHubPermissionLevel, GitHubPullRequestBinding,
     GitHubReviewerAppBinding,
 };
+use crate::orchestrator::core::{
+    FinalizeGitHubRunRequest, MergePullRequestRequest, PrepareGitHubRunRequest,
+    PublishDeveloperCandidateRequest, PublishGitHubTerminalRequest, PublishReviewCheckRequest,
+    PublishReviewerReviewRequest, WaitForMergeGateRequest,
+};
+use crate::orchestrator::workspace::TasksWorkspace;
 use crate::worker::profile::ReviewerId;
 use anyhow::{Result, bail};
 use serde::Deserialize;
@@ -143,11 +152,154 @@ pub(crate) trait GitHubInspectionProvider: Send + Sync {
     fn inspect(&self, request: &GitHubInspectionRequest) -> Result<GitHubInspectionResult>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepositoryPreparedObservation {
+    pub(crate) operation_id: String,
+    pub(crate) base_sha: String,
+    pub(crate) branch: String,
+    pub(crate) worktree_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CandidatePublishedObservation {
+    pub(crate) operation_id: String,
+    pub(crate) task_ordinal: usize,
+    pub(crate) generation: u32,
+    pub(crate) previous_head_sha: String,
+    pub(crate) head_sha: String,
+    pub(crate) pr_number: u64,
+    pub(crate) pr_node_id: String,
+    pub(crate) pr_url: String,
+    pub(crate) pr_actor_bot_user_id: u64,
+    pub(crate) check_run_id: u64,
+    pub(crate) check_url: String,
+    pub(crate) check_actor_app_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewerReviewPublishedObservation {
+    pub(crate) operation_id: String,
+    pub(crate) task_ordinal: usize,
+    pub(crate) reviewer_id: ReviewerId,
+    pub(crate) generation: u32,
+    pub(crate) head_sha: String,
+    pub(crate) verdict: crate::control_api::ReviewerVerdict,
+    pub(crate) review_id: u64,
+    pub(crate) review_url: String,
+    pub(crate) actor_bot_user_id: u64,
+    pub(crate) final_artifact_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewCheckPublishedObservation {
+    pub(crate) operation_id: String,
+    pub(crate) task_ordinal: usize,
+    pub(crate) generation: u32,
+    pub(crate) head_sha: String,
+    pub(crate) check_run_id: u64,
+    pub(crate) check_url: String,
+    pub(crate) state: String,
+    pub(crate) actor_app_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MergeGateObservation {
+    pub(crate) operation_id: String,
+    pub(crate) pr_number: u64,
+    pub(crate) final_head_sha: String,
+    pub(crate) base_sha: String,
+    pub(crate) ruleset_attestation_sha256: String,
+    pub(crate) check_run_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PullRequestMergedObservation {
+    pub(crate) operation_id: String,
+    pub(crate) pr_number: u64,
+    pub(crate) final_head_sha: String,
+    pub(crate) merge_sha: String,
+    pub(crate) merge_url: String,
+    pub(crate) actor_bot_user_id: u64,
+    pub(crate) merge_evidence_durable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitHubRunFinalizedObservation {
+    pub(crate) operation_id: String,
+    pub(crate) pr_number: u64,
+    pub(crate) final_head_sha: String,
+    pub(crate) merge_sha: String,
+    pub(crate) finalization: crate::control_api::GitHubFinalizationSnapshot,
+}
+
+/// Executes the ordered Git/GitHub effects emitted by `SupervisorCore`.
+///
+/// Implementations reconcile every ambiguous external result before returning
+/// one normalized observation. Returning `Err` means the intended operation
+/// could not be proved and must fail closed; the task lane never retries a
+/// model turn to repeat publication.
+pub(crate) trait GitHubWorkflowProvider: Send + Sync {
+    /// Drops only run-local in-memory composition state before an explicitly
+    /// requested fresh run. Durable evidence and preserved repository/remote
+    /// artifacts from the terminal run are intentionally left untouched.
+    fn begin_fresh_run(&self, _terminal_run_id: &str, _fresh_run_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn prepare_repository(
+        &self,
+        workspace: &TasksWorkspace,
+        request: &PrepareGitHubRunRequest,
+    ) -> Result<RepositoryPreparedObservation>;
+
+    fn publish_candidate(
+        &self,
+        request: &PublishDeveloperCandidateRequest,
+    ) -> Result<CandidatePublishedObservation>;
+
+    fn take_partial_operation(
+        &self,
+        _operation_id: &str,
+    ) -> Result<Option<crate::orchestrator::core::GitHubPartialOperation>> {
+        Ok(None)
+    }
+
+    fn publish_review(
+        &self,
+        request: &PublishReviewerReviewRequest,
+    ) -> Result<ReviewerReviewPublishedObservation>;
+
+    fn publish_check(
+        &self,
+        request: &PublishReviewCheckRequest,
+    ) -> Result<ReviewCheckPublishedObservation>;
+
+    fn wait_for_merge_gate(
+        &self,
+        request: &WaitForMergeGateRequest,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<MergeGateObservation>;
+
+    fn merge_pull_request(
+        &self,
+        request: &MergePullRequestRequest,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<PullRequestMergedObservation>;
+
+    fn finalize_run(
+        &self,
+        request: &FinalizeGitHubRunRequest,
+    ) -> Result<GitHubRunFinalizedObservation>;
+
+    fn publish_terminal_best_effort(&self, request: &PublishGitHubTerminalRequest) -> Result<()>;
+}
+
 #[derive(Clone)]
 pub(crate) struct GitHubRuntimeBinding {
     pub(crate) binding: GitHubPullRequestBinding,
     pub(crate) initial_inspection: GitHubInspectionBinding,
     pub(crate) inspector: Arc<dyn GitHubInspectionProvider>,
+    pub(crate) workflow: Arc<dyn GitHubWorkflowProvider>,
 }
 
 pub(crate) fn preflight_runtime<P>(
@@ -158,7 +310,7 @@ pub(crate) fn preflight_runtime<P>(
     reviewer_ids: &[ReviewerId],
 ) -> Result<GitHubRuntimeBinding>
 where
-    P: GitHubPreflightProvider + GitHubInspectionProvider + 'static,
+    P: GitHubPreflightProvider + GitHubInspectionProvider + GitHubWorkflowProvider + 'static,
 {
     let observation = provider.preflight(&GitHubPreflightRequest {
         run_id,
@@ -167,11 +319,13 @@ where
         reviewer_ids,
     })?;
     let frozen = freeze_preflight(config, reviewer_ids, observation)?;
-    let inspector: Arc<dyn GitHubInspectionProvider> = provider;
+    let inspector: Arc<dyn GitHubInspectionProvider> = provider.clone();
+    let workflow: Arc<dyn GitHubWorkflowProvider> = provider;
     Ok(GitHubRuntimeBinding {
         binding: frozen.delivery_binding,
         initial_inspection: frozen.inspection,
         inspector,
+        workflow,
     })
 }
 
@@ -796,6 +950,67 @@ mod tests {
                 .unwrap()
                 .push((request.run_id.clone(), request.session_version));
             Ok(self.inspection_result.clone())
+        }
+    }
+
+    impl GitHubWorkflowProvider for MockProvider {
+        fn prepare_repository(
+            &self,
+            _workspace: &TasksWorkspace,
+            _request: &PrepareGitHubRunRequest,
+        ) -> Result<RepositoryPreparedObservation> {
+            bail!("workflow not used by preflight seam test")
+        }
+
+        fn publish_candidate(
+            &self,
+            _request: &PublishDeveloperCandidateRequest,
+        ) -> Result<CandidatePublishedObservation> {
+            bail!("workflow not used by preflight seam test")
+        }
+
+        fn publish_review(
+            &self,
+            _request: &PublishReviewerReviewRequest,
+        ) -> Result<ReviewerReviewPublishedObservation> {
+            bail!("workflow not used by preflight seam test")
+        }
+
+        fn publish_check(
+            &self,
+            _request: &PublishReviewCheckRequest,
+        ) -> Result<ReviewCheckPublishedObservation> {
+            bail!("workflow not used by preflight seam test")
+        }
+
+        fn wait_for_merge_gate(
+            &self,
+            _request: &WaitForMergeGateRequest,
+            _cancelled: &std::sync::atomic::AtomicBool,
+        ) -> Result<MergeGateObservation> {
+            bail!("workflow not used by preflight seam test")
+        }
+
+        fn merge_pull_request(
+            &self,
+            _request: &MergePullRequestRequest,
+            _cancelled: &std::sync::atomic::AtomicBool,
+        ) -> Result<PullRequestMergedObservation> {
+            bail!("workflow not used by preflight seam test")
+        }
+
+        fn finalize_run(
+            &self,
+            _request: &FinalizeGitHubRunRequest,
+        ) -> Result<GitHubRunFinalizedObservation> {
+            bail!("workflow not used by preflight seam test")
+        }
+
+        fn publish_terminal_best_effort(
+            &self,
+            _request: &PublishGitHubTerminalRequest,
+        ) -> Result<()> {
+            Ok(())
         }
     }
 

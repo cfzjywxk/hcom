@@ -33,6 +33,8 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -295,6 +297,34 @@ struct ActiveTurn {
     completion_token: String,
 }
 
+enum PendingGitHubResult {
+    MergeGate(Result<crate::orchestrator::github::MergeGateObservation>),
+    Merge(Result<crate::orchestrator::github::PullRequestMergedObservation>),
+}
+
+#[derive(Clone, Copy)]
+enum PendingGitHubKind {
+    MergeGate,
+    Merge,
+}
+
+impl PendingGitHubKind {
+    fn failure(self, error: anyhow::Error) -> PendingGitHubResult {
+        match self {
+            Self::MergeGate => PendingGitHubResult::MergeGate(Err(error)),
+            Self::Merge => PendingGitHubResult::Merge(Err(error)),
+        }
+    }
+}
+
+struct PendingGitHubEffect {
+    operation_id: String,
+    kind: PendingGitHubKind,
+    cancelled: Arc<AtomicBool>,
+    receiver: mpsc::Receiver<PendingGitHubResult>,
+    join: std::thread::JoinHandle<()>,
+}
+
 pub(crate) struct TaskLaneSupervisor {
     startup: SessionStartup,
     epoch: String,
@@ -314,6 +344,7 @@ pub(crate) struct TaskLaneSupervisor {
     cleanup_registry: GuardianCleanupRegistry,
     latest_github_inspection: Option<GitHubInspectionBinding>,
     seen_github_inspection_ids: BTreeSet<String>,
+    pending_github_effect: Option<PendingGitHubEffect>,
 }
 
 impl TaskLaneSupervisor {
@@ -418,6 +449,7 @@ impl TaskLaneSupervisor {
             cleanup_registry: GuardianCleanupRegistry::default(),
             latest_github_inspection,
             seen_github_inspection_ids,
+            pending_github_effect: None,
         })
     }
 
@@ -452,6 +484,9 @@ impl TaskLaneSupervisor {
         if self.task_runtime.is_some() || !self.active.is_empty() {
             bail!("terminal run retained a live task runtime");
         }
+        if self.pending_github_effect.is_some() {
+            bail!("terminal run retained an in-flight GitHub merge operation");
+        }
         self.cleanup_registry.ensure_available()?;
         crate::worker::validation::validate_opaque_id("run id", &run_id)?;
 
@@ -459,6 +494,12 @@ impl TaskLaneSupervisor {
             .core
             .next_run(run_id.clone())
             .map_err(|error| anyhow!(error.to_string()))?;
+        if let Some(runtime) = self.sources.github_runtime.as_ref() {
+            runtime
+                .workflow
+                .begin_fresh_run(terminal_run_id, &run_id)
+                .context("failed to reset GitHub workflow for the fresh run")?;
+        }
         self.startup.run_id = run_id;
         self.epoch = format!("exec-supervisor-{}", Uuid::new_v4());
         self.core = next_core;
@@ -840,7 +881,7 @@ impl TaskLaneSupervisor {
                 ));
             }
             plan.push_str(
-                "- topology: one Pull Request per approved run; all tasks append commits to the one generated branch; final delivery uses one exact-head squash merge\n- publication: Developer finals become candidate/PR audit entries; active Reviewer finals become exact-generation native reviews; Architect owns hcom/review and final merge\n- hooks: native Developer commit hooks remain enabled; supervisor-authenticated fetch/push disables repository hooks\n- gates: every task must be LGTM for merge; review_exhausted completes unmerged; base/ruleset/permission/identity drift fails closed\n- cleanup: successful merge removes required generated local artifacts; unsuccessful or needs-human outcomes preserve the PR/branch/worktree with evidence\n\n",
+                "- topology: one Pull Request per approved run; all tasks append commits to the one generated branch; final delivery uses one exact-head squash merge\n- publication: exact opaque Developer and Reviewer finals are published unredacted to the selected private repository; Architect owns hcom/review and final merge\n- credential boundary: keys and operation tokens remain supervisor-owned and never enter worker environments or prompts; mode-0600 files are not an adversarial boundary against another process running as the same user\n- hooks: native Developer commit hooks remain enabled; supervisor-authenticated fetch/push disables repository hooks\n- gates: every task must be LGTM for merge; review_exhausted completes unmerged; base/ruleset/permission/identity drift fails closed\n- cleanup: successful merge removes required generated local artifacts; unsuccessful or needs-human outcomes preserve the PR/branch/worktree with evidence\n\n",
             );
         }
         for (ordinal, task) in self.core.tasks().iter().enumerate() {
@@ -875,6 +916,13 @@ impl TaskLaneSupervisor {
     }
 
     pub(crate) fn cancel(&mut self, expected_session_version: u64, reason: &str) -> Result<()> {
+        if expected_session_version != self.core.version() {
+            bail!("session version is stale");
+        }
+        self.reconcile_pending_before_terminal()?;
+        if self.core.session_state().is_terminal() {
+            return Ok(());
+        }
         let effects = self
             .core
             .reduce(SupervisorEvent::CancelRequested {
@@ -1014,6 +1062,7 @@ impl TaskLaneSupervisor {
     }
 
     fn poll_once_inner(&mut self) -> Result<()> {
+        self.service_pending_github_effect()?;
         if self.core.session_state() != SessionState::Running || self.active.is_empty() {
             return Ok(());
         }
@@ -1094,6 +1143,7 @@ impl TaskLaneSupervisor {
     }
 
     pub(crate) fn shutdown(&mut self) -> Result<()> {
+        self.reconcile_pending_before_terminal()?;
         if !self.core.session_state().is_terminal() {
             let effects = self
                 .core
@@ -1120,6 +1170,133 @@ impl TaskLaneSupervisor {
         while let Some(effect) = effects.pop_front() {
             let follow_up = match effect {
                 SupervisorEffect::PublishStatus | SupervisorEffect::FinishSession { .. } => {
+                    continue;
+                }
+                SupervisorEffect::PrepareGitHubRunRepository(request) => {
+                    let workflow = self.github_workflow()?.clone();
+                    let workspace = self.tasks_workspace.as_ref().ok_or_else(|| {
+                        anyhow!("hcom-tasks workspace is not open for GitHub preparation")
+                    })?;
+                    let observed = match workflow.prepare_repository(workspace, &request) {
+                        Ok(observed) => observed,
+                        Err(error) => {
+                            return self.fail_github_effect(&request.operation_id, error);
+                        }
+                    };
+                    SupervisorEvent::RepositoryPrepared {
+                        expected_version: self.core.version(),
+                        operation_id: observed.operation_id,
+                        base_sha: observed.base_sha,
+                        branch: observed.branch,
+                        worktree_path: observed.worktree_path,
+                    }
+                }
+                SupervisorEffect::PublishDeveloperCandidate(request) => {
+                    let workflow = self.github_workflow()?.clone();
+                    let observed = match workflow.publish_candidate(&request) {
+                        Ok(observed) => observed,
+                        Err(error) => {
+                            return self.fail_github_effect(&request.operation_id, error);
+                        }
+                    };
+                    SupervisorEvent::CandidatePublished {
+                        expected_version: self.core.version(),
+                        operation_id: observed.operation_id,
+                        task_ordinal: observed.task_ordinal,
+                        generation: observed.generation,
+                        previous_head_sha: observed.previous_head_sha,
+                        head_sha: observed.head_sha,
+                        pr_number: observed.pr_number,
+                        pr_node_id: observed.pr_node_id,
+                        pr_url: observed.pr_url,
+                        pr_actor_bot_user_id: observed.pr_actor_bot_user_id,
+                        check_run_id: observed.check_run_id,
+                        check_url: observed.check_url,
+                        check_actor_app_id: observed.check_actor_app_id,
+                    }
+                }
+                SupervisorEffect::PublishReviewerReview(request) => {
+                    let workflow = self.github_workflow()?.clone();
+                    let observed = match workflow.publish_review(&request) {
+                        Ok(observed) => observed,
+                        Err(error) => {
+                            return self.fail_github_effect(&request.operation_id, error);
+                        }
+                    };
+                    SupervisorEvent::ReviewerReviewPublished {
+                        expected_version: self.core.version(),
+                        operation_id: observed.operation_id,
+                        task_ordinal: observed.task_ordinal,
+                        reviewer_id: observed.reviewer_id,
+                        generation: observed.generation,
+                        head_sha: observed.head_sha,
+                        verdict: observed.verdict,
+                        review_id: observed.review_id,
+                        review_url: observed.review_url,
+                        actor_bot_user_id: observed.actor_bot_user_id,
+                        final_artifact_sha256: observed.final_artifact_sha256,
+                    }
+                }
+                SupervisorEffect::OpenOrUpdateReviewCheck(request) => {
+                    let workflow = self.github_workflow()?.clone();
+                    let observed = match workflow.publish_check(&request) {
+                        Ok(observed) => observed,
+                        Err(error) => {
+                            return self.fail_github_effect(&request.operation_id, error);
+                        }
+                    };
+                    SupervisorEvent::ReviewCheckPublished {
+                        expected_version: self.core.version(),
+                        operation_id: observed.operation_id,
+                        task_ordinal: observed.task_ordinal,
+                        generation: observed.generation,
+                        head_sha: observed.head_sha,
+                        check_run_id: observed.check_run_id,
+                        check_url: observed.check_url,
+                        state: observed.state,
+                        actor_app_id: observed.actor_app_id,
+                    }
+                }
+                SupervisorEffect::WaitForMergeGate(request) => {
+                    self.start_merge_gate_wait(request)?;
+                    continue;
+                }
+                SupervisorEffect::MergePullRequest(request) => {
+                    self.start_merge(request)?;
+                    continue;
+                }
+                SupervisorEffect::FinalizeGitHubRun(request) => {
+                    if self.task_runtime.is_some() || !self.active.is_empty() {
+                        return self.fail_github_effect(
+                            &request.operation_id,
+                            anyhow!("GitHub finalization retained a live task worker runtime"),
+                        );
+                    }
+                    let workflow = self.github_workflow()?.clone();
+                    let observed = match workflow.finalize_run(&request) {
+                        Ok(observed) => observed,
+                        Err(error) => {
+                            return self.fail_github_effect(&request.operation_id, error);
+                        }
+                    };
+                    SupervisorEvent::GitHubRunFinalized {
+                        expected_version: self.core.version(),
+                        operation_id: observed.operation_id,
+                        pr_number: observed.pr_number,
+                        final_head_sha: observed.final_head_sha,
+                        merge_sha: observed.merge_sha,
+                        finalization: observed.finalization,
+                    }
+                }
+                SupervisorEffect::PublishGitHubTerminal(request) => {
+                    if let Ok(workflow) = self.github_workflow()
+                        && let Err(error) = workflow.publish_terminal_best_effort(&request)
+                    {
+                        self.note(&format!(
+                            "GitHub terminal publication was not confirmed: {}",
+                            bounded_single_line(&error.to_string())
+                        ));
+                    }
                     continue;
                 }
                 SupervisorEffect::OpenTaskRuntime { task_ordinal } => {
@@ -1260,6 +1437,160 @@ impl TaskLaneSupervisor {
         Ok(())
     }
 
+    fn start_merge_gate_wait(
+        &mut self,
+        request: crate::orchestrator::core::WaitForMergeGateRequest,
+    ) -> Result<()> {
+        if self.pending_github_effect.is_some() {
+            bail!("another GitHub merge operation is already in flight");
+        }
+        let operation_id = request.operation_id.clone();
+        let workflow = self.github_workflow()?.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let thread_cancelled = Arc::clone(&cancelled);
+        let (sender, receiver) = mpsc::channel();
+        let join = std::thread::Builder::new()
+            .name("hcom-github-merge-gate".into())
+            .spawn(move || {
+                let result = workflow.wait_for_merge_gate(&request, &thread_cancelled);
+                let _ = sender.send(PendingGitHubResult::MergeGate(result));
+            })
+            .context("failed to start GitHub merge-gate worker")?;
+        self.pending_github_effect = Some(PendingGitHubEffect {
+            operation_id,
+            kind: PendingGitHubKind::MergeGate,
+            cancelled,
+            receiver,
+            join,
+        });
+        Ok(())
+    }
+
+    fn start_merge(
+        &mut self,
+        request: crate::orchestrator::core::MergePullRequestRequest,
+    ) -> Result<()> {
+        if self.pending_github_effect.is_some() {
+            bail!("another GitHub merge operation is already in flight");
+        }
+        let operation_id = request.operation_id.clone();
+        let workflow = self.github_workflow()?.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let thread_cancelled = Arc::clone(&cancelled);
+        let (sender, receiver) = mpsc::channel();
+        let join = std::thread::Builder::new()
+            .name("hcom-github-merge".into())
+            .spawn(move || {
+                let result = workflow.merge_pull_request(&request, &thread_cancelled);
+                let _ = sender.send(PendingGitHubResult::Merge(result));
+            })
+            .context("failed to start GitHub merge worker")?;
+        self.pending_github_effect = Some(PendingGitHubEffect {
+            operation_id,
+            kind: PendingGitHubKind::Merge,
+            cancelled,
+            receiver,
+            join,
+        });
+        Ok(())
+    }
+
+    fn finish_pending_github_effect(
+        pending: PendingGitHubEffect,
+        mut result: PendingGitHubResult,
+    ) -> (String, PendingGitHubResult) {
+        if pending.join.join().is_err() {
+            result = pending.kind.failure(anyhow!(
+                "GitHub merge worker panicked before clean termination"
+            ));
+        }
+        (pending.operation_id, result)
+    }
+
+    fn cancel_and_join_pending_github_effect(&mut self) -> Option<(String, PendingGitHubResult)> {
+        let pending = self.pending_github_effect.take()?;
+        pending.cancelled.store(true, Ordering::Release);
+        let result = pending.receiver.recv().unwrap_or_else(|_| {
+            pending.kind.failure(anyhow!(
+                "GitHub merge worker exited without returning an observation"
+            ))
+        });
+        Some(Self::finish_pending_github_effect(pending, result))
+    }
+
+    fn reconcile_pending_before_terminal(&mut self) -> Result<()> {
+        let Some((operation_id, result)) = self.cancel_and_join_pending_github_effect() else {
+            return Ok(());
+        };
+        match result {
+            PendingGitHubResult::MergeGate(Ok(_)) => Ok(()),
+            PendingGitHubResult::MergeGate(Err(error)) | PendingGitHubResult::Merge(Err(error))
+                if error.chain().any(|cause| {
+                    cause.is::<crate::orchestrator::github::workflow::GitHubWorkflowCancelled>()
+                }) =>
+            {
+                Ok(())
+            }
+            result => self.apply_pending_github_result(&operation_id, result),
+        }
+    }
+
+    fn service_pending_github_effect(&mut self) -> Result<()> {
+        let Some(pending) = self.pending_github_effect.as_ref() else {
+            return Ok(());
+        };
+        let result = match pending.receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return Ok(()),
+            Err(mpsc::TryRecvError::Disconnected) => pending.kind.failure(anyhow!(
+                "GitHub merge worker exited without returning an observation"
+            )),
+        };
+        let pending = self
+            .pending_github_effect
+            .take()
+            .expect("the pending GitHub effect was just observed");
+        let (operation_id, result) = Self::finish_pending_github_effect(pending, result);
+        self.apply_pending_github_result(&operation_id, result)
+    }
+
+    fn apply_pending_github_result(
+        &mut self,
+        operation_id: &str,
+        result: PendingGitHubResult,
+    ) -> Result<()> {
+        let follow_up = match result {
+            PendingGitHubResult::MergeGate(Ok(observed)) => SupervisorEvent::MergeGateObserved {
+                expected_version: self.core.version(),
+                operation_id: observed.operation_id,
+                pr_number: observed.pr_number,
+                final_head_sha: observed.final_head_sha,
+                base_sha: observed.base_sha,
+                ruleset_attestation_sha256: observed.ruleset_attestation_sha256,
+                check_run_id: observed.check_run_id,
+            },
+            PendingGitHubResult::Merge(Ok(observed)) => SupervisorEvent::PullRequestMerged {
+                expected_version: self.core.version(),
+                operation_id: observed.operation_id,
+                pr_number: observed.pr_number,
+                final_head_sha: observed.final_head_sha,
+                merge_sha: observed.merge_sha,
+                merge_url: observed.merge_url,
+                actor_bot_user_id: observed.actor_bot_user_id,
+                merge_evidence_durable: observed.merge_evidence_durable,
+            },
+            PendingGitHubResult::MergeGate(Err(error)) | PendingGitHubResult::Merge(Err(error)) => {
+                return self.fail_github_effect(operation_id, error);
+            }
+        };
+        let mut next_core = self.core.clone();
+        let effects = next_core
+            .reduce(follow_up)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        self.core = next_core;
+        self.execute_effects(effects)
+    }
+
     fn fail_driver_effect(
         &mut self,
         task_ordinal: usize,
@@ -1287,6 +1618,67 @@ impl TaskLaneSupervisor {
         Err(error)
     }
 
+    fn fail_github_effect(&mut self, operation_id: &str, error: anyhow::Error) -> Result<()> {
+        let partial = self
+            .github_workflow()
+            .ok()
+            .and_then(|workflow| workflow.take_partial_operation(operation_id).ok())
+            .flatten();
+        self.fail_github_effect_with_partial(operation_id, error, partial)
+    }
+
+    fn fail_github_effect_with_partial(
+        &mut self,
+        operation_id: &str,
+        error: anyhow::Error,
+        partial_operation: Option<crate::orchestrator::core::GitHubPartialOperation>,
+    ) -> Result<()> {
+        let detail = bounded_single_line(&error.to_string());
+        self.note(&format!(
+            "GitHub operation {operation_id} could not be reconciled: {detail}"
+        ));
+        let effects = self
+            .core
+            .reduce(SupervisorEvent::GitHubOperationFailed {
+                expected_version: self.core.version(),
+                operation_id: operation_id.into(),
+                detail,
+                partial_operation,
+            })
+            .map_err(|core_error| anyhow!(core_error.to_string()))?;
+        self.execute_effects(effects)?;
+        Err(error)
+    }
+
+    fn github_workflow(
+        &self,
+    ) -> Result<&std::sync::Arc<dyn crate::orchestrator::github::GitHubWorkflowProvider>> {
+        self.sources
+            .github_runtime
+            .as_ref()
+            .map(|runtime| &runtime.workflow)
+            .ok_or_else(|| anyhow!("GitHub workflow driver is unavailable in local mode"))
+    }
+
+    fn effective_task_repository(&self, task_ordinal: usize) -> Result<PathBuf> {
+        let task = self
+            .core
+            .tasks()
+            .get(task_ordinal)
+            .ok_or_else(|| anyhow!("task repository ordinal is out of range"))?;
+        if self.sources.delivery_binding.is_github() {
+            let worktree = self
+                .core
+                .snapshot()
+                .github
+                .and_then(|github| github.worktree_path)
+                .ok_or_else(|| anyhow!("GitHub managed worktree is not prepared"))?;
+            Ok(PathBuf::from(worktree))
+        } else {
+            Ok(PathBuf::from(&task.spec.repository_root))
+        }
+    }
+
     fn open_task_runtime(&mut self, task_ordinal: usize) -> Result<(), RuntimeOpenFailure> {
         self.prepare_and_open_task_runtime(task_ordinal)
     }
@@ -1310,7 +1702,9 @@ impl TaskLaneSupervisor {
                 anyhow!("exec worker runtime task ordinal is out of range"),
             )
         })?;
-        let repository_root = PathBuf::from(&task.spec.repository_root);
+        let repository_root = self
+            .effective_task_repository(task_ordinal)
+            .map_err(|error| RuntimeOpenFailure::new(DriverFailureClass::Repository, error))?;
         let (root, paths) = TaskRuntimePaths::create(
             &self.run_root,
             task_ordinal,
@@ -1377,11 +1771,11 @@ impl TaskLaneSupervisor {
             .get(task_ordinal)
             .ok_or_else(|| anyhow!("role session task ordinal is out of range"))?;
         let task_key = task.spec.task_key.clone();
-        let repository_root = PathBuf::from(&task.spec.repository_root);
+        let repository_root = self.effective_task_repository(task_ordinal)?;
         let project_root = self.startup.project_root.clone();
         let role = lane.role();
         let profile = self.profile(lane).clone();
-        let instructions = role_instructions(role).to_owned();
+        let instructions = self.role_instructions_for_session(role)?;
         let local = self
             .require_task_runtime_mut(task_ordinal)?
             .runtime
@@ -1431,7 +1825,7 @@ impl TaskLaneSupervisor {
             .get(task_ordinal)
             .ok_or_else(|| anyhow!("turn task ordinal is out of range"))?;
         let task_key = task.spec.task_key.clone();
-        let repository_root = PathBuf::from(&task.spec.repository_root);
+        let repository_root = self.effective_task_repository(task_ordinal)?;
         let role = lane.role();
         let prompt = self.build_turn_prompt(task_ordinal, lane, purpose)?;
         let profile = self.profile(lane).clone();
@@ -1568,9 +1962,11 @@ impl TaskLaneSupervisor {
             WorkerRole::Developer => "Developer",
             WorkerRole::Reviewer => lane.as_str(),
         };
+        let repository_root = self.effective_task_repository(task_ordinal)?;
         prompt.push_str(&format!(
             "You are the task {role_name}.\n\nRepository:\n{}\n\nTask file:\n{}\n\nDesign files:\n",
-            spec.repository_root, spec.task_document_path,
+            repository_root.display(),
+            spec.task_document_path,
         ));
         if spec.design_document_paths.is_empty() {
             prompt.push_str("- (none)\n");
@@ -1611,6 +2007,30 @@ impl TaskLaneSupervisor {
 
         match role {
             WorkerRole::Developer => {
+                if let Some(binding) = self.sources.delivery_binding.github() {
+                    let identity = binding.developer_commit_identity();
+                    let snapshot = self.core.snapshot();
+                    let task_status = snapshot
+                        .tasks
+                        .get(task_ordinal)
+                        .ok_or_else(|| anyhow!("GitHub prompt task status is unavailable"))?;
+                    prompt.push_str(&format!(
+                        "\nGitHub Pull Request commit contract:\n- run branch: {}\n- task base: {}\n- previously published head: {}\n- Developer App: {} (app {}, bot user {})\n- exact commit author, committer, and Signed-off-by identity: {} <{}>\n\
+                         Create exactly one new signed-off child commit in this turn. Never amend, rebase, squash, force-push, or rewrite an existing commit. Leave the index and worktree clean. Do not push: the foreground supervisor validates and publishes the commit after your final. Keep the final small enough for hcom's bounded GitHub wrapper.\n",
+                        task_status.branch.as_deref().unwrap_or("not-yet-published"),
+                        task_status.base_revision.as_deref().unwrap_or("run-base-pending"),
+                        snapshot
+                            .github
+                            .as_ref()
+                            .and_then(|github| github.published_head_sha.as_deref())
+                            .unwrap_or("run-base-pending"),
+                        binding.developer_app.slug,
+                        binding.developer_app.app_id,
+                        binding.developer_app.bot_user_id,
+                        identity.name,
+                        identity.email,
+                    ));
+                }
                 match purpose {
                     RuntimeTurnPurpose::DeveloperCorrection => {
                         if task.latest_reviewer_final_paths().is_empty() {
@@ -1638,19 +2058,29 @@ impl TaskLaneSupervisor {
                         prompt.push_str(
                             "\nRead and synthesize every active Reviewer response. Resolve conflicting \
                              suggestions against the approved task and disclose the choice in your \
-                             final. Address valid requested changes from either response. \
-                             If an explicit human, task, design, or applicable instruction still \
-                             requires this run to remain uncommitted, do not modify or amend \
-                             anything: return `STATUS: CLARIFICATION_REQUIRED` for a human \
-                             authority decision. Otherwise, if your task commit exists, fold the \
-                             fix into that SAME commit with \
-                             `git commit --amend`, updating its message so it still describes the \
-                             whole task and ensuring it retains a valid `Signed-off-by` trailer for \
-                             the committing identity. If the Reviewer reported that your task \
-                             commit is missing, create it with that sign-off only after the complete \
-                             fix. This task must end as exactly one commit. Do not amend anything \
-                             older than your own commit. Then report as before.\n",
+                             final. Address valid requested changes from either response.",
                         );
+                        if self.sources.delivery_binding.is_github() {
+                            prompt.push_str(
+                                " The approved GitHub lane requires this correction to be exactly \
+                                 one new signed-off child commit on the published head. Do not \
+                                 amend any existing commit or push. Then report as before.\n",
+                            );
+                        } else {
+                            prompt.push_str(
+                                " If an explicit human, task, design, or applicable instruction \
+                                 still requires this run to remain uncommitted, do not modify or \
+                                 amend anything: return `STATUS: CLARIFICATION_REQUIRED` for a \
+                                 human authority decision. Otherwise, if your task commit exists, \
+                                 fold the fix into that SAME commit with `git commit --amend`, \
+                                 updating its message so it still describes the whole task and \
+                                 ensuring it retains a valid `Signed-off-by` trailer for the \
+                                 committing identity. If the Reviewer reported that your task \
+                                 commit is missing, create it with that sign-off only after the \
+                                 complete fix. This task must end as exactly one commit. Do not \
+                                 amend anything older than your own commit. Then report as before.\n",
+                            );
+                        }
                     }
                     RuntimeTurnPurpose::DeveloperClarificationResume => {
                         let latest = task.clarification_records().last().ok_or_else(|| {
@@ -1681,7 +2111,11 @@ impl TaskLaneSupervisor {
                     RuntimeTurnPurpose::InitialDevelopment => {}
                     _ => bail!("unsupported Developer turn purpose"),
                 }
-                prompt.push_str(DEVELOPER_OUTPUT_CONTRACT);
+                prompt.push_str(if self.sources.delivery_binding.is_github() {
+                    GITHUB_DEVELOPER_OUTPUT_CONTRACT
+                } else {
+                    DEVELOPER_OUTPUT_CONTRACT
+                });
             }
             WorkerRole::Reviewer => {
                 let reviewer_id = lane
@@ -1699,8 +2133,10 @@ impl TaskLaneSupervisor {
                     "\nReviewer identity: {}\nReview generation: {}\n\n{label}:\n{developer_path}\n\nRead the Developer final file and \
                      independently review the selected task. Check every `ASSUMPTION:` the \
                      Developer reported against the approved task, design, and clarification \
-                     records. Confirm the task is represented by one task commit and that no \
-                     hcom-tasks artifact was included in it. If the implementation follows an \
+                     records. Reviewer1 and Reviewer2 are equal peers with the same complete \
+                     review scope and authority; neither lane owns a category or may rely on \
+                     peer coverage. Confirm the committed candidate follows the applicable \
+                     delivery contract and that no hcom-tasks artifact was included in it. If the implementation follows an \
                      applicable clarification, do not report a defect merely because the original \
                      task or design wording was ambiguous. If a finding comes from unresolved \
                      task/design ambiguity rather than an implementation defect, label that \
@@ -1708,13 +2144,53 @@ impl TaskLaneSupervisor {
                     reviewer_id.as_str(),
                     task.review_generation,
                 ));
-                if purpose == RuntimeTurnPurpose::ReviewerRereview {
-                    prompt.push_str(
-                        "\nThe candidate was amended because of the previous review generation \
-                         for this task. Independently and completely review the current exact \
-                         candidate range again. Do not assume any finding was covered by the peer \
-                         Reviewer, and do not depend on or guess the peer response.\n",
-                    );
+                if let Some(binding) = self.sources.delivery_binding.github() {
+                    let snapshot = self.core.snapshot();
+                    let task_status = snapshot
+                        .tasks
+                        .get(task_ordinal)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("GitHub review range is unavailable"))?;
+                    let review_head = task_status
+                        .head_revision
+                        .clone()
+                        .or_else(|| {
+                            snapshot
+                                .github
+                                .as_ref()
+                                .and_then(|github| github.published_head_sha.clone())
+                        })
+                        .ok_or_else(|| anyhow!("GitHub review head is unavailable"))?;
+                    let reviewer = binding
+                        .reviewer_apps
+                        .iter()
+                        .find(|reviewer| reviewer.reviewer_id == reviewer_id)
+                        .ok_or_else(|| anyhow!("GitHub Reviewer App binding is unavailable"))?;
+                    prompt.push_str(&format!(
+                        "\nGitHub Pull Request review contract:\n- exact range: {}..{}\n- run branch: {}\n- Reviewer App: {} (app {}, bot user {})\n\
+                         Review this complete exact range in the managed worktree. It may contain one initial task commit plus append-only correction commits; confirm every commit is a direct child in the published chain, has the frozen Developer identity/sign-off, and no published commit was rewritten. Do not push or publish a GitHub review: the foreground supervisor publishes your exact final under the mapped Reviewer App only after proving the repository still matches this head. Keep the final small enough for hcom's bounded GitHub wrapper.\n",
+                        task_status
+                            .base_revision
+                            .as_deref()
+                            .ok_or_else(|| anyhow!("GitHub review base is unavailable"))?,
+                        review_head,
+                        task_status
+                            .branch
+                            .as_deref()
+                            .ok_or_else(|| anyhow!("GitHub run branch is unavailable"))?,
+                        reviewer.app.slug,
+                        reviewer.app.app_id,
+                        reviewer.app.bot_user_id,
+                    ));
+                }
+                match purpose {
+                    RuntimeTurnPurpose::InitialReview => {
+                        prompt.push_str(INITIAL_REVIEW_INSTRUCTIONS);
+                    }
+                    RuntimeTurnPurpose::ReviewerRereview => {
+                        prompt.push_str(REREVIEW_INSTRUCTIONS);
+                    }
+                    _ => bail!("unsupported Reviewer turn purpose"),
                 }
                 prompt.push_str(REVIEWER_OUTPUT_CONTRACT);
             }
@@ -1724,6 +2200,23 @@ impl TaskLaneSupervisor {
             bail!("rendered task turn prompt exceeds its 256 KiB bound");
         }
         Ok(prompt)
+    }
+
+    fn role_instructions_for_session(&self, role: WorkerRole) -> Result<String> {
+        let Some(binding) = self.sources.delivery_binding.github() else {
+            return Ok(role_instructions(role).into());
+        };
+        let instructions = match role {
+            WorkerRole::Developer => {
+                let identity = binding.developer_commit_identity();
+                format!(
+                    "{GITHUB_DEVELOPER_ROLE_INSTRUCTIONS} The exact frozen Developer commit identity is {} <{}>.",
+                    identity.name, identity.email
+                )
+            }
+            WorkerRole::Reviewer => GITHUB_REVIEWER_ROLE_INSTRUCTIONS.into(),
+        };
+        Ok(instructions)
     }
 
     fn profile(&self, lane: WorkerLane) -> &RuntimeProfile {
@@ -1809,6 +2302,38 @@ fn materialized_environment(
         .collect()
 }
 
+/// Initial review deliberately front-loads complete coverage so one generation
+/// returns as many independently confirmed blockers as practical. Both Reviewer
+/// lanes receive this exact contract; neither lane owns a narrower category.
+const INITIAL_REVIEW_INSTRUCTIONS: &str = "
+This is the initial review generation for this task. Before deciding the verdict,
+derive a task-specific coverage checklist from the approved task, design,
+clarifications, implementation, and exact candidate range. Cover its invariants,
+affected callers and consumers, and relevant success, failure, retry, cleanup,
+and terminal paths. Complete that checklist across the exact candidate range.
+Do not stop after finding the first blocker: continue through the remaining
+coverage, then perform a second counterexample sweep. Return every independently
+confirmed Major or Critical finding that you can substantiate in this turn. Do
+not add speculative findings or treat missing test coverage alone as a blocker.
+";
+
+/// A re-review reuses still-valid independent coverage from the exact resumed
+/// Reviewer session and expands when the append/amendment has broad impact.
+const REREVIEW_INSTRUCTIONS: &str = "
+The candidate changed because of the previous review generation for this task.
+First verify every finding you raised in the previous generation. Then
+independently audit the change and its transitive impact on invariants, callers
+and consumers, and success, failure, retry, cleanup, and terminal paths. Reuse
+your prior validated coverage only where the change cannot invalidate it, and
+re-review every invalidated area. Perform a complete exact-range review when the
+change affects a core invariant, state machine, or externally visible contract;
+adds a caller or concurrency, retry, cleanup, or terminal path; crosses subsystem
+boundaries; or has an impact you cannot bound reliably. Otherwise, do not repeat
+unchanged low-risk coverage merely for ceremony. Your verdict still applies to
+the current exact candidate range. Do not assume any finding was covered by the
+peer Reviewer, and do not depend on or guess the peer response.
+";
+
 /// The reviewer's only output obligation. Deliberately narrow: hcom parses one
 /// anchored line and treats everything else as opaque payload.
 const REVIEWER_OUTPUT_CONTRACT: &str = "
@@ -1820,12 +2345,17 @@ VERDICT: LGTM
 VERDICT: REQUEST_CHANGES
 
 on its own line, with no decoration and no other text on that line. After it,
-write your findings as free-form markdown (path:line references are helpful but
-not required). Judge how deeply to verify. You have the same native host view as
-a human-launched Codex session, but the reviewer role forbids modifying the
-reviewed source, Git state, installed artifacts, or branches. You may copy the
-tree elsewhere and build or test that copy when it helps obtain independent
-evidence.
+write one consolidated set of all independently confirmed findings from this
+turn as concise free-form markdown (path:line references are helpful but not
+required). State the exact candidate range or commit you reviewed, and end with
+a brief `COVERAGE:` summary of the invariants, callers/consumers, and failure or
+lifecycle paths you inspected. On a re-review, also state whether the change
+triggered a complete exact-range review and why. Do not emit the internal
+checklist or a long review narrative. If no blocking finding remains, say so
+directly. You have the same native host view as a human-launched Codex session,
+but the reviewer role forbids modifying the reviewed source, Git state,
+installed artifacts, or branches. You may copy the tree elsewhere and build or
+test that copy when it helps obtain independent evidence.
 ";
 
 /// The Developer's control output obligation, appended to every turn because
@@ -1868,13 +2398,47 @@ blocker.
 hcom does not parse them.
 ";
 
+const GITHUB_DEVELOPER_OUTPUT_CONTRACT: &str = "
+## Required output format
+
+The FIRST line of your final message MUST be exactly one of:
+
+STATUS: READY
+STATUS: CLARIFICATION_REQUIRED
+STATUS: BLOCKED
+
+on its own line, with no decoration and no other text on that line.
+
+Use READY only when this turn's complete change is committed as exactly one new
+signed-off child of the previously published head, all required checks passed,
+the index/worktree are clean, and the foreground supervisor can validate and
+publish it. Report changes, verification, exact commit/head state, remaining
+work, and each defensible local assumption on its own `ASSUMPTION:` line.
+
+Use CLARIFICATION_REQUIRED only when no defensible implementation choice can be
+derived or an explicit instruction requires this turn to remain uncommitted,
+which conflicts with the approved append-only GitHub lane. For that authority
+conflict do not modify or commit the repository; require an explicit human
+resolution. Use BLOCKED only after concrete attempts establish an external or
+mechanical obstacle. Compilation or test failure and work taking longer than
+expected are not by themselves blockers. Do not push; publication belongs to
+the foreground supervisor.
+
+`ASSUMPTION:` and `REQUIREMENT_AMBIGUITY:` are agent-readable conventions;
+hcom does not parse them.
+";
+
+const GITHUB_DEVELOPER_ROLE_INSTRUCTIONS: &str = "You are the task Developer for an approved hcom GitHub Pull Request lane. Execute only the concrete selected task. Every Developer turn creates exactly one new signed-off child commit on the supervisor-published head; corrections append and never amend, rebase, squash, force-push, or rewrite published history. Use the frozen Developer App bot identity for author, committer, and Signed-off-by. Preserve the generated branch and managed worktree, leave the index/worktree clean, and never commit hcom-tasks artifacts unless the approved task explicitly names such a repository file. Do not push or invoke GitHub: the foreground supervisor alone validates and publishes the exact child commit and your exact final. Do not install, release, deploy, edit task/design/clarification sources outside approved scope, or wait for interactive input. Make ordinary local implementation choices yourself and report defensible uncertainty as ASSUMPTION:. Ask for clarification only when no approved candidate exists or the choice decides material externally visible scope. Report BLOCKED only after actual attempts prove an external or mechanical obstacle. An explicit instruction to remain uncommitted conflicts with this approved lane and requires STATUS: CLARIFICATION_REQUIRED without repository mutation.";
+
+const GITHUB_REVIEWER_ROLE_INSTRUCTIONS: &str = "You are the task Reviewer for an approved hcom GitHub Pull Request lane. Independently review the exact task base..published head range against the approved task, design, ordered clarifications, applicable instructions, implementation, and tests. Reviewer1 and Reviewer2 are equal peers with the same complete review scope and authority: there is no specialization or division of responsibility, and neither may assume the other covers a category. The range may contain an initial task commit plus append-only correction commits; verify the contiguous published chain, frozen Developer identity and matching sign-offs, clean repository, and exclusion of hcom-tasks artifacts. An LGTM applies only to the exact current range and head. Do not edit source, index, refs, commits, branch, or HEAD; do not push, publish a GitHub review, install, or release. The foreground supervisor proves the unchanged head and publishes your exact final through your mapped Reviewer App. Use REQUIREMENT_AMBIGUITY: for unresolved requirement conflicts and return the normal verdict. In dual mode both independent turns have the same contract, six-hour timeout, and no extra join deadline or resource cap. Do not mutate a shared Cargo target; copy the tree and use an isolated target for write-producing checks.";
+
 fn role_instructions(role: WorkerRole) -> &'static str {
     match role {
         WorkerRole::Developer => {
             "You are the task Developer: execute the concrete approved task; do not redesign its product scope. First seek answers in the task file, design and clarification files, applicable instructions, existing implementation, and tests. Make ordinary local implementation decisions yourself. If an uncertain choice has a defensible candidate, is consistent with the approved behavior and scope, and can be corrected in review, choose the smallest-impact option, continue, and disclose it as `ASSUMPTION:` in your final. Ask for clarification only when you cannot derive any defensible candidate or the choice would decide material externally visible behavior, acceptance, or scope. Report BLOCKED only after actual attempts establish an external or mechanical obstacle; include concrete observations. Work directly in the exact repository and complete the bounded task. The human's execution approval for this standard hcom lane authorizes exactly one signed-off local candidate commit for this task; a general instruction that commits require human authorization is satisfied by that run approval. If an explicit human, task, design, or applicable instruction instead requires this run to remain uncommitted, do not modify or commit the repository: return `STATUS: CLARIFICATION_REQUIRED` because that requirement is incompatible with the standard review lane and requires an explicit human resolution. Otherwise run the required checks, then commit the complete work as ONE NEW commit whose message describes this task as a whole and whose `Signed-off-by` trailer matches the committing identity (for example, create it with `git commit --signoff`). Never amend, squash, reword, or otherwise rewrite a commit that existed when your first task turn began. On correction or clarification resume, amend your existing task commit if it exists and ensure that it retains a valid matching `Signed-off-by` trailer; if no task commit exists yet, create the one signed-off task commit only after the implementation is complete. Never create a second task commit. Do not create a commit merely to pause. If a pause is necessary after your task commit already exists, leave that commit unchanged and report the exact repository state. Never add any `hcom-tasks` artifact to the task commit. This local candidate commit and its same-task amendments do not authorize push, install, or release. Do not push, install, wait for interactive input, or modify the task/design/clarification source files."
         }
         WorkerRole::Reviewer => {
-            "You are the task Reviewer. Independently inspect the committed task range and decide whether it is sound against the approved task, design files, and every ordered clarification record. The human's execution approval for this standard hcom lane includes exactly one signed-off local Developer candidate commit and same-commit amendments during correction; it never includes push, install, or release. Review disclosed Developer assumptions rather than accepting them automatically. Confirm the developer left the work committed as a single commit for this task, with a message covering it, a valid `Signed-off-by` trailer matching the committing identity, and no `hcom-tasks` artifact; uncommitted work, a missing or mismatched sign-off, or a task split across several commits is a reason to request changes. If an explicit human, task, design, or applicable instruction requires the run to remain uncommitted, return `VERDICT: REQUEST_CHANGES` and label the incompatible workflow requirement `REQUIREMENT_AMBIGUITY:` instead of accepting either side of the contradiction. Distinguish other requirement ambiguity from implementation defects and label the former `REQUIREMENT_AMBIGUITY:` in findings. An LGTM applies to the exact final candidate range already committed; it does not call for another post-LGTM commit or a human decision about retaining that reviewed commit. You must not edit reviewed source, the Git index or refs, the candidate commit, stage, commit, change branch or HEAD, push, or install. In dual-review mode, two Reviewer turns run concurrently; in single-review mode, only Reviewer1 runs. Every Reviewer turn has an independent six-hour timeout and there is no extra join deadline, cgroup, CPU, memory, or Cargo concurrency cap. Do not clean or mutate a shared Cargo target directory; for checks that write build artifacts, copy the tree into your own writable sandbox and use an isolated target directory."
+            "You are the task Reviewer. Independently inspect the committed task range and decide whether it is sound against the approved task, design files, and every ordered clarification record. In dual-review mode, Reviewer1 and Reviewer2 are equal peers with the same complete review scope and authority: there is no role specialization or division of review responsibility, and neither Reviewer may assume the other will inspect any category. The human's execution approval for this standard hcom lane includes exactly one signed-off local Developer candidate commit and same-commit amendments during correction; it never includes push, install, or release. Review disclosed Developer assumptions rather than accepting them automatically. Confirm the developer left the work committed as a single commit for this task, with a message covering it, a valid `Signed-off-by` trailer matching the committing identity, and no `hcom-tasks` artifact; uncommitted work, a missing or mismatched sign-off, or a task split across several commits is a reason to request changes. If an explicit human, task, design, or applicable instruction requires the run to remain uncommitted, return `VERDICT: REQUEST_CHANGES` and label the incompatible workflow requirement `REQUIREMENT_AMBIGUITY:` instead of accepting either side of the contradiction. Distinguish other requirement ambiguity from implementation defects and label the former `REQUIREMENT_AMBIGUITY:` in findings. An LGTM applies to the exact final candidate range already committed; it does not call for another post-LGTM commit or a human decision about retaining that reviewed commit. You must not edit reviewed source, the Git index or refs, the candidate commit, stage, commit, change branch or HEAD, push, or install. In dual-review mode, two Reviewer turns run concurrently; in single-review mode, only Reviewer1 runs. Every Reviewer turn has an independent six-hour timeout and there is no extra join deadline, cgroup, CPU, memory, or Cargo concurrency cap. Do not clean or mutate a shared Cargo target directory; for checks that write build artifacts, copy the tree into your own writable sandbox and use an isolated target directory."
         }
     }
 }
@@ -2101,6 +2665,399 @@ mod tests {
         }
     }
 
+    impl crate::orchestrator::github::GitHubWorkflowProvider for MutableGitHubInspector {
+        fn prepare_repository(
+            &self,
+            _workspace: &TasksWorkspace,
+            _request: &crate::orchestrator::core::PrepareGitHubRunRequest,
+        ) -> Result<crate::orchestrator::github::RepositoryPreparedObservation> {
+            bail!("GitHub workflow is not exercised by inspection-only tests")
+        }
+
+        fn publish_candidate(
+            &self,
+            _request: &crate::orchestrator::core::PublishDeveloperCandidateRequest,
+        ) -> Result<crate::orchestrator::github::CandidatePublishedObservation> {
+            bail!("GitHub workflow is not exercised by inspection-only tests")
+        }
+
+        fn publish_review(
+            &self,
+            _request: &crate::orchestrator::core::PublishReviewerReviewRequest,
+        ) -> Result<crate::orchestrator::github::ReviewerReviewPublishedObservation> {
+            bail!("GitHub workflow is not exercised by inspection-only tests")
+        }
+
+        fn publish_check(
+            &self,
+            _request: &crate::orchestrator::core::PublishReviewCheckRequest,
+        ) -> Result<crate::orchestrator::github::ReviewCheckPublishedObservation> {
+            bail!("GitHub workflow is not exercised by inspection-only tests")
+        }
+
+        fn wait_for_merge_gate(
+            &self,
+            _request: &crate::orchestrator::core::WaitForMergeGateRequest,
+            _cancelled: &std::sync::atomic::AtomicBool,
+        ) -> Result<crate::orchestrator::github::MergeGateObservation> {
+            bail!("GitHub workflow is not exercised by inspection-only tests")
+        }
+
+        fn merge_pull_request(
+            &self,
+            _request: &crate::orchestrator::core::MergePullRequestRequest,
+            _cancelled: &std::sync::atomic::AtomicBool,
+        ) -> Result<crate::orchestrator::github::PullRequestMergedObservation> {
+            bail!("GitHub workflow is not exercised by inspection-only tests")
+        }
+
+        fn finalize_run(
+            &self,
+            _request: &crate::orchestrator::core::FinalizeGitHubRunRequest,
+        ) -> Result<crate::orchestrator::github::GitHubRunFinalizedObservation> {
+            bail!("GitHub workflow is not exercised by inspection-only tests")
+        }
+
+        fn publish_terminal_best_effort(
+            &self,
+            _request: &crate::orchestrator::core::PublishGitHubTerminalRequest,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ScriptedGitHubFailure {
+        Preparation,
+        Review,
+        Check,
+        Merge,
+        Finalization,
+    }
+
+    struct ScriptedGitHubWorkflow {
+        heads: Mutex<VecDeque<String>>,
+        audit: Mutex<Vec<String>>,
+        worktree: Mutex<Option<PathBuf>>,
+        fail_after_confirmation: Option<ScriptedGitHubFailure>,
+        partial_operations:
+            Mutex<BTreeMap<String, crate::orchestrator::core::GitHubPartialOperation>>,
+        merge_gate_entered: Option<Arc<AtomicBool>>,
+        merge_gate_release: Option<Arc<AtomicBool>>,
+        merge_entered: Option<Arc<AtomicBool>>,
+        merge_release: Option<Arc<AtomicBool>>,
+    }
+
+    impl ScriptedGitHubWorkflow {
+        fn record(&self, value: impl Into<String>) {
+            self.audit.lock().unwrap().push(value.into());
+        }
+    }
+
+    impl crate::orchestrator::github::GitHubWorkflowProvider for ScriptedGitHubWorkflow {
+        fn begin_fresh_run(&self, terminal_run_id: &str, fresh_run_id: &str) -> Result<()> {
+            self.record(format!("fresh:{terminal_run_id}:{fresh_run_id}"));
+            Ok(())
+        }
+
+        fn prepare_repository(
+            &self,
+            workspace: &TasksWorkspace,
+            request: &crate::orchestrator::core::PrepareGitHubRunRequest,
+        ) -> Result<crate::orchestrator::github::RepositoryPreparedObservation> {
+            fs::create_dir(workspace.repository_path())?;
+            *self.worktree.lock().unwrap() = Some(workspace.repository_path());
+            self.record("prepare");
+            if self.fail_after_confirmation == Some(ScriptedGitHubFailure::Preparation) {
+                self.partial_operations.lock().unwrap().insert(
+                    request.operation_id.clone(),
+                    crate::orchestrator::core::GitHubPartialOperation::RepositoryPreparation(
+                        crate::orchestrator::core::GitHubPartialRepositoryPreparation {
+                            base_sha: request.run_binding.expected_base_sha.clone(),
+                            branch: request.run_binding.generated_run_branch.clone(),
+                            worktree_path: workspace
+                                .repository_path()
+                                .to_string_lossy()
+                                .into_owned(),
+                            local_base_ref_created: true,
+                            local_branch_created: true,
+                            local_worktree_created: true,
+                        },
+                    ),
+                );
+                bail!("scripted preparation evidence write failed after confirmation");
+            }
+            Ok(crate::orchestrator::github::RepositoryPreparedObservation {
+                operation_id: request.operation_id.clone(),
+                base_sha: request.run_binding.expected_base_sha.clone(),
+                branch: request.run_binding.generated_run_branch.clone(),
+                worktree_path: workspace.repository_path().to_string_lossy().into_owned(),
+            })
+        }
+
+        fn publish_candidate(
+            &self,
+            request: &crate::orchestrator::core::PublishDeveloperCandidateRequest,
+        ) -> Result<crate::orchestrator::github::CandidatePublishedObservation> {
+            let head_sha = self
+                .heads
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| anyhow!("scripted GitHub candidate heads are exhausted"))?;
+            self.record(format!(
+                "candidate:{}:{}:{}",
+                request.task_ordinal,
+                request.generation,
+                request.existing_pr_number.is_some()
+            ));
+            let check_run_id =
+                100 + u64::try_from(request.task_ordinal)? * 20 + u64::from(request.generation);
+            Ok(crate::orchestrator::github::CandidatePublishedObservation {
+                operation_id: request.operation_id.clone(),
+                task_ordinal: request.task_ordinal,
+                generation: request.generation,
+                previous_head_sha: request.previous_head_sha.clone(),
+                head_sha,
+                pr_number: request.existing_pr_number.unwrap_or(7),
+                pr_node_id: "PR_scripted".into(),
+                pr_url: "https://github.com/owner/repo/pull/7".into(),
+                pr_actor_bot_user_id: 22,
+                check_run_id,
+                check_url: format!("https://github.com/owner/repo/runs/{check_run_id}"),
+                check_actor_app_id: 1,
+            })
+        }
+
+        fn publish_review(
+            &self,
+            request: &crate::orchestrator::core::PublishReviewerReviewRequest,
+        ) -> Result<crate::orchestrator::github::ReviewerReviewPublishedObservation> {
+            self.record(format!(
+                "review:{}:{}:{}:{:?}",
+                request.task_ordinal,
+                request.generation,
+                request.reviewer_id.as_str(),
+                request.verdict
+            ));
+            let lane = match request.reviewer_id {
+                ReviewerId::Reviewer1 => 1,
+                ReviewerId::Reviewer2 => 2,
+            };
+            let review_id = 200
+                + u64::try_from(request.task_ordinal)? * 40
+                + u64::from(request.generation) * 2
+                + lane;
+            let observed = crate::orchestrator::github::ReviewerReviewPublishedObservation {
+                operation_id: request.operation_id.clone(),
+                task_ordinal: request.task_ordinal,
+                reviewer_id: request.reviewer_id,
+                generation: request.generation,
+                head_sha: request.head_sha.clone(),
+                verdict: request.verdict,
+                review_id,
+                review_url: format!(
+                    "https://github.com/owner/repo/pull/7#pullrequestreview-{review_id}"
+                ),
+                actor_bot_user_id: if request.reviewer_id == ReviewerId::Reviewer1 {
+                    23
+                } else {
+                    24
+                },
+                final_artifact_sha256: format!("{review_id:064x}"),
+            };
+            if self.fail_after_confirmation == Some(ScriptedGitHubFailure::Review) {
+                self.partial_operations.lock().unwrap().insert(
+                    request.operation_id.clone(),
+                    crate::orchestrator::core::GitHubPartialOperation::ReviewerReview(
+                        crate::orchestrator::core::GitHubPartialReviewerReview {
+                            task_ordinal: observed.task_ordinal,
+                            reviewer_id: observed.reviewer_id,
+                            generation: observed.generation,
+                            head_sha: observed.head_sha.clone(),
+                            verdict: observed.verdict,
+                            review_id: observed.review_id,
+                            review_url: observed.review_url.clone(),
+                            actor_bot_user_id: observed.actor_bot_user_id,
+                            final_artifact_sha256: observed.final_artifact_sha256.clone(),
+                        },
+                    ),
+                );
+                bail!("scripted review evidence write failed after confirmation");
+            }
+            Ok(observed)
+        }
+
+        fn publish_check(
+            &self,
+            request: &crate::orchestrator::core::PublishReviewCheckRequest,
+        ) -> Result<crate::orchestrator::github::ReviewCheckPublishedObservation> {
+            self.record(format!(
+                "check:{}:{}:{}",
+                request.task_ordinal,
+                request.generation,
+                request.conclusion.as_str()
+            ));
+            let observed = crate::orchestrator::github::ReviewCheckPublishedObservation {
+                operation_id: request.operation_id.clone(),
+                task_ordinal: request.task_ordinal,
+                generation: request.generation,
+                head_sha: request.head_sha.clone(),
+                check_run_id: request.check_run_id,
+                check_url: request.check_url.clone(),
+                state: request.conclusion.as_str().into(),
+                actor_app_id: 1,
+            };
+            if self.fail_after_confirmation == Some(ScriptedGitHubFailure::Check) {
+                self.partial_operations.lock().unwrap().insert(
+                    request.operation_id.clone(),
+                    crate::orchestrator::core::GitHubPartialOperation::ReviewCheck(
+                        crate::orchestrator::core::GitHubPartialReviewCheck {
+                            task_ordinal: observed.task_ordinal,
+                            generation: observed.generation,
+                            head_sha: observed.head_sha.clone(),
+                            check_run_id: observed.check_run_id,
+                            check_url: observed.check_url.clone(),
+                            state: observed.state.clone(),
+                            actor_app_id: observed.actor_app_id,
+                        },
+                    ),
+                );
+                bail!("scripted Check evidence write failed after confirmation");
+            }
+            Ok(observed)
+        }
+
+        fn wait_for_merge_gate(
+            &self,
+            request: &crate::orchestrator::core::WaitForMergeGateRequest,
+            _cancelled: &std::sync::atomic::AtomicBool,
+        ) -> Result<crate::orchestrator::github::MergeGateObservation> {
+            self.record("merge-gate");
+            if let Some(entered) = self.merge_gate_entered.as_ref() {
+                entered.store(true, Ordering::Release);
+            }
+            if let Some(release) = self.merge_gate_release.as_ref() {
+                while !release.load(Ordering::Acquire) {
+                    if _cancelled.load(Ordering::Acquire) {
+                        return Err(
+                            crate::orchestrator::github::workflow::GitHubWorkflowCancelled.into(),
+                        );
+                    }
+                    std::thread::yield_now();
+                }
+            }
+            Ok(crate::orchestrator::github::MergeGateObservation {
+                operation_id: request.operation_id.clone(),
+                pr_number: request.pr_number,
+                final_head_sha: request.final_head_sha.clone(),
+                base_sha: "a".repeat(40),
+                ruleset_attestation_sha256: "b".repeat(64),
+                check_run_id: request.check_run_id,
+            })
+        }
+
+        fn merge_pull_request(
+            &self,
+            request: &crate::orchestrator::core::MergePullRequestRequest,
+            _cancelled: &std::sync::atomic::AtomicBool,
+        ) -> Result<crate::orchestrator::github::PullRequestMergedObservation> {
+            self.record("merge");
+            if let Some(entered) = self.merge_entered.as_ref() {
+                entered.store(true, Ordering::Release);
+            }
+            if let Some(release) = self.merge_release.as_ref() {
+                while !release.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            }
+            let observed = crate::orchestrator::github::PullRequestMergedObservation {
+                operation_id: request.operation_id.clone(),
+                pr_number: request.pr_number,
+                final_head_sha: request.final_head_sha.clone(),
+                merge_sha: "f".repeat(40),
+                merge_url: "https://github.com/owner/repo/commit/final".into(),
+                actor_bot_user_id: 21,
+                merge_evidence_durable: true,
+            };
+            if self.fail_after_confirmation == Some(ScriptedGitHubFailure::Merge) {
+                self.partial_operations.lock().unwrap().insert(
+                    request.operation_id.clone(),
+                    crate::orchestrator::core::GitHubPartialOperation::Merge(
+                        crate::orchestrator::core::GitHubPartialMerge {
+                            pr_number: observed.pr_number,
+                            final_head_sha: observed.final_head_sha.clone(),
+                            merge_sha: observed.merge_sha.clone(),
+                            merge_url: observed.merge_url.clone(),
+                            actor_bot_user_id: observed.actor_bot_user_id,
+                        },
+                    ),
+                );
+                bail!("scripted merge evidence write failed after confirmation");
+            }
+            Ok(observed)
+        }
+
+        fn finalize_run(
+            &self,
+            request: &crate::orchestrator::core::FinalizeGitHubRunRequest,
+        ) -> Result<crate::orchestrator::github::GitHubRunFinalizedObservation> {
+            let worktree = self
+                .worktree
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| anyhow!("scripted managed worktree is missing"))?;
+            fs::remove_dir(&worktree)?;
+            self.record("finalize");
+            let observed = crate::orchestrator::github::GitHubRunFinalizedObservation {
+                operation_id: request.operation_id.clone(),
+                pr_number: request.pr_number,
+                final_head_sha: request.final_head_sha.clone(),
+                merge_sha: request.merge_sha.clone(),
+                finalization: crate::control_api::GitHubFinalizationSnapshot {
+                    local_worktree_removed: true,
+                    local_ref_removed: true,
+                    remote_ref_outcome: Some("deleted".into()),
+                },
+            };
+            if self.fail_after_confirmation == Some(ScriptedGitHubFailure::Finalization) {
+                self.partial_operations.lock().unwrap().insert(
+                    request.operation_id.clone(),
+                    crate::orchestrator::core::GitHubPartialOperation::Finalization(
+                        crate::orchestrator::core::GitHubPartialFinalization {
+                            pr_number: observed.pr_number,
+                            final_head_sha: observed.final_head_sha.clone(),
+                            merge_sha: observed.merge_sha.clone(),
+                            finalization: crate::control_api::GitHubFinalizationSnapshot {
+                                local_worktree_removed: true,
+                                local_ref_removed: false,
+                                remote_ref_outcome: None,
+                            },
+                        },
+                    ),
+                );
+                bail!("scripted finalization evidence write failed after cleanup");
+            }
+            Ok(observed)
+        }
+
+        fn take_partial_operation(
+            &self,
+            operation_id: &str,
+        ) -> Result<Option<crate::orchestrator::core::GitHubPartialOperation>> {
+            Ok(self.partial_operations.lock().unwrap().remove(operation_id))
+        }
+
+        fn publish_terminal_best_effort(
+            &self,
+            request: &crate::orchestrator::core::PublishGitHubTerminalRequest,
+        ) -> Result<()> {
+            self.record(format!("terminal:{}", request.outcome));
+            Ok(())
+        }
+    }
+
     fn github_runtime_for_test(
         repository: &Path,
     ) -> (
@@ -2196,6 +3153,7 @@ mod tests {
                 binding,
                 initial_inspection,
                 inspector: inspector.clone(),
+                workflow: inspector.clone(),
             },
             inspector,
         )
@@ -2409,6 +3367,585 @@ mod tests {
                 ("run-github-test".into(), 3)
             ]
         );
+    }
+
+    #[test]
+    fn github_driver_executes_one_pr_multi_task_correction_and_finalization() {
+        let fixture = Fixture::new();
+        let (mut runtime, _inspector) = github_runtime_for_test(&fixture.repository);
+        let workflow = Arc::new(ScriptedGitHubWorkflow {
+            heads: Mutex::new(VecDeque::from([
+                "c".repeat(40),
+                "d".repeat(40),
+                "e".repeat(40),
+            ])),
+            audit: Mutex::new(Vec::new()),
+            worktree: Mutex::new(None),
+            fail_after_confirmation: None,
+            partial_operations: Mutex::new(BTreeMap::new()),
+            merge_gate_entered: None,
+            merge_gate_release: None,
+            merge_entered: None,
+            merge_release: None,
+        });
+        runtime.workflow = workflow.clone();
+        let sources = SessionRuntimeSources::capture_with_github(
+            fixture.sources.parent_environment.clone(),
+            fixture.sources.profiles.clone().unwrap(),
+            Vec::new(),
+            runtime,
+        )
+        .unwrap();
+        let worker_audit = Arc::new(Mutex::new(Audit::default()));
+        let scripts = vec![
+            task_script(
+                "github-one",
+                vec![
+                    FakeTurnScript::new(
+                        WorkerRole::Developer,
+                        RuntimeTurnPurpose::InitialDevelopment,
+                        [ready("github-one-initial")],
+                    ),
+                    FakeTurnScript::new(
+                        WorkerRole::Reviewer,
+                        RuntimeTurnPurpose::InitialReview,
+                        [request_changes("github-one-finding")],
+                    ),
+                    FakeTurnScript::new(
+                        WorkerRole::Developer,
+                        RuntimeTurnPurpose::DeveloperCorrection,
+                        [ready("github-one-correction")],
+                    ),
+                    FakeTurnScript::new(
+                        WorkerRole::Reviewer,
+                        RuntimeTurnPurpose::ReviewerRereview,
+                        [lgtm("github-one-lgtm")],
+                    ),
+                ],
+                vec![Mutation::None; 4],
+            ),
+            task_script(
+                "github-two",
+                vec![
+                    FakeTurnScript::new(
+                        WorkerRole::Developer,
+                        RuntimeTurnPurpose::InitialDevelopment,
+                        [ready("github-two-initial")],
+                    ),
+                    FakeTurnScript::new(
+                        WorkerRole::Reviewer,
+                        RuntimeTurnPurpose::InitialReview,
+                        [lgtm("github-two-lgtm")],
+                    ),
+                ],
+                vec![Mutation::None; 2],
+            ),
+        ];
+        let mut supervisor = TaskLaneSupervisor::open_with_factory(
+            "run-github-test".into(),
+            fixture.project_root.clone(),
+            fixture.run_root.clone(),
+            sources,
+            Box::new(ScriptedFactory {
+                scripts: scripts.into(),
+                audit: worker_audit.clone(),
+            }),
+        )
+        .unwrap();
+        let tasks = vec![
+            fixture.task(
+                "github-one",
+                &[],
+                crate::control_api::protocol::MIN_DUAL_REVIEW_ROUNDS,
+            ),
+            fixture.task(
+                "github-two",
+                &[],
+                crate::control_api::protocol::MIN_DUAL_REVIEW_ROUNDS,
+            ),
+        ];
+        let (plan_version, plan_hash) = supervisor
+            .replace_plan_with_inspection(
+                0,
+                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_reviewer_adapters(),
+                Some("inspection-initial"),
+                tasks,
+            )
+            .unwrap();
+        supervisor
+            .approve_and_start(1, plan_version, &plan_hash, true)
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !supervisor.snapshot().state.is_terminal() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "GitHub workflow did not become terminal before the bounded test deadline"
+            );
+            supervisor.poll_once().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, SessionState::Completed);
+        let github = snapshot.github.unwrap();
+        assert_eq!(github.pr_number, Some(7));
+        assert_eq!(
+            github.outcome,
+            Some(crate::control_api::GitHubDeliveryOutcome::Delivered)
+        );
+        assert_eq!(github.merge_sha, Some("f".repeat(40)));
+        assert_eq!(snapshot.tasks[0].base_revision, Some("a".repeat(40)));
+        assert_eq!(snapshot.tasks[0].head_revision, Some("d".repeat(40)));
+        assert_eq!(snapshot.tasks[1].base_revision, Some("d".repeat(40)));
+        assert_eq!(snapshot.tasks[1].head_revision, Some("e".repeat(40)));
+        assert!(
+            !fixture
+                .project_root
+                .join("hcom-tasks/run-github-test/repository")
+                .exists()
+        );
+
+        let operations = workflow.audit.lock().unwrap().clone();
+        assert_eq!(operations.first().map(String::as_str), Some("prepare"));
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|entry| entry.starts_with("candidate:"))
+                .count(),
+            3
+        );
+        assert!(operations.contains(&"candidate:0:1:false".into()));
+        assert!(operations.contains(&"candidate:0:2:true".into()));
+        assert!(operations.contains(&"candidate:1:1:true".into()));
+        assert_eq!(
+            &operations[operations.len() - 3..],
+            ["merge-gate", "merge", "finalize"]
+        );
+
+        let audit = worker_audit.lock().unwrap();
+        assert_eq!(audit.opens, ["github-one", "github-two"]);
+        let correction = audit
+            .prompts
+            .iter()
+            .find(|(_, purpose, _)| *purpose == RuntimeTurnPurpose::DeveloperCorrection)
+            .map(|(_, _, prompt)| prompt)
+            .unwrap();
+        assert!(correction.contains("exactly one new signed-off child commit"));
+        assert!(!correction.contains("git commit --amend"));
+        for (_, purpose, prompt) in audit
+            .prompts
+            .iter()
+            .filter(|(role, _, _)| *role == WorkerRole::Reviewer)
+        {
+            assert!(prompt.contains("Reviewer1 and Reviewer2 are equal peers"));
+            assert!(prompt.contains("exact range:"));
+            assert!(prompt.contains("foreground supervisor publishes your exact final"));
+            if *purpose == RuntimeTurnPurpose::ReviewerRereview {
+                assert!(prompt.contains("First verify every finding you raised"));
+            }
+        }
+    }
+
+    #[test]
+    fn github_driver_routes_confirmed_partial_operations_before_terminalizing() {
+        for failure in [
+            ScriptedGitHubFailure::Preparation,
+            ScriptedGitHubFailure::Review,
+            ScriptedGitHubFailure::Check,
+            ScriptedGitHubFailure::Merge,
+            ScriptedGitHubFailure::Finalization,
+        ] {
+            let fixture = Fixture::new();
+            let (mut runtime, _inspector) = github_runtime_for_test(&fixture.repository);
+            let workflow = Arc::new(ScriptedGitHubWorkflow {
+                heads: Mutex::new(VecDeque::from(["c".repeat(40)])),
+                audit: Mutex::new(Vec::new()),
+                worktree: Mutex::new(None),
+                fail_after_confirmation: Some(failure),
+                partial_operations: Mutex::new(BTreeMap::new()),
+                merge_gate_entered: None,
+                merge_gate_release: None,
+                merge_entered: None,
+                merge_release: None,
+            });
+            runtime.workflow = workflow.clone();
+            let sources = SessionRuntimeSources::capture_with_github(
+                fixture.sources.parent_environment.clone(),
+                fixture.sources.profiles.clone().unwrap(),
+                Vec::new(),
+                runtime,
+            )
+            .unwrap();
+            let scripts = vec![task_script(
+                "github-partial",
+                vec![
+                    FakeTurnScript::new(
+                        WorkerRole::Developer,
+                        RuntimeTurnPurpose::InitialDevelopment,
+                        [ready("github-partial-initial")],
+                    ),
+                    FakeTurnScript::new(
+                        WorkerRole::Reviewer,
+                        RuntimeTurnPurpose::InitialReview,
+                        [lgtm("github-partial-reviewer1")],
+                    ),
+                    FakeTurnScript::new(
+                        WorkerRole::Reviewer,
+                        RuntimeTurnPurpose::InitialReview,
+                        [lgtm("github-partial-reviewer2")],
+                    ),
+                ],
+                vec![Mutation::None; 3],
+            )];
+            let mut supervisor = TaskLaneSupervisor::open_with_factory(
+                format!("run-github-partial-{failure:?}").to_ascii_lowercase(),
+                fixture.project_root.clone(),
+                fixture.run_root.clone(),
+                sources,
+                Box::new(ScriptedFactory {
+                    scripts: scripts.into(),
+                    audit: Arc::new(Mutex::new(Audit::default())),
+                }),
+            )
+            .unwrap();
+            let (plan_version, plan_hash) = supervisor
+                .replace_plan_with_inspection(
+                    0,
+                    CODEX_TASK_WORKER_ADAPTER,
+                    &pure_codex_reviewer_adapters(),
+                    Some("inspection-initial"),
+                    vec![fixture.task(
+                        "github-partial",
+                        &[],
+                        crate::control_api::protocol::MIN_DUAL_REVIEW_ROUNDS,
+                    )],
+                )
+                .unwrap();
+            let start = supervisor.approve_and_start(1, plan_version, &plan_hash, true);
+
+            let mut observed_error = start.err().map(|error| error.to_string());
+            if failure != ScriptedGitHubFailure::Preparation {
+                assert!(
+                    observed_error.is_none(),
+                    "{failure:?} failed during preparation"
+                );
+                for _ in 0..256 {
+                    match supervisor.poll_once() {
+                        Ok(()) => {}
+                        Err(error) => {
+                            observed_error = Some(error.to_string());
+                            break;
+                        }
+                    }
+                    if supervisor.snapshot().state.is_terminal() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            assert!(
+                observed_error
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("scripted")),
+                "{failure:?} did not return its original workflow failure"
+            );
+            let snapshot = supervisor.snapshot();
+            assert_eq!(snapshot.state, SessionState::NeedsHuman, "{failure:?}");
+            let github = snapshot.github.unwrap();
+            match failure {
+                ScriptedGitHubFailure::Preparation => {
+                    assert!(!github.merge_already_confirmed);
+                    assert_eq!(
+                        github.phase,
+                        Some(crate::control_api::GitHubDeliveryPhase::PreparingRepository)
+                    );
+                    assert!(github.preserved_branch.is_some());
+                    assert!(github.preserved_worktree.is_some());
+                }
+                ScriptedGitHubFailure::Review => {
+                    assert_eq!(snapshot.tasks[0].github_reviews.len(), 1);
+                    assert!(!github.merge_already_confirmed);
+                }
+                ScriptedGitHubFailure::Check => {
+                    assert_eq!(
+                        github
+                            .current_check
+                            .as_ref()
+                            .map(|check| check.state.as_str()),
+                        Some("success")
+                    );
+                    assert_eq!(
+                        snapshot.tasks[0]
+                            .github_check
+                            .as_ref()
+                            .map(|check| check.state.as_str()),
+                        Some("success")
+                    );
+                    assert!(!github.merge_already_confirmed);
+                }
+                ScriptedGitHubFailure::Merge => {
+                    assert!(github.merge_already_confirmed);
+                    assert_eq!(github.merge_sha, Some("f".repeat(40)));
+                    assert_eq!(
+                        github.phase,
+                        Some(crate::control_api::GitHubDeliveryPhase::Finalizing)
+                    );
+                    assert!(github.finalization.is_none());
+                    assert!(github.preserved_branch.is_some());
+                    assert!(github.preserved_worktree.is_some());
+                }
+                ScriptedGitHubFailure::Finalization => {
+                    assert!(github.merge_already_confirmed);
+                    assert_eq!(
+                        github.finalization,
+                        Some(crate::control_api::GitHubFinalizationSnapshot {
+                            local_worktree_removed: true,
+                            local_ref_removed: false,
+                            remote_ref_outcome: None,
+                        })
+                    );
+                    assert!(github.preserved_branch.is_some());
+                    assert!(github.preserved_worktree.is_none());
+                }
+            }
+            let audit = workflow.audit.lock().unwrap();
+            assert_eq!(
+                audit
+                    .iter()
+                    .filter(|entry| entry.as_str() == "merge")
+                    .count(),
+                usize::from(matches!(
+                    failure,
+                    ScriptedGitHubFailure::Merge | ScriptedGitHubFailure::Finalization
+                )),
+                "a confirmed merge must never be retried"
+            );
+            assert_eq!(
+                audit
+                    .iter()
+                    .filter(|entry| entry.as_str() == "finalize")
+                    .count(),
+                usize::from(failure == ScriptedGitHubFailure::Finalization)
+            );
+            assert!(workflow.partial_operations.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn github_merge_wait_keeps_supervisor_responsive_and_fresh_run_never_adopts_it() {
+        let fixture = Fixture::new();
+        let (mut runtime, _inspector) = github_runtime_for_test(&fixture.repository);
+        let merge_gate_entered = Arc::new(AtomicBool::new(false));
+        let merge_gate_release = Arc::new(AtomicBool::new(false));
+        let workflow = Arc::new(ScriptedGitHubWorkflow {
+            heads: Mutex::new(VecDeque::from(["c".repeat(40)])),
+            audit: Mutex::new(Vec::new()),
+            worktree: Mutex::new(None),
+            fail_after_confirmation: None,
+            partial_operations: Mutex::new(BTreeMap::new()),
+            merge_gate_entered: Some(Arc::clone(&merge_gate_entered)),
+            merge_gate_release: Some(Arc::clone(&merge_gate_release)),
+            merge_entered: None,
+            merge_release: None,
+        });
+        runtime.workflow = workflow.clone();
+        let sources = SessionRuntimeSources::capture_with_github(
+            fixture.sources.parent_environment.clone(),
+            fixture.sources.profiles.clone().unwrap(),
+            Vec::new(),
+            runtime,
+        )
+        .unwrap();
+        let scripts = vec![task_script(
+            "github-wait",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("github-wait-initial")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [lgtm("github-wait-lgtm")],
+                ),
+            ],
+            vec![Mutation::None; 2],
+        )];
+        let mut supervisor = TaskLaneSupervisor::open_with_factory(
+            "run-github-wait".into(),
+            fixture.project_root.clone(),
+            fixture.run_root.clone(),
+            sources,
+            Box::new(ScriptedFactory {
+                scripts: scripts.into(),
+                audit: Arc::new(Mutex::new(Audit::default())),
+            }),
+        )
+        .unwrap();
+        let (plan_version, plan_hash) = supervisor
+            .replace_plan_with_inspection(
+                0,
+                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_reviewer_adapters(),
+                Some("inspection-initial"),
+                vec![fixture.task(
+                    "github-wait",
+                    &[],
+                    crate::control_api::protocol::MIN_DUAL_REVIEW_ROUNDS,
+                )],
+            )
+            .unwrap();
+        supervisor
+            .approve_and_start(1, plan_version, &plan_hash, true)
+            .unwrap();
+        for _ in 0..64 {
+            supervisor.poll_once().unwrap();
+            if merge_gate_entered.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(merge_gate_entered.load(Ordering::Acquire));
+        assert_eq!(supervisor.snapshot().state, SessionState::Running);
+        assert!(supervisor.active.is_empty());
+        assert!(supervisor.pending_github_effect.is_some());
+
+        let started = std::time::Instant::now();
+        supervisor.poll_once().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        let version = supervisor.snapshot().version;
+        supervisor
+            .cancel(version, "human cancelled merge wait")
+            .unwrap();
+        assert_eq!(supervisor.snapshot().state, SessionState::Canceled);
+
+        merge_gate_release.store(true, Ordering::Release);
+        for _ in 0..64 {
+            supervisor.poll_once().unwrap();
+            if supervisor.pending_github_effect.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(supervisor.pending_github_effect.is_none());
+        let terminal = supervisor.snapshot();
+        supervisor
+            .begin_next_run_with_id(
+                terminal.version,
+                &terminal.run_id,
+                "run-github-fresh".into(),
+            )
+            .unwrap();
+        let fresh = supervisor.snapshot();
+        assert_eq!(fresh.state, SessionState::AwaitingPlan);
+        assert_eq!(fresh.run_id, "run-github-fresh");
+        let fresh_github = fresh.github.unwrap();
+        assert!(fresh_github.run_binding.is_none());
+        assert!(fresh_github.pr_number.is_none());
+        assert!(!fresh_github.merge_already_confirmed);
+        assert!(
+            workflow
+                .audit
+                .lock()
+                .unwrap()
+                .contains(&"fresh:run-github-wait:run-github-fresh".to_owned())
+        );
+    }
+
+    #[test]
+    fn cancellation_joins_an_inflight_merge_and_reconciles_success_before_terminalizing() {
+        let fixture = Fixture::new();
+        let (mut runtime, _inspector) = github_runtime_for_test(&fixture.repository);
+        let merge_entered = Arc::new(AtomicBool::new(false));
+        let merge_release = Arc::new(AtomicBool::new(false));
+        let workflow = Arc::new(ScriptedGitHubWorkflow {
+            heads: Mutex::new(VecDeque::from(["c".repeat(40)])),
+            audit: Mutex::new(Vec::new()),
+            worktree: Mutex::new(None),
+            fail_after_confirmation: None,
+            partial_operations: Mutex::new(BTreeMap::new()),
+            merge_gate_entered: None,
+            merge_gate_release: None,
+            merge_entered: Some(Arc::clone(&merge_entered)),
+            merge_release: Some(Arc::clone(&merge_release)),
+        });
+        runtime.workflow = workflow.clone();
+        let sources = SessionRuntimeSources::capture_with_github(
+            fixture.sources.parent_environment.clone(),
+            fixture.sources.profiles.clone().unwrap(),
+            Vec::new(),
+            runtime,
+        )
+        .unwrap();
+        let scripts = vec![task_script(
+            "github-merge-race",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("github-merge-race-initial")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [lgtm("github-merge-race-lgtm")],
+                ),
+            ],
+            vec![Mutation::None; 2],
+        )];
+        let mut supervisor = TaskLaneSupervisor::open_with_factory(
+            "run-github-merge-race".into(),
+            fixture.project_root.clone(),
+            fixture.run_root.clone(),
+            sources,
+            Box::new(ScriptedFactory {
+                scripts: scripts.into(),
+                audit: Arc::new(Mutex::new(Audit::default())),
+            }),
+        )
+        .unwrap();
+        let (plan_version, plan_hash) = supervisor
+            .replace_plan_with_inspection(
+                0,
+                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_reviewer_adapters(),
+                Some("inspection-initial"),
+                vec![fixture.task(
+                    "github-merge-race",
+                    &[],
+                    crate::control_api::protocol::MIN_DUAL_REVIEW_ROUNDS,
+                )],
+            )
+            .unwrap();
+        supervisor
+            .approve_and_start(1, plan_version, &plan_hash, true)
+            .unwrap();
+        for _ in 0..128 {
+            supervisor.poll_once().unwrap();
+            if merge_entered.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(merge_entered.load(Ordering::Acquire));
+        assert!(supervisor.pending_github_effect.is_some());
+
+        let release = Arc::clone(&merge_release);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            release.store(true, Ordering::Release);
+        });
+        let version = supervisor.snapshot().version;
+        supervisor
+            .cancel(version, "cancel raced with exact merge")
+            .unwrap();
+        releaser.join().unwrap();
+        assert!(supervisor.pending_github_effect.is_none());
+        let terminal = supervisor.snapshot();
+        assert_eq!(terminal.state, SessionState::Completed);
+        assert!(terminal.github.unwrap().merge_already_confirmed);
+        assert!(workflow.audit.lock().unwrap().contains(&"finalize".into()));
     }
 
     #[test]

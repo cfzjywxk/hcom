@@ -145,6 +145,19 @@ impl PreparedGitWorkspace {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct GitPreparationProgress {
+    pub(crate) local_base_ref_created: bool,
+    pub(crate) local_branch_created: bool,
+    pub(crate) local_worktree_created: bool,
+}
+
+impl GitPreparationProgress {
+    pub(crate) fn has_managed_artifacts(&self) -> bool {
+        self.local_base_ref_created || self.local_branch_created || self.local_worktree_created
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ValidatedDeveloperCommit {
     pub(crate) head_sha: String,
@@ -199,6 +212,22 @@ pub(crate) enum RemoteRefFinalizationOutcome {
     AlreadyAbsent,
     PreservedByPolicy,
     PreservedAfterDeleteFailure,
+    PreservedAfterMutation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct GitFinalizationProgress {
+    pub(crate) local_worktree_removed: bool,
+    pub(crate) local_refs_removed: bool,
+    pub(crate) remote_ref_outcome: Option<RemoteRefFinalizationOutcome>,
+}
+
+impl GitFinalizationProgress {
+    pub(crate) fn has_confirmed_cleanup(&self) -> bool {
+        self.local_worktree_removed
+            || self.local_refs_removed
+            || self.remote_ref_outcome == Some(RemoteRefFinalizationOutcome::PreservedAfterMutation)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,6 +317,39 @@ impl GitWorkspaceManager {
         plan_hash: &str,
         credential: Option<&GitCredential>,
     ) -> Result<PreparedGitWorkspace> {
+        self.prepare_with_progress(workspace, delivery, run, plan_hash, credential)
+            .0
+    }
+
+    pub(crate) fn prepare_with_progress(
+        &self,
+        workspace: &TasksWorkspace,
+        delivery: &GitHubPullRequestBinding,
+        run: &GitHubRunBinding,
+        plan_hash: &str,
+        credential: Option<&GitCredential>,
+    ) -> (Result<PreparedGitWorkspace>, GitPreparationProgress) {
+        let mut progress = GitPreparationProgress::default();
+        let result = self.prepare_inner(
+            workspace,
+            delivery,
+            run,
+            plan_hash,
+            credential,
+            &mut progress,
+        );
+        (result, progress)
+    }
+
+    fn prepare_inner(
+        &self,
+        workspace: &TasksWorkspace,
+        delivery: &GitHubPullRequestBinding,
+        run: &GitHubRunBinding,
+        plan_hash: &str,
+        credential: Option<&GitCredential>,
+        progress: &mut GitPreparationProgress,
+    ) -> Result<PreparedGitWorkspace> {
         validate_sha256("GitHub plan hash", plan_hash)?;
         validate_git_sha("GitHub expected base SHA", &run.expected_base_sha)?;
         if run.inspected_repository_id != delivery.repository_id
@@ -356,7 +418,7 @@ impl GitWorkspaceManager {
 
         let refspec = format!("{}:{namespaced_base_ref}", run.expected_base_ref);
         let remote = self.remote.value(delivery);
-        let _fetch = self.run_remote_git(
+        let fetch = self.run_remote_git(
             &repository_root,
             delivery,
             credential,
@@ -370,10 +432,12 @@ impl GitWorkspaceManager {
                 OsString::from(refspec),
             ],
         );
-        let fetched_exact_base = self
-            .local_ref(&repository_root, &namespaced_base_ref)?
-            .as_deref()
-            == Some(run.expected_base_sha.as_str());
+        if fetch.as_ref().is_ok_and(|output| output.status.success()) {
+            progress.local_base_ref_created = true;
+        }
+        let fetched_base = self.local_ref(&repository_root, &namespaced_base_ref)?;
+        progress.local_base_ref_created = fetched_base.is_some();
+        let fetched_exact_base = fetched_base.as_deref() == Some(run.expected_base_sha.as_str());
         let remote_still_exact = self
             .remote_ref(
                 &repository_root,
@@ -390,26 +454,6 @@ impl GitWorkspaceManager {
         // exact local+remote proof above. No model turn or second fetch is
         // needed.
 
-        let add = self.run_git(
-            &repository_root,
-            [
-                OsString::from("worktree"),
-                OsString::from("add"),
-                OsString::from("--no-track"),
-                OsString::from("-b"),
-                OsString::from(&expected_branch),
-                worktree_path.as_os_str().to_owned(),
-                OsString::from(&run.expected_base_sha),
-            ],
-        )?;
-        if !add.status.success() {
-            bail!("managed linked-worktree creation failed; partial artifacts were preserved");
-        }
-        let canonical_worktree = fs::canonicalize(&worktree_path)
-            .context("failed to canonicalize the prepared GitHub worktree")?;
-        if canonical_worktree != worktree_path {
-            bail!("prepared GitHub worktree path is not canonical");
-        }
         let prepared = PreparedGitWorkspace {
             repository_root,
             worktree_path,
@@ -418,8 +462,59 @@ impl GitWorkspaceManager {
             namespaced_base_ref,
             base_sha: run.expected_base_sha.clone(),
         };
+        let add = self.run_git(
+            &prepared.repository_root,
+            [
+                OsString::from("worktree"),
+                OsString::from("add"),
+                OsString::from("--no-track"),
+                OsString::from("-b"),
+                OsString::from(&prepared.branch),
+                prepared.worktree_path.as_os_str().to_owned(),
+                OsString::from(&run.expected_base_sha),
+            ],
+        );
+        match add {
+            Ok(output) if output.status.success() => {
+                progress.local_branch_created = true;
+                progress.local_worktree_created = true;
+            }
+            Ok(_) => {
+                self.refresh_preparation_progress(&prepared, progress);
+                bail!("managed linked-worktree creation failed; partial artifacts were preserved");
+            }
+            Err(error) => {
+                self.refresh_preparation_progress(&prepared, progress);
+                return Err(error);
+            }
+        }
+        let canonical_worktree = fs::canonicalize(&prepared.worktree_path)
+            .context("failed to canonicalize the prepared GitHub worktree")?;
+        if canonical_worktree != prepared.worktree_path {
+            bail!("prepared GitHub worktree path is not canonical");
+        }
         self.validate_local_checkout(&prepared, &prepared.base_sha)?;
         Ok(prepared)
+    }
+
+    fn refresh_preparation_progress(
+        &self,
+        prepared: &PreparedGitWorkspace,
+        progress: &mut GitPreparationProgress,
+    ) {
+        if let Ok(base_ref) =
+            self.local_ref(&prepared.repository_root, &prepared.namespaced_base_ref)
+        {
+            progress.local_base_ref_created = base_ref.is_some();
+        }
+        if let Ok(branch_ref) = self.local_ref(&prepared.repository_root, &prepared.branch_ref) {
+            progress.local_branch_created = branch_ref.is_some();
+        }
+        progress.local_worktree_created |=
+            prepared.worktree_path.exists() || self.worktree_registered(prepared).unwrap_or(false);
+        if progress.local_worktree_created {
+            progress.local_branch_created = true;
+        }
     }
 
     pub(crate) fn validate_remote_base(
@@ -597,11 +692,43 @@ impl GitWorkspaceManager {
         authorization: &FinalizationAuthorization,
         architect_credential: Option<&GitCredential>,
     ) -> Result<GitFinalizationOutcome> {
+        self.finalize_success_with_progress(prepared, delivery, authorization, architect_credential)
+            .0
+    }
+
+    pub(crate) fn finalize_success_with_progress(
+        &self,
+        prepared: &PreparedGitWorkspace,
+        delivery: &GitHubPullRequestBinding,
+        authorization: &FinalizationAuthorization,
+        architect_credential: Option<&GitCredential>,
+    ) -> (Result<GitFinalizationOutcome>, GitFinalizationProgress) {
+        let mut progress = GitFinalizationProgress::default();
+        let result = self.finalize_success_inner(
+            prepared,
+            delivery,
+            authorization,
+            architect_credential,
+            &mut progress,
+        );
+        (result, progress)
+    }
+
+    fn finalize_success_inner(
+        &self,
+        prepared: &PreparedGitWorkspace,
+        delivery: &GitHubPullRequestBinding,
+        authorization: &FinalizationAuthorization,
+        architect_credential: Option<&GitCredential>,
+        progress: &mut GitFinalizationProgress,
+    ) -> Result<GitFinalizationOutcome> {
         self.validate_namespaced_base(prepared)?;
         if prepared.worktree_path.exists() {
             self.validate_local_checkout(prepared, &authorization.final_head_sha)?;
         } else if self.worktree_registered(prepared)? {
             bail!("managed GitHub worktree is missing but remains registered");
+        } else {
+            progress.local_worktree_removed = true;
         }
 
         let remote_before = self.remote_ref(
@@ -614,7 +741,14 @@ impl GitWorkspaceManager {
             .as_deref()
             .is_some_and(|head| head != authorization.final_head_sha)
         {
+            progress.remote_ref_outcome =
+                Some(RemoteRefFinalizationOutcome::PreservedAfterMutation);
             bail!("merged GitHub run branch was remotely mutated and will not be deleted");
+        }
+        if !delivery.delete_remote_branch_after_merge && remote_before.is_some() {
+            progress.remote_ref_outcome = Some(RemoteRefFinalizationOutcome::PreservedByPolicy);
+        } else if remote_before.is_none() {
+            progress.remote_ref_outcome = Some(RemoteRefFinalizationOutcome::AlreadyAbsent);
         }
 
         if self.branch_is_checked_out_outside_managed_worktree(prepared)? {
@@ -624,28 +758,43 @@ impl GitWorkspaceManager {
         }
 
         if prepared.worktree_path.exists() {
-            let remove = self.run_git(
+            let remove_failed = match self.run_git(
                 &prepared.repository_root,
                 [
                     OsString::from("worktree"),
                     OsString::from("remove"),
                     prepared.worktree_path.as_os_str().to_owned(),
                 ],
-            )?;
-            if !remove.status.success() {
-                bail!("required managed GitHub worktree removal failed");
+            ) {
+                Ok(output) => !output.status.success(),
+                Err(_) => true,
+            };
+            if !remove_failed && !prepared.worktree_path.exists() {
+                // A successful `git worktree remove` confirms both the filesystem
+                // and registration updates even if the following bounded inspection
+                // itself fails.
+                progress.local_worktree_removed = true;
+            }
+            let remains_registered = self.worktree_registered(prepared)?;
+            if prepared.worktree_path.exists() || remains_registered {
+                if remove_failed {
+                    bail!("required managed GitHub worktree removal failed");
+                }
+                bail!("managed GitHub worktree was not completely removed");
             }
         }
         if prepared.worktree_path.exists() || self.worktree_registered(prepared)? {
             bail!("managed GitHub worktree was not completely removed");
         }
+        progress.local_worktree_removed = true;
 
-        self.delete_local_branch_if_exact(prepared, &authorization.final_head_sha)?;
         self.delete_local_ref_if_exact(
             &prepared.repository_root,
             &prepared.namespaced_base_ref,
             &prepared.base_sha,
         )?;
+        self.delete_local_branch_if_exact(prepared, &authorization.final_head_sha)?;
+        progress.local_refs_removed = true;
 
         let remote_ref_outcome = if !delivery.delete_remote_branch_after_merge {
             if remote_before.is_some() {
@@ -673,6 +822,17 @@ impl GitWorkspaceManager {
                     OsString::from(deletion_refspec),
                 ],
             );
+            if deletion
+                .as_ref()
+                .is_ok_and(|output| output.status.success())
+            {
+                // A successful lease-protected push confirms that the exact
+                // expected remote ref was deleted. Retain that effect before
+                // the follow-up inspection, which can still detect a later
+                // mutation but must not erase the confirmed deletion if the
+                // inspection itself fails.
+                progress.remote_ref_outcome = Some(RemoteRefFinalizationOutcome::Deleted);
+            }
             let remote_after = self.remote_ref(
                 &prepared.repository_root,
                 delivery,
@@ -692,12 +852,15 @@ impl GitWorkspaceManager {
                     RemoteRefFinalizationOutcome::PreservedAfterDeleteFailure
                 }
                 Some(_) => {
+                    progress.remote_ref_outcome =
+                        Some(RemoteRefFinalizationOutcome::PreservedAfterMutation);
                     bail!(
                         "merged GitHub run branch changed during final deletion and was preserved"
                     )
                 }
             }
         };
+        progress.remote_ref_outcome = Some(remote_ref_outcome);
 
         Ok(GitFinalizationOutcome {
             merge_sha: authorization.merge_sha.clone(),
@@ -914,13 +1077,23 @@ impl GitWorkspaceManager {
                         OsString::from(reference),
                         OsString::from(expected),
                     ],
-                )?;
+                );
+                if output.as_ref().is_ok_and(|output| output.status.success()) {
+                    // `update-ref -d <ref> <old>` is one atomic exact-value
+                    // deletion. Its successful exit is already the proof; a
+                    // second read would only add a post-effect failure window.
+                    return Ok(());
+                }
                 match self.local_ref(repository, reference)? {
                     None => Ok(()),
                     Some(after) if after != expected => {
                         bail!("generated local GitHub ref changed and was preserved")
                     }
-                    Some(_) if !output.status.success() => {
+                    Some(_)
+                        if output
+                            .as_ref()
+                            .map_or(true, |output| !output.status.success()) =>
+                    {
                         bail!("exact generated local GitHub ref removal command failed")
                     }
                     Some(_) => bail!("exact generated local GitHub ref removal failed"),
@@ -1598,6 +1771,62 @@ mod tests {
     }
 
     #[test]
+    fn preparation_reports_created_artifacts_when_post_add_validation_fails() {
+        let mut fixture = Fixture::new();
+        let worktree = fixture.workspace.repository_path();
+        let wrapper = fixture._temp.path().join("git-dirty-after-worktree-add");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nworktree=false\nadd=false\nfor arg in \"$@\"; do\n  [ \"$arg\" != worktree ] || worktree=true\n  [ \"$arg\" != add ] || add=true\ndone\n/usr/bin/git \"$@\"\nstatus=$?\nif [ \"$status\" -eq 0 ] && [ \"$worktree\" = true ] && [ \"$add\" = true ]; then\n  printf dirty >'{}/untracked-after-add'\nfi\nexit \"$status\"\n",
+                worktree.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        fixture.manager =
+            GitWorkspaceManager::for_local_bare_with_git(fixture.bare.clone(), wrapper);
+
+        let (result, progress) = fixture.manager.prepare_with_progress(
+            &fixture.workspace,
+            &fixture.binding,
+            &fixture.run,
+            &fixture.plan_hash,
+            None,
+        );
+        let error = result.unwrap_err();
+
+        assert!(error.to_string().contains("worktree/index is not clean"));
+        assert_eq!(
+            progress,
+            GitPreparationProgress {
+                local_base_ref_created: true,
+                local_branch_created: true,
+                local_worktree_created: true,
+            }
+        );
+        assert!(worktree.is_dir());
+        assert_eq!(
+            local_ref(
+                &fixture.primary,
+                &format!(
+                    "{LOCAL_BASE_REF_PREFIX}/{}/base",
+                    fixture.workspace.run_id()
+                )
+            ),
+            Some(fixture.base_sha.clone())
+        );
+        assert_eq!(
+            local_ref(
+                &fixture.primary,
+                &format!("refs/heads/{}", fixture.run.generated_run_branch)
+            ),
+            Some(fixture.base_sha.clone())
+        );
+        fixture.assert_primary_unchanged();
+    }
+
+    #[test]
     fn exact_base_append_only_push_and_finalization_leave_primary_checkout_untouched() {
         let fixture = Fixture::new();
         let prepared = fixture.prepare();
@@ -1820,16 +2049,429 @@ mod tests {
             0,
         )
         .unwrap();
-        let error = fixture
-            .manager
-            .finalize_success(&prepared, &fixture.binding, &authorization, None)
-            .unwrap_err();
+        let (result, progress) = fixture.manager.finalize_success_with_progress(
+            &prepared,
+            &fixture.binding,
+            &authorization,
+            None,
+        );
+        let error = result.unwrap_err();
 
         assert!(error.to_string().contains("changed and was preserved"));
+        assert!(progress.local_worktree_removed);
+        assert!(!progress.local_refs_removed);
+        assert_eq!(progress.remote_ref_outcome, None);
         assert!(!prepared.worktree_path().exists());
         assert_eq!(
             local_ref(&fixture.primary, &prepared.branch_ref),
             Some(fixture.base_sha.clone())
+        );
+        assert_eq!(
+            local_ref(&fixture.primary, &prepared.namespaced_base_ref),
+            None
+        );
+        assert_eq!(bare_ref(&fixture.bare, &prepared.branch_ref), Some(head));
+        fixture.assert_primary_unchanged();
+    }
+
+    #[test]
+    fn finalization_reports_remote_mutation_after_local_cleanup() {
+        let mut fixture = Fixture::new();
+        let prepared = fixture.prepare();
+        let head = commit_file(
+            prepared.worktree_path(),
+            &fixture.binding.developer_commit_identity(),
+            "task.txt",
+            "candidate\n",
+            "candidate",
+            true,
+        );
+        let candidate = fixture
+            .manager
+            .validate_developer_commit(&prepared, &fixture.binding, None, None)
+            .unwrap();
+        fixture
+            .manager
+            .push_candidate(&prepared, &fixture.binding, &candidate, None, None)
+            .unwrap();
+
+        let wrapper = fixture._temp.path().join("git-move-remote-before-delete");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nmutate=false\nfor arg in \"$@\"; do\n  [ \"$arg\" != ':{}' ] || mutate=true\ndone\nif [ \"$mutate\" = true ]; then\n  /usr/bin/git --git-dir='{}' update-ref '{}' '{}' '{}' || exit $?\nfi\nexec /usr/bin/git \"$@\"\n",
+                prepared.branch_ref,
+                fixture.bare.display(),
+                prepared.branch_ref,
+                fixture.base_sha,
+                head,
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        fixture.manager =
+            GitWorkspaceManager::for_local_bare_with_git(fixture.bare.clone(), wrapper);
+
+        let authorization = FinalizationAuthorization::after_confirmed_merge(
+            &head,
+            &head,
+            &"f".repeat(40),
+            true,
+            true,
+            0,
+        )
+        .unwrap();
+        let (result, progress) = fixture.manager.finalize_success_with_progress(
+            &prepared,
+            &fixture.binding,
+            &authorization,
+            None,
+        );
+        let error = result.unwrap_err();
+
+        assert!(error.to_string().contains("changed during final deletion"));
+        assert!(progress.local_worktree_removed);
+        assert!(progress.local_refs_removed);
+        assert_eq!(
+            progress.remote_ref_outcome,
+            Some(RemoteRefFinalizationOutcome::PreservedAfterMutation)
+        );
+        assert!(!prepared.worktree_path().exists());
+        assert_eq!(local_ref(&fixture.primary, &prepared.branch_ref), None);
+        assert_eq!(
+            local_ref(&fixture.primary, &prepared.namespaced_base_ref),
+            None
+        );
+        assert_eq!(
+            bare_ref(&fixture.bare, &prepared.branch_ref),
+            Some(fixture.base_sha.clone())
+        );
+        fixture.assert_primary_unchanged();
+    }
+
+    #[test]
+    fn finalization_retains_remote_deletion_when_follow_up_inspection_fails() {
+        let mut fixture = Fixture::new();
+        let prepared = fixture.prepare();
+        let head = commit_file(
+            prepared.worktree_path(),
+            &fixture.binding.developer_commit_identity(),
+            "task.txt",
+            "candidate\n",
+            "candidate",
+            true,
+        );
+        let candidate = fixture
+            .manager
+            .validate_developer_commit(&prepared, &fixture.binding, None, None)
+            .unwrap();
+        fixture
+            .manager
+            .push_candidate(&prepared, &fixture.binding, &candidate, None, None)
+            .unwrap();
+
+        let marker = fixture._temp.path().join("remote-branch-deleted");
+        let wrapper = fixture
+            ._temp
+            .path()
+            .join("git-fail-remote-inspection-after-delete");
+        fs::write(
+            &wrapper,
+            format!(
+                r#"#!/bin/sh
+delete=false
+inspect=false
+for arg in "$@"; do
+  [ "$arg" != ':{}' ] || delete=true
+  [ "$arg" != ls-remote ] || inspect=true
+done
+if [ -f '{}' ] && [ "$inspect" = true ]; then
+  exit 2
+fi
+/usr/bin/git "$@"
+status=$?
+if [ "$status" -eq 0 ] && [ "$delete" = true ]; then
+  touch '{}'
+fi
+exit "$status"
+"#,
+                prepared.branch_ref,
+                marker.display(),
+                marker.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        fixture.manager =
+            GitWorkspaceManager::for_local_bare_with_git(fixture.bare.clone(), wrapper);
+
+        let authorization = FinalizationAuthorization::after_confirmed_merge(
+            &head,
+            &head,
+            &"f".repeat(40),
+            true,
+            true,
+            0,
+        )
+        .unwrap();
+        let (result, progress) = fixture.manager.finalize_success_with_progress(
+            &prepared,
+            &fixture.binding,
+            &authorization,
+            None,
+        );
+        let error = result.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to read exact remote Git ref")
+        );
+        assert!(progress.local_worktree_removed);
+        assert!(progress.local_refs_removed);
+        assert_eq!(
+            progress.remote_ref_outcome,
+            Some(RemoteRefFinalizationOutcome::Deleted)
+        );
+        assert!(marker.is_file());
+        assert!(!prepared.worktree_path().exists());
+        assert_eq!(local_ref(&fixture.primary, &prepared.branch_ref), None);
+        assert_eq!(
+            local_ref(&fixture.primary, &prepared.namespaced_base_ref),
+            None
+        );
+        assert_eq!(bare_ref(&fixture.bare, &prepared.branch_ref), None);
+        fixture.assert_primary_unchanged();
+    }
+
+    #[test]
+    fn finalization_reconciles_worktree_removal_failure_after_effect() {
+        let mut fixture = Fixture::new();
+        let prepared = fixture.prepare();
+        let head = commit_file(
+            prepared.worktree_path(),
+            &fixture.binding.developer_commit_identity(),
+            "task.txt",
+            "candidate\n",
+            "candidate",
+            true,
+        );
+        let candidate = fixture
+            .manager
+            .validate_developer_commit(&prepared, &fixture.binding, None, None)
+            .unwrap();
+        fixture
+            .manager
+            .push_candidate(&prepared, &fixture.binding, &candidate, None, None)
+            .unwrap();
+
+        let wrapper = fixture._temp.path().join("git-fail-after-worktree-remove");
+        fs::write(
+            &wrapper,
+            "#!/bin/sh\nremoved=false\nfor arg in \"$@\"; do\n  [ \"$arg\" != remove ] || removed=true\ndone\n/usr/bin/git \"$@\"\nstatus=$?\n[ \"$status\" -eq 0 ] || exit \"$status\"\n[ \"$removed\" = false ] || exit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        fixture.manager =
+            GitWorkspaceManager::for_local_bare_with_git(fixture.bare.clone(), wrapper);
+
+        let authorization = FinalizationAuthorization::after_confirmed_merge(
+            &head,
+            &head,
+            &"f".repeat(40),
+            true,
+            true,
+            0,
+        )
+        .unwrap();
+        let outcome = fixture
+            .manager
+            .finalize_success(&prepared, &fixture.binding, &authorization, None)
+            .unwrap();
+
+        assert!(outcome.local_worktree_removed);
+        assert!(outcome.local_refs_removed);
+        assert_eq!(
+            outcome.remote_ref_outcome,
+            RemoteRefFinalizationOutcome::Deleted
+        );
+        assert!(!prepared.worktree_path().exists());
+        assert_eq!(local_ref(&fixture.primary, &prepared.branch_ref), None);
+        assert_eq!(
+            local_ref(&fixture.primary, &prepared.namespaced_base_ref),
+            None
+        );
+        assert_eq!(bare_ref(&fixture.bare, &prepared.branch_ref), None);
+        fixture.assert_primary_unchanged();
+    }
+
+    #[test]
+    fn finalization_does_not_reinspect_successfully_deleted_final_local_branch() {
+        let mut fixture = Fixture::new();
+        let prepared = fixture.prepare();
+        let head = commit_file(
+            prepared.worktree_path(),
+            &fixture.binding.developer_commit_identity(),
+            "task.txt",
+            "candidate\n",
+            "candidate",
+            true,
+        );
+        let candidate = fixture
+            .manager
+            .validate_developer_commit(&prepared, &fixture.binding, None, None)
+            .unwrap();
+        fixture
+            .manager
+            .push_candidate(&prepared, &fixture.binding, &candidate, None, None)
+            .unwrap();
+        git_ok(
+            &fixture.bare,
+            [
+                "update-ref",
+                "-d",
+                prepared.branch_ref.as_str(),
+                head.as_str(),
+            ],
+        );
+
+        let marker = fixture._temp.path().join("final-local-branch-removed");
+        let wrapper = fixture
+            ._temp
+            .path()
+            .join("git-fail-inspection-after-final-local-delete");
+        fs::write(
+            &wrapper,
+            format!(
+                r#"#!/bin/sh
+delete=false
+target=false
+inspect=false
+for arg in "$@"; do
+  [ "$arg" != update-ref ] || delete=true
+  [ "$arg" != '{}' ] || target=true
+  [ "$arg" != '{}^{{commit}}' ] || inspect=true
+done
+if [ -f '{}' ] && [ "$inspect" = true ]; then
+  exit 2
+fi
+/usr/bin/git "$@"
+status=$?
+if [ "$status" -eq 0 ] && [ "$delete" = true ] && [ "$target" = true ]; then
+  touch '{}'
+fi
+exit "$status"
+"#,
+                prepared.branch_ref,
+                prepared.branch_ref,
+                marker.display(),
+                marker.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        fixture.manager =
+            GitWorkspaceManager::for_local_bare_with_git(fixture.bare.clone(), wrapper);
+
+        let authorization = FinalizationAuthorization::after_confirmed_merge(
+            &head,
+            &head,
+            &"f".repeat(40),
+            true,
+            true,
+            0,
+        )
+        .unwrap();
+        let outcome = fixture
+            .manager
+            .finalize_success(&prepared, &fixture.binding, &authorization, None)
+            .unwrap();
+
+        assert!(outcome.local_worktree_removed);
+        assert!(outcome.local_refs_removed);
+        assert_eq!(
+            outcome.remote_ref_outcome,
+            RemoteRefFinalizationOutcome::AlreadyAbsent
+        );
+        assert!(marker.is_file());
+        assert!(!prepared.worktree_path().exists());
+        assert_eq!(local_ref(&fixture.primary, &prepared.branch_ref), None);
+        assert_eq!(
+            local_ref(&fixture.primary, &prepared.namespaced_base_ref),
+            None
+        );
+        assert_eq!(bare_ref(&fixture.bare, &prepared.branch_ref), None);
+        fixture.assert_primary_unchanged();
+    }
+
+    #[test]
+    fn finalization_retains_worktree_progress_when_follow_up_inspection_fails() {
+        let mut fixture = Fixture::new();
+        let prepared = fixture.prepare();
+        let head = commit_file(
+            prepared.worktree_path(),
+            &fixture.binding.developer_commit_identity(),
+            "task.txt",
+            "candidate\n",
+            "candidate",
+            true,
+        );
+        let candidate = fixture
+            .manager
+            .validate_developer_commit(&prepared, &fixture.binding, None, None)
+            .unwrap();
+        fixture
+            .manager
+            .push_candidate(&prepared, &fixture.binding, &candidate, None, None)
+            .unwrap();
+
+        let marker = fixture._temp.path().join("worktree-removed");
+        let wrapper = fixture
+            ._temp
+            .path()
+            .join("git-fail-worktree-inspection-after-remove");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nworktree=false\nremove=false\nlist=false\nfor arg in \"$@\"; do\n  [ \"$arg\" != worktree ] || worktree=true\n  [ \"$arg\" != remove ] || remove=true\n  [ \"$arg\" != list ] || list=true\ndone\nif [ \"$worktree\" = true ] && [ \"$remove\" = true ]; then\n  /usr/bin/git \"$@\"\n  status=$?\n  [ \"$status\" -ne 0 ] || touch '{}'\n  exit \"$status\"\nfi\nif [ \"$worktree\" = true ] && [ \"$list\" = true ] && [ -f '{}' ]; then\n  exit 1\nfi\nexec /usr/bin/git \"$@\"\n",
+                marker.display(),
+                marker.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        fixture.manager =
+            GitWorkspaceManager::for_local_bare_with_git(fixture.bare.clone(), wrapper);
+
+        let authorization = FinalizationAuthorization::after_confirmed_merge(
+            &head,
+            &head,
+            &"f".repeat(40),
+            true,
+            true,
+            0,
+        )
+        .unwrap();
+        let (result, progress) = fixture.manager.finalize_success_with_progress(
+            &prepared,
+            &fixture.binding,
+            &authorization,
+            None,
+        );
+        let error = result.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to inspect registered Git worktrees")
+        );
+        assert!(progress.local_worktree_removed);
+        assert!(!progress.local_refs_removed);
+        assert_eq!(progress.remote_ref_outcome, None);
+        assert!(!prepared.worktree_path().exists());
+        assert_eq!(
+            local_ref(&fixture.primary, &prepared.branch_ref),
+            Some(head.clone())
         );
         assert_eq!(
             local_ref(&fixture.primary, &prepared.namespaced_base_ref),

@@ -252,6 +252,7 @@ pub(crate) enum InstallationOperation {
     PullRequestCreate,
     PullRequestRead,
     DeveloperComment,
+    DeveloperCommentRead,
     TerminalComment,
     ReviewPublish,
     ReviewRead,
@@ -274,9 +275,11 @@ impl InstallationOperation {
             | Self::Merge
             | Self::RemoteRefCleanup
             | Self::TerminalComment => role == GitHubAppRole::Architect,
-            Self::GitFetch | Self::GitPush | Self::PullRequestCreate | Self::DeveloperComment => {
-                role == GitHubAppRole::Developer
-            }
+            Self::GitFetch
+            | Self::GitPush
+            | Self::PullRequestCreate
+            | Self::DeveloperComment
+            | Self::DeveloperCommentRead => role == GitHubAppRole::Developer,
             Self::PullRequestRead => {
                 matches!(role, GitHubAppRole::Architect | GitHubAppRole::Developer)
             }
@@ -297,7 +300,9 @@ impl InstallationOperation {
             | Self::DeveloperComment
             | Self::TerminalComment
             | Self::ReviewPublish => &[("pull_requests", Write)],
-            Self::PullRequestRead | Self::ReviewRead => &[("pull_requests", Read)],
+            Self::PullRequestRead | Self::DeveloperCommentRead | Self::ReviewRead => {
+                &[("pull_requests", Read)]
+            }
             Self::CheckPublish => &[("checks", Write)],
             Self::CheckRead => &[("checks", Read)],
             Self::Merge => &[("contents", Write), ("pull_requests", Write)],
@@ -316,6 +321,11 @@ pub(crate) struct InstallationTokenRequest {
     role: GitHubAppRole,
     #[serde(skip)]
     operation: InstallationOperation,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct BootstrapInstallationTokenRequest {
+    permissions: BTreeMap<String, GitHubPermissionLevel>,
 }
 
 impl InstallationTokenRequest {
@@ -399,11 +409,12 @@ pub(crate) fn mint_installation_token(
             super::client::GitHubAuthentication::App(jwt),
             request,
         )
-        .map_err(|error| anyhow!("bounded GitHub installation-token request failed: {error}"))?;
+        .map_err(anyhow::Error::new)
+        .context("bounded GitHub installation-token request failed")?;
     if response.repositories.len() != 1 || response.repositories[0].id != request.repository_id() {
         bail!("GitHub installation token is not scoped to the exact repository");
     }
-    if response.permissions != *request.permissions() {
+    if !matches_requested_permissions(&response.permissions, request.permissions()) {
         bail!("GitHub installation token permissions differ from the operation minimum");
     }
     InstallationToken::from_secret_github_response(
@@ -414,6 +425,71 @@ pub(crate) fn mint_installation_token(
         request.operation(),
         now_unix,
     )
+}
+
+/// Bootstrap an unscoped metadata token before the numeric repository ID is
+/// known. Omitting repository selectors makes GitHub report the installation's
+/// complete repository selection; that response must contain exactly one
+/// repository. The configured owner/name is then read with this token and must
+/// resolve to that same ID. Every later token is scoped by the frozen numeric
+/// ID.
+pub(crate) fn mint_bootstrap_repository_token(
+    client: &super::client::GitHubRestClient,
+    jwt: &AppJwt,
+    installation_id: u64,
+    repository: &str,
+    role: GitHubAppRole,
+    now_unix: i64,
+) -> Result<(InstallationToken, u64)> {
+    if installation_id == 0 {
+        bail!("GitHub App installation ID must be positive");
+    }
+    super::validate_slug("GitHub bootstrap repository", repository)?;
+    let request = BootstrapInstallationTokenRequest {
+        permissions: BTreeMap::new(),
+    };
+    let response: InstallationTokenResponse = client
+        .send_json(
+            super::client::RestEndpoint::CreateInstallationToken { installation_id },
+            super::client::GitHubAuthentication::App(jwt),
+            &request,
+        )
+        .map_err(anyhow::Error::new)
+        .context("bounded GitHub bootstrap-token request failed")?;
+    let repository_id = exact_bootstrap_repository_id(&response)?;
+    if !matches_requested_permissions(&response.permissions, &BTreeMap::new()) {
+        bail!("GitHub bootstrap token permissions exceed metadata-only access");
+    }
+    let token = InstallationToken::from_secret_github_response(
+        response.token,
+        &response.expires_at,
+        repository_id,
+        role,
+        InstallationOperation::RepositoryMetadata,
+        now_unix,
+    )?;
+    Ok((token, repository_id))
+}
+
+fn exact_bootstrap_repository_id(response: &InstallationTokenResponse) -> Result<u64> {
+    if response.repositories.len() != 1 || response.repositories[0].id == 0 {
+        bail!("GitHub App installation must select only one exact repository");
+    }
+    Ok(response.repositories[0].id)
+}
+
+fn matches_requested_permissions(
+    observed: &BTreeMap<String, GitHubPermissionLevel>,
+    requested: &BTreeMap<String, GitHubPermissionLevel>,
+) -> bool {
+    let mut normalized = observed.clone();
+    if normalized
+        .remove("metadata")
+        .is_some_and(|level| level != GitHubPermissionLevel::Read)
+    {
+        return false;
+    }
+    normalized == *requested
 }
 
 #[derive(Serialize)]
@@ -709,6 +785,22 @@ mod tests {
             )
             .is_err()
         );
+        assert!(matches_requested_permissions(
+            &BTreeMap::from([
+                ("contents".into(), GitHubPermissionLevel::Write),
+                ("metadata".into(), GitHubPermissionLevel::Read),
+                ("pull_requests".into(), GitHubPermissionLevel::Write),
+            ]),
+            request.permissions(),
+        ));
+        assert!(!matches_requested_permissions(
+            &BTreeMap::from([
+                ("contents".into(), GitHubPermissionLevel::Write),
+                ("issues".into(), GitHubPermissionLevel::Read),
+                ("pull_requests".into(), GitHubPermissionLevel::Write),
+            ]),
+            request.permissions(),
+        ));
     }
 
     #[test]
@@ -806,5 +898,23 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["repository_ids"], serde_json::json!([99]));
         assert_eq!(body["permissions"], serde_json::json!({"contents":"write"}));
+    }
+
+    #[test]
+    fn bootstrap_token_omits_downscoping_and_rejects_multi_repository_installations() {
+        let request = BootstrapInstallationTokenRequest {
+            permissions: BTreeMap::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({"permissions": {}})
+        );
+        let response = InstallationTokenResponse {
+            token: SecretText::new("opaque bootstrap fixture".into()).unwrap(),
+            expires_at: "1970-01-01T01:16:40Z".into(),
+            repositories: vec![TokenRepository { id: 99 }, TokenRepository { id: 100 }],
+            permissions: BTreeMap::from([("metadata".into(), GitHubPermissionLevel::Read)]),
+        };
+        assert!(exact_bootstrap_repository_id(&response).is_err());
     }
 }
