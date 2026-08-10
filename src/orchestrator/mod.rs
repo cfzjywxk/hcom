@@ -1,11 +1,13 @@
 //! Foreground, in-memory task supervisor for one `hcom arch` invocation.
 
 pub mod core;
+pub(crate) mod github;
 #[cfg(target_os = "linux")]
 pub(crate) mod task_lane;
 #[cfg(target_os = "linux")]
 pub mod workspace;
 
+use crate::control_api::DeliveryBinding;
 use crate::worker::environment::ParentEnvironment;
 use crate::worker::profile::{ArchitectAdapter, SessionInvocationProfiles};
 use anyhow::{Context, Result, bail};
@@ -30,6 +32,8 @@ pub(crate) struct SessionRuntimeSources {
     profiles: Option<SessionInvocationProfiles>,
     architect_additional_directories: Vec<PathBuf>,
     guardian_executable: PathBuf,
+    delivery_binding: DeliveryBinding,
+    github_runtime: Option<github::GitHubRuntimeBinding>,
 }
 
 impl SessionRuntimeSources {
@@ -49,7 +53,38 @@ impl SessionRuntimeSources {
             architect_additional_directories,
             guardian_executable: std::env::current_exe()
                 .context("failed to resolve the current hcom Guardian executable")?,
+            delivery_binding: DeliveryBinding::LocalCandidate,
+            github_runtime: None,
         })
+    }
+
+    #[allow(
+        dead_code,
+        reason = "constructed by the later production GitHub preflight driver"
+    )]
+    pub(crate) fn capture_with_github(
+        parent_environment: impl Into<ParentEnvironment>,
+        profiles: SessionInvocationProfiles,
+        architect_additional_directories: Vec<PathBuf>,
+        github_runtime: github::GitHubRuntimeBinding,
+    ) -> Result<Self> {
+        let mut sources = Self::capture(
+            parent_environment,
+            profiles,
+            architect_additional_directories,
+        )?;
+        github::validate_inspection_result(
+            &github_runtime.binding,
+            &github::GitHubInspectionResult {
+                delivery_binding: github_runtime.binding.clone(),
+                inspection: github_runtime.initial_inspection.clone(),
+            },
+        )?;
+        sources.delivery_binding = DeliveryBinding::GitHubPullRequest {
+            binding: Box::new(github_runtime.binding.clone()),
+        };
+        sources.github_runtime = Some(github_runtime);
+        Ok(sources)
     }
 
     #[cfg(test)]
@@ -64,6 +99,8 @@ impl SessionRuntimeSources {
             architect_additional_directories: Vec::new(),
             guardian_executable: std::env::current_exe()
                 .expect("test process executable must be available"),
+            delivery_binding: DeliveryBinding::LocalCandidate,
+            github_runtime: None,
         }
     }
 

@@ -263,7 +263,7 @@ and the additional-directory instruction policy. The session binding hash
 includes the exact Architect/worker profiles, ordered Reviewer identities,
 worker runtime contracts, and ordered Claude Architect `--add-dir` roots; the
 approved plan hash binds it. The bridge bootstrap carries the same hash under a
-closed schema. Private task-control protocol v9 exposes the ordered active
+closed schema. Private task-control protocol v10 exposes the ordered active
 Reviewer state; an old or mismatched `hcom`/`hcom-architect-mcp` pair rejects the
 bootstrap or protocol version instead of falling back to weaker/default
 profiles.
@@ -562,7 +562,7 @@ generation paths and Reviewer bodies are not copied into the response.
 Snapshots carry `clarification_record_count` rather than the accumulating
 record vector; the Architect uses `session_clarifications_list` with the exact
 run ID and pages of at most eight to read the ordered chain. MCP compatibility
-text and `structuredContent` carry the same v9 metadata without any Reviewer
+text and `structuredContent` carry the same v10 metadata without any Reviewer
 body. Only after a terminal `session_wait` response does the Architect read
 every active Reviewer's non-empty current-generation path chain and use the original
 verdicts and findings for the human-facing delivery. It distinguishes
@@ -615,9 +615,9 @@ without approving a plan or starting workers. The local source gate already
 checks a narrow fail-closed schema policy and a Codex-0.145/0.146 compatibility
 projection, so this real canary is confirmation of the external service rather
 than the primary regression test.
-The protocol-v9 dual-review runner is separately authorized, serial, and
+The protocol-v10 dual-review runner is separately authorized, serial, and
 Haiku/medium-only for Claude; its definitions are present but have not been run.
-Earlier protocol results are not v9 dual-review evidence.
+Earlier protocol results are not v10 dual-review evidence.
 
 Implementation details and test mappings:
 

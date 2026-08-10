@@ -177,11 +177,18 @@ trait SupervisorBackend: Send {
         terminal_run_id: &str,
     ) -> Result<()>;
 
+    fn inspect_github_delivery(
+        &mut self,
+        expected_session_version: u64,
+        run_id: &str,
+    ) -> Result<crate::control_api::GitHubInspectionBinding>;
+
     fn replace_plan(
         &mut self,
         expected_session_version: u64,
         developer_adapter: &str,
         reviewer_adapters: &[crate::control_api::ReviewerAdapterBinding],
+        github_inspection_id: Option<&str>,
         tasks: Vec<crate::control_api::TaskDraft>,
     ) -> Result<(u64, String)>;
 
@@ -251,17 +258,27 @@ impl SupervisorBackend for TaskLaneSupervisor {
         self.begin_next_run(expected_session_version, terminal_run_id)
     }
 
+    fn inspect_github_delivery(
+        &mut self,
+        expected_session_version: u64,
+        run_id: &str,
+    ) -> Result<crate::control_api::GitHubInspectionBinding> {
+        self.inspect_github_delivery(expected_session_version, run_id)
+    }
+
     fn replace_plan(
         &mut self,
         expected_session_version: u64,
         developer_adapter: &str,
         reviewer_adapters: &[crate::control_api::ReviewerAdapterBinding],
+        github_inspection_id: Option<&str>,
         tasks: Vec<crate::control_api::TaskDraft>,
     ) -> Result<(u64, String)> {
-        self.replace_plan(
+        self.replace_plan_with_inspection(
             expected_session_version,
             developer_adapter,
             reviewer_adapters,
+            github_inspection_id,
             tasks,
         )
     }
@@ -489,7 +506,8 @@ impl SessionSupervisorControl {
                 }
                 let (action_set_json, action_set) = canonical_action_set(actions.iter().copied())
                     .map_err(|error| anyhow::anyhow!(error))?;
-                if action_set != ActionName::ARCHITECT.into_iter().collect() {
+                let github_pr = self.supervisor.snapshot().delivery_binding.is_github();
+                if action_set != ActionName::architect(github_pr).iter().copied().collect() {
                     bail!("architect action capability differs from the exact session set");
                 }
                 let binding = ArchitectBinding {
@@ -897,18 +915,27 @@ impl SessionSupervisorControl {
         }
         if matches!(
             &request.action,
-            ControlAction::SessionStatus | ControlAction::SessionClarificationsList { .. }
+            ControlAction::SessionStatus
+                | ControlAction::SessionClarificationsList { .. }
+                | ControlAction::SessionGitHubDeliveryInspect { .. }
         ) {
-            if let ControlAction::SessionClarificationsList { run_id, .. } = &request.action {
+            if let ControlAction::SessionClarificationsList { run_id, .. }
+            | ControlAction::SessionGitHubDeliveryInspect { run_id, .. } = &request.action
+            {
                 let snapshot = self.supervisor.snapshot();
                 if *run_id != snapshot.run_id {
+                    let detail = if matches!(
+                        &request.action,
+                        ControlAction::SessionGitHubDeliveryInspect { .. }
+                    ) {
+                        "GitHub delivery inspection run identity does not match the current run"
+                    } else {
+                        "clarification page run identity does not match the current run"
+                    };
                     return ControlResponse::error(
                         &request.request_id,
                         ControlErrorCode::Conflict,
-                        format!(
-                            "clarification page run identity does not match the current run; current run_id is {}",
-                            snapshot.run_id
-                        ),
+                        format!("{detail}; current run_id is {}", snapshot.run_id),
                     );
                 }
             }
@@ -919,6 +946,10 @@ impl SessionSupervisorControl {
                         ControlAction::SessionClarificationsList { .. } => (
                             ControlErrorCode::Conflict,
                             "clarification page does not match the exact task or cursor",
+                        ),
+                        ControlAction::SessionGitHubDeliveryInspect { .. } => (
+                            ControlErrorCode::Conflict,
+                            "GitHub delivery inspection failed its exact run, version, or binding gate",
                         ),
                         _ => (
                             ControlErrorCode::Internal,
@@ -1014,16 +1045,28 @@ impl SessionSupervisorControl {
                     session: self.supervisor.snapshot(),
                 })
             }
+            ControlAction::SessionGitHubDeliveryInspect {
+                expected_session_version,
+                run_id,
+            } => Ok(ControlResult::GitHubInspection {
+                run_id: run_id.clone(),
+                session_version: *expected_session_version,
+                inspection: self
+                    .supervisor
+                    .inspect_github_delivery(*expected_session_version, run_id)?,
+            }),
             ControlAction::SessionPlanReplace {
                 expected_session_version,
                 developer_adapter,
                 reviewer_adapters,
+                github_inspection_id,
                 tasks,
             } => {
                 let (plan_version, plan_hash) = self.supervisor.replace_plan(
                     *expected_session_version,
                     developer_adapter,
                     reviewer_adapters,
+                    github_inspection_id.as_deref(),
                     tasks.clone(),
                 )?;
                 Ok(ControlResult::Plan {
@@ -1521,9 +1564,18 @@ mod tests {
             _expected_session_version: u64,
             _developer_adapter: &str,
             _reviewer_adapters: &[crate::control_api::ReviewerAdapterBinding],
+            _github_inspection_id: Option<&str>,
             _tasks: Vec<crate::control_api::TaskDraft>,
         ) -> Result<(u64, String)> {
             bail!("unused fake replace_plan")
+        }
+
+        fn inspect_github_delivery(
+            &mut self,
+            _expected_session_version: u64,
+            _run_id: &str,
+        ) -> Result<crate::control_api::GitHubInspectionBinding> {
+            bail!("unused fake GitHub inspection")
         }
 
         fn approve_and_start(
@@ -1691,6 +1743,8 @@ mod tests {
             state,
             version,
             project_root: project_root.to_string_lossy().into_owned(),
+            delivery_binding: Default::default(),
+            github: None,
             plan_version: Some(1),
             plan_hash: Some("a".repeat(64)),
             current_task_ordinal: Some(0),
@@ -1717,6 +1771,8 @@ mod tests {
                 clarification_record_count: 0,
                 base_revision: None,
                 head_revision: None,
+                github_reviews: Vec::new(),
+                github_check: None,
                 developer_session_bound: true,
                 reviewers: [
                     crate::worker::profile::ReviewerId::Reviewer1,
@@ -1832,6 +1888,7 @@ mod tests {
             task_selector: "FBTC-03".into(),
             clarification_record_count: 0,
             reviewer_bindings: Vec::new(),
+            github: None,
         }
     }
 

@@ -6,11 +6,12 @@
 use super::core::{
     DriverFailure, DriverFailureClass, SupervisorCore, SupervisorEffect, SupervisorEvent,
 };
+use super::github::{GitHubInspectionRequest, validate_inspection_result};
 use super::workspace::{ProjectTasksWorkspace, TasksWorkspace};
 use super::{SessionRuntimeSources, SessionStartup, ensure_private_directory, sha256_hex};
 use crate::control_api::{
-    ReviewerAdapterBinding, ReviewerBindingSnapshot, SessionState, SessionStatusSnapshot,
-    TaskDraft, TaskState, WorkerRole,
+    DeliveryBinding, GitHubInspectionBinding, GitHubRunBinding, ReviewerAdapterBinding,
+    ReviewerBindingSnapshot, SessionState, SessionStatusSnapshot, TaskDraft, TaskState, WorkerRole,
 };
 use crate::worker::claude_exec_runtime::{ClaudeExecRuntimeConfig, ClaudeExecTaskWorkerRuntime};
 use crate::worker::environment::{
@@ -27,7 +28,7 @@ use crate::worker::runtime::{
     TaskWorkerProfiles, WorkerLane,
 };
 use anyhow::{Context, Result, anyhow, bail};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -60,14 +61,34 @@ fn session_binding_hash(
     worker_profiles: &TaskWorkerProfiles,
     contract: &RuntimeContractIdentity,
     architect_additional_directories: &[PathBuf],
+    delivery_binding: &DeliveryBinding,
 ) -> Result<String> {
     Ok(sha256_hex(&serde_json::to_vec(&(
-        "hcom-provider-routed-session-binding-v1",
+        "hcom-provider-routed-session-binding-v2",
         session_profiles.canonical_hash(),
         worker_profiles.canonical_hash(),
         contract.canonical_hash(),
         architect_additional_directories,
+        delivery_binding,
     ))?))
+}
+
+fn derive_github_run_binding(
+    run_id: &str,
+    plan_hash: &str,
+    inspection: GitHubInspectionBinding,
+) -> GitHubRunBinding {
+    // Twelve digest characters keep the branch readable while the complete
+    // digest remains bound in plan.md/status and in every later operation.
+    let generated_run_branch = format!("hcom/{run_id}-{}", &plan_hash[..12]);
+    GitHubRunBinding {
+        inspected_repository_id: inspection.inspected_repository_id,
+        expected_base_ref: inspection.expected_base_ref,
+        expected_base_sha: inspection.expected_base_sha,
+        ruleset_attestation_sha256: inspection.ruleset_attestation_sha256,
+        inspection_id: inspection.inspection_id,
+        generated_run_branch,
+    }
 }
 
 impl RuntimeFactory for ProductionRuntimeFactory {
@@ -291,6 +312,8 @@ pub(crate) struct TaskLaneSupervisor {
     project_tasks_workspace: Option<ProjectTasksWorkspace>,
     tasks_workspace: Option<TasksWorkspace>,
     cleanup_registry: GuardianCleanupRegistry,
+    latest_github_inspection: Option<GitHubInspectionBinding>,
+    seen_github_inspection_ids: BTreeSet<String>,
 }
 
 impl TaskLaneSupervisor {
@@ -333,6 +356,7 @@ impl TaskLaneSupervisor {
             &profiles,
             &contract,
             &sources.architect_additional_directories,
+            &sources.delivery_binding,
         )?;
         let startup = SessionStartup {
             run_id: run_id.clone(),
@@ -350,11 +374,12 @@ impl TaskLaneSupervisor {
                 contract_sha256: binding.profile.provider.contract_identity().contract_sha256,
             })
             .collect();
-        let core = SupervisorCore::new_with_reviewer_bindings(
+        let core = SupervisorCore::new_with_delivery_binding(
             run_id,
             project_root,
             binding_hash,
             reviewer_bindings,
+            sources.delivery_binding.clone(),
         )
         .map_err(|error| anyhow!(error.to_string()))?;
         let developer_adapter = profiles.developer.provider.as_str().into();
@@ -366,6 +391,14 @@ impl TaskLaneSupervisor {
                 adapter: binding.profile.provider.as_str().into(),
             })
             .collect();
+        let latest_github_inspection = sources
+            .github_runtime
+            .as_ref()
+            .map(|runtime| runtime.initial_inspection.clone());
+        let seen_github_inspection_ids = latest_github_inspection
+            .as_ref()
+            .map(|inspection| BTreeSet::from([inspection.inspection_id.clone()]))
+            .unwrap_or_default();
         Ok(Self {
             startup,
             epoch: format!("exec-supervisor-{}", Uuid::new_v4()),
@@ -383,6 +416,8 @@ impl TaskLaneSupervisor {
             project_tasks_workspace: None,
             tasks_workspace: None,
             cleanup_registry: GuardianCleanupRegistry::default(),
+            latest_github_inspection,
+            seen_github_inspection_ids,
         })
     }
 
@@ -430,14 +465,75 @@ impl TaskLaneSupervisor {
         self.next_session = 1;
         self.next_turn = 1;
         self.tasks_workspace = None;
+        self.latest_github_inspection = None;
+        self.seen_github_inspection_ids.clear();
         Ok(())
     }
 
+    pub(crate) fn inspect_github_delivery(
+        &mut self,
+        expected_session_version: u64,
+        run_id: &str,
+    ) -> Result<GitHubInspectionBinding> {
+        if expected_session_version != self.core.version() {
+            bail!("session version is stale");
+        }
+        if run_id != self.core.run_id() {
+            bail!("GitHub inspection run identity is stale");
+        }
+        if !matches!(
+            self.core.session_state(),
+            SessionState::AwaitingPlan | SessionState::AwaitingApproval
+        ) {
+            bail!("GitHub delivery inspection is available only before run start");
+        }
+        let runtime =
+            self.sources.github_runtime.as_ref().ok_or_else(|| {
+                anyhow!("GitHub delivery inspection is unavailable in local mode")
+            })?;
+        // Once a refresh is requested, the previously retained observation can
+        // no longer authorize start. This stays fail-closed even when the
+        // provider fails or violates its contract by reusing an inspection ID.
+        self.latest_github_inspection = None;
+        let result = runtime.inspector.inspect(&GitHubInspectionRequest {
+            run_id: run_id.into(),
+            session_version: expected_session_version,
+            delivery_binding: runtime.binding.clone(),
+        })?;
+        validate_inspection_result(&runtime.binding, &result)?;
+        if !self
+            .seen_github_inspection_ids
+            .insert(result.inspection.inspection_id.clone())
+        {
+            bail!("GitHub delivery inspection did not return a new inspection ID");
+        }
+        self.latest_github_inspection = Some(result.inspection.clone());
+        Ok(result.inspection)
+    }
+
+    #[cfg(test)]
     pub(crate) fn replace_plan(
         &mut self,
         expected_session_version: u64,
         developer_adapter: &str,
         reviewer_adapters: &[ReviewerAdapterBinding],
+        tasks: Vec<TaskDraft>,
+    ) -> Result<(u64, String)> {
+        self.replace_plan_with_inspection(
+            expected_session_version,
+            developer_adapter,
+            reviewer_adapters,
+            None,
+            tasks,
+        )
+    }
+
+    pub(crate) fn replace_plan_with_inspection(
+        &mut self,
+        expected_session_version: u64,
+        developer_adapter: &str,
+        reviewer_adapters: &[ReviewerAdapterBinding],
+        github_inspection_id: Option<&str>,
         tasks: Vec<TaskDraft>,
     ) -> Result<(u64, String)> {
         if developer_adapter != self.developer_adapter
@@ -455,8 +551,28 @@ impl TaskLaneSupervisor {
             bail!("task plan cannot change after this run starts");
         }
 
-        // A task's repository_root is just the source directory handed to its
-        // workers: hcom neither opens it, locks it, nor inspects its Git state.
+        let github_inspection = match (&self.sources.delivery_binding, github_inspection_id) {
+            (DeliveryBinding::LocalCandidate, None) => None,
+            (DeliveryBinding::LocalCandidate, Some(_)) => {
+                bail!("local candidate plans cannot bind a GitHub inspection")
+            }
+            (DeliveryBinding::GitHubPullRequest { .. }, None) => {
+                bail!("GitHub Pull Request plans require the latest inspection ID")
+            }
+            (DeliveryBinding::GitHubPullRequest { .. }, Some(inspection_id)) => {
+                let inspection = self.latest_github_inspection.clone().ok_or_else(|| {
+                    anyhow!("GitHub Pull Request plan has no current read-only inspection")
+                })?;
+                if inspection.inspection_id != inspection_id {
+                    bail!("GitHub Pull Request plan inspection ID is stale");
+                }
+                Some(inspection)
+            }
+        };
+
+        // A local task's repository_root is just the source directory handed
+        // to its workers. GitHub v1 deliberately narrows every task to the one
+        // canonical repository frozen by preflight.
         for task in &tasks {
             let root = PathBuf::from(&task.repository_root);
             if !root.is_dir() {
@@ -464,6 +580,14 @@ impl TaskLaneSupervisor {
                     "task {} names a source directory that does not exist: {}",
                     task.task_key,
                     root.display()
+                );
+            }
+            if let Some(binding) = self.sources.delivery_binding.github()
+                && task.repository_root != binding.local_repository_root
+            {
+                bail!(
+                    "GitHub Pull Request task {} repository_root differs from the frozen local repository root",
+                    task.task_key
                 );
             }
             if self
@@ -504,12 +628,20 @@ impl TaskLaneSupervisor {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or_else(|| anyhow!("plan version overflow"))?;
-        let plan_hash = self.core.expected_plan_hash(plan_version, &tasks);
+        let plan_hash = self.core.expected_plan_hash_for_inspection(
+            plan_version,
+            &tasks,
+            github_inspection.as_ref(),
+        );
+        let github_run_binding = github_inspection.map(|inspection| {
+            derive_github_run_binding(&self.startup.run_id, &plan_hash, inspection)
+        });
         let event = SupervisorEvent::PlanBound {
             expected_version: expected_session_version,
             plan_version,
             plan_hash: plan_hash.clone(),
             tasks,
+            github_run_binding,
         };
         let effects = self
             .core
@@ -528,6 +660,60 @@ impl TaskLaneSupervisor {
     ) -> Result<()> {
         if !approval_confirmed {
             bail!("run start requires explicit human execution authorization");
+        }
+        if expected_session_version != self.core.version()
+            || self.core.session_state() != SessionState::AwaitingApproval
+            || self.core.plan_version() != Some(plan_version)
+            || self.core.plan_hash() != Some(plan_hash)
+        {
+            bail!("run start binding is stale or does not match the displayed plan");
+        }
+        if let Some((delivery_binding, inspector)) = self
+            .sources
+            .github_runtime
+            .as_ref()
+            .map(|runtime| (runtime.binding.clone(), runtime.inspector.clone()))
+        {
+            let approved = self
+                .core
+                .github_run_binding()
+                .cloned()
+                .ok_or_else(|| anyhow!("GitHub Pull Request plan has no frozen run binding"))?;
+            if self
+                .latest_github_inspection
+                .as_ref()
+                .is_none_or(|latest| latest.inspection_id != approved.inspection_id)
+            {
+                bail!(
+                    "GitHub Pull Request plan inspection was superseded; bind and display the newest inspection"
+                );
+            }
+            let observed = inspector.inspect(&GitHubInspectionRequest {
+                run_id: self.core.run_id().into(),
+                session_version: expected_session_version,
+                delivery_binding: delivery_binding.clone(),
+            })?;
+            if let Err(error) = validate_inspection_result(&delivery_binding, &observed) {
+                // A validated identity or complete-permission-map drift makes
+                // this approval permanently stale, even if GitHub later
+                // returns to the previously approved values.
+                self.latest_github_inspection = None;
+                return Err(error);
+            }
+            if observed.inspection.inspected_repository_id != approved.inspected_repository_id
+                || observed.inspection.expected_base_ref != approved.expected_base_ref
+                || observed.inspection.expected_base_sha != approved.expected_base_sha
+                || observed.inspection.ruleset_attestation_sha256
+                    != approved.ruleset_attestation_sha256
+            {
+                // Do not let a drift-then-revert sequence resurrect the same
+                // approval. A fresh inspection ID and redisplayed plan are
+                // required before another start attempt.
+                self.latest_github_inspection = None;
+                bail!(
+                    "GitHub base ref, base SHA, or hcom-critical rules changed after plan binding; inspect and redisplay the plan"
+                );
+            }
         }
         self.cleanup_registry.ensure_available()?;
         let effects = self
@@ -598,6 +784,65 @@ impl TaskLaneSupervisor {
             "# hcom arch run {}\n\nplan version: {plan_version}\nplan hash: {plan_hash}\n\n",
             self.startup.run_id
         );
+        if let DeliveryBinding::GitHubPullRequest { binding } = &self.sources.delivery_binding {
+            let run_binding = self
+                .core
+                .github_run_binding()
+                .expect("a bound GitHub plan has a run binding");
+            plan.push_str("## delivery\n\n- mode: GitHub Pull Request\n");
+            plan.push_str(&format!(
+                "- private repository: {}/{} (id {})\n- local repository root: {}\n- base branch: {}\n- inspected base ref: {}\n- inspected base SHA: {}\n- ruleset attestation SHA-256: {}\n- inspection ID: {}\n- generated run branch: {}\n- merge method: {}\n- merge wait seconds: {}\n- review Check: {}\n- delete remote branch after merge: {}\n",
+                binding.owner,
+                binding.repository,
+                binding.repository_id,
+                binding.local_repository_root,
+                binding.base_branch,
+                run_binding.expected_base_ref,
+                run_binding.expected_base_sha,
+                run_binding.ruleset_attestation_sha256,
+                run_binding.inspection_id,
+                run_binding.generated_run_branch,
+                binding.merge_method,
+                binding.merge_wait_seconds,
+                binding.review_check_name,
+                binding.delete_remote_branch_after_merge,
+            ));
+            let commit_identity = binding.developer_commit_identity();
+            plan.push_str(&format!(
+                "- Developer commit identity: {} <{}> (author, committer, and Signed-off-by)\n",
+                commit_identity.name, commit_identity.email
+            ));
+            plan.push_str(&format!(
+                "- Architect App: {} (app {}, installation {}, bot {}, effective permissions {})\n- Developer App: {} (app {}, installation {}, bot {}, effective permissions {})\n",
+                binding.architect_app.slug,
+                binding.architect_app.app_id,
+                binding.architect_app.installation_id,
+                binding.architect_app.bot_user_id,
+                serde_json::to_string(&binding.architect_app.effective_permissions)
+                    .expect("GitHub permission map is serializable"),
+                binding.developer_app.slug,
+                binding.developer_app.app_id,
+                binding.developer_app.installation_id,
+                binding.developer_app.bot_user_id,
+                serde_json::to_string(&binding.developer_app.effective_permissions)
+                    .expect("GitHub permission map is serializable"),
+            ));
+            for reviewer in &binding.reviewer_apps {
+                plan.push_str(&format!(
+                    "- {:?} App: {} (app {}, installation {}, bot {}, effective permissions {})\n",
+                    reviewer.reviewer_id,
+                    reviewer.app.slug,
+                    reviewer.app.app_id,
+                    reviewer.app.installation_id,
+                    reviewer.app.bot_user_id,
+                    serde_json::to_string(&reviewer.app.effective_permissions)
+                        .expect("GitHub permission map is serializable"),
+                ));
+            }
+            plan.push_str(
+                "- topology: one Pull Request per approved run; all tasks append commits to the one generated branch; final delivery uses one exact-head squash merge\n- publication: Developer finals become candidate/PR audit entries; active Reviewer finals become exact-generation native reviews; Architect owns hcom/review and final merge\n- hooks: native Developer commit hooks remain enabled; supervisor-authenticated fetch/push disables repository hooks\n- gates: every task must be LGTM for merge; review_exhausted completes unmerged; base/ruleset/permission/identity drift fails closed\n- cleanup: successful merge removes required generated local artifacts; unsuccessful or needs-human outcomes preserve the PR/branch/worktree with evidence\n\n",
+            );
+        }
         for (ordinal, task) in self.core.tasks().iter().enumerate() {
             let spec = &task.spec;
             plan.push_str(&format!(
@@ -716,7 +961,11 @@ impl TaskLaneSupervisor {
     }
 
     pub(crate) fn snapshot(&self) -> SessionStatusSnapshot {
-        self.core.snapshot()
+        let mut snapshot = self.core.snapshot();
+        if let Some(github) = snapshot.github.as_mut() {
+            github.latest_inspection = self.latest_github_inspection.clone();
+        }
+        snapshot
     }
 
     pub(crate) fn clarification_page(
@@ -1734,7 +1983,14 @@ mod tests {
     fn binding_hash(profiles: &SessionInvocationProfiles, roots: &[PathBuf]) -> String {
         let workers = TaskWorkerProfiles::from_session_profiles(profiles).unwrap();
         let contract = workers.contract_identity();
-        session_binding_hash(profiles, &workers, &contract, roots).unwrap()
+        session_binding_hash(
+            profiles,
+            &workers,
+            &contract,
+            roots,
+            &DeliveryBinding::LocalCandidate,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1784,6 +2040,375 @@ mod tests {
         assert_ne!(base_hash, binding_hash(&base, &roots));
         let reversed = [roots[1].clone(), roots[0].clone()];
         assert_ne!(binding_hash(&base, &roots), binding_hash(&base, &reversed));
+
+        let workers = TaskWorkerProfiles::from_session_profiles(&base).unwrap();
+        let contract = workers.contract_identity();
+        let app = |id, slug: &str| crate::control_api::GitHubAppBinding {
+            app_id: id,
+            installation_id: id + 10,
+            slug: slug.into(),
+            bot_user_id: id + 20,
+            effective_permissions: BTreeMap::new(),
+        };
+        let github = DeliveryBinding::GitHubPullRequest {
+            binding: Box::new(crate::control_api::GitHubPullRequestBinding {
+                owner: "owner".into(),
+                repository: "repo".into(),
+                repository_id: 99,
+                visibility: "private".into(),
+                local_repository_root: "/repo".into(),
+                base_branch: "master".into(),
+                merge_method: "squash".into(),
+                merge_wait_seconds: 21_600,
+                delete_remote_branch_after_merge: true,
+                architect_app: app(1, "arch"),
+                developer_app: app(2, "dev"),
+                reviewer_apps: vec![
+                    crate::control_api::GitHubReviewerAppBinding {
+                        reviewer_id: ReviewerId::Reviewer1,
+                        app: app(3, "reviewer1"),
+                    },
+                    crate::control_api::GitHubReviewerAppBinding {
+                        reviewer_id: ReviewerId::Reviewer2,
+                        app: app(4, "reviewer2"),
+                    },
+                ],
+                review_check_name: "hcom/review".into(),
+            }),
+        };
+        let github_hash = session_binding_hash(&base, &workers, &contract, &[], &github).unwrap();
+        assert_ne!(
+            base_hash, github_hash,
+            "delivery mode must bind the session hash"
+        );
+    }
+
+    struct MutableGitHubInspector {
+        result: Mutex<crate::orchestrator::github::GitHubInspectionResult>,
+        requests: Mutex<Vec<(String, u64)>>,
+    }
+
+    impl crate::orchestrator::github::GitHubInspectionProvider for MutableGitHubInspector {
+        fn inspect(
+            &self,
+            request: &crate::orchestrator::github::GitHubInspectionRequest,
+        ) -> Result<crate::orchestrator::github::GitHubInspectionResult> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push((request.run_id.clone(), request.session_version));
+            Ok(self.result.lock().unwrap().clone())
+        }
+    }
+
+    fn github_runtime_for_test(
+        repository: &Path,
+    ) -> (
+        crate::orchestrator::github::GitHubRuntimeBinding,
+        Arc<MutableGitHubInspector>,
+    ) {
+        let app =
+            |id, slug: &str, permissions: &[(&str, crate::control_api::GitHubPermissionLevel)]| {
+                crate::control_api::GitHubAppBinding {
+                    app_id: id,
+                    installation_id: id + 10,
+                    slug: slug.into(),
+                    bot_user_id: id + 20,
+                    effective_permissions: permissions
+                        .iter()
+                        .map(|(name, level)| ((*name).into(), *level))
+                        .collect(),
+                }
+            };
+        let reviewer_permissions = [(
+            "pull_requests",
+            crate::control_api::GitHubPermissionLevel::Write,
+        )];
+        let binding = crate::control_api::GitHubPullRequestBinding {
+            owner: "owner".into(),
+            repository: "repo".into(),
+            repository_id: 99,
+            visibility: "private".into(),
+            local_repository_root: repository.to_string_lossy().into_owned(),
+            base_branch: "master".into(),
+            merge_method: "squash".into(),
+            merge_wait_seconds: 21_600,
+            delete_remote_branch_after_merge: true,
+            architect_app: app(
+                1,
+                "arch",
+                &[
+                    (
+                        "administration",
+                        crate::control_api::GitHubPermissionLevel::Read,
+                    ),
+                    ("checks", crate::control_api::GitHubPermissionLevel::Write),
+                    ("contents", crate::control_api::GitHubPermissionLevel::Write),
+                    (
+                        "pull_requests",
+                        crate::control_api::GitHubPermissionLevel::Write,
+                    ),
+                ],
+            ),
+            developer_app: app(
+                2,
+                "dev",
+                &[
+                    ("contents", crate::control_api::GitHubPermissionLevel::Write),
+                    (
+                        "pull_requests",
+                        crate::control_api::GitHubPermissionLevel::Write,
+                    ),
+                ],
+            ),
+            reviewer_apps: vec![
+                crate::control_api::GitHubReviewerAppBinding {
+                    reviewer_id: ReviewerId::Reviewer1,
+                    app: app(3, "reviewer1", &reviewer_permissions),
+                },
+                crate::control_api::GitHubReviewerAppBinding {
+                    reviewer_id: ReviewerId::Reviewer2,
+                    app: app(4, "reviewer2", &reviewer_permissions),
+                },
+            ],
+            review_check_name: crate::control_api::GITHUB_REVIEW_CHECK_NAME.into(),
+        };
+        let initial_inspection = GitHubInspectionBinding {
+            inspected_repository_id: 99,
+            expected_base_ref: "refs/heads/master".into(),
+            expected_base_sha: "a".repeat(40),
+            ruleset_attestation_sha256: "b".repeat(64),
+            inspection_id: "inspection-initial".into(),
+        };
+        let refreshed = GitHubInspectionBinding {
+            inspection_id: "inspection-refreshed".into(),
+            ..initial_inspection.clone()
+        };
+        let inspector = Arc::new(MutableGitHubInspector {
+            result: Mutex::new(crate::orchestrator::github::GitHubInspectionResult {
+                delivery_binding: binding.clone(),
+                inspection: refreshed,
+            }),
+            requests: Mutex::new(Vec::new()),
+        });
+        (
+            crate::orchestrator::github::GitHubRuntimeBinding {
+                binding,
+                initial_inspection,
+                inspector: inspector.clone(),
+            },
+            inspector,
+        )
+    }
+
+    #[test]
+    fn github_inspection_is_read_only_and_plan_start_bind_exact_observation() {
+        let fixture = Fixture::new();
+        let (runtime, inspector) = github_runtime_for_test(&fixture.repository);
+        let sources = SessionRuntimeSources::capture_with_github(
+            fixture.sources.parent_environment.clone(),
+            fixture.sources.profiles.clone().unwrap(),
+            Vec::new(),
+            runtime,
+        )
+        .unwrap();
+        let mut supervisor = TaskLaneSupervisor::open_with_factory(
+            "run-github-test".into(),
+            fixture.project_root.clone(),
+            fixture.run_root.clone(),
+            sources,
+            Box::new(ScriptedFactory {
+                scripts: VecDeque::new(),
+                audit: Arc::new(Mutex::new(Audit::default())),
+            }),
+        )
+        .unwrap();
+
+        let before = supervisor.snapshot();
+        assert_eq!(before.version, 0);
+        assert_eq!(
+            before
+                .github
+                .as_ref()
+                .unwrap()
+                .latest_inspection
+                .as_ref()
+                .unwrap()
+                .inspection_id,
+            "inspection-initial"
+        );
+        let refreshed = supervisor
+            .inspect_github_delivery(0, "run-github-test")
+            .unwrap();
+        assert_eq!(refreshed.inspection_id, "inspection-refreshed");
+        assert_eq!(supervisor.snapshot().version, 0);
+
+        let task = fixture.task("github-binding", &[], 7);
+        assert!(
+            supervisor
+                .replace_plan_with_inspection(
+                    0,
+                    CODEX_TASK_WORKER_ADAPTER,
+                    &pure_codex_reviewer_adapters(),
+                    Some("inspection-initial"),
+                    vec![task.clone()],
+                )
+                .is_err()
+        );
+        let mut wrong_root = task.clone();
+        wrong_root.repository_root = fixture.project_root.to_string_lossy().into_owned();
+        assert!(
+            supervisor
+                .replace_plan_with_inspection(
+                    0,
+                    CODEX_TASK_WORKER_ADAPTER,
+                    &pure_codex_reviewer_adapters(),
+                    Some("inspection-refreshed"),
+                    vec![wrong_root],
+                )
+                .is_err()
+        );
+        let (plan_version, plan_hash) = supervisor
+            .replace_plan_with_inspection(
+                0,
+                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_reviewer_adapters(),
+                Some("inspection-refreshed"),
+                vec![task],
+            )
+            .unwrap();
+        let planned = supervisor.snapshot();
+        let run_binding = planned.github.unwrap().run_binding.unwrap();
+        assert_eq!(
+            planned.tasks[0].branch.as_deref(),
+            Some(run_binding.generated_run_branch.as_str())
+        );
+        assert_eq!(
+            planned.tasks[0].base_revision.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+
+        let duplicate_error = supervisor
+            .inspect_github_delivery(1, "run-github-test")
+            .unwrap_err();
+        assert!(duplicate_error.to_string().contains("new inspection ID"));
+        assert!(
+            supervisor
+                .approve_and_start(1, plan_version, &plan_hash, true)
+                .unwrap_err()
+                .to_string()
+                .contains("inspection was superseded")
+        );
+
+        inspector.result.lock().unwrap().inspection.inspection_id = "inspection-newest".into();
+        supervisor
+            .inspect_github_delivery(1, "run-github-test")
+            .unwrap();
+        let error = supervisor
+            .approve_and_start(1, plan_version, &plan_hash, true)
+            .unwrap_err();
+        assert!(error.to_string().contains("inspection was superseded"));
+        let task = fixture.task("github-binding", &[], 7);
+        let (plan_version, plan_hash) = supervisor
+            .replace_plan_with_inspection(
+                1,
+                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_reviewer_adapters(),
+                Some("inspection-newest"),
+                vec![task],
+            )
+            .unwrap();
+        inspector
+            .result
+            .lock()
+            .unwrap()
+            .inspection
+            .expected_base_sha = "c".repeat(40);
+        let error = supervisor
+            .approve_and_start(2, plan_version, &plan_hash, true)
+            .unwrap_err();
+        assert!(error.to_string().contains("changed after plan binding"));
+        assert_eq!(supervisor.snapshot().state, SessionState::AwaitingApproval);
+        assert!(!fixture.project_root.join("hcom-tasks").exists());
+
+        inspector
+            .result
+            .lock()
+            .unwrap()
+            .inspection
+            .expected_base_sha = "a".repeat(40);
+        let retry_error = supervisor
+            .approve_and_start(2, plan_version, &plan_hash, true)
+            .unwrap_err();
+        assert!(
+            retry_error
+                .to_string()
+                .contains("inspection was superseded")
+        );
+
+        inspector.result.lock().unwrap().inspection.inspection_id =
+            "inspection-after-base-drift".into();
+        supervisor
+            .inspect_github_delivery(2, "run-github-test")
+            .unwrap();
+        let task = fixture.task("github-binding", &[], 7);
+        let (plan_version, plan_hash) = supervisor
+            .replace_plan_with_inspection(
+                2,
+                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_reviewer_adapters(),
+                Some("inspection-after-base-drift"),
+                vec![task],
+            )
+            .unwrap();
+        inspector
+            .result
+            .lock()
+            .unwrap()
+            .delivery_binding
+            .architect_app
+            .effective_permissions
+            .insert(
+                "workflows".into(),
+                crate::control_api::GitHubPermissionLevel::Write,
+            );
+        let permission_error = supervisor
+            .approve_and_start(3, plan_version, &plan_hash, true)
+            .unwrap_err();
+        assert!(
+            permission_error
+                .to_string()
+                .contains("permission map drifted")
+        );
+        inspector
+            .result
+            .lock()
+            .unwrap()
+            .delivery_binding
+            .architect_app
+            .effective_permissions
+            .remove("workflows");
+        let retry_error = supervisor
+            .approve_and_start(3, plan_version, &plan_hash, true)
+            .unwrap_err();
+        assert!(
+            retry_error
+                .to_string()
+                .contains("inspection was superseded")
+        );
+        assert_eq!(supervisor.snapshot().state, SessionState::AwaitingApproval);
+        assert!(!fixture.project_root.join("hcom-tasks").exists());
+        assert_eq!(
+            inspector.requests.lock().unwrap().as_slice(),
+            [
+                ("run-github-test".into(), 0),
+                ("run-github-test".into(), 1),
+                ("run-github-test".into(), 1),
+                ("run-github-test".into(), 2),
+                ("run-github-test".into(), 2),
+                ("run-github-test".into(), 3)
+            ]
+        );
     }
 
     #[test]

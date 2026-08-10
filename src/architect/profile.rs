@@ -17,6 +17,9 @@ pub(super) struct LoadedInvocationProfiles {
     pub config_path: PathBuf,
     pub loaded_from_file: bool,
     pub legacy_reviewer_migrated: bool,
+    /// Retained but deliberately not interpreted unless the explicit
+    /// `--github-pr` delivery selector is present.
+    pub github: Option<toml::Value>,
 }
 
 #[derive(Deserialize)]
@@ -27,6 +30,7 @@ struct ArchitectToml {
     reviewer: Option<toml::Value>,
     reviewer1: Option<toml::Value>,
     reviewer2: Option<toml::Value>,
+    github: Option<toml::Value>,
 }
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -253,6 +257,7 @@ fn load_invocation_profiles_with_defaults(
                 config_path: path.to_owned(),
                 loaded_from_file: false,
                 legacy_reviewer_migrated: false,
+                github: None,
             });
         }
         Err(error) => {
@@ -312,11 +317,13 @@ fn load_invocation_profiles_with_defaults(
         .context("architect profile configuration is malformed TOML")?;
     let mut profiles = defaults()?;
     let mut legacy_reviewer_migrated = false;
+    let mut github = None;
     if let Some(value) = document.get("architect") {
         let configured: ArchitectToml = value
             .clone()
             .try_into()
             .context("invalid [architect] profile configuration")?;
+        github = configured.github;
         if let Some(value) = configured.profile {
             apply_architect_override(&mut profiles.architect, value)
                 .context("invalid [architect.profile] configuration")?;
@@ -385,6 +392,7 @@ fn load_invocation_profiles_with_defaults(
         config_path: path.to_owned(),
         loaded_from_file: true,
         legacy_reviewer_migrated,
+        github,
     })
 }
 
@@ -439,6 +447,23 @@ mod tests {
         assert_eq!(reviewer2.model, "opus");
         assert_eq!(reviewer2.effort, "xhigh");
         assert!(reviewer2.dangerously_skip_permissions);
+    }
+
+    #[test]
+    fn github_subtable_is_recognized_but_semantically_inert_for_local_mode() {
+        let (_temp, path) = write_config(
+            r#"
+[architect.github]
+stale_unknown_field = "ignored unless --github-pr is selected"
+
+[architect.github.apps.reviewer2]
+incomplete = true
+"#,
+        );
+        let loaded =
+            load_task_lane_profiles_for_mode(&path, ArchitectAdapter::Codex, true).unwrap();
+        assert!(loaded.github.is_some());
+        assert_eq!(loaded.profiles.reviewers.len(), 1);
     }
 
     #[test]

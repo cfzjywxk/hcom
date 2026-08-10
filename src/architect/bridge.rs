@@ -1,5 +1,8 @@
+#[cfg(test)]
+use super::tools::ARCHITECT_INSTRUCTIONS;
 use super::tools::{
-    ARCHITECT_INSTRUCTIONS, control_action, tool_definitions, validate_codex_tool_definitions,
+    architect_instructions_for_delivery, control_action_for_delivery,
+    tool_definitions_for_delivery, validate_codex_tool_definitions,
 };
 use crate::control_api::client::ControlClient;
 use crate::control_api::codec::{
@@ -92,6 +95,7 @@ pub(super) struct BridgeConfiguration {
     pub architect_additional_directories: Vec<PathBuf>,
     pub developer_adapter: String,
     pub reviewer_adapters: Vec<ReviewerAdapterBinding>,
+    pub github_pr: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -291,9 +295,10 @@ fn validate_bridge_configuration(configuration: &BridgeConfiguration) -> Result<
         &configuration.reviewer_adapters,
     )?;
     if architect_adapter == ArchitectAdapter::Codex {
-        validate_codex_tool_definitions(&tool_definitions(
+        validate_codex_tool_definitions(&tool_definitions_for_delivery(
             &configuration.developer_adapter,
             &configuration.reviewer_adapters,
+            configuration.github_pr,
         ))?;
     }
     let paths = ControlPaths::new(&configuration.run_root)?;
@@ -528,7 +533,7 @@ fn serve_mcp_connection(
                         "protocolVersion":MCP_PROTOCOL_VERSION,
                         "capabilities":{"tools":{"listChanged":false}},
                         "serverInfo":{"name":"hcom-session-task-control","version":"1"},
-                        "instructions":ARCHITECT_INSTRUCTIONS
+                        "instructions":architect_instructions_for_delivery(configuration.github_pr)
                     }
                 })
             }),
@@ -544,9 +549,10 @@ fn serve_mcp_connection(
                 json!({
                     "jsonrpc":"2.0",
                     "id":id,
-                        "result":{"tools":tool_definitions(
+                        "result":{"tools":tool_definitions_for_delivery(
                             &configuration.developer_adapter,
                             &configuration.reviewer_adapters,
+                            configuration.github_pr,
                         )}
                 })
             }),
@@ -706,11 +712,12 @@ fn prepare_control_request(
         serde_json::from_value(params.ok_or_else(|| anyhow::anyhow!("tool call omitted params"))?)
             .context("invalid typed tool call")
             .map_err(|_| ToolCallRefusal(TOOL_REFUSAL_ENVELOPE))?;
-    let action = control_action(
+    let action = control_action_for_delivery(
         &params.name,
         params.arguments,
         &configuration.developer_adapter,
         &configuration.reviewer_adapters,
+        configuration.github_pr,
     )
     .map_err(|_| ToolCallRefusal(TOOL_REFUSAL_ACTION))?;
     Ok(ControlRequest {
@@ -1065,6 +1072,7 @@ mod tests {
                         "codex-reviewer",
                         "claude-reviewer-2.1.220",
                     ),
+                    github_pr: false,
                 },
             }
         }
@@ -1173,6 +1181,8 @@ mod tests {
             state: SessionState::AwaitingPlan,
             version: 0,
             project_root: "/project".into(),
+            delivery_binding: Default::default(),
+            github: None,
             plan_version: None,
             plan_hash: None,
             current_task_ordinal: None,
@@ -1221,6 +1231,8 @@ mod tests {
             clarification_record_count: 0,
             base_revision: None,
             head_revision: None,
+            github_reviews: Vec::new(),
+            github_check: None,
             developer_session_bound: true,
             reviewers: [ReviewerId::Reviewer1, ReviewerId::Reviewer2]
                 .into_iter()
@@ -1267,6 +1279,8 @@ mod tests {
                 clarification_record_count: 64,
                 base_revision: None,
                 head_revision: None,
+                github_reviews: Vec::new(),
+                github_check: None,
                 developer_session_bound: true,
                 reviewers: reviewers.clone(),
                 outcome_detail: Some("review generation exhausted".repeat(32)),
@@ -1281,6 +1295,8 @@ mod tests {
                     state: SessionState::Completed,
                     version: u64::MAX,
                     project_root: path,
+                    delivery_binding: Default::default(),
+                    github: None,
                     plan_version: Some(u64::MAX),
                     plan_hash: Some("f".repeat(64)),
                     current_task_ordinal: Some(63),
@@ -1389,6 +1405,7 @@ mod tests {
             architect_additional_directories: Vec::new(),
             developer_adapter: "codex-developer".into(),
             reviewer_adapters: reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
+            github_pr: false,
         };
         let activation = BridgeActivation {
             architect_pid: std::process::id(),
@@ -1535,6 +1552,7 @@ mod tests {
                     reviewer_final_message_paths: vec!["/artifacts/reviewer/final.md".into()],
                     responses_received: 1,
                     responses_expected: 2,
+                    github: None,
                 },
             },
         );
@@ -1561,7 +1579,7 @@ mod tests {
     }
 
     #[test]
-    fn status_result_preserves_v9_active_bindings_and_current_generation_without_peer_body() {
+    fn status_result_preserves_v10_active_bindings_and_current_generation_without_peer_body() {
         let reviewer1_path = "/artifacts/reviewer/reviewer1/final.md";
         let mut session = status_snapshot();
         session.state = SessionState::Running;
@@ -1601,6 +1619,8 @@ mod tests {
             clarification_record_count: 0,
             base_revision: None,
             head_revision: None,
+            github_reviews: Vec::new(),
+            github_check: None,
             developer_session_bound: true,
             reviewers: vec![
                 ReviewerResultSnapshot {
@@ -2144,6 +2164,7 @@ mod tests {
                 ref developer_adapter,
                 reviewer_adapters: ref requested_reviewers,
                 ref tasks,
+                ..
             } if developer_adapter == "codex-developer"
                 && requested_reviewers == &reviewer_adapters(
                     "codex-reviewer",
@@ -2368,6 +2389,7 @@ mod tests {
             architect_additional_directories: Vec::new(),
             developer_adapter: "codex-developer".into(),
             reviewer_adapters: reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
+            github_pr: false,
         };
         validate_bridge_configuration(&configuration).unwrap();
 

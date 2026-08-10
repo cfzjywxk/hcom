@@ -34,8 +34,8 @@ pub fn run_cli_with_config(args: &[String], config_path: &Path) -> Result<i32> {
 pub fn help_text() -> &'static str {
     r#"Usage:
   cd <project-directory>
-  hcom arch codex [--single-review] [architect-profile-options]
-  hcom arch claude [architect-profile-options]
+  hcom arch codex [--single-review] [--github-pr] [architect-profile-options]
+  hcom arch claude [--github-pr] [architect-profile-options]
 
 Launch one blank, foreground Codex or Claude architect with capability-bound
 in-memory session-task tools. The invocation's exact current directory is the
@@ -51,6 +51,7 @@ Profile configuration is read once from $HCOM_DIR/config.toml (default:
   [architect.developer]  fresh per-task developer profile
   [architect.reviewer1]  fresh per-task Reviewer1 profile
   [architect.reviewer2]  fresh per-task Reviewer2 profile
+  [architect.github]     opt-in GitHub PR deployment (used only with --github-pr)
 
 Each table is a partial override: omitted fields keep the built-in role
 default. Codex accepts reasoning_effort or its effort alias. Developer,
@@ -69,6 +70,15 @@ setting still comes from $HCOM_DIR/config.toml. It must be a canonical
 absolute regular file that exists, so a mistyped path fails closed instead of
 silently selecting the built-in defaults, while an absent default path still
 selects them. Startup prints the exact loaded path and marks it as --config.
+
+--github-pr explicitly selects the GitHub Pull Request delivery surface. A
+GitHub table is inert without that flag: the local lane does not validate its
+values, inspect/open App keys, invoke Git, or contact GitHub. With the flag,
+the closed deployment table and exact active single/dual App set are validated
+before the blank foreground Architect starts. GitHub write authority still
+begins only after the complete inspected plan is approved.
+This profile/binding release fails closed at the read-only App/API driver seam;
+later GitHub auth/client and workflow tasks make the opt-in lane runnable.
 
 Architect CLI overrides (higher priority than TOML):
   --model <model>
@@ -109,7 +119,7 @@ Only typed profile fields are accepted; arbitrary native argv is not. The
 effective sanitized profiles, their SHA-256 hash, and the exact session binding
 hash are printed at startup and frozen for every sequential run in that
 foreground Architect invocation. Startup also prints `review mode: single` or
-`review mode: dual`. The private task-control protocol is v9:
+`review mode: dual`. The private task-control protocol is v10:
 its plan hash binds the ordered Reviewer identities and exact session
 profile/runtime contract; the closed bridge bootstrap carries the same binding
 hash. A mismatched hcom and
@@ -133,7 +143,7 @@ runs through the Linux per-invocation descendant Guardian. That Guardian uses
 PR_SET_CHILD_SUBREAPER while live; external service-manager resources and
 unexpected Guardian death remain outside its cleanup guarantee.
 
-Each authorized task binds the exact canonical source directory, absolute task
+In the default local-candidate lane, each authorized task binds the exact canonical source directory, absolute task
 document path, ordered absolute design document paths, and task selector
 discovered by the Architect from project documentation. hcom transports those
 strings without reading, copying, hashing, locking, or drift-checking the
@@ -159,8 +169,10 @@ non-mutation is a role instruction rather than an OS read-only mount. Each
 independently reads the Developer's exact durable final through its path and
 never receives another Reviewer's response. Corrections carry every active
 same-generation Reviewer response path in stable binding order; re-reviews
-carry only the latest Developer path. hcom never pushes,
-installs, resets, rebases, merges, or applies changes.
+carry only the latest Developer path. The local-candidate lane never pushes,
+installs, resets, rebases, merges, or applies changes. The explicit GitHub Pull
+Request lane is constrained by its separately displayed and approved frozen
+delivery/run binding.
 
 The foreground parent owns every worker and task-local exec runtime; it keeps
 state only in memory and performs no daemon, project store, or cross-session

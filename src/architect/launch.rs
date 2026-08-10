@@ -63,6 +63,10 @@ struct ArchitectArgs {
     #[arg(long = "single-review")]
     single_review: bool,
 
+    /// Select the explicit GitHub Pull Request delivery lane.
+    #[arg(long = "github-pr")]
+    github_pr: bool,
+
     #[arg(long)]
     model: Option<String>,
 
@@ -103,6 +107,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
     if args.single_review && architect_adapter != ArchitectAdapter::Codex {
         bail!("--single-review is available only with `hcom arch codex`");
     }
+    let parent_environment = ParentEnvironment::capture_current()?;
     // An explicit --config replaces only the profile configuration source; every
     // other hcom setting still comes from $HCOM_DIR/config.toml.
     let explicit_config = args
@@ -126,6 +131,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
                 config_path: PathBuf::from("<built-in defaults>"),
                 loaded_from_file: false,
                 legacy_reviewer_migrated: false,
+                github: None,
             }
         }
     };
@@ -138,8 +144,6 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
     apply_architect_cli_overrides(&args, &mut loaded.profiles)?;
     let (developer_adapter, reviewer_adapters) =
         worker_adapter_bindings(architect_adapter, &loaded.profiles)?;
-    validate_foreground_terminal()?;
-    let parent_environment = ParentEnvironment::capture_current()?;
     let claude_environment = loaded
         .profiles
         .uses_claude()
@@ -147,6 +151,29 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         .transpose()?;
 
     let project_root = canonical_project_directory(&std::env::current_dir()?)?;
+    if args.github_pr {
+        let reviewer_ids = loaded
+            .profiles
+            .reviewers
+            .iter()
+            .map(|binding| binding.reviewer_id)
+            .collect::<Vec<_>>();
+        let github = loaded.github.take().ok_or_else(|| {
+            anyhow::anyhow!("--github-pr requires a closed [architect.github] configuration")
+        })?;
+        let _deployment = crate::orchestrator::github::parse_github_deployment_config(
+            github,
+            &reviewer_ids,
+            &project_root,
+        )?;
+        // GITHUB-PR-01 deliberately stops at the typed auth/API seam. A
+        // foreground session cannot start until the bounded credential/client
+        // implementation supplies a validated read-only observation.
+        bail!(
+            "--github-pr read-only App/API preflight is unavailable until the GitHub auth/client driver is installed"
+        );
+    }
+    validate_foreground_terminal()?;
     let architect_additional_directories =
         validate_additional_directories(architect_adapter, &args.additional_directories)?;
     let session_root = create_private_session_runtime()?;
@@ -242,7 +269,10 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
             architect_adapter: architect_adapter.contract_name().into(),
             launch_nonce: launch_nonce.clone(),
             capability: capability.clone(),
-            actions: ActionName::ARCHITECT.into_iter().collect(),
+            actions: ActionName::architect(args.github_pr)
+                .iter()
+                .copied()
+                .collect(),
         },
     ) {
         Ok(version) => version,
@@ -303,6 +333,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         architect_additional_directories: architect_additional_directories.clone(),
         developer_adapter: developer_adapter.into(),
         reviewer_adapters,
+        github_pr: args.github_pr,
     };
     if let Err(error) = configure_bridge(&mut bridge.bootstrap, configuration) {
         terminate_child(&mut bridge.child);
@@ -1687,6 +1718,124 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "--config must be an existing canonical absolute regular file"
+        );
+    }
+
+    #[test]
+    fn github_flag_fails_closed_on_missing_or_invalid_config_before_terminal_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let write = |name: &str, contents: &str| {
+            let path = root.join(name);
+            fs::write(&path, contents).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            path
+        };
+        let absent = write("absent.toml", "");
+        let error = run_cli(
+            &[
+                "arch".into(),
+                "codex".into(),
+                "--single-review".into(),
+                "--github-pr".into(),
+                "--config".into(),
+                absent.to_string_lossy().into_owned(),
+            ],
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "--github-pr requires a closed [architect.github] configuration"
+        );
+
+        let invalid = write(
+            "invalid.toml",
+            "[architect.github]\nstale_unknown_field = true\n",
+        );
+        let local_error = run_cli(
+            &[
+                "arch".into(),
+                "codex".into(),
+                "--single-review".into(),
+                "--config".into(),
+                invalid.to_string_lossy().into_owned(),
+            ],
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            local_error.to_string(),
+            "hcom arch requires stdin/stdout/stderr on a real terminal",
+            "without --github-pr the stale table must remain semantically inert"
+        );
+        let error = run_cli(
+            &[
+                "arch".into(),
+                "codex".into(),
+                "--single-review".into(),
+                "--github-pr".into(),
+                "--config".into(),
+                invalid.to_string_lossy().into_owned(),
+            ],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid [architect.github] configuration"),
+            "GitHub config must be parsed before foreground terminal validation: {error}"
+        );
+
+        let repository_root = fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let valid = write(
+            "valid.toml",
+            &format!(
+                r#"
+[architect.github]
+owner = "owner"
+repository = "repository"
+local_repository_root = "{}"
+base_branch = "master"
+merge_method = "squash"
+merge_wait_seconds = 21600
+delete_remote_branch_after_merge = true
+private_repository_required = true
+
+[architect.github.apps.architect]
+app_id = 1
+slug = "hcom-arch"
+private_key_file = "/var/lib/hcom-secrets/arch.pem"
+
+[architect.github.apps.developer]
+app_id = 2
+slug = "hcom-dev"
+private_key_file = "/var/lib/hcom-secrets/dev.pem"
+
+[architect.github.apps.reviewer1]
+app_id = 3
+slug = "hcom-reviewer1"
+private_key_file = "/var/lib/hcom-secrets/reviewer1.pem"
+"#,
+                repository_root.display()
+            ),
+        );
+        let error = run_cli(
+            &[
+                "arch".into(),
+                "codex".into(),
+                "--single-review".into(),
+                "--github-pr".into(),
+                "--config".into(),
+                valid.to_string_lossy().into_owned(),
+            ],
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "--github-pr read-only App/API preflight is unavailable until the GitHub auth/client driver is installed"
         );
     }
 

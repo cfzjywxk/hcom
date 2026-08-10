@@ -1,10 +1,10 @@
 use crate::worker::profile::ReviewerId;
 use crate::worker::runtime::WorkerLane;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
 
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
@@ -21,7 +21,9 @@ pub const MAX_CLARIFICATION_PAGE_RECORDS: u8 = 8;
 pub const MAX_CLARIFICATION_RECORDS_PER_TASK: usize = 64;
 pub const MAX_CLARIFICATION_RECORDS_PER_RUN: usize = MAX_TASKS * MAX_CLARIFICATION_ROUNDS as usize;
 const fn max_progress_events_per_run() -> usize {
-    let events_per_round = match (MAX_REVIEW_ROUNDS as usize).checked_mul(MAX_REVIEWER_COUNT + 1) {
+    // GitHub delivery adds one candidate publication to the existing request
+    // plus per-Reviewer response events for every possible generation.
+    let events_per_round = match (MAX_REVIEW_ROUNDS as usize).checked_mul(MAX_REVIEWER_COUNT + 2) {
         Some(value) => value,
         None => panic!("progress event capacity overflow"),
     };
@@ -29,13 +31,245 @@ const fn max_progress_events_per_run() -> usize {
         Some(value) => value,
         None => panic!("progress event capacity overflow"),
     };
-    match MAX_TASKS.checked_mul(events_per_task) {
+    let task_events = match MAX_TASKS.checked_mul(events_per_task) {
+        Some(value) => value,
+        None => panic!("progress event capacity overflow"),
+    };
+    // One merge-wait transition and one post-merge finalization transition.
+    match task_events.checked_add(2) {
         Some(value) => value,
         None => panic!("progress event capacity overflow"),
     }
 }
 
 pub const MAX_PROGRESS_EVENTS_PER_RUN: usize = max_progress_events_per_run();
+
+pub const GITHUB_REVIEW_CHECK_NAME: &str = "hcom/review";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubAppRole {
+    Architect,
+    Developer,
+    Reviewer1,
+    Reviewer2,
+}
+
+impl GitHubAppRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Architect => "architect",
+            Self::Developer => "developer",
+            Self::Reviewer1 => "reviewer1",
+            Self::Reviewer2 => "reviewer2",
+        }
+    }
+
+    pub fn for_reviewers(reviewers: &[ReviewerId]) -> Vec<Self> {
+        let mut roles = vec![Self::Architect, Self::Developer, Self::Reviewer1];
+        if reviewers.contains(&ReviewerId::Reviewer2) {
+            roles.push(Self::Reviewer2);
+        }
+        roles
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubPermissionLevel {
+    Read,
+    Write,
+}
+
+impl GitHubPermissionLevel {
+    pub fn satisfies(self, required: Self) -> bool {
+        self >= required
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubAppBinding {
+    pub app_id: u64,
+    pub installation_id: u64,
+    pub slug: String,
+    pub bot_user_id: u64,
+    /// The complete effective registration/installation permission map, not
+    /// merely hcom's required subset. Stable owner-approved supersets remain
+    /// visible and any later drift can therefore fail closed.
+    pub effective_permissions: BTreeMap<String, GitHubPermissionLevel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubReviewerAppBinding {
+    pub reviewer_id: ReviewerId,
+    pub app: GitHubAppBinding,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubCommitIdentity {
+    pub name: String,
+    pub email: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubPullRequestBinding {
+    pub owner: String,
+    pub repository: String,
+    pub repository_id: u64,
+    pub visibility: String,
+    pub local_repository_root: String,
+    pub base_branch: String,
+    pub merge_method: String,
+    pub merge_wait_seconds: u32,
+    pub delete_remote_branch_after_merge: bool,
+    pub architect_app: GitHubAppBinding,
+    pub developer_app: GitHubAppBinding,
+    pub reviewer_apps: Vec<GitHubReviewerAppBinding>,
+    pub review_check_name: String,
+}
+
+impl GitHubPullRequestBinding {
+    pub fn developer_commit_identity(&self) -> GitHubCommitIdentity {
+        let bot_login = format!("{}[bot]", self.developer_app.slug);
+        GitHubCommitIdentity {
+            name: bot_login.clone(),
+            email: format!(
+                "{}+{}@users.noreply.github.com",
+                self.developer_app.bot_user_id, bot_login
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DeliveryBinding {
+    #[default]
+    LocalCandidate,
+    #[serde(rename = "github_pull_request")]
+    GitHubPullRequest {
+        #[serde(flatten)]
+        binding: Box<GitHubPullRequestBinding>,
+    },
+}
+
+impl DeliveryBinding {
+    pub fn is_github(&self) -> bool {
+        matches!(self, Self::GitHubPullRequest { .. })
+    }
+
+    pub fn github(&self) -> Option<&GitHubPullRequestBinding> {
+        match self {
+            Self::LocalCandidate => None,
+            Self::GitHubPullRequest { binding } => Some(binding.as_ref()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubInspectionBinding {
+    pub inspected_repository_id: u64,
+    pub expected_base_ref: String,
+    pub expected_base_sha: String,
+    pub ruleset_attestation_sha256: String,
+    pub inspection_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubRunBinding {
+    pub inspected_repository_id: u64,
+    pub expected_base_ref: String,
+    pub expected_base_sha: String,
+    pub ruleset_attestation_sha256: String,
+    pub inspection_id: String,
+    pub generated_run_branch: String,
+}
+
+impl GitHubRunBinding {
+    pub fn inspection(&self) -> GitHubInspectionBinding {
+        GitHubInspectionBinding {
+            inspected_repository_id: self.inspected_repository_id,
+            expected_base_ref: self.expected_base_ref.clone(),
+            expected_base_sha: self.expected_base_sha.clone(),
+            ruleset_attestation_sha256: self.ruleset_attestation_sha256.clone(),
+            inspection_id: self.inspection_id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubDeliveryPhase {
+    PreparingRepository,
+    TasksRunning,
+    AwaitingMerge,
+    Finalizing,
+    Delivered,
+    PreservedUnmerged,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubDeliveryOutcome {
+    Delivered,
+    UnmergedReviewExhausted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubReviewSnapshot {
+    pub reviewer_id: ReviewerId,
+    pub generation: u32,
+    pub head_sha: String,
+    pub verdict: ReviewerVerdict,
+    pub review_id: u64,
+    pub review_url: String,
+    pub final_artifact_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubCheckSnapshot {
+    pub check_run_id: u64,
+    pub check_url: String,
+    pub state: String,
+    pub head_sha: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubFinalizationSnapshot {
+    pub local_worktree_removed: bool,
+    pub local_ref_removed: bool,
+    pub remote_ref_outcome: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubDeliveryStatusSnapshot {
+    pub latest_inspection: Option<GitHubInspectionBinding>,
+    pub run_binding: Option<GitHubRunBinding>,
+    pub worktree_path: Option<String>,
+    pub pr_number: Option<u64>,
+    pub pr_url: Option<String>,
+    pub published_head_sha: Option<String>,
+    pub current_check: Option<GitHubCheckSnapshot>,
+    pub phase: Option<GitHubDeliveryPhase>,
+    pub outcome: Option<GitHubDeliveryOutcome>,
+    pub final_base_sha: Option<String>,
+    pub final_ruleset_attestation_sha256: Option<String>,
+    pub merge_sha: Option<String>,
+    pub merge_url: Option<String>,
+    pub finalization: Option<GitHubFinalizationSnapshot>,
+    pub preserved_branch: Option<String>,
+    pub preserved_worktree: Option<String>,
+}
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -94,6 +328,7 @@ impl CallerAuth {
 #[serde(rename_all = "snake_case")]
 pub enum ActionName {
     SessionRunBegin,
+    SessionGitHubDeliveryInspect,
     SessionPlanReplace,
     SessionApproveAndStart,
     SessionClarificationSubmit,
@@ -116,11 +351,32 @@ impl ActionName {
         Self::SessionStatus,
         Self::SessionCancel,
     ];
-    pub const ALL: [Self; 9] = Self::ARCHITECT;
+    pub const GITHUB_ARCHITECT: [Self; 10] = [
+        Self::SessionRunBegin,
+        Self::SessionGitHubDeliveryInspect,
+        Self::SessionPlanReplace,
+        Self::SessionApproveAndStart,
+        Self::SessionClarificationSubmit,
+        Self::SessionClarificationRequireHuman,
+        Self::SessionClarificationsList,
+        Self::SessionWait,
+        Self::SessionStatus,
+        Self::SessionCancel,
+    ];
+    pub const ALL: [Self; 10] = Self::GITHUB_ARCHITECT;
+
+    pub fn architect(github_pr: bool) -> &'static [Self] {
+        if github_pr {
+            &Self::GITHUB_ARCHITECT
+        } else {
+            &Self::ARCHITECT
+        }
+    }
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SessionRunBegin => "session_run_begin",
+            Self::SessionGitHubDeliveryInspect => "session_github_delivery_inspect",
             Self::SessionPlanReplace => "session_plan_replace",
             Self::SessionApproveAndStart => "session_approve_and_start",
             Self::SessionClarificationSubmit => "session_clarification_submit",
@@ -140,10 +396,17 @@ pub enum ControlAction {
         expected_session_version: u64,
         terminal_run_id: String,
     },
+    #[serde(rename = "session_github_delivery_inspect")]
+    SessionGitHubDeliveryInspect {
+        expected_session_version: u64,
+        run_id: String,
+    },
     SessionPlanReplace {
         expected_session_version: u64,
         developer_adapter: String,
         reviewer_adapters: Vec<ReviewerAdapterBinding>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        github_inspection_id: Option<String>,
         tasks: Vec<TaskDraft>,
     },
     SessionApproveAndStart {
@@ -191,6 +454,7 @@ impl ControlAction {
     pub fn name(&self) -> ActionName {
         match self {
             Self::SessionRunBegin { .. } => ActionName::SessionRunBegin,
+            Self::SessionGitHubDeliveryInspect { .. } => ActionName::SessionGitHubDeliveryInspect,
             Self::SessionPlanReplace { .. } => ActionName::SessionPlanReplace,
             Self::SessionApproveAndStart { .. } => ActionName::SessionApproveAndStart,
             Self::SessionClarificationSubmit { .. } => ActionName::SessionClarificationSubmit,
@@ -213,14 +477,19 @@ impl ControlAction {
             Self::SessionRunBegin {
                 terminal_run_id, ..
             } => validate_id("terminal_run_id", terminal_run_id),
+            Self::SessionGitHubDeliveryInspect { run_id, .. } => validate_id("run_id", run_id),
             Self::SessionPlanReplace {
                 developer_adapter,
                 reviewer_adapters,
+                github_inspection_id,
                 tasks,
                 ..
             } => {
                 validate_single_line("developer_adapter", developer_adapter, 64)?;
                 validate_reviewer_adapter_bindings(reviewer_adapters)?;
+                if let Some(inspection_id) = github_inspection_id {
+                    validate_id("github_inspection_id", inspection_id)?;
+                }
                 validate_tasks(tasks, reviewer_adapters.len())
             }
             Self::SessionApproveAndStart {
@@ -522,8 +791,29 @@ pub enum TaskCompletionOutcome {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubTaskProgressSnapshot {
+    pub pr_number: u64,
+    pub pr_url: String,
+    pub task_base_sha: String,
+    pub published_head_sha: String,
+    pub check_run_id: Option<u64>,
+    pub check_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionProgressEvent {
+    CandidatePublished {
+        sequence: u32,
+        task_ordinal: u32,
+        task_key: String,
+        completed_tasks: u32,
+        total_tasks: u32,
+        review_generation: u32,
+        developer_final_path: String,
+        github: GitHubTaskProgressSnapshot,
+    },
     ReviewRequested {
         sequence: u32,
         task_ordinal: u32,
@@ -539,6 +829,8 @@ pub enum SessionProgressEvent {
         task_selector: String,
         clarification_record_count: u32,
         reviewer_bindings: Vec<ReviewerBindingSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        github: Option<GitHubTaskProgressSnapshot>,
     },
     ReviewResponded {
         sequence: u32,
@@ -555,6 +847,8 @@ pub enum SessionProgressEvent {
         reviewer_final_message_paths: Vec<String>,
         responses_received: u8,
         responses_expected: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        github: Option<GitHubTaskProgressSnapshot>,
     },
     TaskCompleted {
         sequence: u32,
@@ -568,37 +862,68 @@ pub enum SessionProgressEvent {
         outcome: TaskCompletionOutcome,
         developer_final_path: String,
         reviewers: Vec<ReviewerResultSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        github: Option<GitHubTaskProgressSnapshot>,
+    },
+    MergeWaiting {
+        sequence: u32,
+        completed_tasks: u32,
+        total_tasks: u32,
+        pr_number: u64,
+        pr_url: String,
+        final_head_sha: String,
+        check_run_id: u64,
+        check_url: String,
+    },
+    RunFinalizing {
+        sequence: u32,
+        completed_tasks: u32,
+        total_tasks: u32,
+        pr_number: u64,
+        pr_url: String,
+        final_head_sha: String,
+        merge_sha: String,
     },
 }
 
 impl SessionProgressEvent {
     pub fn sequence(&self) -> u32 {
         match self {
-            Self::ReviewRequested { sequence, .. }
+            Self::CandidatePublished { sequence, .. }
+            | Self::ReviewRequested { sequence, .. }
             | Self::ReviewResponded { sequence, .. }
-            | Self::TaskCompleted { sequence, .. } => *sequence,
+            | Self::TaskCompleted { sequence, .. }
+            | Self::MergeWaiting { sequence, .. }
+            | Self::RunFinalizing { sequence, .. } => *sequence,
         }
     }
 
-    pub fn task_ordinal(&self) -> u32 {
+    pub fn task_ordinal(&self) -> Option<u32> {
         match self {
-            Self::ReviewRequested { task_ordinal, .. }
+            Self::CandidatePublished { task_ordinal, .. }
+            | Self::ReviewRequested { task_ordinal, .. }
             | Self::ReviewResponded { task_ordinal, .. }
-            | Self::TaskCompleted { task_ordinal, .. } => *task_ordinal,
+            | Self::TaskCompleted { task_ordinal, .. } => Some(*task_ordinal),
+            Self::MergeWaiting { .. } | Self::RunFinalizing { .. } => None,
         }
     }
 
-    pub fn task_key(&self) -> &str {
+    pub fn task_key(&self) -> Option<&str> {
         match self {
-            Self::ReviewRequested { task_key, .. }
+            Self::CandidatePublished { task_key, .. }
+            | Self::ReviewRequested { task_key, .. }
             | Self::ReviewResponded { task_key, .. }
-            | Self::TaskCompleted { task_key, .. } => task_key,
+            | Self::TaskCompleted { task_key, .. } => Some(task_key),
+            Self::MergeWaiting { .. } | Self::RunFinalizing { .. } => None,
         }
     }
 
     pub fn completed_tasks(&self) -> u32 {
         match self {
-            Self::ReviewRequested {
+            Self::CandidatePublished {
+                completed_tasks, ..
+            }
+            | Self::ReviewRequested {
                 completed_tasks, ..
             }
             | Self::ReviewResponded {
@@ -606,15 +931,24 @@ impl SessionProgressEvent {
             }
             | Self::TaskCompleted {
                 completed_tasks, ..
+            }
+            | Self::MergeWaiting {
+                completed_tasks, ..
+            }
+            | Self::RunFinalizing {
+                completed_tasks, ..
             } => *completed_tasks,
         }
     }
 
     pub fn total_tasks(&self) -> u32 {
         match self {
-            Self::ReviewRequested { total_tasks, .. }
+            Self::CandidatePublished { total_tasks, .. }
+            | Self::ReviewRequested { total_tasks, .. }
             | Self::ReviewResponded { total_tasks, .. }
-            | Self::TaskCompleted { total_tasks, .. } => *total_tasks,
+            | Self::TaskCompleted { total_tasks, .. }
+            | Self::MergeWaiting { total_tasks, .. }
+            | Self::RunFinalizing { total_tasks, .. } => *total_tasks,
         }
     }
 }
@@ -690,6 +1024,12 @@ pub enum ControlResult {
         plan_version: u64,
         plan_hash: String,
     },
+    #[serde(rename = "github_inspection")]
+    GitHubInspection {
+        run_id: String,
+        session_version: u64,
+        inspection: GitHubInspectionBinding,
+    },
     Clarifications {
         page: ClarificationPage,
     },
@@ -715,6 +1055,8 @@ pub struct SessionStatusSnapshot {
     pub state: SessionState,
     pub version: u64,
     pub project_root: String,
+    pub delivery_binding: DeliveryBinding,
+    pub github: Option<GitHubDeliveryStatusSnapshot>,
     pub plan_version: Option<u64>,
     pub plan_hash: Option<String>,
     pub current_task_ordinal: Option<u32>,
@@ -744,6 +1086,8 @@ pub struct TaskStatusSnapshot {
     pub clarification_record_count: u32,
     pub base_revision: Option<String>,
     pub head_revision: Option<String>,
+    pub github_reviews: Vec<GitHubReviewSnapshot>,
+    pub github_check: Option<GitHubCheckSnapshot>,
     pub developer_session_bound: bool,
     pub reviewers: Vec<ReviewerResultSnapshot>,
     pub outcome_detail: Option<String>,
@@ -1025,6 +1369,7 @@ mod tests {
                     adapter: "claude-reviewer-2.1.220".into(),
                 },
             ],
+            github_inspection_id: None,
             tasks: vec![task("one"), task("two")],
         };
         assert!(valid.validate().is_ok());
@@ -1069,6 +1414,7 @@ mod tests {
                 reviewer_id: ReviewerId::Reviewer1,
                 adapter: "codex-reviewer".into(),
             }],
+            github_inspection_id: None,
             tasks: vec![TaskDraft {
                 max_review_rounds: rounds,
                 ..task("single")
@@ -1276,6 +1622,7 @@ mod tests {
                 task_selector: "TASK-03".into(),
                 clarification_record_count: 1,
                 reviewer_bindings: Vec::new(),
+                github: None,
             },
         };
         let encoded = serde_json::to_value(&result).unwrap();
@@ -1297,11 +1644,46 @@ mod tests {
     }
 
     #[test]
+    fn github_protocol_names_are_stable_acronyms() {
+        let action = ControlAction::SessionGitHubDeliveryInspect {
+            expected_session_version: 4,
+            run_id: "run-one".into(),
+        };
+        let encoded = serde_json::to_value(&action).unwrap();
+        assert_eq!(encoded["action"], "session_github_delivery_inspect");
+        assert!(matches!(
+            serde_json::from_value::<ControlAction>(encoded).unwrap(),
+            ControlAction::SessionGitHubDeliveryInspect {
+                expected_session_version: 4,
+                ref run_id,
+            } if run_id == "run-one"
+        ));
+
+        let result = ControlResult::GitHubInspection {
+            run_id: "run-one".into(),
+            session_version: 4,
+            inspection: GitHubInspectionBinding {
+                inspected_repository_id: 99,
+                expected_base_ref: "refs/heads/master".into(),
+                expected_base_sha: "a".repeat(40),
+                ruleset_attestation_sha256: "b".repeat(64),
+                inspection_id: "inspection-one".into(),
+            },
+        };
+        let encoded = serde_json::to_value(&result).unwrap();
+        assert_eq!(encoded["kind"], "github_inspection");
+        assert_eq!(
+            serde_json::from_value::<ControlResult>(encoded).unwrap(),
+            result
+        );
+    }
+
+    #[test]
     fn previous_protocol_version_fails_closed() {
-        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(PROTOCOL_VERSION, 10);
         let request = ControlRequest {
-            protocol_version: 8,
-            request_id: "v8-request".into(),
+            protocol_version: 9,
+            request_id: "v10-request".into(),
             caller: CallerAuth::Human {
                 process_birth: "123:456".into(),
             },
@@ -1310,8 +1692,8 @@ mod tests {
         assert!(request.validate().is_err());
 
         let response = ControlResponse {
-            protocol_version: 8,
-            request_id: "v8-response".into(),
+            protocol_version: 9,
+            request_id: "v10-response".into(),
             ok: false,
             result: None,
             error: Some(ControlErrorBody {
@@ -1332,6 +1714,7 @@ mod tests {
             names,
             [
                 "session_run_begin",
+                "session_github_delivery_inspect",
                 "session_plan_replace",
                 "session_approve_and_start",
                 "session_clarification_submit",

@@ -7,6 +7,7 @@
 
 use crate::control_api::{
     ActiveWorkerSnapshot, ArchitectActionReason, ClarificationPage, ClarificationRecord,
+    DeliveryBinding, GitHubDeliveryStatusSnapshot, GitHubInspectionBinding, GitHubRunBinding,
     MAX_CLARIFICATION_PAGE_RECORDS, MAX_CLARIFICATION_RECORDS_PER_RUN,
     MAX_CLARIFICATION_RECORDS_PER_TASK, MAX_PROGRESS_EVENTS_PER_RUN,
     PendingArchitectActionSnapshot, ReviewerBindingSnapshot, ReviewerResultSnapshot,
@@ -24,6 +25,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
+
+#[cfg(test)]
+use crate::control_api::GitHubTaskProgressSnapshot;
 
 const MAX_CORE_DIAGNOSTIC_BYTES: usize = 1024;
 const MAX_COMPLETION_TOKEN_BYTES: usize = 128;
@@ -74,6 +78,7 @@ pub enum SupervisorEvent {
         plan_version: u64,
         plan_hash: String,
         tasks: Vec<TaskDraft>,
+        github_run_binding: Option<GitHubRunBinding>,
     },
     ExecutionAuthorized {
         expected_version: u64,
@@ -496,6 +501,8 @@ pub struct SupervisorCore {
     run_id: String,
     project_root: PathBuf,
     profile_hash: String,
+    delivery_binding: DeliveryBinding,
+    github_run_binding: Option<GitHubRunBinding>,
     reviewer_bindings: Vec<ReviewerBindingSnapshot>,
     session_state: SessionState,
     version: u64,
@@ -540,11 +547,46 @@ impl SupervisorCore {
         Self::new_at_version(run_id, project_root, profile_hash, reviewer_bindings, 0)
     }
 
+    pub fn new_with_delivery_binding(
+        run_id: String,
+        project_root: PathBuf,
+        profile_hash: String,
+        reviewer_bindings: Vec<ReviewerBindingSnapshot>,
+        delivery_binding: DeliveryBinding,
+    ) -> Result<Self, SupervisorError> {
+        Self::new_at_version_with_delivery(
+            run_id,
+            project_root,
+            profile_hash,
+            reviewer_bindings,
+            delivery_binding,
+            0,
+        )
+    }
+
     fn new_at_version(
         run_id: String,
         project_root: PathBuf,
         profile_hash: String,
         reviewer_bindings: Vec<ReviewerBindingSnapshot>,
+        version: u64,
+    ) -> Result<Self, SupervisorError> {
+        Self::new_at_version_with_delivery(
+            run_id,
+            project_root,
+            profile_hash,
+            reviewer_bindings,
+            DeliveryBinding::LocalCandidate,
+            version,
+        )
+    }
+
+    fn new_at_version_with_delivery(
+        run_id: String,
+        project_root: PathBuf,
+        profile_hash: String,
+        reviewer_bindings: Vec<ReviewerBindingSnapshot>,
+        delivery_binding: DeliveryBinding,
         version: u64,
     ) -> Result<Self, SupervisorError> {
         validate_identifier("run id", &run_id)?;
@@ -557,6 +599,8 @@ impl SupervisorCore {
             run_id,
             project_root,
             profile_hash,
+            delivery_binding,
+            github_run_binding: None,
             reviewer_bindings,
             session_state: SessionState::AwaitingPlan,
             version,
@@ -598,11 +642,12 @@ impl SupervisorCore {
             .version
             .checked_add(1)
             .ok_or_else(|| SupervisorError::overflow("session version overflow"))?;
-        Self::new_at_version(
+        Self::new_at_version_with_delivery(
             run_id,
             self.project_root.clone(),
             self.profile_hash.clone(),
             self.reviewer_bindings.clone(),
+            self.delivery_binding.clone(),
             version,
         )
     }
@@ -649,14 +694,30 @@ impl SupervisorCore {
         self.plan_hash.as_deref()
     }
 
+    pub fn github_run_binding(&self) -> Option<&GitHubRunBinding> {
+        self.github_run_binding.as_ref()
+    }
+
     pub fn expected_plan_hash(&self, plan_version: u64, tasks: &[TaskDraft]) -> String {
+        self.expected_plan_hash_for_inspection(plan_version, tasks, None)
+    }
+
+    pub fn expected_plan_hash_for_inspection(
+        &self,
+        plan_version: u64,
+        tasks: &[TaskDraft],
+        github_inspection: Option<&GitHubInspectionBinding>,
+    ) -> String {
         canonical_hash(&(
-            "hcom-provider-routed-session-plan-v2",
+            "hcom-provider-routed-session-plan-v3",
             &self.run_id,
             plan_version,
             &self.project_root,
             &self.profile_hash,
             &self.reviewer_bindings,
+            &self.delivery_binding,
+            github_inspection,
+            "hcom/<run-id>-<first-12-plan-hash-chars>",
             tasks,
         ))
     }
@@ -667,6 +728,14 @@ impl SupervisorCore {
             state: self.session_state,
             version: self.version,
             project_root: self.project_root.to_string_lossy().into_owned(),
+            delivery_binding: self.delivery_binding.clone(),
+            github: self
+                .delivery_binding
+                .is_github()
+                .then(|| GitHubDeliveryStatusSnapshot {
+                    run_binding: self.github_run_binding.clone(),
+                    ..GitHubDeliveryStatusSnapshot::default()
+                }),
             plan_version: self.plan_version,
             plan_hash: self.plan_hash.clone(),
             current_task_ordinal: self
@@ -698,7 +767,10 @@ impl SupervisorCore {
                     task_document_path: task.spec.task_document_path.clone(),
                     design_document_paths: task.spec.design_document_paths.clone(),
                     task_selector: task.spec.task_selector.clone(),
-                    branch: None,
+                    branch: self
+                        .github_run_binding
+                        .as_ref()
+                        .map(|binding| binding.generated_run_branch.clone()),
                     review_round: task.review_round,
                     review_generation: task.review_generation,
                     max_review_rounds: task.spec.max_review_rounds,
@@ -706,8 +778,16 @@ impl SupervisorCore {
                     max_clarification_rounds: task.spec.max_clarification_rounds,
                     clarification_record_count: u32::try_from(task.clarification_records.len())
                         .unwrap_or(u32::MAX),
-                    base_revision: None,
+                    base_revision: (index == 0)
+                        .then(|| {
+                            self.github_run_binding
+                                .as_ref()
+                                .map(|binding| binding.expected_base_sha.clone())
+                        })
+                        .flatten(),
                     head_revision: None,
+                    github_reviews: Vec::new(),
+                    github_check: None,
                     developer_session_bound: task.developer_session.is_some(),
                     reviewers: self
                         .reviewer_ids()
@@ -866,8 +946,9 @@ impl SupervisorCore {
                 plan_version,
                 plan_hash,
                 tasks,
+                github_run_binding,
                 ..
-            } => self.bind_plan(plan_version, plan_hash, tasks),
+            } => self.bind_plan(plan_version, plan_hash, tasks, github_run_binding),
             SupervisorEvent::ExecutionAuthorized {
                 plan_version,
                 plan_hash,
@@ -998,6 +1079,7 @@ impl SupervisorCore {
         plan_version: u64,
         plan_hash: String,
         tasks: Vec<TaskDraft>,
+        github_run_binding: Option<GitHubRunBinding>,
     ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
         if !matches!(
             self.session_state,
@@ -1030,11 +1112,64 @@ impl SupervisorCore {
             }
         }
 
-        let expected_hash = self.expected_plan_hash(plan_version, &tasks);
+        match (&self.delivery_binding, &github_run_binding) {
+            (DeliveryBinding::LocalCandidate, None) => {}
+            (DeliveryBinding::LocalCandidate, Some(_)) => {
+                return Err(SupervisorError::invalid_plan(
+                    "local candidate plan unexpectedly contains a GitHub run binding",
+                ));
+            }
+            (DeliveryBinding::GitHubPullRequest { binding }, Some(run)) => {
+                if run.inspected_repository_id != binding.repository_id
+                    || run.expected_base_ref != format!("refs/heads/{}", binding.base_branch)
+                    || run.expected_base_sha.len() != 40
+                    || !run
+                        .expected_base_sha
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    || validate_sha256(
+                        "GitHub ruleset attestation",
+                        &run.ruleset_attestation_sha256,
+                    )
+                    .is_err()
+                    || validate_identifier("GitHub inspection ID", &run.inspection_id).is_err()
+                    || binding
+                        .reviewer_apps
+                        .iter()
+                        .map(|reviewer| reviewer.reviewer_id)
+                        .ne(self.reviewer_ids())
+                    || tasks
+                        .iter()
+                        .any(|task| task.repository_root != binding.local_repository_root)
+                {
+                    return Err(SupervisorError::invalid_plan(
+                        "GitHub run binding differs from the frozen delivery binding",
+                    ));
+                }
+            }
+            (DeliveryBinding::GitHubPullRequest { .. }, None) => {
+                return Err(SupervisorError::invalid_plan(
+                    "GitHub Pull Request plan omitted its inspected run binding",
+                ));
+            }
+        }
+        let inspection = github_run_binding
+            .as_ref()
+            .map(GitHubRunBinding::inspection);
+        let expected_hash =
+            self.expected_plan_hash_for_inspection(plan_version, &tasks, inspection.as_ref());
         if plan_hash != expected_hash {
             return Err(SupervisorError::invalid_plan(
                 "plan hash does not match the exact ordered plan binding",
             ));
+        }
+        if let Some(run) = &github_run_binding {
+            let expected_branch = format!("hcom/{}-{}", self.run_id, &plan_hash[..12]);
+            if run.generated_run_branch != expected_branch {
+                return Err(SupervisorError::invalid_plan(
+                    "GitHub run branch is not derived from the exact run and plan hash",
+                ));
+            }
         }
         let next_plan_version = plan_version
             .checked_add(1)
@@ -1047,6 +1182,7 @@ impl SupervisorCore {
             .collect();
         self.plan_version = Some(plan_version);
         self.plan_hash = Some(plan_hash);
+        self.github_run_binding = github_run_binding;
         self.next_plan_version = next_plan_version;
         self.current_task = None;
         self.terminal_detail = None;
@@ -2013,6 +2149,7 @@ impl SupervisorCore {
                 task_selector: task.spec.task_selector.clone(),
                 clarification_record_count,
                 reviewer_bindings: self.reviewer_bindings.clone(),
+                github: None,
             });
         Ok(())
     }
@@ -2057,6 +2194,7 @@ impl SupervisorCore {
                     .map_err(|_| SupervisorError::overflow("Reviewer response count overflow"))?,
                 responses_expected: u8::try_from(self.reviewer_bindings.len())
                     .map_err(|_| SupervisorError::overflow("Reviewer binding count overflow"))?,
+                github: None,
             });
         Ok(())
     }
@@ -2099,6 +2237,7 @@ impl SupervisorCore {
                 outcome,
                 developer_final_path,
                 reviewers: reviewer_result_snapshots(task, &self.reviewer_ids()),
+                github: None,
             });
         Ok(())
     }
@@ -2383,16 +2522,27 @@ impl SupervisorCore {
                     "run progress events are not ordered and contiguous",
                 ));
             }
-            let task_ordinal = usize::try_from(event.task_ordinal())
-                .map_err(|_| SupervisorError::invariant("progress task ordinal overflow"))?;
-            if self
-                .tasks
-                .get(task_ordinal)
-                .is_none_or(|task| task.spec.task_key != event.task_key())
-            {
-                return Err(SupervisorError::invariant(
-                    "progress event task identity is invalid",
-                ));
+            match (event.task_ordinal(), event.task_key()) {
+                (Some(task_ordinal), Some(task_key)) => {
+                    let task_ordinal = usize::try_from(task_ordinal).map_err(|_| {
+                        SupervisorError::invariant("progress task ordinal overflow")
+                    })?;
+                    if self
+                        .tasks
+                        .get(task_ordinal)
+                        .is_none_or(|task| task.spec.task_key != task_key)
+                    {
+                        return Err(SupervisorError::invariant(
+                            "progress event task identity is invalid",
+                        ));
+                    }
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(SupervisorError::invariant(
+                        "progress event task identity is incomplete",
+                    ));
+                }
             }
             if event.total_tasks() != total_tasks || event.completed_tasks() > total_tasks {
                 return Err(SupervisorError::invariant(
@@ -2977,7 +3127,10 @@ fn canonical_hash(value: &impl Serialize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control_api::protocol::{MAX_REVIEW_ROUNDS, MIN_DUAL_REVIEW_ROUNDS};
+    use crate::control_api::protocol::{
+        GitHubAppBinding, GitHubPermissionLevel, GitHubPullRequestBinding,
+        GitHubReviewerAppBinding, MAX_REVIEW_ROUNDS, MIN_DUAL_REVIEW_ROUNDS,
+    };
     use crate::worker::runtime::DeveloperOutcomeV1;
 
     const PROFILE_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -3099,6 +3252,7 @@ mod tests {
             plan_version,
             plan_hash,
             tasks,
+            github_run_binding: None,
         })
         .unwrap()
     }
@@ -3729,6 +3883,7 @@ mod tests {
             plan_version,
             plan_hash,
             tasks,
+            github_run_binding: None,
         }
     }
 
@@ -4150,6 +4305,150 @@ mod tests {
         assert_ne!(
             dual.expected_plan_hash(1, &tasks),
             single.expected_plan_hash(1, &tasks)
+        );
+    }
+
+    fn github_delivery_binding() -> DeliveryBinding {
+        let app =
+            |id: u64, slug: &str, permissions: &[(&str, GitHubPermissionLevel)]| GitHubAppBinding {
+                app_id: id,
+                installation_id: id + 10,
+                slug: slug.into(),
+                bot_user_id: id + 20,
+                effective_permissions: permissions
+                    .iter()
+                    .map(|(name, level)| ((*name).into(), *level))
+                    .collect(),
+            };
+        let reviewer_permissions = [("pull_requests", GitHubPermissionLevel::Write)];
+        DeliveryBinding::GitHubPullRequest {
+            binding: Box::new(GitHubPullRequestBinding {
+                owner: "owner".into(),
+                repository: "repo".into(),
+                repository_id: 99,
+                visibility: "private".into(),
+                local_repository_root: "/repo".into(),
+                base_branch: "master".into(),
+                merge_method: "squash".into(),
+                merge_wait_seconds: 21_600,
+                delete_remote_branch_after_merge: true,
+                architect_app: app(
+                    1,
+                    "hcom-arch",
+                    &[
+                        ("administration", GitHubPermissionLevel::Read),
+                        ("checks", GitHubPermissionLevel::Write),
+                        ("contents", GitHubPermissionLevel::Write),
+                        ("pull_requests", GitHubPermissionLevel::Write),
+                    ],
+                ),
+                developer_app: app(
+                    2,
+                    "hcom-dev",
+                    &[
+                        ("contents", GitHubPermissionLevel::Write),
+                        ("pull_requests", GitHubPermissionLevel::Write),
+                    ],
+                ),
+                reviewer_apps: vec![
+                    GitHubReviewerAppBinding {
+                        reviewer_id: ReviewerId::Reviewer1,
+                        app: app(3, "hcom-reviewer1", &reviewer_permissions),
+                    },
+                    GitHubReviewerAppBinding {
+                        reviewer_id: ReviewerId::Reviewer2,
+                        app: app(4, "hcom-reviewer2", &reviewer_permissions),
+                    },
+                ],
+                review_check_name: "hcom/review".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn github_plan_hash_binds_delivery_inspection_and_cycle_free_branch() {
+        let tasks = vec![task("one", "/repo", MIN_DUAL_REVIEW_ROUNDS)];
+        let delivery = github_delivery_binding();
+        let mut github = SupervisorCore::new_with_delivery_binding(
+            "run-one".into(),
+            PathBuf::from("/project"),
+            PROFILE_HASH.into(),
+            default_reviewer_bindings(),
+            delivery,
+        )
+        .unwrap();
+        let inspection = GitHubInspectionBinding {
+            inspected_repository_id: 99,
+            expected_base_ref: "refs/heads/master".into(),
+            expected_base_sha: "a".repeat(40),
+            ruleset_attestation_sha256: "b".repeat(64),
+            inspection_id: "inspect-one".into(),
+        };
+        let hash = github.expected_plan_hash_for_inspection(1, &tasks, Some(&inspection));
+        assert_ne!(hash, new_core().expected_plan_hash(1, &tasks));
+        let mut actor_delivery = github_delivery_binding();
+        let DeliveryBinding::GitHubPullRequest { binding } = &mut actor_delivery else {
+            unreachable!()
+        };
+        binding.architect_app.bot_user_id += 1;
+        let actor_core = SupervisorCore::new_with_delivery_binding(
+            "run-one".into(),
+            PathBuf::from("/project"),
+            PROFILE_HASH.into(),
+            default_reviewer_bindings(),
+            actor_delivery,
+        )
+        .unwrap();
+        assert_ne!(
+            hash,
+            actor_core.expected_plan_hash_for_inspection(1, &tasks, Some(&inspection))
+        );
+        let mut moved_base = inspection.clone();
+        moved_base.expected_base_sha = "c".repeat(40);
+        assert_ne!(
+            hash,
+            github.expected_plan_hash_for_inspection(1, &tasks, Some(&moved_base))
+        );
+        let mut moved_rules = inspection.clone();
+        moved_rules.ruleset_attestation_sha256 = "d".repeat(64);
+        assert_ne!(
+            hash,
+            github.expected_plan_hash_for_inspection(1, &tasks, Some(&moved_rules))
+        );
+        let mut newer_inspection = inspection.clone();
+        newer_inspection.inspection_id = "inspect-two".into();
+        assert_ne!(
+            hash,
+            github.expected_plan_hash_for_inspection(1, &tasks, Some(&newer_inspection))
+        );
+        let expected_branch = format!("hcom/run-one-{}", &hash[..12]);
+        let run_binding = GitHubRunBinding {
+            inspected_repository_id: inspection.inspected_repository_id,
+            expected_base_ref: inspection.expected_base_ref.clone(),
+            expected_base_sha: inspection.expected_base_sha.clone(),
+            ruleset_attestation_sha256: inspection.ruleset_attestation_sha256.clone(),
+            inspection_id: inspection.inspection_id.clone(),
+            generated_run_branch: expected_branch.clone(),
+        };
+        github
+            .reduce(SupervisorEvent::PlanBound {
+                expected_version: 0,
+                plan_version: 1,
+                plan_hash: hash.clone(),
+                tasks,
+                github_run_binding: Some(run_binding.clone()),
+            })
+            .unwrap();
+        let snapshot = github.snapshot();
+        assert_eq!(snapshot.plan_hash.as_deref(), Some(hash.as_str()));
+        assert_eq!(snapshot.github.unwrap().run_binding, Some(run_binding));
+        assert_eq!(
+            snapshot.tasks[0].branch.as_deref(),
+            Some(expected_branch.as_str())
+        );
+        assert_eq!(
+            snapshot.tasks[0].base_revision.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
     }
 
@@ -5329,7 +5628,7 @@ mod tests {
     }
 
     #[test]
-    fn full_dual_review_progress_capacity_retains_exactly_3904_events() {
+    fn full_dual_review_progress_capacity_retains_exactly_5186_events() {
         let mut core = new_core();
         let tasks = (0..MAX_TASKS)
             .map(|ordinal| task(&format!("task-{ordinal}"), "/repo", MAX_REVIEW_ROUNDS))
@@ -5340,6 +5639,25 @@ mod tests {
         for task_ordinal in 0..MAX_TASKS {
             let task_key = core.tasks[task_ordinal].spec.task_key.clone();
             for review_generation in 1..=u32::from(MAX_REVIEW_ROUNDS) {
+                sequence += 1;
+                core.progress_events
+                    .push(SessionProgressEvent::CandidatePublished {
+                        sequence,
+                        task_ordinal: u32::try_from(task_ordinal).unwrap(),
+                        task_key: task_key.clone(),
+                        completed_tasks: u32::try_from(task_ordinal).unwrap(),
+                        total_tasks: u32::try_from(MAX_TASKS).unwrap(),
+                        review_generation,
+                        developer_final_path: "/artifacts/developer/final.md".into(),
+                        github: GitHubTaskProgressSnapshot {
+                            pr_number: 1,
+                            pr_url: "https://github.com/owner/repo/pull/1".into(),
+                            task_base_sha: "a".repeat(40),
+                            published_head_sha: "b".repeat(40),
+                            check_run_id: Some(1),
+                            check_url: Some("https://github.com/owner/repo/runs/1".into()),
+                        },
+                    });
                 sequence += 1;
                 core.progress_events
                     .push(SessionProgressEvent::ReviewRequested {
@@ -5363,6 +5681,7 @@ mod tests {
                         task_selector: task_key.clone(),
                         clarification_record_count: 0,
                         reviewer_bindings: core.reviewer_bindings.clone(),
+                        github: None,
                     });
                 for (response_index, reviewer_id) in reviewer_ids().into_iter().enumerate() {
                     sequence += 1;
@@ -5388,6 +5707,7 @@ mod tests {
                             ],
                             responses_received: u8::try_from(response_index + 1).unwrap(),
                             responses_expected: 2,
+                            github: None,
                         });
                 }
             }
@@ -5416,10 +5736,35 @@ mod tests {
                             ],
                         })
                         .collect(),
+                    github: None,
                 });
         }
 
-        assert_eq!(MAX_PROGRESS_EVENTS_PER_RUN, 3904);
+        sequence += 1;
+        core.progress_events
+            .push(SessionProgressEvent::MergeWaiting {
+                sequence,
+                completed_tasks: 0,
+                total_tasks: u32::try_from(MAX_TASKS).unwrap(),
+                pr_number: 1,
+                pr_url: "https://github.com/owner/repo/pull/1".into(),
+                final_head_sha: "b".repeat(40),
+                check_run_id: 1,
+                check_url: "https://github.com/owner/repo/runs/1".into(),
+            });
+        sequence += 1;
+        core.progress_events
+            .push(SessionProgressEvent::RunFinalizing {
+                sequence,
+                completed_tasks: 0,
+                total_tasks: u32::try_from(MAX_TASKS).unwrap(),
+                pr_number: 1,
+                pr_url: "https://github.com/owner/repo/pull/1".into(),
+                final_head_sha: "b".repeat(40),
+                merge_sha: "c".repeat(40),
+            });
+
+        assert_eq!(MAX_PROGRESS_EVENTS_PER_RUN, 5186);
         assert_eq!(
             usize::try_from(sequence).unwrap(),
             MAX_PROGRESS_EVENTS_PER_RUN
@@ -5440,7 +5785,7 @@ mod tests {
 
         let mut overflow = core.clone();
         let mut impossible = overflow.progress_events.last().unwrap().clone();
-        let SessionProgressEvent::TaskCompleted {
+        let SessionProgressEvent::RunFinalizing {
             sequence: impossible_sequence,
             ..
         } = &mut impossible
