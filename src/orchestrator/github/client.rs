@@ -1,0 +1,1434 @@
+//! Closed, blocking GitHub REST client.
+//!
+//! Production construction fixes the origin to `api.github.com`, uses rustls
+//! with native roots, disables redirects, and applies per-request body/time
+//! bounds. Tests may replace only the origin while exercising this same code.
+
+use super::auth::{AppJwt, InstallationOperation, InstallationToken};
+use super::{validate_branch, validate_slug};
+use anyhow::{Result, anyhow, bail};
+use reqwest::Url;
+use reqwest::blocking::{Client, Response};
+use reqwest::header::{
+    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue,
+    RETRY_AFTER, USER_AGENT,
+};
+use reqwest::redirect::Policy;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use std::fmt;
+use std::io::Read;
+use std::time::Duration;
+use thiserror::Error;
+use zeroize::Zeroizing;
+
+pub(crate) const GITHUB_API_ORIGIN: &str = "https://api.github.com/";
+pub(crate) const GITHUB_API_VERSION: &str = "2022-11-28";
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const MAX_RESPONSE_BODY_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_LIST_PAGES: u16 = 64;
+pub(crate) const MAX_LIST_ITEMS: usize = 4_096;
+pub(crate) const MAX_RECONCILIATION_BYTES: usize = 64 * 1024 * 1024;
+const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_REQUEST_ID_BYTES: usize = 128;
+const PAGE_SIZE: usize = 100;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestMethod {
+    Get,
+    Post,
+    Patch,
+    Put,
+    Delete,
+}
+
+impl RestMethod {
+    fn reqwest(self) -> reqwest::Method {
+        match self {
+            Self::Get => reqwest::Method::GET,
+            Self::Post => reqwest::Method::POST,
+            Self::Patch => reqwest::Method::PATCH,
+            Self::Put => reqwest::Method::PUT,
+            Self::Delete => reqwest::Method::DELETE,
+        }
+    }
+
+    fn is_mutating(self) -> bool {
+        self != Self::Get
+    }
+}
+
+/// Every REST route the v1 lane can issue. There is deliberately no raw URL,
+/// path, or method variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RestEndpoint {
+    AppIdentity,
+    RepositoryInstallation {
+        owner: String,
+        repository: String,
+    },
+    CreateInstallationToken {
+        installation_id: u64,
+    },
+    Repository {
+        owner: String,
+        repository: String,
+    },
+    BotUser {
+        login: String,
+    },
+    Reference {
+        owner: String,
+        repository: String,
+        qualified_ref: String,
+    },
+    RulesForBranch {
+        owner: String,
+        repository: String,
+        branch: String,
+    },
+    ListPullRequests {
+        owner: String,
+        repository: String,
+        head: String,
+        base: String,
+        page: u16,
+    },
+    CreatePullRequest {
+        owner: String,
+        repository: String,
+    },
+    PullRequest {
+        owner: String,
+        repository: String,
+        number: u64,
+    },
+    ListIssueComments {
+        owner: String,
+        repository: String,
+        number: u64,
+        page: u16,
+    },
+    CreateIssueComment {
+        owner: String,
+        repository: String,
+        number: u64,
+    },
+    ListReviews {
+        owner: String,
+        repository: String,
+        number: u64,
+        page: u16,
+    },
+    CreateReview {
+        owner: String,
+        repository: String,
+        number: u64,
+    },
+    ListCheckRuns {
+        owner: String,
+        repository: String,
+        head_sha: String,
+        page: u16,
+    },
+    CreateCheckRun {
+        owner: String,
+        repository: String,
+    },
+    CheckRun {
+        owner: String,
+        repository: String,
+        check_run_id: u64,
+        update: bool,
+    },
+    MergePullRequest {
+        owner: String,
+        repository: String,
+        number: u64,
+    },
+    DeleteReference {
+        owner: String,
+        repository: String,
+        qualified_ref: String,
+    },
+}
+
+impl RestEndpoint {
+    pub(crate) fn method(&self) -> RestMethod {
+        match self {
+            Self::AppIdentity
+            | Self::RepositoryInstallation { .. }
+            | Self::Repository { .. }
+            | Self::BotUser { .. }
+            | Self::Reference { .. }
+            | Self::RulesForBranch { .. }
+            | Self::ListPullRequests { .. }
+            | Self::PullRequest { .. }
+            | Self::ListIssueComments { .. }
+            | Self::ListReviews { .. }
+            | Self::ListCheckRuns { .. }
+            | Self::CheckRun { update: false, .. } => RestMethod::Get,
+            Self::CreateInstallationToken { .. }
+            | Self::CreatePullRequest { .. }
+            | Self::CreateIssueComment { .. }
+            | Self::CreateReview { .. }
+            | Self::CreateCheckRun { .. } => RestMethod::Post,
+            Self::CheckRun { update: true, .. } => RestMethod::Patch,
+            Self::MergePullRequest { .. } => RestMethod::Put,
+            Self::DeleteReference { .. } => RestMethod::Delete,
+        }
+    }
+
+    pub(crate) fn template(&self) -> &'static str {
+        match self {
+            Self::AppIdentity => "GET /app",
+            Self::RepositoryInstallation { .. } => "GET /repos/{owner}/{repo}/installation",
+            Self::CreateInstallationToken { .. } => {
+                "POST /app/installations/{installation_id}/access_tokens"
+            }
+            Self::Repository { .. } => "GET /repos/{owner}/{repo}",
+            Self::BotUser { .. } => "GET /users/{bot}",
+            Self::Reference { .. } => "GET /repos/{owner}/{repo}/git/ref/{ref}",
+            Self::RulesForBranch { .. } => "GET /repos/{owner}/{repo}/rules/branches/{branch}",
+            Self::ListPullRequests { .. } => "GET /repos/{owner}/{repo}/pulls",
+            Self::CreatePullRequest { .. } => "POST /repos/{owner}/{repo}/pulls",
+            Self::PullRequest { .. } => "GET /repos/{owner}/{repo}/pulls/{number}",
+            Self::ListIssueComments { .. } => "GET /repos/{owner}/{repo}/issues/{number}/comments",
+            Self::CreateIssueComment { .. } => {
+                "POST /repos/{owner}/{repo}/issues/{number}/comments"
+            }
+            Self::ListReviews { .. } => "GET /repos/{owner}/{repo}/pulls/{number}/reviews",
+            Self::CreateReview { .. } => "POST /repos/{owner}/{repo}/pulls/{number}/reviews",
+            Self::ListCheckRuns { .. } => "GET /repos/{owner}/{repo}/commits/{head}/check-runs",
+            Self::CreateCheckRun { .. } => "POST /repos/{owner}/{repo}/check-runs",
+            Self::CheckRun { update: false, .. } => {
+                "GET /repos/{owner}/{repo}/check-runs/{check_id}"
+            }
+            Self::CheckRun { update: true, .. } => {
+                "PATCH /repos/{owner}/{repo}/check-runs/{check_id}"
+            }
+            Self::MergePullRequest { .. } => "PUT /repos/{owner}/{repo}/pulls/{number}/merge",
+            Self::DeleteReference { .. } => "DELETE /repos/{owner}/{repo}/git/refs/{ref}",
+        }
+    }
+
+    fn expected_status(&self) -> u16 {
+        match self {
+            Self::CreateInstallationToken { .. }
+            | Self::CreatePullRequest { .. }
+            | Self::CreateIssueComment { .. }
+            | Self::CreateCheckRun { .. } => 201,
+            Self::DeleteReference { .. } => 204,
+            Self::AppIdentity
+            | Self::RepositoryInstallation { .. }
+            | Self::Repository { .. }
+            | Self::BotUser { .. }
+            | Self::Reference { .. }
+            | Self::RulesForBranch { .. }
+            | Self::ListPullRequests { .. }
+            | Self::PullRequest { .. }
+            | Self::ListIssueComments { .. }
+            | Self::ListReviews { .. }
+            | Self::CreateReview { .. }
+            | Self::ListCheckRuns { .. }
+            | Self::CheckRun { .. }
+            | Self::MergePullRequest { .. } => 200,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        let validate_repo = |owner: &str, repository: &str| {
+            validate_slug("GitHub owner", owner)?;
+            validate_slug("GitHub repository", repository)
+        };
+        let validate_number = |value: u64| {
+            if value == 0 {
+                bail!("GitHub object number must be positive");
+            }
+            Ok(())
+        };
+        let validate_page = |page: u16| {
+            if !(1..=MAX_LIST_PAGES).contains(&page) {
+                bail!("GitHub pagination page is outside the bounded range");
+            }
+            Ok(())
+        };
+        match self {
+            Self::AppIdentity => Ok(()),
+            Self::RepositoryInstallation { owner, repository }
+            | Self::Repository { owner, repository }
+            | Self::CreatePullRequest { owner, repository }
+            | Self::CreateCheckRun { owner, repository } => validate_repo(owner, repository),
+            Self::CreateInstallationToken { installation_id } => validate_number(*installation_id),
+            Self::BotUser { login } => {
+                let slug = login
+                    .strip_suffix("[bot]")
+                    .ok_or_else(|| anyhow!("GitHub bot login must end in [bot]"))?;
+                validate_slug("GitHub bot login slug", slug)
+            }
+            Self::Reference {
+                owner,
+                repository,
+                qualified_ref,
+            }
+            | Self::DeleteReference {
+                owner,
+                repository,
+                qualified_ref,
+            } => {
+                validate_repo(owner, repository)?;
+                validate_qualified_ref(qualified_ref)
+            }
+            Self::RulesForBranch {
+                owner,
+                repository,
+                branch,
+            } => {
+                validate_repo(owner, repository)?;
+                validate_branch(branch)
+            }
+            Self::ListPullRequests {
+                owner,
+                repository,
+                head,
+                base,
+                page,
+            } => {
+                validate_repo(owner, repository)?;
+                validate_branch(base)?;
+                validate_page(*page)?;
+                let (head_owner, head_branch) = head
+                    .split_once(':')
+                    .ok_or_else(|| anyhow!("GitHub PR head selector must be owner:branch"))?;
+                validate_slug("GitHub PR head owner", head_owner)?;
+                validate_branch(head_branch)
+            }
+            Self::PullRequest {
+                owner,
+                repository,
+                number,
+            }
+            | Self::CreateIssueComment {
+                owner,
+                repository,
+                number,
+            }
+            | Self::CreateReview {
+                owner,
+                repository,
+                number,
+            }
+            | Self::MergePullRequest {
+                owner,
+                repository,
+                number,
+            } => {
+                validate_repo(owner, repository)?;
+                validate_number(*number)
+            }
+            Self::ListIssueComments {
+                owner,
+                repository,
+                number,
+                page,
+            }
+            | Self::ListReviews {
+                owner,
+                repository,
+                number,
+                page,
+            } => {
+                validate_repo(owner, repository)?;
+                validate_number(*number)?;
+                validate_page(*page)
+            }
+            Self::ListCheckRuns {
+                owner,
+                repository,
+                head_sha,
+                page,
+            } => {
+                validate_repo(owner, repository)?;
+                super::validate_git_sha("GitHub Check head", head_sha)?;
+                validate_page(*page)
+            }
+            Self::CheckRun {
+                owner,
+                repository,
+                check_run_id,
+                ..
+            } => {
+                validate_repo(owner, repository)?;
+                validate_number(*check_run_id)
+            }
+        }
+    }
+
+    fn url(&self, base: &Url) -> Result<Url> {
+        self.validate()?;
+        let mut url = base.clone();
+        url.set_query(None);
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("fixed GitHub API origin cannot accept path segments"))?;
+            segments.clear();
+            let mut push_repo = |owner: &str, repository: &str| {
+                segments.push("repos").push(owner).push(repository);
+            };
+            match self {
+                Self::AppIdentity => {
+                    segments.push("app");
+                }
+                Self::RepositoryInstallation { owner, repository } => {
+                    push_repo(owner, repository);
+                    segments.push("installation");
+                }
+                Self::CreateInstallationToken { installation_id } => {
+                    segments
+                        .push("app")
+                        .push("installations")
+                        .push(&installation_id.to_string())
+                        .push("access_tokens");
+                }
+                Self::Repository { owner, repository } => push_repo(owner, repository),
+                Self::BotUser { login } => {
+                    segments.push("users").push(login);
+                }
+                Self::Reference {
+                    owner,
+                    repository,
+                    qualified_ref,
+                } => {
+                    push_repo(owner, repository);
+                    segments.push("git").push("ref");
+                    for part in qualified_ref.split('/') {
+                        segments.push(part);
+                    }
+                }
+                Self::RulesForBranch {
+                    owner,
+                    repository,
+                    branch,
+                } => {
+                    push_repo(owner, repository);
+                    segments.push("rules").push("branches");
+                    for part in branch.split('/') {
+                        segments.push(part);
+                    }
+                }
+                Self::ListPullRequests {
+                    owner, repository, ..
+                }
+                | Self::CreatePullRequest { owner, repository } => {
+                    push_repo(owner, repository);
+                    segments.push("pulls");
+                }
+                Self::PullRequest {
+                    owner,
+                    repository,
+                    number,
+                } => {
+                    push_repo(owner, repository);
+                    segments.push("pulls").push(&number.to_string());
+                }
+                Self::ListIssueComments {
+                    owner,
+                    repository,
+                    number,
+                    ..
+                }
+                | Self::CreateIssueComment {
+                    owner,
+                    repository,
+                    number,
+                } => {
+                    push_repo(owner, repository);
+                    segments
+                        .push("issues")
+                        .push(&number.to_string())
+                        .push("comments");
+                }
+                Self::ListReviews {
+                    owner,
+                    repository,
+                    number,
+                    ..
+                }
+                | Self::CreateReview {
+                    owner,
+                    repository,
+                    number,
+                } => {
+                    push_repo(owner, repository);
+                    segments
+                        .push("pulls")
+                        .push(&number.to_string())
+                        .push("reviews");
+                }
+                Self::ListCheckRuns {
+                    owner,
+                    repository,
+                    head_sha,
+                    ..
+                } => {
+                    push_repo(owner, repository);
+                    segments.push("commits").push(head_sha).push("check-runs");
+                }
+                Self::CreateCheckRun { owner, repository } => {
+                    push_repo(owner, repository);
+                    segments.push("check-runs");
+                }
+                Self::CheckRun {
+                    owner,
+                    repository,
+                    check_run_id,
+                    ..
+                } => {
+                    push_repo(owner, repository);
+                    segments.push("check-runs").push(&check_run_id.to_string());
+                }
+                Self::MergePullRequest {
+                    owner,
+                    repository,
+                    number,
+                } => {
+                    push_repo(owner, repository);
+                    segments
+                        .push("pulls")
+                        .push(&number.to_string())
+                        .push("merge");
+                }
+                Self::DeleteReference {
+                    owner,
+                    repository,
+                    qualified_ref,
+                } => {
+                    push_repo(owner, repository);
+                    segments.push("git").push("refs");
+                    for part in qualified_ref.split('/') {
+                        segments.push(part);
+                    }
+                }
+            }
+        }
+        match self {
+            Self::ListPullRequests {
+                head, base, page, ..
+            } => {
+                url.query_pairs_mut()
+                    .append_pair("state", "all")
+                    .append_pair("head", head)
+                    .append_pair("base", base)
+                    .append_pair("per_page", &PAGE_SIZE.to_string())
+                    .append_pair("page", &page.to_string());
+            }
+            Self::ListIssueComments { page, .. } | Self::ListReviews { page, .. } => {
+                url.query_pairs_mut()
+                    .append_pair("per_page", &PAGE_SIZE.to_string())
+                    .append_pair("page", &page.to_string());
+            }
+            Self::ListCheckRuns { page, .. } => {
+                url.query_pairs_mut()
+                    .append_pair("filter", "all")
+                    .append_pair("per_page", &PAGE_SIZE.to_string())
+                    .append_pair("page", &page.to_string());
+            }
+            _ => {}
+        }
+        Ok(url)
+    }
+
+    fn accepts_installation_operation(&self, operation: InstallationOperation) -> bool {
+        use InstallationOperation as O;
+        match self {
+            Self::Repository { .. } | Self::BotUser { .. } => true,
+            Self::Reference { .. } => matches!(
+                operation,
+                O::RepositoryAndRefRead | O::GitFetch | O::GitPush | O::RemoteRefCleanup | O::Merge
+            ),
+            Self::RulesForBranch { .. } => operation == O::RulesetAttestation,
+            Self::ListPullRequests { .. } | Self::PullRequest { .. } => matches!(
+                operation,
+                O::PullRequestCreate | O::PullRequestRead | O::DeveloperComment | O::Merge
+            ),
+            Self::CreatePullRequest { .. } => operation == O::PullRequestCreate,
+            Self::ListIssueComments { .. } | Self::CreateIssueComment { .. } => {
+                matches!(operation, O::DeveloperComment | O::TerminalComment)
+            }
+            Self::ListReviews { .. } | Self::CreateReview { .. } => {
+                matches!(operation, O::ReviewPublish | O::ReviewRead | O::Merge)
+            }
+            Self::ListCheckRuns { .. } | Self::CheckRun { update: false, .. } => {
+                matches!(operation, O::CheckPublish | O::CheckRead | O::Merge)
+            }
+            Self::CreateCheckRun { .. } | Self::CheckRun { update: true, .. } => {
+                operation == O::CheckPublish
+            }
+            Self::MergePullRequest { .. } => operation == O::Merge,
+            Self::DeleteReference { .. } => operation == O::RemoteRefCleanup,
+            Self::AppIdentity
+            | Self::RepositoryInstallation { .. }
+            | Self::CreateInstallationToken { .. } => false,
+        }
+    }
+}
+
+fn validate_qualified_ref(value: &str) -> Result<()> {
+    let branch = value
+        .strip_prefix("heads/")
+        .ok_or_else(|| anyhow!("GitHub REST ref must be under heads/"))?;
+    validate_branch(branch)
+}
+
+pub(crate) enum GitHubAuthentication<'a> {
+    App(&'a AppJwt),
+    Installation(&'a InstallationToken),
+}
+
+impl fmt::Debug for GitHubAuthentication<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::App(_) => formatter.write_str("GitHubAuthentication::App([redacted])"),
+            Self::Installation(token) => formatter
+                .debug_tuple("GitHubAuthentication::Installation")
+                .field(token)
+                .finish(),
+        }
+    }
+}
+
+pub(crate) struct ApiResponse {
+    pub(crate) status: u16,
+    pub(crate) request_id: Option<String>,
+    method: RestMethod,
+    endpoint: &'static str,
+    body: Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for ApiResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApiResponse")
+            .field("status", &self.status)
+            .field("request_id", &self.request_id)
+            .field("method", &self.method)
+            .field("endpoint", &self.endpoint)
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
+}
+
+impl ApiResponse {
+    pub(crate) fn json<T: DeserializeOwned>(&self) -> std::result::Result<T, GitHubApiError> {
+        serde_json::from_slice(&self.body).map_err(|_| GitHubApiError::InvalidResponse {
+            endpoint: self.endpoint,
+            reason: "response body does not match the required typed JSON shape".into(),
+            ambiguous: self.method.is_mutating(),
+        })
+    }
+
+    pub(crate) fn body_len(&self) -> usize {
+        self.body.len()
+    }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum GitHubApiError {
+    #[error("GitHub {method:?} {endpoint} transport failed (ambiguous={ambiguous})")]
+    Transport {
+        method: RestMethod,
+        endpoint: &'static str,
+        ambiguous: bool,
+    },
+    #[error(
+        "GitHub {method:?} {endpoint} returned HTTP {status} (request_id={request_id:?}, retry_after={retry_after_seconds:?}, rate_limit_reset={rate_limit_reset_unix:?}): {reason}"
+    )]
+    Http {
+        method: RestMethod,
+        endpoint: &'static str,
+        status: u16,
+        request_id: Option<String>,
+        retry_after_seconds: Option<u64>,
+        rate_limit_reset_unix: Option<u64>,
+        reason: String,
+    },
+    #[error("GitHub {endpoint} response is invalid (ambiguous={ambiguous}): {reason}")]
+    InvalidResponse {
+        endpoint: &'static str,
+        reason: String,
+        ambiguous: bool,
+    },
+    #[error("GitHub {endpoint} exceeded the {bound} bound (ambiguous={ambiguous})")]
+    BoundExceeded {
+        endpoint: &'static str,
+        bound: &'static str,
+        ambiguous: bool,
+    },
+    #[error("GitHub credential scope does not permit {endpoint}")]
+    CredentialScope { endpoint: &'static str },
+}
+
+impl GitHubApiError {
+    pub(crate) fn requires_mutation_reconciliation(&self) -> bool {
+        match self {
+            Self::Transport {
+                ambiguous: true, ..
+            }
+            | Self::InvalidResponse {
+                ambiguous: true, ..
+            }
+            | Self::BoundExceeded {
+                ambiguous: true, ..
+            } => true,
+            Self::Http { method, status, .. } if method.is_mutating() => {
+                matches!(*status, 405 | 408 | 409 | 422 | 429 | 500..=599)
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::Http { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_bound_exceeded(&self) -> bool {
+        matches!(self, Self::BoundExceeded { .. })
+    }
+
+    pub(crate) fn rate_limit_signals(&self) -> (Option<u64>, Option<u64>) {
+        match self {
+            Self::Http {
+                retry_after_seconds,
+                rate_limit_reset_unix,
+                ..
+            } => (*retry_after_seconds, *rate_limit_reset_unix),
+            _ => (None, None),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct GitHubRestClient {
+    client: Client,
+    api_base: Url,
+}
+
+impl fmt::Debug for GitHubRestClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitHubRestClient")
+            .field("origin", &self.api_base.origin().ascii_serialization())
+            .field("redirects", &"disabled")
+            .field("response_cap", &MAX_RESPONSE_BODY_BYTES)
+            .finish()
+    }
+}
+
+impl GitHubRestClient {
+    pub(crate) fn new() -> Result<Self> {
+        ensure_rustls_crypto_provider()?;
+        let api_base = Url::parse(GITHUB_API_ORIGIN).expect("fixed GitHub API URL is valid");
+        let client = client_builder(true)
+            .build()
+            .map_err(|_| anyhow!("failed to build the bounded rustls GitHub HTTP client"))?;
+        Ok(Self { client, api_base })
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_test(api_base: Url) -> Result<Self> {
+        if api_base.scheme() != "http" || api_base.cannot_be_a_base() {
+            bail!("fake GitHub origin must be a hierarchical HTTP URL");
+        }
+        ensure_rustls_crypto_provider()?;
+        let client = client_builder(false)
+            .no_proxy()
+            .build()
+            .map_err(|_| anyhow!("failed to build fake GitHub HTTP client"))?;
+        Ok(Self { client, api_base })
+    }
+
+    pub(crate) fn get<T: DeserializeOwned>(
+        &self,
+        endpoint: RestEndpoint,
+        auth: GitHubAuthentication<'_>,
+    ) -> std::result::Result<T, GitHubApiError> {
+        let response = self.execute(endpoint, auth, None)?;
+        response.json()
+    }
+
+    pub(crate) fn send_json<B: Serialize, T: DeserializeOwned>(
+        &self,
+        endpoint: RestEndpoint,
+        auth: GitHubAuthentication<'_>,
+        body: &B,
+    ) -> std::result::Result<T, GitHubApiError> {
+        let bytes = serde_json::to_vec(body).map_err(|_| GitHubApiError::InvalidResponse {
+            endpoint: endpoint.template(),
+            reason: "request body could not be serialized".into(),
+            ambiguous: false,
+        })?;
+        if bytes.len() > MAX_REQUEST_BODY_BYTES {
+            return Err(GitHubApiError::BoundExceeded {
+                endpoint: endpoint.template(),
+                bound: "2-MiB request-body",
+                ambiguous: false,
+            });
+        }
+        let response = self.execute(endpoint, auth, Some(&bytes))?;
+        response.json()
+    }
+
+    pub(crate) fn send_json_allow_empty<B: Serialize>(
+        &self,
+        endpoint: RestEndpoint,
+        auth: GitHubAuthentication<'_>,
+        body: &B,
+    ) -> std::result::Result<ApiResponse, GitHubApiError> {
+        let bytes = serde_json::to_vec(body).map_err(|_| GitHubApiError::InvalidResponse {
+            endpoint: endpoint.template(),
+            reason: "request body could not be serialized".into(),
+            ambiguous: false,
+        })?;
+        if bytes.len() > MAX_REQUEST_BODY_BYTES {
+            return Err(GitHubApiError::BoundExceeded {
+                endpoint: endpoint.template(),
+                bound: "2-MiB request-body",
+                ambiguous: false,
+            });
+        }
+        self.execute(endpoint, auth, Some(&bytes))
+    }
+
+    pub(crate) fn delete(
+        &self,
+        endpoint: RestEndpoint,
+        auth: GitHubAuthentication<'_>,
+    ) -> std::result::Result<ApiResponse, GitHubApiError> {
+        self.execute(endpoint, auth, None)
+    }
+
+    pub(crate) fn paginated_values<F>(
+        &self,
+        mut endpoint_for_page: F,
+        auth: GitHubAuthentication<'_>,
+        array_field: Option<&str>,
+    ) -> std::result::Result<Vec<serde_json::Value>, GitHubApiError>
+    where
+        F: FnMut(u16) -> RestEndpoint,
+    {
+        let mut items = Vec::new();
+        let mut aggregate_bytes = 0usize;
+        for page in 1..=MAX_LIST_PAGES {
+            let endpoint = endpoint_for_page(page);
+            let response = self.execute(endpoint, auth_ref(&auth), None)?;
+            aggregate_bytes = aggregate_bytes.checked_add(response.body_len()).ok_or(
+                GitHubApiError::BoundExceeded {
+                    endpoint: "paginated reconciliation list",
+                    bound: "64-MiB aggregate-byte",
+                    ambiguous: false,
+                },
+            )?;
+            if aggregate_bytes > MAX_RECONCILIATION_BYTES {
+                return Err(GitHubApiError::BoundExceeded {
+                    endpoint: "paginated reconciliation list",
+                    bound: "64-MiB aggregate-byte",
+                    ambiguous: false,
+                });
+            }
+            let value: serde_json::Value = response.json()?;
+            let page_items = if let Some(field) = array_field {
+                value
+                    .get(field)
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| GitHubApiError::InvalidResponse {
+                        endpoint: "paginated reconciliation list",
+                        reason: "response omitted its bounded item array".into(),
+                        ambiguous: false,
+                    })?
+            } else {
+                value
+                    .as_array()
+                    .ok_or_else(|| GitHubApiError::InvalidResponse {
+                        endpoint: "paginated reconciliation list",
+                        reason: "response is not a bounded item array".into(),
+                        ambiguous: false,
+                    })?
+            };
+            if items.len().saturating_add(page_items.len()) > MAX_LIST_ITEMS {
+                return Err(GitHubApiError::BoundExceeded {
+                    endpoint: "paginated reconciliation list",
+                    bound: "4096-item",
+                    ambiguous: false,
+                });
+            }
+            items.extend(page_items.iter().cloned());
+            if page_items.len() < PAGE_SIZE {
+                return Ok(items);
+            }
+        }
+        Err(GitHubApiError::BoundExceeded {
+            endpoint: "paginated reconciliation list",
+            bound: "64-page",
+            ambiguous: false,
+        })
+    }
+
+    fn execute(
+        &self,
+        endpoint: RestEndpoint,
+        auth: GitHubAuthentication<'_>,
+        body: Option<&[u8]>,
+    ) -> std::result::Result<ApiResponse, GitHubApiError> {
+        let method = endpoint.method();
+        let template = endpoint.template();
+        let expected_status = endpoint.expected_status();
+        if method == RestMethod::Get && body.is_some()
+            || method != RestMethod::Get && body.is_none() && !matches!(method, RestMethod::Delete)
+        {
+            return Err(GitHubApiError::InvalidResponse {
+                endpoint: template,
+                reason: "request method/body shape violates the closed endpoint contract".into(),
+                ambiguous: false,
+            });
+        }
+        match auth {
+            GitHubAuthentication::App(_) => {
+                if !matches!(
+                    endpoint,
+                    RestEndpoint::AppIdentity
+                        | RestEndpoint::RepositoryInstallation { .. }
+                        | RestEndpoint::CreateInstallationToken { .. }
+                ) {
+                    return Err(GitHubApiError::CredentialScope { endpoint: template });
+                }
+            }
+            GitHubAuthentication::Installation(token) => {
+                if !endpoint.accepts_installation_operation(token.operation()) {
+                    return Err(GitHubApiError::CredentialScope { endpoint: template });
+                }
+            }
+        }
+        let url = endpoint
+            .url(&self.api_base)
+            .map_err(|_| GitHubApiError::InvalidResponse {
+                endpoint: template,
+                reason: "validated endpoint parameters could not form a fixed-origin URL".into(),
+                ambiguous: false,
+            })?;
+        let mut request = self.client.request(method.reqwest(), url).header(
+            AUTHORIZATION,
+            authorization_header(&auth)
+                .map_err(|_| GitHubApiError::CredentialScope { endpoint: template })?,
+        );
+        if let Some(body) = body {
+            request = request
+                .header(CONTENT_TYPE, "application/json")
+                .body(body.to_vec());
+        }
+        let response = request.send().map_err(|_| GitHubApiError::Transport {
+            method,
+            endpoint: template,
+            // A mutating request can have reached GitHub before a timeout or
+            // connection loss was observed. It must be reconciled before retry.
+            ambiguous: method.is_mutating(),
+        })?;
+        normalize_response(method, template, expected_status, response)
+    }
+}
+
+fn ensure_rustls_crypto_provider() -> Result<()> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // reqwest's no-provider feature lets this crate retain the AWS-LC
+        // provider already selected by the relay stack. Installation races are
+        // harmless: a losing caller observes the winner below.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        bail!("failed to install the process rustls crypto provider");
+    }
+    Ok(())
+}
+
+fn client_builder(https_only: bool) -> reqwest::blocking::ClientBuilder {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/vnd.github+json"),
+    );
+    headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    headers.insert(USER_AGENT, HeaderValue::from_static("hcom-github-pr-v1"));
+    headers.insert(
+        "X-GitHub-Api-Version",
+        HeaderValue::from_static(GITHUB_API_VERSION),
+    );
+    let builder = Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(Policy::none())
+        .default_headers(headers);
+    if https_only {
+        builder.https_only(true)
+    } else {
+        builder
+    }
+}
+
+fn auth_ref<'a>(auth: &'a GitHubAuthentication<'a>) -> GitHubAuthentication<'a> {
+    match auth {
+        GitHubAuthentication::App(jwt) => GitHubAuthentication::App(jwt),
+        GitHubAuthentication::Installation(token) => GitHubAuthentication::Installation(token),
+    }
+}
+
+fn authorization_header(auth: &GitHubAuthentication<'_>) -> Result<HeaderValue> {
+    let value = match auth {
+        GitHubAuthentication::App(jwt) => jwt.expose(),
+        GitHubAuthentication::Installation(token) => token.expose(),
+    };
+    let bearer = Zeroizing::new(format!("Bearer {value}"));
+    HeaderValue::from_bytes(bearer.as_bytes())
+        .map_err(|_| anyhow!("GitHub credential cannot form an Authorization header"))
+}
+
+fn normalize_response(
+    method: RestMethod,
+    endpoint: &'static str,
+    expected_status: u16,
+    mut response: Response,
+) -> std::result::Result<ApiResponse, GitHubApiError> {
+    let status = response.status();
+    let request_id = bounded_header(response.headers(), "x-github-request-id");
+    let retry_after_seconds = response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds <= 86_400);
+    let rate_limit_reset_unix = (response
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        == Some("0"))
+    .then(|| {
+        response
+            .headers()
+            .get("x-ratelimit-reset")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value <= i64::MAX as u64)
+    })
+    .flatten();
+    if let Some(length) = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        && length > MAX_RESPONSE_BODY_BYTES as u64
+    {
+        return Err(GitHubApiError::BoundExceeded {
+            endpoint,
+            bound: "2-MiB response-body",
+            ambiguous: method.is_mutating(),
+        });
+    }
+    if let Some(encoding) = response.headers().get("content-encoding")
+        && encoding
+            .to_str()
+            .map_or(true, |value| !value.eq_ignore_ascii_case("identity"))
+    {
+        return Err(GitHubApiError::InvalidResponse {
+            endpoint,
+            reason: "compressed response was returned despite identity-only negotiation".into(),
+            ambiguous: method.is_mutating(),
+        });
+    }
+    // Installation-token responses carry a credential in JSON. Zeroize every
+    // owned response body, not merely bodies the typed layer already knows to
+    // contain a token.
+    let mut body = Zeroizing::new(Vec::new());
+    response
+        .by_ref()
+        .take(MAX_RESPONSE_BODY_BYTES as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|_| GitHubApiError::Transport {
+            method,
+            endpoint,
+            // The request has already returned headers; callers of a mutating
+            // endpoint reconcile any body-read failure conservatively.
+            ambiguous: method.is_mutating(),
+        })?;
+    if body.len() > MAX_RESPONSE_BODY_BYTES {
+        return Err(GitHubApiError::BoundExceeded {
+            endpoint,
+            bound: "2-MiB response-body",
+            ambiguous: method.is_mutating(),
+        });
+    }
+    if !body.is_empty() && !is_json_content_type(response.headers()) {
+        return Err(GitHubApiError::InvalidResponse {
+            endpoint,
+            reason: "non-empty response is not a GitHub JSON media type".into(),
+            ambiguous: method.is_mutating(),
+        });
+    }
+    if !status.is_success() {
+        return Err(GitHubApiError::Http {
+            method,
+            endpoint,
+            status: status.as_u16(),
+            request_id,
+            retry_after_seconds,
+            rate_limit_reset_unix,
+            reason: sanitized_remote_reason(&body),
+        });
+    }
+    if status.as_u16() != expected_status {
+        return Err(GitHubApiError::InvalidResponse {
+            endpoint,
+            reason: format!(
+                "response status {} differs from expected {expected_status}",
+                status.as_u16()
+            ),
+            ambiguous: method.is_mutating(),
+        });
+    }
+    Ok(ApiResponse {
+        status: status.as_u16(),
+        request_id,
+        method,
+        endpoint,
+        body,
+    })
+}
+
+fn bounded_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= MAX_REQUEST_ID_BYTES
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+                })
+        })
+        .map(str::to_owned)
+}
+
+fn is_json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .is_some_and(|value| value == "application/json" || value.ends_with("+json"))
+}
+
+fn sanitized_remote_reason(body: &[u8]) -> String {
+    let fallback = "remote API rejected the bounded request".to_owned();
+    let Some(message) = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("message")?.as_str().map(str::to_owned))
+    else {
+        return fallback;
+    };
+    if message.is_empty()
+        || message.len() > 256
+        || !message
+            .bytes()
+            .all(|byte| byte == b' ' || byte.is_ascii_graphic())
+    {
+        return fallback;
+    }
+    let lower = message.to_ascii_lowercase();
+    if [
+        "token",
+        "authorization",
+        "bearer",
+        "private key",
+        "jwt",
+        "secret",
+        "password",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return fallback;
+    }
+    message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control_api::GitHubAppRole;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn token(operation: InstallationOperation) -> InstallationToken {
+        InstallationToken::from_github_response(
+            "fixture-token-no-real-prefix".into(),
+            "2099-01-01T00:00:00Z",
+            99,
+            match operation {
+                InstallationOperation::ReviewPublish | InstallationOperation::ReviewRead => {
+                    GitHubAppRole::Reviewer1
+                }
+                InstallationOperation::RulesetAttestation
+                | InstallationOperation::CheckPublish
+                | InstallationOperation::CheckRead
+                | InstallationOperation::Merge
+                | InstallationOperation::RemoteRefCleanup
+                | InstallationOperation::TerminalComment => GitHubAppRole::Architect,
+                _ => GitHubAppRole::Developer,
+            },
+            operation,
+            4_070_905_200,
+        )
+        .unwrap()
+    }
+
+    fn serve_once(response: Vec<u8>) -> (Url, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            reader.get_mut().write_all(&response).unwrap();
+            request
+        });
+        (Url::parse(&format!("http://{address}/")).unwrap(), handle)
+    }
+
+    #[test]
+    fn typed_client_uses_closed_url_headers_and_bounded_json_path() {
+        let body = br#"{"id":99,"private":true}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-GitHub-Request-Id: fixture-1\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes()
+        .into_iter()
+        .chain(body.iter().copied())
+        .collect();
+        let (origin, server) = serve_once(response);
+        let client = GitHubRestClient::new_for_test(origin).unwrap();
+        let token = token(InstallationOperation::RepositoryMetadata);
+        let value: serde_json::Value = client
+            .get(
+                RestEndpoint::Repository {
+                    owner: "owner".into(),
+                    repository: "repo".into(),
+                },
+                GitHubAuthentication::Installation(&token),
+            )
+            .unwrap();
+        assert_eq!(value["id"], 99);
+        let request = server.join().unwrap();
+        assert!(request.starts_with("GET /repos/owner/repo HTTP/1.1\r\n"));
+        assert!(request.contains("x-github-api-version: 2022-11-28\r\n"));
+        assert!(request.contains("accept-encoding: identity\r\n"));
+        assert!(request.contains("authorization: Bearer fixture-token-no-real-prefix\r\n"));
+    }
+
+    #[test]
+    fn credential_operation_scope_is_enforced_before_network() {
+        let client =
+            GitHubRestClient::new_for_test(Url::parse("http://127.0.0.1:9/").unwrap()).unwrap();
+        let token = token(InstallationOperation::ReviewPublish);
+        let error = client
+            .get::<serde_json::Value>(
+                RestEndpoint::RulesForBranch {
+                    owner: "owner".into(),
+                    repository: "repo".into(),
+                    branch: "master".into(),
+                },
+                GitHubAuthentication::Installation(&token),
+            )
+            .unwrap_err();
+        assert!(matches!(error, GitHubApiError::CredentialScope { .. }));
+        assert!(!format!("{error}").contains("fixture-token"));
+    }
+
+    #[test]
+    fn redirects_compression_and_oversized_bodies_fail_closed() {
+        let responses = [
+            b"HTTP/1.1 302 Found\r\nLocation: https://example.com/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_vec(),
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_RESPONSE_BODY_BYTES + 1
+            )
+            .into_bytes(),
+        ];
+        for response in responses {
+            let (origin, server) = serve_once(response);
+            let client = GitHubRestClient::new_for_test(origin).unwrap();
+            let token = token(InstallationOperation::RepositoryMetadata);
+            let result = client.get::<serde_json::Value>(
+                RestEndpoint::Repository {
+                    owner: "owner".into(),
+                    repository: "repo".into(),
+                },
+                GitHubAuthentication::Installation(&token),
+            );
+            assert!(result.is_err());
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn url_parameters_cannot_replace_the_origin_or_escape_the_allowlist() {
+        assert!(
+            RestEndpoint::Repository {
+                owner: "https://evil.invalid".into(),
+                repository: "repo".into(),
+            }
+            .url(&Url::parse(GITHUB_API_ORIGIN).unwrap())
+            .is_err()
+        );
+        let url = RestEndpoint::Reference {
+            owner: "owner".into(),
+            repository: "repo".into(),
+            qualified_ref: "heads/feature/topic".into(),
+        }
+        .url(&Url::parse(GITHUB_API_ORIGIN).unwrap())
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://api.github.com/repos/owner/repo/git/ref/heads/feature/topic"
+        );
+        let bot_url = RestEndpoint::BotUser {
+            login: "hcom-dev[bot]".into(),
+        }
+        .url(&Url::parse(GITHUB_API_ORIGIN).unwrap())
+        .unwrap();
+        assert_eq!(
+            bot_url.as_str(),
+            "https://api.github.com/users/hcom-dev[bot]"
+        );
+        assert!(
+            RestEndpoint::BotUser {
+                login: "hcom-dev".into(),
+            }
+            .url(&Url::parse(GITHUB_API_ORIGIN).unwrap())
+            .is_err()
+        );
+        assert!(
+            RestEndpoint::BotUser {
+                login: "hcom/dev[bot]".into(),
+            }
+            .url(&Url::parse(GITHUB_API_ORIGIN).unwrap())
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sensitive_remote_reasons_are_never_reflected() {
+        let body = br#"{"message":"bearer fixture-token-no-real-prefix was rejected"}"#;
+        assert_eq!(
+            sanitized_remote_reason(body),
+            "remote API rejected the bounded request"
+        );
+        assert_eq!(
+            sanitized_remote_reason(br#"{"message":"Merge conflict"}"#),
+            "Merge conflict"
+        );
+        super::super::validate_id("fixture", "request-id").unwrap();
+    }
+
+    #[test]
+    fn endpoint_statuses_and_rate_limit_signals_are_exact_and_sanitized() {
+        let body = br#"{"id":1}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes()
+        .into_iter()
+        .chain(body.iter().copied())
+        .collect();
+        let (origin, server) = serve_once(response);
+        let client = GitHubRestClient::new_for_test(origin).unwrap();
+        let comment_token = token(InstallationOperation::DeveloperComment);
+        let error = client
+            .send_json::<_, serde_json::Value>(
+                RestEndpoint::CreateIssueComment {
+                    owner: "owner".into(),
+                    repository: "repo".into(),
+                    number: 1,
+                },
+                GitHubAuthentication::Installation(&comment_token),
+                &serde_json::json!({"body":"fixture"}),
+            )
+            .unwrap_err();
+        assert!(matches!(&error, GitHubApiError::InvalidResponse { .. }));
+        assert!(format!("{error}").contains("expected 201"));
+        assert!(error.requires_mutation_reconciliation());
+        server.join().unwrap();
+
+        let body = br#"{"message":"secondary rate limit"}"#;
+        let response = format!(
+            "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 7\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 4070908800\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes()
+        .into_iter()
+        .chain(body.iter().copied())
+        .collect();
+        let (origin, server) = serve_once(response);
+        let client = GitHubRestClient::new_for_test(origin).unwrap();
+        let repository_token = token(InstallationOperation::RepositoryMetadata);
+        let error = client
+            .get::<serde_json::Value>(
+                RestEndpoint::Repository {
+                    owner: "owner".into(),
+                    repository: "repo".into(),
+                },
+                GitHubAuthentication::Installation(&repository_token),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            GitHubApiError::Http {
+                method: RestMethod::Get,
+                status: 403,
+                retry_after_seconds: Some(7),
+                rate_limit_reset_unix: Some(4_070_908_800),
+                ..
+            }
+        ));
+        assert!(!error.requires_mutation_reconciliation());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn mutation_http_failures_that_can_hide_an_effect_require_reconciliation() {
+        let error = GitHubApiError::Http {
+            method: RestMethod::Post,
+            endpoint: "POST /repos/{owner}/{repo}/pulls",
+            status: 422,
+            request_id: Some("fixture".into()),
+            retry_after_seconds: None,
+            rate_limit_reset_unix: None,
+            reason: "remote API rejected the bounded request".into(),
+        };
+        assert!(error.requires_mutation_reconciliation());
+        assert_eq!(error.http_status(), Some(422));
+    }
+}

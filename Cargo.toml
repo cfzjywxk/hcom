@@ -1,6 +1,6 @@
 [package]
 name = "hcom"
-version = "1.0.17"
+version = "1.0.18"
 edition = "2024"
 authors = ["hcom"]
 description = "Connect Claude Code, Gemini CLI, Codex, OpenCode, Kilo Code, Pi, Oh My Pi, Antigravity, Cursor, Kimi, and Copilot so agents can message, watch, and spawn each other across terminals"
@@ -51,6 +51,12 @@ rustls = "0.23.37"
 webpki-roots = "1.0.6"
 rustls-native-certs = "0.8.3"
 lru = "0.16"
+# GitHub Pull Request lane. Keep this blocking and rustls-only: the foreground
+# supervisor has no async runtime and owns every credential-bearing request.
+# Reuse the crate's existing rustls provider instead of enabling a second one.
+reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots-no-provider", "system-proxy"] }
+rsa = { version = "=0.9.10", features = ["getrandom", "sha2"] }
+zeroize = { version = "=1.8.2", features = ["std"] }
 
 # Unix-only: PTY, signals, fd polling, file locks, process groups.
 [target.'cfg(unix)'.dependencies]

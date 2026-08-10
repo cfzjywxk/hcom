@@ -10,7 +10,11 @@
     reason = "GITHUB-PR-01 defines seams consumed by later auth/API and driver tasks"
 )]
 
+pub(crate) mod auth;
+pub(crate) mod client;
+pub(crate) mod evidence;
 pub(crate) mod git;
+pub(crate) mod publication;
 
 use crate::control_api::{
     DeliveryBinding, GITHUB_REVIEW_CHECK_NAME, GitHubAppBinding, GitHubAppRole,
@@ -551,7 +555,9 @@ fn validate_effective_permissions(
     Ok(())
 }
 
-fn required_permissions(role: GitHubAppRole) -> &'static [(&'static str, GitHubPermissionLevel)] {
+pub(crate) fn required_permissions(
+    role: GitHubAppRole,
+) -> &'static [(&'static str, GitHubPermissionLevel)] {
     const ARCHITECT: &[(&str, GitHubPermissionLevel)] = &[
         ("administration", GitHubPermissionLevel::Read),
         ("checks", GitHubPermissionLevel::Write),
@@ -571,7 +577,7 @@ fn required_permissions(role: GitHubAppRole) -> &'static [(&'static str, GitHubP
     }
 }
 
-fn validate_slug(label: &str, value: &str) -> Result<()> {
+pub(crate) fn validate_slug(label: &str, value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > MAX_GITHUB_SLUG_BYTES
         || value.starts_with(['-', '.'])
@@ -585,7 +591,7 @@ fn validate_slug(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_branch(value: &str) -> Result<()> {
+pub(crate) fn validate_branch(value: &str) -> Result<()> {
     // Match the literal branch-name rules enforced by
     // `git check-ref-format --branch`. `@{-n}` is deliberately rejected by the
     // `@{` rule: Git expands that shorthand using local checkout history, while
@@ -647,7 +653,7 @@ fn validate_key_path(path: &Path, project_root: &Path, repository_root: &Path) -
     Ok(())
 }
 
-fn validate_id(label: &str, value: &str) -> Result<()> {
+pub(crate) fn validate_id(label: &str, value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 128
         || !value
@@ -659,7 +665,7 @@ fn validate_id(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_git_sha(label: &str, value: &str) -> Result<()> {
+pub(crate) fn validate_git_sha(label: &str, value: &str) -> Result<()> {
     if value.len() != 40
         || !value
             .bytes()
@@ -670,7 +676,7 @@ fn validate_git_sha(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_sha256(label: &str, value: &str) -> Result<()> {
+pub(crate) fn validate_sha256(label: &str, value: &str) -> Result<()> {
     if value.len() != 64
         || !value
             .bytes()
