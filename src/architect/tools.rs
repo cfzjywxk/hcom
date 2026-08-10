@@ -91,7 +91,7 @@ not separately authorized, and do not create another post-LGTM commit.";
 
 const LOCAL_ARCHITECT_COMMIT_CONTRACT: &str = "The standard delegated loop requires each Developer to create exactly one signed-off local candidate commit for its task before review and to amend only that same task commit for corrections. Approval of the run includes this local candidate-commit topology; it does not authorize push, install, release, or an extra commit after LGTM. Do not write or bind a task/design source that forbids the required local candidate commit. A general rule that local commits require human authorization is satisfied by the human's execution authorization for this run. If the human explicitly requires this run to remain uncommitted, explain that the standard lane is incompatible and ask before binding or starting it. If a Developer reports this authority conflict after start, it is never an Architect-derivable clarification: call session_clarification_require_human even while autonomous clarification budget remains. Do not submit an autonomous clarification or reinterpret run approval as overriding the explicit no-commit instruction.";
 
-const GITHUB_ARCHITECT_COMMIT_CONTRACT: &str = "The GitHub Pull Request delegated loop requires every Developer turn to create exactly one new signed-off child commit on the generated run branch. Corrections and later-task initial turns append commits; they never amend, rebase, squash, reword, or force-push published run history. Approval of the exact displayed plan includes this append-only commit and bounded one-PR push topology; it does not authorize install, release, deployment, or a further commit for a task after that task reaches LGTM. Do not write or bind a task/design source that forbids the required commits. A general rule that commits and the bound GitHub writes require human authorization is satisfied by the human's execution authorization for this exact plan. If the human explicitly requires this run to remain uncommitted or unpushed, explain that the GitHub Pull Request lane is incompatible and ask before binding or starting it. If a Developer reports this authority conflict after start, it is never an Architect-derivable clarification: call session_clarification_require_human even while autonomous clarification budget remains. Do not submit an autonomous clarification or reinterpret run approval as overriding the explicit restriction.";
+const GITHUB_ARCHITECT_COMMIT_CONTRACT: &str = "The GitHub Pull Request delegated loop requires every Developer turn to create exactly one new signed-off child commit on the generated run branch. Corrections and later-task initial turns append commits; they never amend, rebase, squash, reword, or force-push published run history. The foreground supervisor publishes each successful Developer final and each Reviewer final byte-for-byte, without redaction or secret scanning, inside a generated GitHub body whose UTF-8 hard cap is 60 KiB; disclose that external publication to the selected private repository in the complete plan. Approval of the exact displayed plan includes this append-only commit and bounded one-PR push topology; it does not authorize install, release, deployment, or a further commit for a task after that task reaches LGTM. Do not write or bind a task/design source that forbids the required commits. A general rule that commits and the bound GitHub writes require human authorization is satisfied by the human's execution authorization for this exact plan. If the human explicitly requires this run to remain uncommitted or unpushed, explain that the GitHub Pull Request lane is incompatible and ask before binding or starting it. If a Developer reports this authority conflict after start, it is never an Architect-derivable clarification: call session_clarification_require_human even while autonomous clarification budget remains. Do not submit an autonomous clarification or reinterpret run approval as overriding the explicit restriction.";
 
 const LOCAL_ARCHITECT_LGTM_HANDOFF: &str = "For an LGTM task, the final Developer task commit has already been reviewed at its exact candidate range. Report that local reviewed commit and the absence of any separately authorized push or install; do not ask whether to retain or revert it merely because commit was not separately authorized, and do not create another post-LGTM commit.";
 
@@ -105,11 +105,23 @@ binding: private owner/repository, canonical local repository root, base \
 branch and inspected SHA, ruleset attestation, generated run branch, active \
 App IDs/slugs with ordered Reviewer mapping, publication/check/merge policy, \
 merge wait, drift and cleanup behavior. Every task repository_root must equal \
-the frozen local repository root. The read-only inspection does not authorize \
-any GitHub write. Approval of the exact displayed plan authorizes only the \
-bounded one-PR workflow encoded by that binding; it still does not authorize \
-installation, release, package publication, deployment, or unrelated \
-repository/branch mutation.";
+the frozen local repository root. Explicitly disclose that each Developer and \
+Reviewer native final is opaque payload published byte-for-byte without \
+redaction or secret scanning to the selected private repository, and that its \
+generated PR/review/comment body has a 60 KiB UTF-8 hard cap. The read-only \
+inspection does not authorize any GitHub write. Approval of the exact displayed \
+plan authorizes only the bounded one-PR workflow encoded by that binding; it \
+still does not authorize installation, release, package publication, deployment, \
+or unrelated repository/branch mutation.\n\nFor progress, report the exact PR URL, \
+generation, and published head from the typed event without reading native \
+finals. At terminal, read only the listed current-generation final paths and \
+report the PR number/URL; run base/final head; every task base..final-head range \
+and outcome; ordered Reviewer App verdict/review URLs; final hcom/review Check; \
+approved and final ruleset attestations; delivery outcome; merge SHA when \
+confirmed; and any preserved branch, worktree, or PR. Distinguish delivered, \
+unmerged_review_exhausted, pre-merge operational failure, and a confirmed merge \
+whose required finalization failed. Never retry or imply retry of a confirmed \
+merge, and never imply that a fresh run adopts a preserved PR/worktree.";
 
 pub(crate) fn architect_instructions_for_delivery(github_pr: bool) -> String {
     if github_pr {
@@ -933,6 +945,20 @@ mod tests {
             github_instructions
                 .contains("A later task's initial turn still appends its own required commit")
         );
+        for required in [
+            "published byte-for-byte without redaction or secret scanning",
+            "60 KiB UTF-8 hard cap",
+            "every task base..final-head range",
+            "unmerged_review_exhausted",
+            "confirmed merge whose required finalization failed",
+            "Never retry or imply retry of a confirmed merge",
+            "never imply that a fresh run adopts a preserved PR/worktree",
+        ] {
+            assert!(
+                github_instructions.contains(required),
+                "GitHub Architect handoff omitted {required}"
+            );
+        }
         assert!(!github_instructions.contains("to amend only that same task commit"));
         assert!(!github_instructions.contains("absence of any separately authorized push"));
         assert_eq!(
@@ -1054,46 +1080,57 @@ mod tests {
             }],
             reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220"),
         ] {
-            let tools = tool_definitions("codex-developer", &reviewers);
-            validate_codex_tool_definitions(&tools).unwrap();
-            for tool in &tools {
-                let projected = codex_0145_0146_projection(&tool["inputSchema"]);
-                validate_codex_schema_node(
-                    &projected,
-                    &format!("{}.projected", tool["name"].as_str().unwrap()),
-                )
-                .unwrap();
+            for github_pr in [false, true] {
+                let tools = tool_definitions_for_delivery("codex-developer", &reviewers, github_pr);
+                validate_codex_tool_definitions(&tools).unwrap();
+                for tool in &tools {
+                    let projected = codex_0145_0146_projection(&tool["inputSchema"]);
+                    validate_codex_schema_node(
+                        &projected,
+                        &format!(
+                            "{}.{}.projected",
+                            tool["name"].as_str().unwrap(),
+                            if github_pr { "github" } else { "local" }
+                        ),
+                    )
+                    .unwrap();
+                }
+
+                let plan = tools
+                    .iter()
+                    .find(|tool| tool["name"] == "session_plan_replace")
+                    .unwrap();
+                let projected_plan = codex_0145_0146_projection(&plan["inputSchema"]);
+                let reviewer_schema = &projected_plan["properties"]["reviewer_adapters"];
+                assert_eq!(reviewer_schema["type"], "array");
+                assert_eq!(reviewer_schema["items"]["type"], "object");
+                assert!(reviewer_schema.get("enum").is_none());
+                let rounds = &projected_plan["properties"]["tasks"]["items"]["properties"]["max_review_rounds"];
+                assert!(rounds.get("minimum").is_none());
+                assert!(rounds.get("maximum").is_none());
+                assert!(
+                    rounds["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains("hcom's typed protocol enforces this range")
+                );
+                assert_eq!(
+                    projected_plan["properties"]
+                        .get("github_inspection_id")
+                        .is_some(),
+                    github_pr
+                );
+
+                let approve = tools
+                    .iter()
+                    .find(|tool| tool["name"] == "session_approve_and_start")
+                    .unwrap();
+                let projected_approve = codex_0145_0146_projection(&approve["inputSchema"]);
+                assert_eq!(
+                    projected_approve["properties"]["approval_confirmed"]["enum"],
+                    json!([true])
+                );
             }
-
-            let plan = tools
-                .iter()
-                .find(|tool| tool["name"] == "session_plan_replace")
-                .unwrap();
-            let projected_plan = codex_0145_0146_projection(&plan["inputSchema"]);
-            let reviewer_schema = &projected_plan["properties"]["reviewer_adapters"];
-            assert_eq!(reviewer_schema["type"], "array");
-            assert_eq!(reviewer_schema["items"]["type"], "object");
-            assert!(reviewer_schema.get("enum").is_none());
-            let rounds =
-                &projected_plan["properties"]["tasks"]["items"]["properties"]["max_review_rounds"];
-            assert!(rounds.get("minimum").is_none());
-            assert!(rounds.get("maximum").is_none());
-            assert!(
-                rounds["description"]
-                    .as_str()
-                    .unwrap()
-                    .contains("hcom's typed protocol enforces this range")
-            );
-
-            let approve = tools
-                .iter()
-                .find(|tool| tool["name"] == "session_approve_and_start")
-                .unwrap();
-            let projected_approve = codex_0145_0146_projection(&approve["inputSchema"]);
-            assert_eq!(
-                projected_approve["properties"]["approval_confirmed"]["enum"],
-                json!([true])
-            );
         }
     }
 

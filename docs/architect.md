@@ -11,10 +11,13 @@ review generation. Same-task correction resumes the exact Developer
 session and re-review resumes each Reviewer's own exact native session; a
 later task or later run starts fresh sessions.
 
-There is no daemon, Project Store, cross-Architect recovery, final apply, push,
-or install. Parent exit stops the workers and loses the current in-memory
-control state. Each terminal run and its durable artifacts remain immutable;
-starting another run does not revive or modify it.
+There is no daemon, Project Store, cross-Architect recovery, final apply, or
+install. The default local-candidate lane never pushes. The explicit GitHub PR
+lane performs only its bound branch/PR/review/Check/squash workflow after plan
+approval; it does not grant general GitHub, install, or release authority.
+Parent exit stops the workers and loses the current in-memory control state.
+Each terminal run and its durable artifacts remain immutable; starting another
+run does not revive or modify it.
 
 ## Start
 
@@ -23,8 +26,12 @@ cd /path/to/project
 hcom arch codex
 # Codex Architect with only Reviewer1:
 hcom arch codex --single-review
+# opt-in Pull Request delivery (also composes with --single-review):
+hcom arch codex --github-pr
 # or
 hcom arch claude [--add-dir /absolute/external/repository]...
+# Claude Architect with opt-in Pull Request delivery:
+hcom arch claude --github-pr [--add-dir /absolute/external/repository]...
 # with an exact profile configuration file instead of $HCOM_DIR/config.toml:
 hcom arch codex --config /absolute/path/to/profiles.toml
 ```
@@ -55,6 +62,11 @@ Each worker lane may explicitly select Codex or Claude. An unavailable selected
 adapter fails closed; hcom never silently falls back to another provider.
 `--single-review` is rejected for a Claude foreground Architect before any
 interactive process is spawned.
+
+The delivery mode is independent of provider topology. See the
+[GitHub Pull Request lane](github-pr-lane.md) for its closed deployment
+configuration, publication disclosure, role identities, lifecycle, and local
+acceptance coverage.
 
 ## Native Architect projection
 
@@ -268,6 +280,39 @@ Reviewer state; an old or mismatched `hcom`/`hcom-architect-mcp` pair rejects th
 bootstrap or protocol version instead of falling back to weaker/default
 profiles.
 
+## Delivery modes
+
+`LocalCandidate` is the default. It does not interpret a parsed
+`[architect.github]` value, open App keys, invoke Git for delivery, or contact
+GitHub. Tasks operate directly in their named source repositories and finish
+as reviewed signed-off local candidate commits.
+
+`--github-pr` selects `GitHubPullRequest`. Only this flag activates the closed
+`[architect.github]` configuration and read-only private-repository/App/base/
+rules preflight. Preflight finishes before the blank foreground Architect is
+launched and creates no remote or local delivery artifact. Startup prints the
+frozen non-secret repository, merge policy, active App identities and complete
+permission maps, and initial base/rules inspection. Keys, JWTs, installation
+tokens, and key paths are excluded from that binding.
+
+Before each plan is displayed, the Architect refreshes the read-only delivery
+inspection. The typed plan binds its exact inspection ID, base ref/SHA,
+ruleset attestation, and derived run branch. Start revalidates the base and
+rules before creating a linked worktree or making any GitHub write; stale
+approval is rejected and must be reinspected and redisplayed. The frozen
+delivery profile persists across sequential runs, while every run receives a
+fresh run ID, inspection, base SHA, plan hash, branch, worktree, and PR.
+
+One approved GitHub run appends all task and correction commits to one branch
+and one PR. Successful Developer and Reviewer finals are opaque and published
+byte-for-byte without redaction or secret scanning, under the 60 KiB UTF-8
+generated-body limit disclosed in the plan. Active Reviewers publish
+independently under their bound Apps; same-head LGTM from all active lanes is
+required before `hcom/review` succeeds and the exact-head squash merge begins.
+Review exhaustion completes unmerged and preserves the PR, branch, and
+worktree. Parent exit provides no recovery, and a later foreground Architect
+does not adopt those preserved artifacts as a new run.
+
 ## Session identity
 
 The task-control relay authenticates the hcom-spawned Architect/bridge
@@ -294,6 +339,7 @@ session_plan_replace({
     { reviewer_id: "reviewer1", adapter: reviewer1_adapter }
     // dual mode has one additional ordered Reviewer2 binding
   ],
+  github_inspection_id, // required only in --github-pr mode
   tasks: [{
     task_key,
     title,
@@ -345,20 +391,29 @@ and an explicit “do not start” always wins. A bare generic
 implement/proceed/finish/drive request selects the delegated workflow rather
 than Architect-side implementation, but does not by itself authorize start.
 
-Execution approval for the standard task lane includes exactly one signed-off
-local Developer candidate commit per task. Reviewer corrections amend that same
-commit, and LGTM applies to the final exact candidate range; there is no extra
-post-LGTM commit. A general instruction that commits require human
-authorization is satisfied by approval of this run. An explicit requirement
-that the run remain uncommitted is incompatible with the lane and must be
-resolved before binding or start. If that conflict reaches a Developer, the
-Developer returns `CLARIFICATION_REQUIRED` without modifying the repository,
-and the Architect must call `session_clarification_require_human` regardless of
-remaining autonomous clarification budget. It cannot autonomously reinterpret
-run approval as overriding the explicit instruction. Developer commit and
-amend instructions require a matching `Signed-off-by` trailer; every active
-Reviewer checks it. Candidate commits do not authorize push, install, or
-release.
+Execution approval for the local-candidate lane includes exactly one
+signed-off local Developer candidate commit per task. Reviewer corrections
+amend that same commit, and LGTM applies to the final exact candidate range;
+there is no extra post-LGTM commit. A general instruction that commits require
+human authorization is satisfied by approval of this run. An explicit
+requirement that the run remain uncommitted is incompatible with the lane and
+must be resolved before binding or start. If that conflict reaches a
+Developer, the Developer returns `CLARIFICATION_REQUIRED` without modifying
+the repository, and the Architect must call
+`session_clarification_require_human` regardless of remaining autonomous
+clarification budget. It cannot autonomously reinterpret run approval as
+overriding the explicit instruction. Developer commit/amend instructions
+require a matching `Signed-off-by` trailer; every active Reviewer checks it.
+Local candidate commits do not authorize push, install, or release.
+
+Execution approval for the GitHub lane instead authorizes the exact bound
+workflow disclosed in the plan. The initial task change is one signed-off
+child commit and every correction is another signed-off child commit; no
+published commit is amended or force-pushed. The supervisor alone supplies the
+frozen Developer bot identity, pushes, creates/updates the PR and Check,
+publishes exact finals under the mapped Apps, and requests the exact-head
+squash merge. Workers receive neither credentials nor authority to push or
+call GitHub themselves. Install and release remain separate.
 
 All role prompts carry the exact project/source paths, task document path,
 ordered design document paths, selector, instruction-discovery rule, and fixed
@@ -384,9 +439,20 @@ After a run reaches a terminal state, the Architect first completes its
 Reviewer and clarification evidence handoff. For LGTM it reports the final
 local candidate commit as already reviewed at the exact range; it neither asks
 whether to retain or revert that commit merely for lack of separate commit
-authorization nor creates another commit after LGTM. Push, install, and release
-remain separate human decisions. If the human later requests more delegated
-work, the same foreground Architect creates a new empty run:
+authorization nor creates another commit after LGTM. Local-lane push, install,
+and release remain separate human decisions.
+
+For GitHub delivery, progress includes the exact PR URL, generation, and head
+SHA without rereading native-final bodies. Terminal handoff additionally gives
+the PR number/URL; run base/final head; every task's exact base/final range and
+outcome; ordered Reviewer App review URLs/verdicts; `hcom/review` Check
+URL/state; approved and final ruleset attestations; delivery outcome; and merge
+SHA if delivered. An unmerged or human-action outcome names the preserved
+branch/worktree/PR. A confirmed-merge finalization failure is reported as such,
+never as unmerged and never as permission to retry merge.
+
+If the human later requests more delegated work, the same foreground Architect
+creates a new empty run:
 
 ```text
 session_run_begin({
@@ -474,13 +540,16 @@ task lane runtime before advancing. Runtime failure, identity mismatch, cleanup 
 or a second unclassifiable verdict in either Reviewer lane cancels any live
 peer and moves the run to a human-visible terminal state without aggregating a
 single response. Parent exit/cancel stops every active owned process tree. hcom
-never pushes, installs, resets, rebases, or automatically recovers after the
-parent exits.
+never installs, resets, rebases, or automatically recovers after the parent
+exits. The local lane never pushes; the GitHub lane pushes only the validated
+append-only run branch under the frozen Developer App and reconciles ambiguous
+results before retrying.
 
 After dispatch, the Codex Architect calls `session_wait` with the returned run
 ID and session version and `after_progress_sequence: 0`. This blocking MCP
 subscription completes for one retained `review_requested`,
-`review_responded`, or `task_completed` event; when the run becomes
+`review_responded`, or `task_completed` event; GitHub mode additionally emits
+`candidate_published`, `merge_waiting`, and `run_finalizing`; when the run becomes
 `completed`, `needs_human`, `failed`, or `canceled`; or when a Developer
 clarification/blocker action is latched. The local supervisor continues
 lifecycle monitoring and advances Developer-to-active-Reviewer and correction
@@ -619,7 +688,16 @@ The protocol-v10 dual-review runner is separately authorized, serial, and
 Haiku/medium-only for Claude; its definitions are present but have not been run.
 Earlier protocol results are not v10 dual-review evidence.
 
+The default test suite exercises the complete delivery matrix without live
+services: local and GitHub modes, single and dual Reviewers, temporary Git
+repositories/bare remotes, fake HTTP providers, append-only corrections and
+multi-task PRs, every LGTM/REQUEST_CHANGES join, review exhaustion, exact-head
+merge/finalization, reconciliation, drift/cancel/cleanup, hostile Git config,
+protocol/schema projections, and control/MCP size boundaries. It performs no
+live GitHub, network, model, or interactive TUI operation.
+
 Implementation details and test mappings:
 
 - [Codex Architect adapter contract](codex-adapter-contract.md)
 - [Codex exec worker lane](codex-exec-worker-lane.md)
+- [GitHub Pull Request lane](github-pr-lane.md)

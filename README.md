@@ -90,12 +90,12 @@ Reviewers concurrently and waits for both responses. With
 `hcom arch codex --single-review`, only Reviewer1 is active. Same-task
 corrections resume the exact Developer session and re-review resumes each
 active Reviewer's own exact native session.
-Execution approval for this standard lane includes one signed-off local
-candidate commit per task. Review corrections amend that same commit; LGTM
-requires every active Reviewer to approve the same generation of the final
-exact candidate range, so every amendment invalidates all earlier verdicts
-and there is no extra post-LGTM commit. Push, install, and release remain
-separately authorized.
+In the default local-candidate lane, execution approval includes one signed-off
+local candidate commit per task. Review corrections amend that same commit;
+LGTM requires every active Reviewer to approve the same generation of the
+final exact candidate range, so every amendment invalidates all earlier
+verdicts and there is no extra post-LGTM commit. Push, install, and release
+remain separately authorized in that lane.
 If a developer exits with only allowed-path uncommitted changes, the
 supervisor exact-resumes that developer once to finish checks and commit before
 starting the reviewer; it does not terminate the whole run merely because the
@@ -106,10 +106,25 @@ cd /path/to/project
 hcom arch codex
 # single Reviewer1 lane:
 hcom arch codex --single-review
+# opt-in GitHub Pull Request delivery (also composes with --single-review):
+hcom arch codex --github-pr
 # or: hcom arch claude
 # profiles from an exact file instead of $HCOM_DIR/config.toml:
 hcom arch codex --config /absolute/path/to/profiles.toml
 ```
+
+`--github-pr` is an explicit delivery surface. Without it, any
+`[architect.github]` table is inert and the local lane opens no App key,
+invokes no feature-owned Git command, and makes no GitHub request. With it,
+hcom performs read-only private-repository/App/rules preflight before the blank
+Architect starts; writes begin only after an inspected typed plan is approved.
+One approved run owns one append-only branch, linked worktree, and Pull
+Request. Successful Developer and Reviewer finals are published byte-for-byte
+without redaction or secret scanning, subject to a 60 KiB UTF-8 generated-body
+cap. Every active Reviewer must publish same-head LGTM before the final Check
+can succeed and an exact-head squash merge can be requested; review exhaustion
+preserves the PR/branch/worktree unmerged. Install and release are never
+implied. See the [GitHub Pull Request lane guide](docs/github-pr-lane.md).
 
 Codex roles default to `gpt-5.6-sol` with `xhigh` reasoning,
 `danger-full-access`, and approval policy `never`. Claude roles default to
@@ -213,15 +228,17 @@ repeat that authorization merely because the exact binding was created later.
 Unless the human explicitly assigns implementation to the current Architect
 session, generic implementation requests mean planning and delegation through
 the Developer/Reviewer loop; standing alone, they do not authorize starting
-that loop. The standard lane requires one signed-off local task commit before
-review and same-commit amendments during correction. The Developer is
-instructed to add and preserve the matching `Signed-off-by` trailer, and every
-active Reviewer checks it.
-An explicit no-commit requirement is incompatible and must be resolved before
-start; a general commit-authorization rule is satisfied by run approval. If an
-explicit no-commit conflict nevertheless reaches a Developer, the Developer
-must not modify or commit, and the Architect must require a human decision
-regardless of remaining autonomous clarification budget.
+that loop. The local-candidate lane requires one signed-off local task commit
+before review and same-commit amendments during correction. The GitHub lane
+requires one new signed-off child commit on each Developer turn and never
+rewrites a published commit. The Developer is instructed to use the matching
+identity and `Signed-off-by` trailer, and every active Reviewer checks it.
+An explicit no-commit requirement—or no-push in GitHub mode—is incompatible
+and must be resolved before start; a general commit-authorization rule is
+satisfied by exact run approval. If that explicit authority conflict
+nevertheless reaches a Developer, the Developer must not modify or commit, and
+the Architect must require a human decision regardless of remaining autonomous
+clarification budget.
 Repository identity is selected by the Architect from that plan; there is no
 host-path allowlist. The Codex Architect has the native same-user host view;
 hcom commands inside it use private per-run state so the live retained hcom

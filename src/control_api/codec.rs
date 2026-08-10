@@ -145,6 +145,11 @@ mod tests {
             read_request_frame(&mut Cursor::new(header)),
             Err(FrameError::Oversize)
         ));
+        let header = ((MAX_RESPONSE_BYTES + 1) as u32).to_be_bytes();
+        assert!(matches!(
+            read_response_frame(&mut Cursor::new(header)),
+            Err(FrameError::Oversize)
+        ));
     }
 
     #[test]
@@ -201,7 +206,7 @@ mod tests {
 
     #[test]
     fn maximum_dual_reviewer_status_shape_stays_within_the_response_frame() {
-        let reviewer_path = format!("/{}", "p".repeat(699));
+        let reviewer_path = format!("/{}", "\\".repeat(4095));
         let reviewers = [ReviewerId::Reviewer1, ReviewerId::Reviewer2]
             .into_iter()
             .map(|reviewer_id| ReviewerResultSnapshot {
@@ -276,8 +281,8 @@ mod tests {
         );
         let payload = serde_json::to_vec(&response).unwrap();
         assert!(
-            payload.len() > MAX_RESPONSE_BYTES / 2,
-            "fixture must exercise a materially large dual-Reviewer frame"
+            payload.len() > MAX_REQUEST_BYTES,
+            "accumulated legal status must exercise the larger response-only frame"
         );
         assert!(
             payload.len() < MAX_RESPONSE_BYTES,

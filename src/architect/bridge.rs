@@ -1269,7 +1269,7 @@ mod tests {
                 repository_root: path.clone(),
                 task_document_path: path.clone(),
                 design_document_paths: vec![path.clone()],
-                task_selector: format!("task-{ordinal}"),
+                task_selector: path.clone(),
                 branch: None,
                 review_round: 20,
                 review_generation: 20,
@@ -1283,7 +1283,7 @@ mod tests {
                 github_check: None,
                 developer_session_bound: true,
                 reviewers: reviewers.clone(),
-                outcome_detail: Some("review generation exhausted".repeat(32)),
+                outcome_detail: Some(path.clone()),
                 latest_developer_final_path: Some(path.clone()),
             })
             .collect();
@@ -1294,7 +1294,7 @@ mod tests {
                     run_id: "run-maximum".into(),
                     state: SessionState::Completed,
                     version: u64::MAX,
-                    project_root: path,
+                    project_root: path.clone(),
                     delivery_binding: Default::default(),
                     github: None,
                     plan_version: Some(u64::MAX),
@@ -1303,24 +1303,155 @@ mod tests {
                     active_workers: Vec::new(),
                     reviewer_bindings: reviewer_bindings(),
                     pending_architect_action: None,
-                    terminal_detail: Some("all tasks reached terminal review outcomes".repeat(32)),
+                    terminal_detail: Some(path),
                     tasks,
                 },
             },
         )
     }
 
-    fn largest_control_bounded_dual_status_response() -> ControlResponse {
-        let mut accepted = None;
-        for path_bytes in 1..=4096 {
-            let response = maximum_dual_status_response(path_bytes);
-            if serde_json::to_vec(&response).unwrap().len() <= MAX_RESPONSE_BYTES {
-                accepted = Some(response);
-            } else {
-                break;
-            }
+    fn maximum_github_dual_status_response(path_bytes: usize) -> ControlResponse {
+        let mut response = maximum_dual_status_response(path_bytes);
+        let Some(ControlResult::Session { session }) = response.result.as_mut() else {
+            unreachable!()
+        };
+        let path = session.project_root.clone();
+        let permissions = |values: &[(&str, crate::control_api::GitHubPermissionLevel)]| {
+            values
+                .iter()
+                .map(|(name, level)| ((*name).to_owned(), *level))
+                .collect()
+        };
+        let app = |id, slug: &str, permissions| crate::control_api::GitHubAppBinding {
+            app_id: id,
+            installation_id: id + 10,
+            slug: slug.into(),
+            bot_user_id: id + 20,
+            effective_permissions: permissions,
+        };
+        let architect = app(
+            1,
+            "hcom-arch",
+            permissions(&[
+                (
+                    "administration",
+                    crate::control_api::GitHubPermissionLevel::Read,
+                ),
+                ("checks", crate::control_api::GitHubPermissionLevel::Write),
+                ("contents", crate::control_api::GitHubPermissionLevel::Write),
+                (
+                    "pull_requests",
+                    crate::control_api::GitHubPermissionLevel::Write,
+                ),
+            ]),
+        );
+        let developer = app(
+            2,
+            "hcom-dev",
+            permissions(&[
+                ("contents", crate::control_api::GitHubPermissionLevel::Write),
+                (
+                    "pull_requests",
+                    crate::control_api::GitHubPermissionLevel::Write,
+                ),
+            ]),
+        );
+        let reviewer_apps = [
+            (ReviewerId::Reviewer1, 3, "hcom-reviewer1"),
+            (ReviewerId::Reviewer2, 4, "hcom-reviewer2"),
+        ]
+        .into_iter()
+        .map(
+            |(reviewer_id, id, slug)| crate::control_api::GitHubReviewerAppBinding {
+                reviewer_id,
+                app: app(
+                    id,
+                    slug,
+                    permissions(&[(
+                        "pull_requests",
+                        crate::control_api::GitHubPermissionLevel::Write,
+                    )]),
+                ),
+            },
+        )
+        .collect::<Vec<_>>();
+        let branch = "hcom/run-maximum-0123456789ab".to_owned();
+        let base_sha = "a".repeat(40);
+        let head_sha = "b".repeat(40);
+        let rules = "c".repeat(64);
+        session.delivery_binding = crate::control_api::DeliveryBinding::GitHubPullRequest {
+            binding: Box::new(crate::control_api::GitHubPullRequestBinding {
+                owner: "owner".into(),
+                repository: "repository".into(),
+                repository_id: u64::MAX,
+                visibility: "private".into(),
+                local_repository_root: "/repository".into(),
+                base_branch: "master".into(),
+                merge_method: "squash".into(),
+                merge_wait_seconds: 86_400,
+                delete_remote_branch_after_merge: true,
+                architect_app: architect,
+                developer_app: developer,
+                reviewer_apps,
+                review_check_name: crate::control_api::GITHUB_REVIEW_CHECK_NAME.into(),
+            }),
+        };
+        let run_binding = crate::control_api::GitHubRunBinding {
+            inspected_repository_id: u64::MAX,
+            expected_base_ref: "refs/heads/master".into(),
+            expected_base_sha: base_sha.clone(),
+            ruleset_attestation_sha256: rules.clone(),
+            inspection_id: "inspection-maximum".into(),
+            generated_run_branch: branch.clone(),
+        };
+        let maximum_github_url = |kind: &str| {
+            let prefix = format!("https://github.com/owner/repository/{kind}/");
+            format!("{prefix}{}", "u".repeat(2048 - prefix.len()))
+        };
+        let check = crate::control_api::GitHubCheckSnapshot {
+            check_run_id: u64::MAX,
+            check_url: maximum_github_url("runs"),
+            state: "action_required".into(),
+            head_sha: head_sha.clone(),
+        };
+        session.github = Some(crate::control_api::GitHubDeliveryStatusSnapshot {
+            latest_inspection: None,
+            run_binding: Some(run_binding),
+            worktree_path: Some(path),
+            pr_number: Some(u64::MAX),
+            pr_url: Some(maximum_github_url("pull")),
+            published_head_sha: Some(head_sha.clone()),
+            current_check: Some(check.clone()),
+            phase: Some(crate::control_api::GitHubDeliveryPhase::PreservedUnmerged),
+            outcome: Some(crate::control_api::GitHubDeliveryOutcome::UnmergedReviewExhausted),
+            final_base_sha: Some(base_sha.clone()),
+            final_ruleset_attestation_sha256: Some(rules),
+            merge_already_confirmed: false,
+            merge_sha: None,
+            merge_url: None,
+            finalization: None,
+            preserved_branch: Some(branch.clone()),
+            preserved_worktree: Some("/project/hcom-tasks/run-maximum/repository".into()),
+        });
+        for task in &mut session.tasks {
+            task.branch = Some(branch.clone());
+            task.base_revision = Some(base_sha.clone());
+            task.head_revision = Some(head_sha.clone());
+            task.github_reviews = [ReviewerId::Reviewer1, ReviewerId::Reviewer2]
+                .into_iter()
+                .map(|reviewer_id| crate::control_api::GitHubReviewSnapshot {
+                    reviewer_id,
+                    generation: 20,
+                    head_sha: head_sha.clone(),
+                    verdict: ReviewerVerdict::RequestChanges,
+                    review_id: u64::MAX,
+                    review_url: maximum_github_url("pull-request-review"),
+                    final_artifact_sha256: "d".repeat(64),
+                })
+                .collect();
+            task.github_check = Some(check.clone());
         }
-        accepted.expect("at least one maximum dual status fixture fits")
+        response
     }
 
     fn maximum_clarification_response() -> ControlResponse {
@@ -2294,26 +2425,65 @@ mod tests {
             MAX_MCP_LINE_BYTES,
             MAX_RESPONSE_BYTES * 3 + MAX_REQUEST_BYTES + 4096
         );
-        let dual_status = largest_control_bounded_dual_status_response();
+        let dual_status = maximum_dual_status_response(4096);
         let dual_payload = serde_json::to_vec(&dual_status).unwrap();
         assert!(
-            dual_payload.len() > MAX_RESPONSE_BYTES * 99 / 100,
-            "dual status fixture did not reach the control-frame boundary: {}",
+            dual_payload.len() > MAX_REQUEST_BYTES,
+            "maximum legal dual status did not exceed the narrower request frame: {}",
             dual_payload.len()
         );
-        let next = maximum_dual_status_response(
-            dual_status
-                .result
-                .as_ref()
-                .and_then(|result| match result {
-                    ControlResult::Session { session } => Some(session.project_root.len() + 1),
-                    _ => None,
-                })
-                .unwrap(),
+        assert!(
+            dual_payload.len() <= MAX_RESPONSE_BYTES,
+            "maximum legal dual status exceeded the response frame: {}",
+            dual_payload.len()
         );
-        assert!(serde_json::to_vec(&next).unwrap().len() > MAX_RESPONSE_BYTES);
 
-        for response in [dual_status, maximum_clarification_response()] {
+        let github_dual_status = maximum_github_dual_status_response(4096);
+        let github_payload = serde_json::to_vec(&github_dual_status).unwrap();
+        assert!(
+            github_payload.len() > dual_payload.len(),
+            "maximum legal GitHub status did not add its bounded URL evidence: {}",
+            github_payload.len()
+        );
+        assert!(
+            github_payload.len() <= MAX_RESPONSE_BYTES,
+            "maximum legal GitHub dual status exceeded the response frame: {}",
+            github_payload.len()
+        );
+        assert!(
+            github_payload.len() <= MAX_RESPONSE_BYTES * 3 / 4,
+            "maximum legal GitHub dual status left insufficient frame margin: {}",
+            github_payload.len()
+        );
+        let Some(ControlResult::Session { session }) = github_dual_status.result.as_ref() else {
+            unreachable!()
+        };
+        assert_eq!(
+            session
+                .github
+                .as_ref()
+                .unwrap()
+                .pr_url
+                .as_ref()
+                .unwrap()
+                .len(),
+            2048
+        );
+        assert!(session.tasks.iter().all(|task| {
+            task.github_check
+                .as_ref()
+                .is_some_and(|check| check.check_url.len() == 2048)
+                && task
+                    .github_reviews
+                    .iter()
+                    .all(|review| review.review_url.len() == 2048)
+        }));
+
+        for response in [
+            dual_status,
+            github_dual_status,
+            maximum_clarification_response(),
+        ] {
             response.validate().unwrap();
             let control_payload = serde_json::to_vec(&response).unwrap();
             assert!(control_payload.len() <= MAX_RESPONSE_BYTES);

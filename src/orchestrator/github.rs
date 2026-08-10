@@ -1,13 +1,13 @@
 //! Typed, I/O-free GitHub delivery contracts.
 //!
 //! Authentication, HTTP, and Git implementations deliberately sit behind the
-//! traits in this module.  The profile/binding task can therefore validate and
+//! traits in this module. The production workflow can therefore validate and
 //! freeze identity, permission, repository, and inspection observations
 //! without giving the pure supervisor ambient filesystem or network access.
 
 #![allow(
     dead_code,
-    reason = "GITHUB-PR-01 defines seams consumed by later auth/API and driver tasks"
+    reason = "the closed GitHub adapter retains bounded typed seams exercised independently by tests"
 )]
 
 pub(crate) mod auth;

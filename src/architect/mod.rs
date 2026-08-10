@@ -77,8 +77,15 @@ values, inspect/open App keys, invoke Git, or contact GitHub. With the flag,
 the closed deployment table and exact active single/dual App set are validated
 before the blank foreground Architect starts. GitHub write authority still
 begins only after the complete inspected plan is approved.
-This profile/binding release fails closed at the read-only App/API driver seam;
-later GitHub auth/client and workflow tasks make the opt-in lane runnable.
+One approved run uses one hcom-owned branch, linked worktree, and Pull Request;
+task commits append without force-push. Successful Developer and Reviewer
+finals are opaque publication payloads: hcom publishes them byte-for-byte
+without redaction or secret scanning, and rejects generated bodies above the
+60 KiB UTF-8 cap. All active Reviewers must publish same-head LGTM before the
+`hcom/review` Check succeeds and an exact-head squash merge is attempted.
+Review exhaustion leaves the PR, branch, and worktree preserved and unmerged.
+Neither delivery mode authorizes install or release, and the GitHub lane never
+adopts an earlier foreground process's preserved artifacts as a new run.
 
 Architect CLI overrides (higher priority than TOML):
   --model <model>

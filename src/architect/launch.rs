@@ -183,6 +183,9 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
     } else {
         None
     };
+    let github_startup_summary = github_runtime
+        .as_ref()
+        .map(|runtime| (runtime.binding.clone(), runtime.initial_inspection.clone()));
     validate_foreground_terminal()?;
     let session_root = create_private_session_runtime()?;
     let run_root = fs::canonicalize(session_root.path())?;
@@ -255,9 +258,11 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
             stdout,
             "worker runtime: lane-router (one native provider runtime per effective worker lane)"
         )?;
-        writeln!(
-            stdout,
-            "task repositories: discovered from project documentation and bound only after explicit execution authorization; each developer commits directly there"
+        write_delivery_startup_summary(
+            &mut stdout,
+            github_startup_summary
+                .as_ref()
+                .map(|(binding, inspection)| (binding, inspection)),
         )?;
         stdout.flush()?;
     }
@@ -632,6 +637,89 @@ fn write_profile_summary(
     for binding in &profiles.reviewers {
         write_reviewer_profile(output, binding.reviewer_id.as_str(), &binding.profile)?;
     }
+    Ok(())
+}
+
+fn write_delivery_startup_summary(
+    output: &mut impl Write,
+    github: Option<(
+        &crate::control_api::GitHubPullRequestBinding,
+        &crate::control_api::GitHubInspectionBinding,
+    )>,
+) -> Result<()> {
+    let Some((binding, inspection)) = github else {
+        writeln!(
+            output,
+            "task repositories: discovered from project documentation and bound only after explicit execution authorization; each developer commits directly there"
+        )?;
+        return Ok(());
+    };
+
+    writeln!(
+        output,
+        "delivery mode: GitHub Pull Request (explicit --github-pr)"
+    )?;
+    writeln!(
+        output,
+        "github repository: {}/{} id={} visibility={} local_root={} base={}",
+        binding.owner,
+        binding.repository,
+        binding.repository_id,
+        binding.visibility,
+        binding.local_repository_root,
+        binding.base_branch
+    )?;
+    writeln!(
+        output,
+        "github delivery: merge_method={} merge_wait_seconds={} delete_remote_branch_after_merge={} review_check={}",
+        binding.merge_method,
+        binding.merge_wait_seconds,
+        binding.delete_remote_branch_after_merge,
+        binding.review_check_name
+    )?;
+    write_github_app_summary(output, "architect", &binding.architect_app)?;
+    write_github_app_summary(output, "developer", &binding.developer_app)?;
+    for reviewer in &binding.reviewer_apps {
+        write_github_app_summary(output, reviewer.reviewer_id.as_str(), &reviewer.app)?;
+    }
+    writeln!(
+        output,
+        "github initial inspection: id={} repository_id={} base_ref={} base_sha={} ruleset_attestation_sha256={}",
+        inspection.inspection_id,
+        inspection.inspected_repository_id,
+        inspection.expected_base_ref,
+        inspection.expected_base_sha,
+        inspection.ruleset_attestation_sha256
+    )?;
+    writeln!(
+        output,
+        "github authority: startup preflight was read-only; no branch, worktree, Pull Request, Check, review, comment, push, or merge is created before an inspected typed plan is explicitly approved"
+    )?;
+    writeln!(
+        output,
+        "github publication: successful Developer and Reviewer finals are opaque and published byte-for-byte without redaction or secret scanning; generated bodies have a 60 KiB UTF-8 hard cap"
+    )?;
+    writeln!(
+        output,
+        "task repositories: every task must use the frozen GitHub local repository root; one approved run owns one append-only branch, linked worktree, and Pull Request"
+    )?;
+    Ok(())
+}
+
+fn write_github_app_summary(
+    output: &mut impl Write,
+    role: &str,
+    app: &crate::control_api::GitHubAppBinding,
+) -> Result<()> {
+    writeln!(
+        output,
+        "github {role} app: app_id={} installation_id={} slug={} bot_user_id={} permissions={}",
+        app.app_id,
+        app.installation_id,
+        app.slug,
+        app.bot_user_id,
+        serde_json::to_string(&app.effective_permissions)?
+    )?;
     Ok(())
 }
 
@@ -2163,5 +2251,70 @@ private_key_file = "/var/lib/hcom-secrets/reviewer1.pem"
             String::from_utf8(notice).unwrap(),
             "deprecated profile config: [architect.reviewer] was resolved once for reviewer1; declare [architect.reviewer1] explicitly\n"
         );
+    }
+
+    #[test]
+    fn delivery_startup_summary_distinguishes_local_and_frozen_github_authority() {
+        let mut local = Vec::new();
+        write_delivery_startup_summary(&mut local, None).unwrap();
+        let local = String::from_utf8(local).unwrap();
+        assert_eq!(
+            local,
+            "task repositories: discovered from project documentation and bound only after explicit execution authorization; each developer commits directly there\n"
+        );
+
+        let app = |id: u64, slug: &str, permission: &str| crate::control_api::GitHubAppBinding {
+            app_id: id,
+            installation_id: id + 10,
+            slug: slug.into(),
+            bot_user_id: id + 20,
+            effective_permissions: std::collections::BTreeMap::from([(
+                permission.into(),
+                crate::control_api::GitHubPermissionLevel::Write,
+            )]),
+        };
+        let binding = crate::control_api::GitHubPullRequestBinding {
+            owner: "owner".into(),
+            repository: "repository".into(),
+            repository_id: 42,
+            visibility: "private".into(),
+            local_repository_root: "/source".into(),
+            base_branch: "master".into(),
+            merge_method: "squash".into(),
+            merge_wait_seconds: 21_600,
+            delete_remote_branch_after_merge: true,
+            architect_app: app(1, "hcom-arch", "checks"),
+            developer_app: app(2, "hcom-dev", "contents"),
+            reviewer_apps: vec![crate::control_api::GitHubReviewerAppBinding {
+                reviewer_id: crate::worker::profile::ReviewerId::Reviewer1,
+                app: app(3, "hcom-reviewer1", "pull_requests"),
+            }],
+            review_check_name: crate::control_api::GITHUB_REVIEW_CHECK_NAME.into(),
+        };
+        let inspection = crate::control_api::GitHubInspectionBinding {
+            inspected_repository_id: 42,
+            expected_base_ref: "refs/heads/master".into(),
+            expected_base_sha: "a".repeat(40),
+            ruleset_attestation_sha256: "b".repeat(64),
+            inspection_id: "inspection-1".into(),
+        };
+        let mut github = Vec::new();
+        write_delivery_startup_summary(&mut github, Some((&binding, &inspection))).unwrap();
+        let github = String::from_utf8(github).unwrap();
+        for required in [
+            "delivery mode: GitHub Pull Request (explicit --github-pr)",
+            "github repository: owner/repository id=42 visibility=private local_root=/source base=master",
+            "github architect app: app_id=1 installation_id=11 slug=hcom-arch bot_user_id=21 permissions={\"checks\":\"write\"}",
+            "github reviewer1 app: app_id=3 installation_id=13 slug=hcom-reviewer1",
+            "github initial inspection: id=inspection-1 repository_id=42 base_ref=refs/heads/master",
+            "startup preflight was read-only",
+            "published byte-for-byte without redaction or secret scanning",
+            "60 KiB UTF-8 hard cap",
+            "one append-only branch, linked worktree, and Pull Request",
+        ] {
+            assert!(github.contains(required), "missing {required:?}: {github}");
+        }
+        assert!(!github.contains("private_key"));
+        assert!(!github.contains("token"));
     }
 }

@@ -22,10 +22,13 @@ never protocol.
 messages between them. It does not run checks, inspect commits, or judge
 whether the work is any good. Developers verify their own work, reviewers
 verify independently at whatever depth they choose, and the human plus real CI
-are the last word. hcom neither pushes nor installs, so a wrong judgment costs
-a review round or a local commit, both cheap and revertible.
+are the last word. In the default local-candidate mode hcom neither pushes nor
+installs, so a wrong judgment costs a review round or a local commit, both
+cheap and revertible. The explicit [GitHub Pull Request lane](github-pr-lane.md)
+adds a supervisor-owned bound publication workflow; workers still receive no
+GitHub credentials or direct push authority.
 
-**The approved lane includes its local candidate commit.** Each Developer
+**The approved local lane includes its candidate commit.** Each Developer
 creates exactly one signed-off local task commit before review and amends only
 that commit for corrections. Its create/amend instructions require a matching
 `Signed-off-by` trailer, which every active Reviewer checks. A general instruction
@@ -37,7 +40,9 @@ must escalate it to the human regardless of remaining autonomous clarification
 budget and cannot autonomously override it. Reviewer LGTM applies to the exact
 final candidate range already committed only when every active Reviewer returns LGTM
 for the same generation; it does not authorize or require another commit.
-Push, install, and release always remain separate.
+Local-lane push, install, and release always remain separate. GitHub-lane plan
+approval covers only the disclosed bound PR workflow; install and release
+remain separate there as well.
 
 ## Invocation
 
@@ -333,16 +338,19 @@ documented boundary, and re-litigating it needs a product decision, not a
 patch. Each entry says what breaks, what stands in for it, and what it would
 take to change.
 
-### The supervisor never inspects the work
+### The local-candidate supervisor never inspects the work
 
 It does not run checks, read commits, or look at Git at all. A developer that
 misreports what it did, omits a sign-off, commits outside the task's scope,
 rewrites history, or leaves the tree dirty will still reach review.
 
 *Stands in for it:* the reviewer verifies independently at whatever depth it
-chooses, the human reads the final report, and real CI runs after a push. hcom
-neither pushes nor installs, so the worst case is a wasted review round or a
-local commit to revert — both cheap.
+chooses, the human reads the final report, and real CI runs after a separately
+authorized push. The local lane neither pushes nor installs, so the worst case
+is a wasted review round or a local commit to revert — both cheap. GitHub mode
+is deliberately different: its delivery adapter validates append-only exact
+commit topology and identity before publishing, while still leaving code
+quality judgment to the Reviewers.
 
 *To change it:* that is a different product. Adding any of those checks back
 turns an untidy checkout into a failed run, which is exactly the failure mode
@@ -435,4 +443,5 @@ verdicts/findings, distinguishing same-generation LGTM,
 either Reviewer body, and the Architect does not rerun tests, review, or
 validation unless the human asks. For LGTM, it reports the final reviewed local
 candidate without asking whether to retain/revert it or creating a post-LGTM
-commit; push/install/release remain separately authorized.
+commit; local push/install/release remain separately authorized. GitHub mode
+uses its separate terminal delivery handoff and bound publication contract.

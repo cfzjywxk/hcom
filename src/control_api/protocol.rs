@@ -6,7 +6,11 @@ use std::path::{Component, Path};
 
 pub const PROTOCOL_VERSION: u32 = 10;
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
-pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+// A response can accumulate current-generation evidence for all 64 tasks:
+// four Reviewer final paths, one Developer path, two review URLs, and one
+// Check URL per task, in addition to the original bounded plan fields. Keep
+// requests narrow, but give that closed legal status shape its own hard bound.
+pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 const MAX_ID_BYTES: usize = 128;
 const MAX_PATH_BYTES: usize = 4096;

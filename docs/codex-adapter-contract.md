@@ -250,10 +250,11 @@ source gate unless the human explicitly authorizes it.
 
 | Contract | Regression |
 |---|---|
-| defaults are explicit | `architect::profile::tests::missing_file_uses_reviewed_defaults`, `worker::profile::tests::task_lane_defaults_to_codex_developer_and_claude_reviewer` |
+| defaults are explicit | `architect::profile::tests::missing_file_uses_reviewed_defaults`, `worker::profile::tests::task_lane_defaults_to_codex_developer_codex_reviewer1_and_claude_reviewer2` |
 | no prompt or input injection | `architect::launch::tests::native_profile_has_no_prompt_or_secret_transport`, `blank_codex_launch_keeps_input_empty_and_preserves_native_host_semantics` |
 | native config plus one MCP leaf | `architect::launch::tests::codex_control_server_is_an_additive_cli_overlay_not_a_private_config` |
-| Codex MCP schema compatibility | `architect::tools::tests::generated_tool_schemas_stay_inside_the_codex_compatibility_policy`, `architect::tools::tests::codex_schema_policy_rejects_lossy_or_ambiguous_shapes_before_launch` |
+| Codex MCP schema compatibility across local/GitHub and single/dual inventories | `architect::tools::tests::generated_tool_schemas_stay_inside_the_codex_compatibility_policy`, `architect::tools::tests::codex_schema_policy_rejects_lossy_or_ambiguous_shapes_before_launch` |
+| full bounded local/GitHub status through duplicated MCP projection | `architect::bridge::tests::maximum_control_responses_fit_losslessly_in_the_duplicated_mcp_envelope` |
 | native worker argv/config | `worker::exec_runtime::tests::happy_developer_turn_completes_and_captures_thread_id`, `reviewer_registers_the_external_repository_as_a_native_workspace_root` |
 | byte-exact native environment with no additions | `orchestrator::task_lane::tests::complete_parent_environment_is_preserved_byte_for_byte` |
 | path-only peer and terminal handoff | `orchestrator::task_lane::tests::request_changes_round_routes_only_ordered_durable_paths`, `architect::bridge::tests::session_wait_keeps_mcp_responsive_and_returns_terminal_result` |
@@ -268,10 +269,12 @@ The standard source gate is:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --quiet --locked --all-targets
-git diff --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
 cargo build --quiet --release --locked
+git show --check
+bash -n scripts/dual-review-e2e
+target/release/hcom --version
 ```
 
 The model-backed E2E/contract default is

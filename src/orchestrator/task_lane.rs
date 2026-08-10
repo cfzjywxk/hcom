@@ -2016,7 +2016,7 @@ impl TaskLaneSupervisor {
                         .ok_or_else(|| anyhow!("GitHub prompt task status is unavailable"))?;
                     prompt.push_str(&format!(
                         "\nGitHub Pull Request commit contract:\n- run branch: {}\n- task base: {}\n- previously published head: {}\n- Developer App: {} (app {}, bot user {})\n- exact commit author, committer, and Signed-off-by identity: {} <{}>\n\
-                         Create exactly one new signed-off child commit in this turn. Never amend, rebase, squash, force-push, or rewrite an existing commit. Leave the index and worktree clean. Do not push: the foreground supervisor validates and publishes the commit after your final. Keep the final small enough for hcom's bounded GitHub wrapper.\n",
+                         Create exactly one new signed-off child commit in this turn. Never amend, rebase, squash, force-push, or rewrite an existing commit. Leave the index and worktree clean. Do not push: the foreground supervisor validates and publishes the commit after your final. Your final is opaque payload published byte-for-byte without redaction or secret scanning to the selected private repository; keep the complete generated GitHub body within its 60 KiB UTF-8 hard cap.\n",
                         task_status.branch.as_deref().unwrap_or("not-yet-published"),
                         task_status.base_revision.as_deref().unwrap_or("run-base-pending"),
                         snapshot
@@ -2088,17 +2088,33 @@ impl TaskLaneSupervisor {
                         })?;
                         prompt.push_str(&format!(
                             "\nResume the same task using clarification sequence {}. Re-read your \
-                             request at {} and the Architect response at {} before continuing. \
-                             Preserve any existing task commit exactly until you have a complete \
-                             correction to amend into it. If the request reported an explicit \
-                             no-commit conflict, proceed only when the newest clarification records \
-                             the human's decision resolving that authority conflict; otherwise \
-                             return `STATUS: CLARIFICATION_REQUIRED` again without modifying or \
-                             committing the repository.\n",
+                             request at {} and the Architect response at {} before continuing.\n",
                             latest.sequence,
                             latest.developer_request_path,
                             latest.architect_clarification_path,
                         ));
+                        if self.sources.delivery_binding.is_github() {
+                            prompt.push_str(
+                                "Preserve every published commit exactly. Complete this turn as \
+                                 exactly one new signed-off child commit on the previously \
+                                 published head; do not amend, rebase, squash, reword, force-push, \
+                                 or push. If the request reported an explicit no-commit or no-push \
+                                 conflict, proceed only when the newest clarification records the \
+                                 human's decision resolving that authority conflict; otherwise \
+                                 return `STATUS: CLARIFICATION_REQUIRED` again without modifying \
+                                 or committing the repository.\n",
+                            );
+                        } else {
+                            prompt.push_str(
+                                "Preserve any existing task commit exactly until you have a \
+                                 complete correction to amend into it. If the request reported an \
+                                 explicit no-commit conflict, proceed only when the newest \
+                                 clarification records the human's decision resolving that \
+                                 authority conflict; otherwise return \
+                                 `STATUS: CLARIFICATION_REQUIRED` again without modifying or \
+                                 committing the repository.\n",
+                            );
+                        }
                         if !task.latest_reviewer_final_paths().is_empty() {
                             prompt.push_str(
                                 "\nPreviously supplied Reviewer final messages remain applicable:\n",
@@ -2168,7 +2184,7 @@ impl TaskLaneSupervisor {
                         .ok_or_else(|| anyhow!("GitHub Reviewer App binding is unavailable"))?;
                     prompt.push_str(&format!(
                         "\nGitHub Pull Request review contract:\n- exact range: {}..{}\n- run branch: {}\n- Reviewer App: {} (app {}, bot user {})\n\
-                         Review this complete exact range in the managed worktree. It may contain one initial task commit plus append-only correction commits; confirm every commit is a direct child in the published chain, has the frozen Developer identity/sign-off, and no published commit was rewritten. Do not push or publish a GitHub review: the foreground supervisor publishes your exact final under the mapped Reviewer App only after proving the repository still matches this head. Keep the final small enough for hcom's bounded GitHub wrapper.\n",
+                         Review this complete exact range in the managed worktree. It may contain one initial task commit plus append-only correction commits; confirm every commit is a direct child in the published chain, has the frozen Developer identity/sign-off, and no published commit was rewritten. Do not push or publish a GitHub review: the foreground supervisor publishes your exact final under the mapped Reviewer App only after proving the repository still matches this head. Your final is opaque payload published byte-for-byte without redaction or secret scanning to the selected private repository; keep the complete generated review body within its 60 KiB UTF-8 hard cap.\n",
                         task_status
                             .base_revision
                             .as_deref()
@@ -2412,8 +2428,11 @@ on its own line, with no decoration and no other text on that line.
 Use READY only when this turn's complete change is committed as exactly one new
 signed-off child of the previously published head, all required checks passed,
 the index/worktree are clean, and the foreground supervisor can validate and
-publish it. Report changes, verification, exact commit/head state, remaining
-work, and each defensible local assumption on its own `ASSUMPTION:` line.
+publish it. Your exact final is externally published byte-for-byte without
+redaction or secret scanning inside a generated GitHub body capped at 60 KiB
+UTF-8. Report changes,
+verification, exact commit/head state, remaining work, and each defensible local
+assumption on its own `ASSUMPTION:` line.
 
 Use CLARIFICATION_REQUIRED only when no defensible implementation choice can be
 derived or an explicit instruction requires this turn to remain uncommitted,
@@ -2428,9 +2447,9 @@ the foreground supervisor.
 hcom does not parse them.
 ";
 
-const GITHUB_DEVELOPER_ROLE_INSTRUCTIONS: &str = "You are the task Developer for an approved hcom GitHub Pull Request lane. Execute only the concrete selected task. Every Developer turn creates exactly one new signed-off child commit on the supervisor-published head; corrections append and never amend, rebase, squash, force-push, or rewrite published history. Use the frozen Developer App bot identity for author, committer, and Signed-off-by. Preserve the generated branch and managed worktree, leave the index/worktree clean, and never commit hcom-tasks artifacts unless the approved task explicitly names such a repository file. Do not push or invoke GitHub: the foreground supervisor alone validates and publishes the exact child commit and your exact final. Do not install, release, deploy, edit task/design/clarification sources outside approved scope, or wait for interactive input. Make ordinary local implementation choices yourself and report defensible uncertainty as ASSUMPTION:. Ask for clarification only when no approved candidate exists or the choice decides material externally visible scope. Report BLOCKED only after actual attempts prove an external or mechanical obstacle. An explicit instruction to remain uncommitted conflicts with this approved lane and requires STATUS: CLARIFICATION_REQUIRED without repository mutation.";
+const GITHUB_DEVELOPER_ROLE_INSTRUCTIONS: &str = "You are the task Developer for an approved hcom GitHub Pull Request lane. Execute only the concrete selected task. Every Developer turn creates exactly one new signed-off child commit on the supervisor-published head; corrections append and never amend, rebase, squash, force-push, or rewrite published history. Use the frozen Developer App bot identity for author, committer, and Signed-off-by. Preserve the generated branch and managed worktree, leave the index/worktree clean, and never commit hcom-tasks artifacts unless the approved task explicitly names such a repository file. Do not push or invoke GitHub: the foreground supervisor alone validates and publishes the exact child commit and your exact final. That final is opaque payload published byte-for-byte without redaction or secret scanning to the selected private repository, inside a generated body with a 60 KiB UTF-8 hard cap; do not put credential material in it. Do not install, release, deploy, edit task/design/clarification sources outside approved scope, or wait for interactive input. Make ordinary local implementation choices yourself and report defensible uncertainty as ASSUMPTION:. Ask for clarification only when no approved candidate exists or the choice decides material externally visible scope. Report BLOCKED only after actual attempts prove an external or mechanical obstacle. An explicit instruction to remain uncommitted or unpushed conflicts with this approved lane and requires STATUS: CLARIFICATION_REQUIRED without repository mutation.";
 
-const GITHUB_REVIEWER_ROLE_INSTRUCTIONS: &str = "You are the task Reviewer for an approved hcom GitHub Pull Request lane. Independently review the exact task base..published head range against the approved task, design, ordered clarifications, applicable instructions, implementation, and tests. Reviewer1 and Reviewer2 are equal peers with the same complete review scope and authority: there is no specialization or division of responsibility, and neither may assume the other covers a category. The range may contain an initial task commit plus append-only correction commits; verify the contiguous published chain, frozen Developer identity and matching sign-offs, clean repository, and exclusion of hcom-tasks artifacts. An LGTM applies only to the exact current range and head. Do not edit source, index, refs, commits, branch, or HEAD; do not push, publish a GitHub review, install, or release. The foreground supervisor proves the unchanged head and publishes your exact final through your mapped Reviewer App. Use REQUIREMENT_AMBIGUITY: for unresolved requirement conflicts and return the normal verdict. In dual mode both independent turns have the same contract, six-hour timeout, and no extra join deadline or resource cap. Do not mutate a shared Cargo target; copy the tree and use an isolated target for write-producing checks.";
+const GITHUB_REVIEWER_ROLE_INSTRUCTIONS: &str = "You are the task Reviewer for an approved hcom GitHub Pull Request lane. Independently review the exact task base..published head range against the approved task, design, ordered clarifications, applicable instructions, implementation, and tests. Reviewer1 and Reviewer2 are equal peers with the same complete review scope and authority: there is no specialization or division of responsibility, neither may assume the other covers a category, and neither receives the peer final. The range may contain an initial task commit plus append-only correction commits; verify the contiguous published chain, frozen Developer identity and matching sign-offs, clean repository, and exclusion of hcom-tasks artifacts. An LGTM applies only to the exact current range and head. Do not edit source, index, refs, commits, branch, or HEAD; do not push, publish a GitHub review, install, or release. The foreground supervisor proves the unchanged head and publishes your exact final through your mapped Reviewer App. That final is opaque payload published byte-for-byte without redaction or secret scanning to the selected private repository, inside a generated body with a 60 KiB UTF-8 hard cap; do not put credential material in it. Use REQUIREMENT_AMBIGUITY: for unresolved requirement conflicts and return the normal verdict. In dual mode both independent turns have the same contract, six-hour timeout, and no extra join deadline or resource cap. Do not mutate a shared Cargo target; copy the tree and use an isolated target for write-producing checks.";
 
 fn role_instructions(role: WorkerRole) -> &'static str {
     match role {
@@ -2512,6 +2531,13 @@ mod tests {
 
     fn pure_codex_reviewer_adapters() -> Vec<ReviewerAdapterBinding> {
         reviewer_adapter_bindings(CODEX_TASK_WORKER_ADAPTER, CODEX_TASK_WORKER_ADAPTER)
+    }
+
+    fn pure_codex_single_reviewer_adapters() -> Vec<ReviewerAdapterBinding> {
+        vec![ReviewerAdapterBinding {
+            reviewer_id: ReviewerId::Reviewer1,
+            adapter: CODEX_TASK_WORKER_ADAPTER.into(),
+        }]
     }
 
     fn reviewer_paths(task: &crate::control_api::TaskStatusSnapshot) -> Vec<String> {
@@ -3159,6 +3185,24 @@ mod tests {
         )
     }
 
+    fn github_runtime_for_single_review_test(
+        repository: &Path,
+    ) -> (
+        crate::orchestrator::github::GitHubRuntimeBinding,
+        Arc<MutableGitHubInspector>,
+    ) {
+        let (mut runtime, inspector) = github_runtime_for_test(repository);
+        runtime.binding.reviewer_apps.truncate(1);
+        inspector
+            .result
+            .lock()
+            .unwrap()
+            .delivery_binding
+            .reviewer_apps
+            .truncate(1);
+        (runtime, inspector)
+    }
+
     #[test]
     fn github_inspection_is_read_only_and_plan_start_bind_exact_observation() {
         let fixture = Fixture::new();
@@ -3524,6 +3568,62 @@ mod tests {
 
         let audit = worker_audit.lock().unwrap();
         assert_eq!(audit.opens, ["github-one", "github-two"]);
+        let first_reviewer_poll = audit
+            .lane_events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ScriptedLaneEvent::TurnPolled(WorkerLane::Reviewer(_))
+                )
+            })
+            .unwrap();
+        for reviewer_id in [ReviewerId::Reviewer1, ReviewerId::Reviewer2] {
+            let start = audit
+                .lane_events
+                .iter()
+                .position(|event| {
+                    *event == ScriptedLaneEvent::TurnStarted(WorkerLane::Reviewer(reviewer_id))
+                })
+                .unwrap();
+            assert!(
+                start < first_reviewer_poll,
+                "both GitHub Reviewer lanes must start before either is polled"
+            );
+        }
+        for (lane, instructions) in &audit.role_instructions {
+            for required in [
+                "published byte-for-byte without redaction or secret scanning",
+                "60 KiB UTF-8 hard cap",
+                "do not put credential material in it",
+            ] {
+                assert!(
+                    instructions.contains(required),
+                    "{lane:?} GitHub role contract omitted {required}"
+                );
+            }
+            match lane {
+                WorkerLane::Developer => {
+                    assert!(instructions.contains("exact frozen Developer commit identity"));
+                    assert!(instructions.contains("remain uncommitted or unpushed"));
+                }
+                WorkerLane::Reviewer(_) => {
+                    assert!(instructions.contains("neither receives the peer final"));
+                    assert!(instructions.contains("mapped Reviewer App"));
+                }
+            }
+        }
+        let first_developer = audit
+            .prompts
+            .iter()
+            .find(|(role, purpose, _)| {
+                *role == WorkerRole::Developer && *purpose == RuntimeTurnPurpose::InitialDevelopment
+            })
+            .map(|(_, _, prompt)| prompt)
+            .unwrap();
+        assert!(first_developer.contains("exact commit author, committer, and Signed-off-by"));
+        assert!(first_developer.contains("published byte-for-byte without redaction"));
+        assert!(first_developer.contains("60 KiB UTF-8 hard cap"));
         let correction = audit
             .prompts
             .iter()
@@ -3532,6 +3632,7 @@ mod tests {
             .unwrap();
         assert!(correction.contains("exactly one new signed-off child commit"));
         assert!(!correction.contains("git commit --amend"));
+        assert!(correction.contains("published byte-for-byte without redaction"));
         for (_, purpose, prompt) in audit
             .prompts
             .iter()
@@ -3540,10 +3641,287 @@ mod tests {
             assert!(prompt.contains("Reviewer1 and Reviewer2 are equal peers"));
             assert!(prompt.contains("exact range:"));
             assert!(prompt.contains("foreground supervisor publishes your exact final"));
+            assert!(prompt.contains("published byte-for-byte without redaction"));
+            assert!(prompt.contains("60 KiB UTF-8 hard cap"));
             if *purpose == RuntimeTurnPurpose::ReviewerRereview {
                 assert!(prompt.contains("First verify every finding you raised"));
             }
         }
+    }
+
+    #[test]
+    fn github_single_reviewer_driver_omits_reviewer2_from_runtime_publication_and_status() {
+        let fixture = Fixture::new();
+        let (mut runtime, _inspector) = github_runtime_for_single_review_test(&fixture.repository);
+        let workflow = Arc::new(ScriptedGitHubWorkflow {
+            heads: Mutex::new(VecDeque::from(["c".repeat(40)])),
+            audit: Mutex::new(Vec::new()),
+            worktree: Mutex::new(None),
+            fail_after_confirmation: None,
+            partial_operations: Mutex::new(BTreeMap::new()),
+            merge_gate_entered: None,
+            merge_gate_release: None,
+            merge_entered: None,
+            merge_release: None,
+        });
+        runtime.workflow = workflow.clone();
+        let profiles =
+            SessionInvocationProfiles::for_single_review_task_lane(ArchitectAdapter::Codex)
+                .unwrap();
+        let sources = SessionRuntimeSources::capture_with_github(
+            fixture.sources.parent_environment.clone(),
+            profiles,
+            Vec::new(),
+            runtime,
+        )
+        .unwrap();
+        let worker_audit = Arc::new(Mutex::new(Audit::default()));
+        let scripts = vec![single_reviewer_task_script(
+            "github-single",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("github-single-initial")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [lgtm("github-single-lgtm")],
+                ),
+            ],
+            vec![Mutation::None; 2],
+        )];
+        let mut supervisor = TaskLaneSupervisor::open_with_factory(
+            "run-github-single".into(),
+            fixture.project_root.clone(),
+            fixture.run_root.clone(),
+            sources,
+            Box::new(ScriptedFactory {
+                scripts: scripts.into(),
+                audit: worker_audit.clone(),
+            }),
+        )
+        .unwrap();
+        let (plan_version, plan_hash) = supervisor
+            .replace_plan_with_inspection(
+                0,
+                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_single_reviewer_adapters(),
+                Some("inspection-initial"),
+                vec![fixture.task(
+                    "github-single",
+                    &[],
+                    crate::control_api::protocol::MIN_SINGLE_REVIEW_ROUNDS,
+                )],
+            )
+            .unwrap();
+        supervisor
+            .approve_and_start(1, plan_version, &plan_hash, true)
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !supervisor.snapshot().state.is_terminal() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "single-review GitHub workflow did not become terminal"
+            );
+            supervisor.poll_once().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, SessionState::Completed);
+        assert_eq!(snapshot.reviewer_bindings.len(), 1);
+        assert_eq!(
+            snapshot.reviewer_bindings[0].reviewer_id,
+            ReviewerId::Reviewer1
+        );
+        let DeliveryBinding::GitHubPullRequest { binding } = &snapshot.delivery_binding else {
+            panic!("single-review run lost its GitHub delivery binding")
+        };
+        assert_eq!(binding.reviewer_apps.len(), 1);
+        assert_eq!(binding.reviewer_apps[0].reviewer_id, ReviewerId::Reviewer1);
+        assert_eq!(snapshot.tasks[0].reviewers.len(), 1);
+        assert_eq!(snapshot.tasks[0].github_reviews.len(), 1);
+        assert_eq!(
+            snapshot.tasks[0].github_reviews[0].reviewer_id,
+            ReviewerId::Reviewer1
+        );
+
+        let operations = workflow.audit.lock().unwrap();
+        let reviews = operations
+            .iter()
+            .filter(|entry| entry.starts_with("review:"))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(reviews, ["review:0:1:reviewer1:Lgtm"]);
+        assert!(operations.iter().all(|entry| !entry.contains("reviewer2")));
+        drop(operations);
+
+        let audit = worker_audit.lock().unwrap();
+        assert!(
+            audit
+                .lane_sessions
+                .iter()
+                .all(|(_, lane, _)| { *lane != WorkerLane::Reviewer(ReviewerId::Reviewer2) })
+        );
+        assert!(
+            audit
+                .role_instructions
+                .iter()
+                .all(|(lane, _)| { *lane != WorkerLane::Reviewer(ReviewerId::Reviewer2) })
+        );
+    }
+
+    #[test]
+    fn github_correction_clarification_resume_keeps_append_only_commit_instructions() {
+        let fixture = Fixture::new();
+        let (mut runtime, _inspector) = github_runtime_for_single_review_test(&fixture.repository);
+        let workflow = Arc::new(ScriptedGitHubWorkflow {
+            heads: Mutex::new(VecDeque::from(["c".repeat(40), "d".repeat(40)])),
+            audit: Mutex::new(Vec::new()),
+            worktree: Mutex::new(None),
+            fail_after_confirmation: None,
+            partial_operations: Mutex::new(BTreeMap::new()),
+            merge_gate_entered: None,
+            merge_gate_release: None,
+            merge_entered: None,
+            merge_release: None,
+        });
+        runtime.workflow = workflow.clone();
+        let profiles =
+            SessionInvocationProfiles::for_single_review_task_lane(ArchitectAdapter::Codex)
+                .unwrap();
+        let sources = SessionRuntimeSources::capture_with_github(
+            fixture.sources.parent_environment.clone(),
+            profiles,
+            Vec::new(),
+            runtime,
+        )
+        .unwrap();
+        let worker_audit = Arc::new(Mutex::new(Audit::default()));
+        let scripts = vec![single_reviewer_task_script(
+            "github-clarify",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("github-clarify-initial")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [request_changes("github-clarify-finding")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::DeveloperCorrection,
+                    [clarification_required("github-clarify-question")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::DeveloperClarificationResume,
+                    [ready("github-clarify-correction")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::ReviewerRereview,
+                    [lgtm("github-clarify-lgtm")],
+                ),
+            ],
+            vec![Mutation::None; 5],
+        )];
+        let mut supervisor = TaskLaneSupervisor::open_with_factory(
+            "run-github-clarify".into(),
+            fixture.project_root.clone(),
+            fixture.run_root.clone(),
+            sources,
+            Box::new(ScriptedFactory {
+                scripts: scripts.into(),
+                audit: worker_audit.clone(),
+            }),
+        )
+        .unwrap();
+        let (plan_version, plan_hash) = supervisor
+            .replace_plan_with_inspection(
+                0,
+                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_single_reviewer_adapters(),
+                Some("inspection-initial"),
+                vec![fixture.task(
+                    "github-clarify",
+                    &[],
+                    crate::control_api::protocol::MIN_SINGLE_REVIEW_ROUNDS,
+                )],
+            )
+            .unwrap();
+        supervisor
+            .approve_and_start(1, plan_version, &plan_hash, true)
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (action_snapshot, pending) = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "GitHub correction clarification did not reach the Architect action"
+            );
+            supervisor.poll_once().unwrap();
+            let snapshot = supervisor.snapshot();
+            if let Some(pending) = snapshot.pending_architect_action.clone() {
+                break (snapshot, pending);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(action_snapshot.tasks[0].review_round, 1);
+        fs::write(
+            &pending.clarification_output_path,
+            "Apply the approved narrow correction.\n",
+        )
+        .unwrap();
+        supervisor
+            .submit_clarification(
+                action_snapshot.version,
+                pending.task_ordinal,
+                &pending.task_key,
+                pending.sequence,
+                &pending.developer_request_path,
+                &pending.clarification_output_path,
+                false,
+            )
+            .unwrap();
+
+        let terminal = drive_terminal(&mut supervisor);
+        assert_eq!(terminal.state, SessionState::Completed);
+        assert_eq!(terminal.tasks[0].review_round, 2);
+        let operations = workflow.audit.lock().unwrap();
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|entry| entry.starts_with("candidate:"))
+                .count(),
+            2
+        );
+        drop(operations);
+
+        let audit = worker_audit.lock().unwrap();
+        let resume_prompt = audit
+            .prompts
+            .iter()
+            .find(|(_, purpose, _)| *purpose == RuntimeTurnPurpose::DeveloperClarificationResume)
+            .map(|(_, _, prompt)| prompt)
+            .unwrap();
+        for required in [
+            "Preserve every published commit exactly",
+            "exactly one new signed-off child commit",
+            "do not amend, rebase, squash, reword, force-push, or push",
+            "explicit no-commit or no-push conflict",
+        ] {
+            assert!(
+                resume_prompt.contains(required),
+                "GitHub clarification resume omitted {required}"
+            );
+        }
+        assert!(!resume_prompt.contains("correction to amend into it"));
     }
 
     #[test]
@@ -3999,6 +4377,51 @@ mod tests {
                 "per-turn Developer output contract omitted {required}"
             );
         }
+
+        let github_developer = GITHUB_DEVELOPER_ROLE_INSTRUCTIONS;
+        for required in [
+            "exactly one new signed-off child commit",
+            "never amend, rebase, squash, force-push, or rewrite",
+            "frozen Developer App bot identity",
+            "foreground supervisor alone validates and publishes",
+            "published byte-for-byte without redaction or secret scanning",
+            "60 KiB UTF-8 hard cap",
+            "remain uncommitted or unpushed",
+            "STATUS: CLARIFICATION_REQUIRED",
+        ] {
+            assert!(
+                github_developer.contains(required),
+                "GitHub Developer role contract omitted {required}"
+            );
+        }
+        let github_reviewer = GITHUB_REVIEWER_ROLE_INSTRUCTIONS;
+        for required in [
+            "exact task base..published head range",
+            "neither receives the peer final",
+            "contiguous published chain",
+            "mapped Reviewer App",
+            "published byte-for-byte without redaction or secret scanning",
+            "60 KiB UTF-8 hard cap",
+            "Do not edit source, index, refs, commits, branch, or HEAD",
+        ] {
+            assert!(
+                github_reviewer.contains(required),
+                "GitHub Reviewer role contract omitted {required}"
+            );
+        }
+        for required in [
+            "exactly one new",
+            "externally published byte-for-byte without",
+            "redaction or secret scanning",
+            "generated GitHub body capped at 60 KiB",
+            "UTF-8. Report changes",
+            "Do not push",
+        ] {
+            assert!(
+                GITHUB_DEVELOPER_OUTPUT_CONTRACT.contains(required),
+                "GitHub Developer output contract omitted {required}"
+            );
+        }
     }
 
     #[derive(Clone)]
@@ -4044,6 +4467,7 @@ mod tests {
         opens: Vec<String>,
         sessions: Vec<(String, WorkerRole, u64)>,
         lane_sessions: Vec<(String, WorkerLane, u64)>,
+        role_instructions: Vec<(WorkerLane, String)>,
         turns: Vec<(String, WorkerRole, RuntimeTurnPurpose, u64)>,
         lane_events: Vec<ScriptedLaneEvent>,
         prompts: Vec<(WorkerRole, RuntimeTurnPurpose, String)>,
@@ -4126,6 +4550,7 @@ mod tests {
             }
             let role = spec.role;
             let profile = spec.profile.clone();
+            let role_instructions = spec.developer_instructions.clone();
             let session = self.inner.open_session(spec)?;
             self.sessions.insert(session, lane);
             let mut audit = self.audit.lock().unwrap();
@@ -4135,6 +4560,7 @@ mod tests {
             audit
                 .lane_sessions
                 .push((self.task_key.clone(), lane, session.counter()));
+            audit.role_instructions.push((lane, role_instructions));
             audit.profiles.push((self.task_key.clone(), role, profile));
             Ok(session)
         }

@@ -7,7 +7,7 @@
 
 #![allow(
     dead_code,
-    reason = "GITHUB-PR-02 is consumed by the later GitHub workflow driver task"
+    reason = "the managed workspace retains bounded helper seams exercised independently by tests"
 )]
 
 use super::{validate_git_sha, validate_sha256};
