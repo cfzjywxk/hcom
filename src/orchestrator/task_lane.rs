@@ -1459,13 +1459,14 @@ impl TaskLaneSupervisor {
                     reviewer_id.as_str(),
                     task.review_generation,
                 ));
-                if purpose == RuntimeTurnPurpose::ReviewerRereview {
-                    prompt.push_str(
-                        "\nThe candidate was amended because of the previous review generation \
-                         for this task. Independently and completely review the current exact \
-                         candidate range again. Do not assume any finding was covered by the peer \
-                         Reviewer, and do not depend on or guess the peer response.\n",
-                    );
+                match purpose {
+                    RuntimeTurnPurpose::InitialReview => {
+                        prompt.push_str(INITIAL_REVIEW_INSTRUCTIONS);
+                    }
+                    RuntimeTurnPurpose::ReviewerRereview => {
+                        prompt.push_str(REREVIEW_INSTRUCTIONS);
+                    }
+                    _ => bail!("unsupported Reviewer turn purpose"),
                 }
                 prompt.push_str(REVIEWER_OUTPUT_CONTRACT);
             }
@@ -1560,8 +1561,43 @@ fn materialized_environment(
         .collect()
 }
 
-/// The reviewer's only output obligation. Deliberately narrow: hcom parses one
-/// anchored line and treats everything else as opaque payload.
+/// Initial review deliberately front-loads complete coverage so one generation
+/// returns as many independently confirmed blockers as practical. Both Reviewer
+/// lanes receive this exact contract; neither lane owns a narrower category.
+const INITIAL_REVIEW_INSTRUCTIONS: &str = "
+This is the initial review generation for this task. Before deciding the verdict,
+derive a task-specific coverage checklist from the approved task, design,
+clarifications, implementation, and exact candidate range. Cover its invariants,
+affected callers and consumers, and relevant success, failure, retry, cleanup,
+and terminal paths. Complete that checklist across the exact candidate range.
+Do not stop after finding the first blocker: continue through the remaining
+coverage, then perform a second counterexample sweep. Return every independently
+confirmed Major or Critical finding that you can substantiate in this turn. Do
+not add speculative findings or treat missing test coverage alone as a blocker.
+";
+
+/// A re-review reuses still-valid independent coverage from the exact resumed
+/// Reviewer session. It expands back to a complete review only when the
+/// amendment invalidates the old coverage too broadly to bound safely.
+const REREVIEW_INSTRUCTIONS: &str = "
+The candidate was amended because of the previous review generation for this
+task. First verify every finding you raised in the previous generation. Then
+independently audit the amendment and its transitive impact on invariants,
+callers and consumers, and success, failure, retry, cleanup, and terminal paths.
+Reuse your prior validated coverage only where the amendment cannot invalidate
+it, and re-review every invalidated area. Perform a complete exact-range review
+when the amendment changes a core invariant, state machine, or externally
+visible contract; adds a caller or concurrency, retry, cleanup, or terminal
+path; crosses subsystem boundaries; or has an impact you cannot bound reliably.
+Otherwise, do not repeat unchanged low-risk coverage merely for ceremony. Your
+verdict still applies to the current exact candidate range. Do not assume any
+finding was covered by the peer Reviewer, and do not depend on or guess the peer
+response.
+";
+
+/// The reviewer's only output obligation. hcom parses one anchored line and
+/// treats everything else as opaque payload, but the concise coverage record
+/// lets the exact resumed Reviewer avoid repeating still-valid work.
 const REVIEWER_OUTPUT_CONTRACT: &str = "
 ## Required output format
 
@@ -1571,12 +1607,17 @@ VERDICT: LGTM
 VERDICT: REQUEST_CHANGES
 
 on its own line, with no decoration and no other text on that line. After it,
-write your findings as free-form markdown (path:line references are helpful but
-not required). Judge how deeply to verify. You have the same native host view as
-a human-launched Codex session, but the reviewer role forbids modifying the
-reviewed source, Git state, installed artifacts, or branches. You may copy the
-tree elsewhere and build or test that copy when it helps obtain independent
-evidence.
+write one consolidated set of all independently confirmed findings from this
+turn as concise free-form markdown (path:line references are helpful but not
+required). State the exact candidate range or commit you reviewed, and end with
+a brief `COVERAGE:` summary of the invariants, callers/consumers, and failure or
+lifecycle paths you inspected. On a re-review, also state whether the amendment
+triggered a complete exact-range review and why. Do not emit the internal
+checklist or a long review narrative. If no blocking finding remains, say so
+directly. You have the same native host view as a human-launched Codex session,
+but the reviewer role forbids modifying the reviewed source, Git state,
+installed artifacts, or branches. You may copy the tree elsewhere and build or
+test that copy when it helps obtain independent evidence.
 ";
 
 /// The Developer's control output obligation, appended to every turn because
@@ -1625,7 +1666,7 @@ fn role_instructions(role: WorkerRole) -> &'static str {
             "You are the task Developer: execute the concrete approved task; do not redesign its product scope. First seek answers in the task file, design and clarification files, applicable instructions, existing implementation, and tests. Make ordinary local implementation decisions yourself. If an uncertain choice has a defensible candidate, is consistent with the approved behavior and scope, and can be corrected in review, choose the smallest-impact option, continue, and disclose it as `ASSUMPTION:` in your final. Ask for clarification only when you cannot derive any defensible candidate or the choice would decide material externally visible behavior, acceptance, or scope. Report BLOCKED only after actual attempts establish an external or mechanical obstacle; include concrete observations. Work directly in the exact repository and complete the bounded task. The human's execution approval for this standard hcom lane authorizes exactly one signed-off local candidate commit for this task; a general instruction that commits require human authorization is satisfied by that run approval. If an explicit human, task, design, or applicable instruction instead requires this run to remain uncommitted, do not modify or commit the repository: return `STATUS: CLARIFICATION_REQUIRED` because that requirement is incompatible with the standard review lane and requires an explicit human resolution. Otherwise run the required checks, then commit the complete work as ONE NEW commit whose message describes this task as a whole and whose `Signed-off-by` trailer matches the committing identity (for example, create it with `git commit --signoff`). Never amend, squash, reword, or otherwise rewrite a commit that existed when your first task turn began. On correction or clarification resume, amend your existing task commit if it exists and ensure that it retains a valid matching `Signed-off-by` trailer; if no task commit exists yet, create the one signed-off task commit only after the implementation is complete. Never create a second task commit. Do not create a commit merely to pause. If a pause is necessary after your task commit already exists, leave that commit unchanged and report the exact repository state. Never add any `hcom-tasks` artifact to the task commit. This local candidate commit and its same-task amendments do not authorize push, install, or release. Do not push, install, wait for interactive input, or modify the task/design/clarification source files."
         }
         WorkerRole::Reviewer => {
-            "You are the task Reviewer. Independently inspect the committed task range and decide whether it is sound against the approved task, design files, and every ordered clarification record. The human's execution approval for this standard hcom lane includes exactly one signed-off local Developer candidate commit and same-commit amendments during correction; it never includes push, install, or release. Review disclosed Developer assumptions rather than accepting them automatically. Confirm the developer left the work committed as a single commit for this task, with a message covering it, a valid `Signed-off-by` trailer matching the committing identity, and no `hcom-tasks` artifact; uncommitted work, a missing or mismatched sign-off, or a task split across several commits is a reason to request changes. If an explicit human, task, design, or applicable instruction requires the run to remain uncommitted, return `VERDICT: REQUEST_CHANGES` and label the incompatible workflow requirement `REQUIREMENT_AMBIGUITY:` instead of accepting either side of the contradiction. Distinguish other requirement ambiguity from implementation defects and label the former `REQUIREMENT_AMBIGUITY:` in findings. An LGTM applies to the exact final candidate range already committed; it does not call for another post-LGTM commit or a human decision about retaining that reviewed commit. You must not edit reviewed source, the Git index or refs, the candidate commit, stage, commit, change branch or HEAD, push, or install. In dual-review mode, two Reviewer turns run concurrently; in single-review mode, only Reviewer1 runs. Every Reviewer turn has an independent six-hour timeout and there is no extra join deadline, cgroup, CPU, memory, or Cargo concurrency cap. Do not clean or mutate a shared Cargo target directory; for checks that write build artifacts, copy the tree into your own writable sandbox and use an isolated target directory."
+            "You are the task Reviewer. Independently inspect the committed task range and decide whether it is sound against the approved task, design files, and every ordered clarification record. In dual-review mode, Reviewer1 and Reviewer2 are equal peers with the same complete review scope and authority: there is no role specialization or division of review responsibility, and neither Reviewer may assume the other will inspect any category. The human's execution approval for this standard hcom lane includes exactly one signed-off local Developer candidate commit and same-commit amendments during correction; it never includes push, install, or release. Review disclosed Developer assumptions rather than accepting them automatically. Confirm the developer left the work committed as a single commit for this task, with a message covering it, a valid `Signed-off-by` trailer matching the committing identity, and no `hcom-tasks` artifact; uncommitted work, a missing or mismatched sign-off, or a task split across several commits is a reason to request changes. If an explicit human, task, design, or applicable instruction requires the run to remain uncommitted, return `VERDICT: REQUEST_CHANGES` and label the incompatible workflow requirement `REQUIREMENT_AMBIGUITY:` instead of accepting either side of the contradiction. Distinguish other requirement ambiguity from implementation defects and label the former `REQUIREMENT_AMBIGUITY:` in findings. An LGTM applies to the exact final candidate range already committed; it does not call for another post-LGTM commit or a human decision about retaining that reviewed commit. You must not edit reviewed source, the Git index or refs, the candidate commit, stage, commit, change branch or HEAD, push, or install. In dual-review mode, two Reviewer turns run concurrently; in single-review mode, only Reviewer1 runs. Every Reviewer turn has an independent six-hour timeout and there is no extra join deadline, cgroup, CPU, memory, or Cargo concurrency cap. Do not clean or mutate a shared Cargo target directory; for checks that write build artifacts, copy the tree into your own writable sandbox and use an isolated target directory."
         }
     }
 }
@@ -1807,6 +1848,9 @@ mod tests {
 
         let reviewer = role_instructions(WorkerRole::Reviewer);
         for required in [
+            "Reviewer1 and Reviewer2 are equal peers",
+            "same complete review scope and authority",
+            "no role specialization or division of review responsibility",
             "exactly one signed-off local Developer candidate commit",
             "VERDICT: REQUEST_CHANGES",
             "REQUIREMENT_AMBIGUITY:",
@@ -1837,6 +1881,56 @@ mod tests {
                 "per-turn Developer output contract omitted {required}"
             );
         }
+    }
+
+    #[test]
+    fn reviewer_turn_contract_batches_initial_findings_and_bounds_rereview_scope() {
+        for required in [
+            "derive a task-specific coverage checklist",
+            "affected callers and consumers",
+            "Do not stop after finding the first blocker",
+            "perform a second counterexample sweep",
+            "confirmed Major or Critical finding",
+            "missing test coverage alone",
+        ] {
+            assert!(
+                INITIAL_REVIEW_INSTRUCTIONS.contains(required),
+                "initial Reviewer instructions omitted {required}"
+            );
+        }
+
+        for required in [
+            "verify every finding you raised",
+            "audit the amendment and its transitive impact",
+            "Reuse your prior validated coverage",
+            "re-review every invalidated area",
+            "Perform a complete exact-range review",
+            "impact you cannot bound reliably",
+            "do not repeat unchanged low-risk coverage",
+            "verdict still applies to the current exact candidate range",
+        ] {
+            assert!(
+                REREVIEW_INSTRUCTIONS.contains(required),
+                "Reviewer re-review instructions omitted {required}"
+            );
+        }
+
+        for required in [
+            "one consolidated set of all independently confirmed findings",
+            "exact candidate range or commit",
+            "brief `COVERAGE:` summary",
+            "triggered a complete exact-range review",
+            "checklist or a long review narrative",
+        ] {
+            assert!(
+                REVIEWER_OUTPUT_CONTRACT.contains(required),
+                "Reviewer output contract omitted {required}"
+            );
+        }
+        assert!(!REVIEWER_OUTPUT_CONTRACT.contains("Judge how deeply to verify"));
+        assert!(!REREVIEW_INSTRUCTIONS.contains(
+            "Independently and completely review the current exact candidate range again"
+        ));
     }
 
     #[derive(Clone)]
@@ -4018,14 +4112,22 @@ mod tests {
             2
         );
         // Each role receives the peer's durable path, never the peer body.
-        let review_prompt = audit
+        let review_prompts = audit
             .prompts
             .iter()
-            .find(|(role, purpose, _)| {
+            .filter(|(role, purpose, _)| {
                 *role == WorkerRole::Reviewer && *purpose == RuntimeTurnPurpose::InitialReview
             })
             .map(|(_, _, prompt)| prompt.clone())
-            .expect("initial review prompt");
+            .collect::<Vec<_>>();
+        assert_eq!(review_prompts.len(), 2);
+        for review_prompt in &review_prompts {
+            assert!(review_prompt.contains("derive a task-specific coverage checklist"));
+            assert!(review_prompt.contains("Do not stop after finding the first blocker"));
+            assert!(review_prompt.contains("perform a second counterexample sweep"));
+            assert!(review_prompt.contains("brief `COVERAGE:` summary"));
+        }
+        let review_prompt = &review_prompts[0];
         let development_prompt = audit
             .prompts
             .iter()
@@ -4034,7 +4136,7 @@ mod tests {
             })
             .map(|(_, _, prompt)| prompt.clone())
             .expect("initial development prompt");
-        for prompt in [&development_prompt, &review_prompt] {
+        for prompt in [&development_prompt, review_prompt] {
             assert!(prompt.contains("AGENTS.md"));
             assert!(prompt.contains("AGENTS.override.md"));
             assert!(prompt.contains(fixture.project_root.to_str().unwrap()));
@@ -4081,14 +4183,27 @@ mod tests {
             .find(clarification_path.to_str().unwrap())
             .expect("clarification Reviewer path");
         assert!(original_index < clarification_index);
-        let rereview_prompt = audit
+        let rereview_prompts = audit
             .prompts
             .iter()
-            .find(|(role, purpose, _)| {
+            .filter(|(role, purpose, _)| {
                 *role == WorkerRole::Reviewer && *purpose == RuntimeTurnPurpose::ReviewerRereview
             })
             .map(|(_, _, prompt)| prompt.clone())
-            .expect("re-review prompt");
+            .collect::<Vec<_>>();
+        assert_eq!(rereview_prompts.len(), 2);
+        for rereview_prompt in &rereview_prompts {
+            assert!(rereview_prompt.contains("verify every finding you raised"));
+            assert!(rereview_prompt.contains("audit the amendment and its transitive impact"));
+            assert!(rereview_prompt.contains("Reuse your prior validated coverage"));
+            assert!(rereview_prompt.contains("re-review every invalidated area"));
+            assert!(rereview_prompt.contains("Perform a complete exact-range review"));
+            assert!(rereview_prompt.contains("do not repeat unchanged low-risk coverage"));
+            assert!(!rereview_prompt.contains(
+                "Independently and completely review the current exact candidate range again"
+            ));
+        }
+        let rereview_prompt = &rereview_prompts[0];
         assert!(!rereview_prompt.contains("second attempt: handled overflow"));
         assert!(
             rereview_prompt.contains(

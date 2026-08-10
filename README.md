@@ -90,6 +90,15 @@ Reviewers concurrently and waits for both responses. With
 `hcom arch codex --single-review`, only Reviewer1 is active. Same-task
 corrections resume the exact Developer session and re-review resumes each
 active Reviewer's own exact native session.
+Reviewer1 and Reviewer2 are equal peers with the same complete scope and
+authority; neither owns a review category or may rely on the other to cover it.
+Each initial review front-loads a task-derived invariant, caller/consumer, and
+failure/lifecycle pass, continues after the first blocker, and consolidates all
+confirmed Major/Critical findings. A re-review reuses only still-valid coverage,
+verifies the Reviewer's prior findings, and audits the amendment plus its
+transitive impact. It repeats the complete exact-range review only when core
+behavior changed or that impact cannot be bounded reliably. Reviewer finals
+record the exact range and a concise coverage summary, not a verbose checklist.
 Execution approval for this standard lane includes one signed-off local
 candidate commit per task. Review corrections amend that same commit; LGTM
 requires every active Reviewer to approve the same generation of the final
@@ -222,14 +231,20 @@ hcom commands inside it use private per-run state so the live retained hcom
 store is not addressed through the normal CLI.
 
 After dispatch, the Codex Architect makes a blocking `session_wait` call bound
-to the exact current run ID and a run-local progress cursor. The foreground
+to the exact current run ID and a run-local progress cursor. hcom marks its
+reserved Codex control MCP server as direct-only, outside code mode. The one
+pending MCP call therefore remains suspended inside Codex until hcom returns a
+real review event, Architect action, or terminal result; it does not create
+periodic code-mode yields, model wakeups, or heartbeat updates. The foreground
 supervisor advances Developer and all active Reviewers without Architect model calls
-and returns one retained review-request, per-Reviewer response, or
-task-completion event, a latched Developer clarification/blocker action, or a
-terminal state. Progress exposes the completed `review_round`, current
+and returns only a retained review request after a Developer final, a
+per-Reviewer response after a Reviewer final, a latched Developer
+clarification/blocker action, or a terminal state. Internal task-completion
+bookkeeping, status publication, poll/timer ticks, and transport yields do not
+release the wait. Worker-result progress exposes the completed `review_round`, current
 `review_generation`, Reviewer identity and response counts, exact durable
 paths, and—on review request—the ordered Reviewer bindings. The Architect
-displays each progress event without reading the response body. A Reviewer
+displays each worker-result event without reading the response body. A Reviewer
 response is partial progress while its received count is below the expected
 count, so the Architect continues waiting rather than reporting the review
 cycle complete or implying a Developer correction. It immediately re-arms the
@@ -241,8 +256,11 @@ the Architect turn until the human answers. No timer or status polling is
 involved. Esc cancels only the wait subscription, not the run. A pending action
 takes priority over queued progress and records its `published_version`: an
 older-version reconnect re-delivers it, while a same-version repeat is rejected
-until the action is resolved. Queued progress, including every active Reviewer
-response event, is delivered before a retained terminal result.
+until the action is resolved. Queued worker progress remains retained while the
+run is nonterminal. A terminal snapshot supersedes it and carries final worker
+evidence, so the final Reviewer result, derived task completion, and successful
+terminal transition produce one terminal wakeup; abnormal terminal transitions
+also return immediately.
 `session_status` is for an explicit human progress query only; it exposes the
 bounded concurrent active-worker list, session-level Reviewer bindings,
 current-generation Reviewer results, and clarification counts, not response

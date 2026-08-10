@@ -7,7 +7,8 @@ use super::peer::{
 };
 use super::protocol::{
     ActionName, CallerAuth, ClarificationPage, ControlAction, ControlErrorCode, ControlRequest,
-    ControlResponse, ControlResult, canonical_action_set, parse_canonical_action_set,
+    ControlResponse, ControlResult, SessionProgressEvent, canonical_action_set,
+    parse_canonical_action_set,
 };
 use super::registration::{
     REGISTRATION_REFUSAL_GENERIC, RegistrationAction, RegistrationCaller, RegistrationRequest,
@@ -236,6 +237,35 @@ trait SupervisorBackend: Send {
     fn poll_once(&mut self) -> Result<()>;
 
     fn shutdown(&mut self) -> Result<()>;
+}
+
+fn wait_progress_event_after(
+    supervisor: &dyn SupervisorBackend,
+    run_id: &str,
+    after_sequence: u32,
+) -> Result<Option<SessionProgressEvent>> {
+    let mut cursor = after_sequence;
+    loop {
+        let Some(event) = supervisor.progress_event_after(run_id, cursor)? else {
+            return Ok(None);
+        };
+        let sequence = event.sequence();
+        if sequence <= cursor {
+            bail!("session progress sequence did not advance");
+        }
+        match event {
+            worker_event @ SessionProgressEvent::ReviewRequested { .. }
+            | worker_event @ SessionProgressEvent::ReviewResponded { .. } => {
+                return Ok(Some(worker_event));
+            }
+            SessionProgressEvent::TaskCompleted { .. } => {
+                // TaskCompleted is retained as bounded run evidence, but it is
+                // derived from a Reviewer response and must never wake the
+                // Architect again.
+                cursor = sequence;
+            }
+        }
+    }
 }
 
 impl SupervisorBackend for TaskLaneSupervisor {
@@ -683,10 +713,11 @@ impl SessionSupervisorControl {
                 ),
             );
         }
-        let progress_event = match self
-            .supervisor
-            .progress_event_after(run_id, *after_progress_sequence)
-        {
+        let progress_event = match wait_progress_event_after(
+            self.supervisor.as_ref(),
+            run_id,
+            *after_progress_sequence,
+        ) {
             Ok(event) => event,
             Err(_) => {
                 return write_response(
@@ -718,6 +749,15 @@ impl SessionSupervisorControl {
                 ),
             );
         }
+        if snapshot.state.is_terminal() {
+            return write_response(
+                &mut stream,
+                &ControlResponse::success(
+                    &request.request_id,
+                    ControlResult::Session { session: snapshot },
+                ),
+            );
+        }
         if let Some(event) = progress_event {
             return write_response(
                 &mut stream,
@@ -728,15 +768,6 @@ impl SessionSupervisorControl {
                         session_version: snapshot.version,
                         event,
                     },
-                ),
-            );
-        }
-        if snapshot.state.is_terminal() {
-            return write_response(
-                &mut stream,
-                &ControlResponse::success(
-                    &request.request_id,
-                    ControlResult::Session { session: snapshot },
                 ),
             );
         }
@@ -803,10 +834,11 @@ impl SessionSupervisorControl {
             return;
         }
         let progress_event = match self.pending_wait.as_ref() {
-            Some(wait) => match self
-                .supervisor
-                .progress_event_after(&wait.run_id, wait.after_progress_sequence)
-            {
+            Some(wait) => match wait_progress_event_after(
+                self.supervisor.as_ref(),
+                &wait.run_id,
+                wait.after_progress_sequence,
+            ) {
                 Ok(event) => event,
                 Err(_) => {
                     let Some(mut wait) = self.pending_wait.take() else {
@@ -835,6 +867,11 @@ impl SessionSupervisorControl {
             return;
         };
         let result = if snapshot.pending_architect_action.is_some() {
+            ControlResult::Session { session: snapshot }
+        } else if snapshot.state.is_terminal() {
+            // A terminal snapshot contains the final worker evidence. Prefer
+            // it over queued progress so the final Reviewer response and the
+            // derived task completion cannot cause multiple model wakeups.
             ControlResult::Session { session: snapshot }
         } else if let Some(event) = progress_event {
             ControlResult::Progress {
@@ -1817,8 +1854,12 @@ mod tests {
     }
 
     fn review_requested_event() -> crate::control_api::SessionProgressEvent {
+        review_requested_event_at(1)
+    }
+
+    fn review_requested_event_at(sequence: u32) -> crate::control_api::SessionProgressEvent {
         crate::control_api::SessionProgressEvent::ReviewRequested {
-            sequence: 1,
+            sequence,
             task_ordinal: 0,
             task_key: "wait-task".into(),
             completed_tasks: 0,
@@ -1832,6 +1873,49 @@ mod tests {
             task_selector: "FBTC-03".into(),
             clarification_record_count: 0,
             reviewer_bindings: Vec::new(),
+        }
+    }
+
+    fn review_responded_event(sequence: u32) -> crate::control_api::SessionProgressEvent {
+        crate::control_api::SessionProgressEvent::ReviewResponded {
+            sequence,
+            task_ordinal: 0,
+            task_key: "wait-task".into(),
+            completed_tasks: 0,
+            total_tasks: 1,
+            review_round: 1,
+            review_generation: 1,
+            max_review_rounds: 7,
+            reviewer_id: crate::worker::profile::ReviewerId::Reviewer1,
+            reviewer_verdict: crate::control_api::ReviewerVerdict::Lgtm,
+            developer_final_path: "/artifacts/developer/native-final.partial".into(),
+            reviewer_final_message_paths: vec!["/artifacts/reviewer/native-final.partial".into()],
+            responses_received: 1,
+            responses_expected: 1,
+        }
+    }
+
+    fn task_completed_event(sequence: u32) -> crate::control_api::SessionProgressEvent {
+        crate::control_api::SessionProgressEvent::TaskCompleted {
+            sequence,
+            task_ordinal: 0,
+            task_key: "wait-task".into(),
+            completed_tasks: 1,
+            total_tasks: 1,
+            review_round: 1,
+            review_generation: 1,
+            max_review_rounds: 7,
+            outcome: crate::control_api::TaskCompletionOutcome::Lgtm,
+            developer_final_path: "/artifacts/developer/native-final.partial".into(),
+            reviewers: vec![crate::control_api::ReviewerResultSnapshot {
+                reviewer_id: crate::worker::profile::ReviewerId::Reviewer1,
+                session_bound: true,
+                current_generation: Some(1),
+                current_verdict: Some(crate::control_api::ReviewerVerdict::Lgtm),
+                current_final_message_paths: vec![
+                    "/artifacts/reviewer/native-final.partial".into(),
+                ],
+            }],
         }
     }
 
@@ -1920,7 +2004,7 @@ mod tests {
     }
 
     #[test]
-    fn a_progress_event_releases_an_already_pending_wait() {
+    fn a_worker_result_releases_an_already_pending_wait() {
         let (mut control, caller, _) =
             fake_wait_control(crate::control_api::SessionState::Running, 7, false);
         let mut client = serve_wait(
@@ -1952,6 +2036,65 @@ mod tests {
     }
 
     #[test]
+    fn status_and_derived_task_completion_do_not_release_wait_but_worker_return_does() {
+        let (mut control, caller, _) =
+            fake_wait_control(crate::control_api::SessionState::Running, 7, false);
+        let mut client = serve_wait(
+            &mut control,
+            &wait_request_after(caller, "wait-before-derived-progress", 7, 0),
+        );
+        assert!(control.pending_wait.is_some());
+
+        let mut snapshot = control.supervisor.snapshot();
+        snapshot.version = 8;
+        control.supervisor = Box::new(FakeSupervisor {
+            startup: control.supervisor.startup().clone(),
+            snapshot,
+            progress_events: Vec::new(),
+            fail_poll: false,
+        });
+        control.service_pending_wait();
+        assert!(
+            control.pending_wait.is_some(),
+            "a running status publication must not wake the Architect"
+        );
+
+        let snapshot = control.supervisor.snapshot();
+        control.supervisor = Box::new(FakeSupervisor {
+            startup: control.supervisor.startup().clone(),
+            snapshot,
+            progress_events: vec![task_completed_event(1)],
+            fail_poll: false,
+        });
+        control.service_pending_wait();
+        assert!(
+            control.pending_wait.is_some(),
+            "derived task completion must not wake the Architect"
+        );
+
+        let snapshot = control.supervisor.snapshot();
+        control.supervisor = Box::new(FakeSupervisor {
+            startup: control.supervisor.startup().clone(),
+            snapshot,
+            progress_events: vec![task_completed_event(1), review_requested_event_at(2)],
+            fail_poll: false,
+        });
+        control.service_pending_wait();
+
+        assert!(control.pending_wait.is_none());
+        let frame = read_response_frame(&mut client).unwrap();
+        let response: ControlResponse = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(
+            response.result,
+            Some(ControlResult::Progress {
+                run_id: "run-wait-test".into(),
+                session_version: 8,
+                event: review_requested_event_at(2),
+            })
+        );
+    }
+
+    #[test]
     fn invalidated_pending_progress_cursor_returns_the_closed_conflict() {
         let (mut control, caller, _) =
             fake_wait_control(crate::control_api::SessionState::Running, 7, false);
@@ -1978,7 +2121,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_action_precedes_progress_and_progress_precedes_terminal() {
+    fn pending_action_precedes_worker_return() {
         let (mut action_control, action_caller, _) =
             fake_wait_control(crate::control_api::SessionState::Running, 9, true);
         let snapshot = action_control.supervisor.snapshot();
@@ -1998,42 +2141,65 @@ mod tests {
             panic!("pending Architect action must take priority")
         };
         assert!(session.pending_architect_action.is_some());
+    }
 
-        let (mut terminal_control, terminal_caller, _) =
-            fake_wait_control(crate::control_api::SessionState::Completed, 11, false);
-        let snapshot = terminal_control.supervisor.snapshot();
-        terminal_control.supervisor = Box::new(FakeSupervisor {
-            startup: terminal_control.supervisor.startup().clone(),
+    #[test]
+    fn terminal_coalesces_queued_worker_return_and_derived_completion() {
+        let (mut control, caller, _) =
+            fake_wait_control(crate::control_api::SessionState::Running, 7, false);
+        let mut client = serve_wait(
+            &mut control,
+            &wait_request_after(caller, "wait-before-terminal", 7, 0),
+        );
+        assert!(control.pending_wait.is_some());
+
+        let mut snapshot = control.supervisor.snapshot();
+        snapshot.version = 11;
+        snapshot.state = crate::control_api::SessionState::Completed;
+        snapshot.terminal_detail = Some("all tasks completed".into());
+        snapshot.tasks[0].state = crate::control_api::TaskState::Lgtm;
+        control.supervisor = Box::new(FakeSupervisor {
+            startup: control.supervisor.startup().clone(),
             snapshot,
-            progress_events: vec![review_requested_event()],
+            progress_events: vec![review_responded_event(1), task_completed_event(2)],
             fail_poll: false,
         });
-        let mut progress_client = serve_wait(
-            &mut terminal_control,
-            &wait_request_after(
-                terminal_caller.clone(),
-                "wait-progress-before-terminal",
-                7,
-                0,
-            ),
+        control.service_pending_wait();
+
+        assert!(control.pending_wait.is_none());
+        let frame = read_response_frame(&mut client).unwrap();
+        let response: ControlResponse = serde_json::from_slice(&frame).unwrap();
+        let Some(ControlResult::Session { session }) = response.result else {
+            panic!("terminal snapshot must coalesce queued progress")
+        };
+        assert_eq!(session.state, crate::control_api::SessionState::Completed);
+        assert_eq!(session.version, 11);
+
+        let (mut replay_control, replay_caller, _) =
+            fake_wait_control(crate::control_api::SessionState::Completed, 11, false);
+        let replay_snapshot = replay_control.supervisor.snapshot();
+        replay_control.supervisor = Box::new(FakeSupervisor {
+            startup: replay_control.supervisor.startup().clone(),
+            snapshot: replay_snapshot,
+            progress_events: vec![review_responded_event(1), task_completed_event(2)],
+            fail_poll: false,
+        });
+        let mut replay_client = serve_wait(
+            &mut replay_control,
+            &wait_request_after(replay_caller, "wait-terminal-replay", 7, 0),
         );
-        let frame = read_response_frame(&mut progress_client).unwrap();
+        let frame = read_response_frame(&mut replay_client).unwrap();
         let response: ControlResponse = serde_json::from_slice(&frame).unwrap();
         assert!(matches!(
             response.result,
-            Some(ControlResult::Progress { .. })
+            Some(ControlResult::Session {
+                session: crate::control_api::SessionStatusSnapshot {
+                    state: crate::control_api::SessionState::Completed,
+                    version: 11,
+                    ..
+                }
+            })
         ));
-
-        let mut terminal_client = serve_wait(
-            &mut terminal_control,
-            &wait_request_after(terminal_caller, "wait-terminal-after-progress", 11, 1),
-        );
-        let frame = read_response_frame(&mut terminal_client).unwrap();
-        let response: ControlResponse = serde_json::from_slice(&frame).unwrap();
-        let Some(ControlResult::Session { session }) = response.result else {
-            panic!("terminal snapshot must follow drained progress")
-        };
-        assert_eq!(session.state, crate::control_api::SessionState::Completed);
     }
 
     #[test]

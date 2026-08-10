@@ -1172,10 +1172,17 @@ fn codex_control_mcp_overrides(
     // remains loaded, including every other MCP server, while a stale or
     // user-defined table under the reserved name cannot leave incompatible
     // transport fields merged into the control server.
+    //
+    // Keep these control tools out of Codex code mode. A long-running nested
+    // MCP call is hosted by a code-mode cell which periodically yields back to
+    // the model even though the underlying session_wait is still pending.
+    // Direct MCP exposure lets Codex own the one blocking tool call until hcom
+    // returns a real worker-result/action/terminal event, without changing
+    // code-mode behavior for any native or user-configured tool.
     let value = format!(
         "{prefix}={{ command = {command}, args = {args}, startup_timeout_sec = 10, \
          tool_timeout_sec = {CODEX_CONTROL_TOOL_TIMEOUT_SECS}, enabled = true, \
-         default_tools_approval_mode = \"approve\" }}"
+         default_tools_approval_mode = \"approve\", omit_tools_from = [\"code_mode\"] }}"
     );
     Ok(vec!["--config".into(), value])
 }
@@ -1519,7 +1526,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_native_argv_and_additive_mcp_overlay_remain_unchanged() {
+    fn codex_native_argv_keeps_only_hcom_control_tools_out_of_code_mode() {
         let (_temp, tools, context) = fixture_context(ArchitectAdapter::Codex, Vec::new());
         let profile = ArchitectInvocationProfile::Codex {
             profile: CodexInvocationProfile::architect_default(),
@@ -1547,6 +1554,21 @@ mod tests {
         let encoded = argv.join("\n");
         assert!(encoded.contains("mcp_servers.hcom_session_task_control={"));
         assert!(encoded.contains("default_tools_approval_mode = \"approve\""));
+        assert!(encoded.contains("omit_tools_from = [\"code_mode\"]"));
+        let control_override = argv
+            .windows(2)
+            .find_map(|pair| {
+                (pair[0] == "--config"
+                    && pair[1].starts_with("mcp_servers.hcom_session_task_control="))
+                .then_some(pair[1].as_str())
+            })
+            .unwrap();
+        let parsed: toml::Value = toml::from_str(control_override).unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["hcom_session_task_control"]["omit_tools_from"],
+            toml::Value::Array(vec![toml::Value::String("code_mode".into())])
+        );
+        assert!(!argv.iter().any(|argument| argument == "--disable"));
         assert!(!argv.iter().any(|argument| argument == "-"));
     }
 
