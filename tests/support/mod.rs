@@ -100,6 +100,67 @@ impl Hcom {
         }
     }
 
+    /// Add a fixture-owned Codex executable that supports only the version
+    /// probe used by ordinary hook setup. Version 0.130.0 selects the modern
+    /// `hooks` feature key while remaining below Codex's hook-trust boundary,
+    /// so these CLI smokes do not need the app-server hooks/list protocol.
+    ///
+    /// This is deliberately opt-in: real-tool fixtures and ordinary `Hcom`
+    /// callers retain the inherited PATH assembled by [`Hcom::new`].
+    pub fn with_codex_hook_probe(mut self) -> Self {
+        let probe_dir = self.root.path().join("codex-hook-probe");
+        fs::create_dir(&probe_dir).expect("create isolated Codex hook probe directory");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let probe = probe_dir.join("codex");
+            fs::write(
+                &probe,
+                b"#!/bin/sh\n\
+if [ \"$#\" -eq 3 ] && [ \"$1\" = \"--disable\" ] && [ \"$2\" = \"plugins\" ] && [ \"$3\" = \"--version\" ]; then\n\
+    printf '%s\\n' 'codex-cli 0.130.0'\n\
+    exit 0\n\
+fi\n\
+printf '%s\\n' 'fixture Codex supports only --disable plugins --version' >&2\n\
+exit 64\n",
+            )
+            .expect("write isolated Codex hook probe");
+            fs::set_permissions(&probe, fs::Permissions::from_mode(0o700))
+                .expect("make isolated Codex hook probe executable");
+        }
+
+        #[cfg(windows)]
+        {
+            let probe = probe_dir.join("codex.cmd");
+            fs::write(
+                &probe,
+                b"@echo off\r\n\
+if not \"%~1\"==\"--disable\" goto unsupported\r\n\
+if not \"%~2\"==\"plugins\" goto unsupported\r\n\
+if not \"%~3\"==\"--version\" goto unsupported\r\n\
+if not \"%~4\"==\"\" goto unsupported\r\n\
+echo codex-cli 0.130.0\r\n\
+exit /b 0\r\n\
+:unsupported\r\n\
+echo fixture Codex supports only --disable plugins --version 1>&2\r\n\
+exit /b 64\r\n",
+            )
+            .expect("write isolated Codex hook probe");
+        }
+
+        let mut path_entries = vec![probe_dir];
+        path_entries.extend(std::env::split_paths(&self.path_env));
+        self.path_env =
+            std::env::join_paths(path_entries).expect("prepend isolated Codex hook probe to PATH");
+        self
+    }
+
+    pub fn isolated_path(&self) -> &OsStr {
+        &self.path_env
+    }
+
     pub fn path(&self) -> &Path {
         &self.hcom_dir
     }

@@ -132,7 +132,7 @@ fn unrelated_direct_codex_and_claude_hooks_ignore_other_hcom_instances() {
 
 #[test]
 fn direct_codex_and_claude_require_explicit_hcom_start_to_bind() {
-    let h = Hcom::new();
+    let h = Hcom::new().with_codex_hook_probe();
 
     let claude_start = run_explicit_start(&h, "CLAUDECODE", "1");
     assert!(
@@ -240,7 +240,7 @@ fn direct_codex_and_claude_require_explicit_hcom_start_to_bind() {
 
 #[test]
 fn direct_codex_and_claude_bind_from_delayed_transcript_marker() {
-    let h = Hcom::new();
+    let h = Hcom::new().with_codex_hook_probe();
 
     let claude_start = run_explicit_start(&h, "CLAUDECODE", "1");
     assert!(
@@ -356,6 +356,50 @@ fn fixture_drop_terminates_registered_process_group() {
 }
 
 #[test]
+fn codex_hook_probe_is_opt_in_and_precedes_the_ambient_path() {
+    let plain = Hcom::new();
+    let plain_path: Vec<_> = std::env::split_paths(plain.isolated_path()).collect();
+    let mut expected_plain_path = Vec::new();
+    if let Some(parent) = std::path::Path::new(env!("CARGO_BIN_EXE_hcom")).parent() {
+        expected_plain_path.push(parent.to_path_buf());
+    }
+    if let Some(inherited) = std::env::var_os("PATH") {
+        expected_plain_path.extend(std::env::split_paths(&inherited));
+    }
+    assert_eq!(
+        plain_path, expected_plain_path,
+        "an unopted fixture must preserve Hcom::new's original PATH"
+    );
+
+    let opted = Hcom::new().with_codex_hook_probe();
+    let opted_path: Vec<_> = std::env::split_paths(opted.isolated_path()).collect();
+    assert_eq!(
+        opted_path.first(),
+        Some(&opted.root_path().join("codex-hook-probe")),
+        "the fixture probe must precede every ambient PATH entry"
+    );
+    assert_eq!(
+        &opted_path[1..],
+        plain_path.as_slice(),
+        "opting in must only prepend the fixture-owned probe"
+    );
+    assert!(opted.home.starts_with(opted.root_path()));
+    assert!(opted.codex_home.starts_with(opted.root_path()));
+
+    let output = opted
+        .external_cmd("codex")
+        .args(["--disable", "plugins", "--version"])
+        .output()
+        .expect("run isolated Codex hook probe");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "codex-cli 0.130.0"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn top_level_help_preserves_retained_commands_and_omits_stale_commands() {
     let h = Hcom::new();
     let (code, stdout, _stderr) = h.run(["--help"]);
@@ -413,13 +457,13 @@ fn fork_version_help_and_status_use_human_visible_version() {
 
     let (code, stdout, stderr) = h.run(["--version"]);
     assert_eq!(code, 0);
-    assert_eq!(stdout, "hcom 1.0.27\n");
+    assert_eq!(stdout, "hcom 1.0.28\n");
     assert!(stderr.is_empty(), "stderr={stderr}");
 
     let (code, stdout, stderr) = h.run(["--help"]);
     assert_eq!(code, 0, "stderr={stderr}");
     assert!(
-        stdout.starts_with("hcom (hook-comms) v1.0.27 "),
+        stdout.starts_with("hcom (hook-comms) v1.0.28 "),
         "stdout={stdout}"
     );
     assert!(
@@ -430,14 +474,14 @@ fn fork_version_help_and_status_use_human_visible_version() {
 
     let (code, stdout, stderr) = h.run(["status"]);
     assert_eq!(code, 0, "stderr={stderr}");
-    assert_eq!(stdout.lines().next(), Some("hcom 1.0.27"));
+    assert_eq!(stdout.lines().next(), Some("hcom 1.0.28"));
     assert!(stderr.is_empty(), "stderr={stderr}");
 
     let (code, stdout, stderr) = h.run(["status", "--json"]);
     assert_eq!(code, 0, "stderr={stderr}");
     assert!(stderr.is_empty(), "stderr={stderr}");
     let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(status["version"]["current"], "1.0.27");
+    assert_eq!(status["version"]["current"], "1.0.28");
     assert!(status["version"]["latest"].is_null());
     assert_eq!(status["version"]["update_available"], false);
     assert!(status["version"]["update_cmd"].is_null());
@@ -1089,7 +1133,7 @@ fn events_empty_in_fresh_dir() {
 #[cfg(unix)]
 #[test]
 fn hook_only_codex_review_delivers_lgtm_without_a_new_user_prompt() {
-    let h = Hcom::new();
+    let h = Hcom::new().with_codex_hook_probe();
     let (hooks_code, hooks_stdout, hooks_stderr) = h.run(["hooks", "add", "codex"]);
     assert_eq!(hooks_code, 0, "stdout={hooks_stdout} stderr={hooks_stderr}");
 
@@ -1308,7 +1352,7 @@ fn hook_only_codex_review_delivers_lgtm_without_a_new_user_prompt() {
 #[cfg(unix)]
 #[test]
 fn tagged_interactive_review_request_changes_fixed_and_lgtm() {
-    let h = Hcom::new();
+    let h = Hcom::new().with_codex_hook_probe();
     let (hooks_code, hooks_stdout, hooks_stderr) = h.run(["hooks", "add", "codex"]);
     assert_eq!(hooks_code, 0, "stdout={hooks_stdout} stderr={hooks_stderr}");
     let developer_process = "tagged-review-developer-process";
