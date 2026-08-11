@@ -5716,14 +5716,26 @@ mod tests {
     }
 
     fn drive_terminal(supervisor: &mut TaskLaneSupervisor) -> SessionStatusSnapshot {
-        for _ in 0..64 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
             supervisor.poll_once().unwrap();
             let snapshot = supervisor.snapshot();
             if snapshot.state.is_terminal() {
                 return snapshot;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scripted exec worker supervisor did not become terminal before the bounded \
+                 deadline; current_state={:?} version={} current_task_ordinal={:?} \
+                 active_lanes={:?} pending_github_effect={}",
+                snapshot.state,
+                snapshot.version,
+                snapshot.current_task_ordinal,
+                supervisor.active.keys().collect::<Vec<_>>(),
+                supervisor.pending_github_effect.is_some(),
+            );
+            std::thread::yield_now();
         }
-        panic!("scripted exec worker supervisor did not become terminal");
     }
 
     fn apply_mutation(repository: &Path, mutation: Mutation) -> Result<()> {
@@ -5962,6 +5974,53 @@ mod tests {
                 .read_dir()
                 .unwrap()
                 .any(|entry| entry.is_ok())
+        );
+    }
+
+    #[test]
+    fn terminal_driver_tolerates_more_than_one_fixed_poll_burst() {
+        let fixture = Fixture::new();
+        let audit = Arc::new(Mutex::new(Audit::default()));
+        let delayed_developer = std::iter::repeat_n(
+            RuntimeTurnPoll::Pending {
+                telemetry: RuntimeTelemetry::default(),
+            },
+            128,
+        )
+        .chain([ready("scheduled-after-poll-burst")]);
+        let script = task_script(
+            "scheduled-terminal",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    delayed_developer,
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [lgtm("scheduled-terminal-lgtm")],
+                ),
+            ],
+            vec![Mutation::None; 2],
+        );
+        let mut supervisor = fixture.supervisor(vec![script], Arc::clone(&audit));
+        start(
+            &mut supervisor,
+            vec![fixture.task("scheduled-terminal", &["src"], 2)],
+        );
+
+        let snapshot = drive_terminal(&mut supervisor);
+        assert_eq!(snapshot.state, SessionState::Completed);
+        assert!(
+            audit
+                .lock()
+                .unwrap()
+                .lane_events
+                .iter()
+                .filter(|event| matches!(event, ScriptedLaneEvent::TurnPolled(_)))
+                .count()
+                > 64
         );
     }
 

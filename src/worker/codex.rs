@@ -1559,7 +1559,8 @@ mod tests {
     use crate::control_api::WorkerRole;
     use crate::worker::environment::{ExecutionEnvironmentLease, WorkerEnvironmentIdentity};
     use crate::worker::{
-        HeartbeatControl, NativeSessionBinding, ProcessRunner, WorkerAdapter, prepare_create_turn,
+        HeartbeatControl, NativeSessionBinding, ProcessRunner, WorkerAdapter,
+        create_hermetic_git_facade, output_test_command_with_etxtbsy_retry, prepare_create_turn,
         prepare_resume_turn,
     };
     use std::os::unix::fs::PermissionsExt;
@@ -1618,7 +1619,7 @@ mod tests {
             write_executable(&codex, fake_codex_script());
             let bwrap = tools.join("bwrap");
             write_executable(&bwrap, fake_bwrap_script());
-            let git = fs::canonicalize(GIT_EXECUTABLE).unwrap();
+            let git = create_hermetic_git_facade(&tools, Path::new(GIT_EXECUTABLE), GIT_VERSION);
 
             git_ok(
                 &git,
@@ -3496,24 +3497,28 @@ printf '%s\n' '{"type":"turn.completed"}'
     }
 
     fn git_ok(git: &Path, workspace: &Path, args: &[&str]) {
-        let status = Command::new(git)
+        let mut command = Command::new(git);
+        command
             .args(args)
             .current_dir(workspace)
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .status()
-            .unwrap();
-        assert!(status.success(), "git fixture command failed: {args:?}");
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        let output = output_test_command_with_etxtbsy_retry(&mut command).unwrap();
+        assert!(
+            output.status.success(),
+            "git fixture command failed: {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn git_line(git: &Path, workspace: &Path, args: &[&str]) -> String {
-        let output = Command::new(git)
+        let mut command = Command::new(git);
+        command
             .args(args)
             .current_dir(workspace)
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .output()
-            .unwrap();
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        let output = output_test_command_with_etxtbsy_retry(&mut command).unwrap();
         assert!(output.status.success());
         String::from_utf8(output.stdout).unwrap().trim().into()
     }

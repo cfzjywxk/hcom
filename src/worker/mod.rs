@@ -55,6 +55,40 @@ pub use runtime::{
     TaskWorkerRuntime, WorkerLane,
 };
 
+/// Give production-style unit fixtures a stable Git identity while preserving
+/// the runner's real Git behavior for every operation other than `--version`.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn create_hermetic_git_facade(
+    directory: &std::path::Path,
+    real_git: &std::path::Path,
+    exact_version: &str,
+) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+
+    let real_git = std::fs::canonicalize(real_git).expect("resolve fixture Git executable");
+    let real_git = real_git.to_str().expect("fixture Git path is UTF-8");
+    let facade = directory.join("git");
+    let script = format!(
+        "#!/bin/sh\n\
+         set -eu\n\
+         if [ \"$#\" -eq 1 ] && [ \"$1\" = \"--version\" ]; then\n\
+             printf '%s\\n' {}\n\
+             exit 0\n\
+         fi\n\
+         exec {} \"$@\"\n",
+        shell_quote(exact_version),
+        shell_quote(real_git),
+    );
+    std::fs::write(&facade, script).expect("write fixture Git facade");
+    std::fs::set_permissions(&facade, std::fs::Permissions::from_mode(0o700))
+        .expect("make fixture Git facade executable");
+    std::fs::canonicalize(facade).expect("resolve fixture Git facade")
+}
+
 /// Unit tests create temporary executables while other test threads are
 /// concurrently forking helpers. A fork can briefly inherit another thread's
 /// still-open write descriptor and make Linux return ETXTBSY for an otherwise
@@ -80,13 +114,76 @@ pub(crate) fn spawn_test_command_with_etxtbsy_retry(
 }
 
 #[cfg(all(test, target_os = "linux"))]
+pub(crate) fn output_test_command_with_etxtbsy_retry(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Output> {
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    spawn_test_command_with_etxtbsy_retry(command)?.wait_with_output()
+}
+
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::spawn_test_command_with_etxtbsy_retry;
+    use super::{
+        create_hermetic_git_facade, output_test_command_with_etxtbsy_retry,
+        spawn_test_command_with_etxtbsy_retry,
+    };
     use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     use std::time::Duration;
+
+    #[test]
+    fn hermetic_git_facade_pins_version_and_transparently_delegates() {
+        let temp = tempfile::tempdir().unwrap();
+        let real_git = std::fs::canonicalize("/usr/bin/git").unwrap();
+        let expected_version = "git version fixture-contract";
+        let facade = create_hermetic_git_facade(temp.path(), &real_git, expected_version);
+
+        let mut version_command = Command::new(&facade);
+        version_command.arg("--version");
+        let version = output_test_command_with_etxtbsy_retry(&mut version_command).unwrap();
+        assert!(version.status.success());
+        assert_eq!(
+            String::from_utf8(version.stdout).unwrap(),
+            format!("{expected_version}\n")
+        );
+        assert!(version.stderr.is_empty());
+
+        let repository = temp.path().join("repository");
+        let mut init_command = Command::new(&facade);
+        init_command
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .arg(&repository);
+        let initialized = output_test_command_with_etxtbsy_retry(&mut init_command).unwrap();
+        assert!(
+            initialized.status.success(),
+            "fixture Git init failed: {}",
+            String::from_utf8_lossy(&initialized.stderr)
+        );
+
+        let run = |executable: &std::path::Path, arguments: &[&str]| {
+            let mut command = Command::new(executable);
+            command
+                .args(arguments)
+                .current_dir(&repository)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null");
+            output_test_command_with_etxtbsy_retry(&mut command).unwrap()
+        };
+        for arguments in [
+            &["rev-parse", "--show-toplevel"][..],
+            &["rev-parse", "--verify", "refs/heads/missing"][..],
+        ] {
+            let delegated = run(&facade, arguments);
+            let direct = run(&real_git, arguments);
+            assert_eq!(delegated.status.code(), direct.status.code());
+            assert_eq!(delegated.stdout, direct.stdout);
+            assert_eq!(delegated.stderr, direct.stderr);
+        }
+    }
 
     #[test]
     fn temporary_executable_spawn_retries_etxtbsy() {
