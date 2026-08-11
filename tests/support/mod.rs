@@ -494,6 +494,22 @@ impl Hcom {
         Ok(pid)
     }
 
+    pub fn instance_inject_port(&self, name: &str) -> Result<Option<i64>, String> {
+        let db_path = self.hcom_dir.join("hcom.db");
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let conn = rusqlite::Connection::open(&db_path)
+            .map_err(|e| format!("open {}: {e}", db_path.display()))?;
+        conn.query_row(
+            "SELECT port FROM notify_endpoints WHERE instance = ?1 AND kind = 'inject'",
+            [name],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| format!("query inject port for {name}: {e}"))
+    }
+
     pub fn track_cleanup_pid(&self, pid: i64) {
         if pid > 1 {
             self.cleanup_pids.borrow_mut().insert(pid);

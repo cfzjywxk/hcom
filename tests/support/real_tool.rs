@@ -151,6 +151,236 @@ pub fn require_pinned<C: ToolCase>(h: &Hcom, case: &C) {
     }
 }
 
+const ENDPOINT_RETRY_LIMIT: usize = 160;
+const ENDPOINT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FixtureProcessState {
+    pub(crate) instance_present: bool,
+    pub(crate) process_bound: bool,
+    pub(crate) pid: Option<i64>,
+    pub(crate) process_alive: bool,
+    pub(crate) inject_port: Option<i64>,
+    pub(crate) status: Option<String>,
+    pub(crate) status_context: Option<String>,
+}
+
+impl FixtureProcessState {
+    fn can_retry(&self) -> bool {
+        self.instance_present && self.process_bound && self.pid.is_some() && self.process_alive
+    }
+}
+
+impl std::fmt::Display for FixtureProcessState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "instance_present={} process_bound={} pid={:?} process_alive={} inject_port={:?} status={:?} status_context={:?}",
+            self.instance_present,
+            self.process_bound,
+            self.pid,
+            self.process_alive,
+            self.inject_port,
+            self.status,
+            self.status_context,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointFailureKind {
+    Recoverable,
+    Fatal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EndpointAttemptError {
+    kind: EndpointFailureKind,
+    detail: String,
+}
+
+impl EndpointAttemptError {
+    fn recoverable(detail: impl Into<String>) -> Self {
+        Self {
+            kind: EndpointFailureKind::Recoverable,
+            detail: detail.into(),
+        }
+    }
+
+    fn fatal(detail: impl Into<String>) -> Self {
+        Self {
+            kind: EndpointFailureKind::Fatal,
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) fn from_command(stage: &str, code: i32, stdout: &str, stderr: &str) -> Self {
+        let output = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+        let kind = if output.contains("no inject port")
+            || output.contains("no response from")
+            || output.contains("connection refused")
+        {
+            EndpointFailureKind::Recoverable
+        } else {
+            EndpointFailureKind::Fatal
+        };
+        Self {
+            kind,
+            detail: format!(
+                "{stage} exited {code}: stdout={} stderr={}",
+                stdout.trim(),
+                stderr.trim()
+            ),
+        }
+    }
+}
+
+/// Retry a fixture-owned endpoint operation only while its registered instance
+/// remains both process-bound and alive. The attempt closure owns the readiness
+/// handshake, so each retry observes the current DB port instead of reusing the
+/// port from a prior successful screen query.
+pub(crate) fn retry_fixture_endpoint<T>(
+    description: &str,
+    max_attempts: usize,
+    deadline: Instant,
+    retry_interval: Duration,
+    mut attempt: impl FnMut() -> Result<T, EndpointAttemptError>,
+    mut inspect_process: impl FnMut() -> Result<FixtureProcessState, String>,
+) -> Result<T, String> {
+    assert!(max_attempts > 0, "endpoint retry limit must be positive");
+    let mut last_error = None;
+    let mut last_state = None;
+
+    for attempt_number in 1..=max_attempts {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error) if error.kind == EndpointFailureKind::Fatal => {
+                return Err(format!(
+                    "{description}: non-retryable endpoint failure on attempt {attempt_number}: {}",
+                    error.detail
+                ));
+            }
+            Err(error) => {
+                let state = inspect_process().map_err(|inspect_error| {
+                    format!(
+                        "{description}: could not verify fixture process after recoverable endpoint failure `{}`: {inspect_error}",
+                        error.detail
+                    )
+                })?;
+                if !state.can_retry() {
+                    return Err(format!(
+                        "{description}: endpoint failed but the fixture child is no longer process-bound/alive; failure={}; state={state}",
+                        error.detail
+                    ));
+                }
+                last_error = Some(error.detail);
+                last_state = Some(state);
+            }
+        }
+
+        if attempt_number == max_attempts || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(retry_interval);
+    }
+
+    Err(format!(
+        "{description}: recoverable endpoint never stabilized (stale port or prompt not ready); last_failure={}; last_state={}",
+        last_error.as_deref().unwrap_or("<none>"),
+        last_state
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "<none>".to_string())
+    ))
+}
+
+fn fixture_process_state(h: &Hcom, name: &str) -> Result<FixtureProcessState, String> {
+    let instance = h.instance_json(name)?;
+    let pid = h.instance_pid(name)?;
+    let process_alive = pid.is_some_and(|pid| h.process_group_alive(pid));
+    let process_bound = instance
+        .as_ref()
+        .and_then(|value| value.get("process_bound"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let status = instance
+        .as_ref()
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let status_context = instance
+        .as_ref()
+        .and_then(|value| value.get("status_context"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    Ok(FixtureProcessState {
+        instance_present: instance.is_some(),
+        process_bound,
+        pid,
+        process_alive,
+        inject_port: h.instance_inject_port(name)?,
+        status,
+        status_context,
+    })
+}
+
+fn attempt_prompt_submit(h: &Hcom, name: &str, prompt: &str) -> Result<(), EndpointAttemptError> {
+    let (screen_code, screen_stdout, screen_stderr) = h.run(["term", name, "--json"]);
+    if screen_code != 0 {
+        return Err(EndpointAttemptError::from_command(
+            "screen handshake",
+            screen_code,
+            &screen_stdout,
+            &screen_stderr,
+        ));
+    }
+    let screen: Value = serde_json::from_str(screen_stdout.trim()).map_err(|error| {
+        EndpointAttemptError::fatal(format!(
+            "screen handshake returned invalid JSON: {error}; stdout={} stderr={}",
+            screen_stdout.trim(),
+            screen_stderr.trim()
+        ))
+    })?;
+    let ready = screen.get("ready").and_then(Value::as_bool) == Some(true);
+    let prompt_empty = screen.get("prompt_empty").and_then(Value::as_bool) == Some(true);
+    let input_text = screen
+        .get("input_text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    let (stage, argv) = if input_text == prompt {
+        (
+            "submit recovered draft",
+            vec!["term", "inject", name, "--enter", "--force"],
+        )
+    } else if input_text.is_empty() && (ready || prompt_empty) {
+        (
+            "inject prompt",
+            vec!["term", "inject", name, prompt, "--enter", "--force"],
+        )
+    } else if input_text.is_empty() || prompt.starts_with(input_text) {
+        return Err(EndpointAttemptError::recoverable(format!(
+            "screen handshake connected but prompt is not ready: ready={ready} prompt_empty={prompt_empty} input_len={}",
+            input_text.len()
+        )));
+    } else {
+        return Err(EndpointAttemptError::fatal(format!(
+            "screen handshake found an unexpected fixture draft; expected_len={} actual_len={} ready={ready} prompt_empty={prompt_empty}",
+            prompt.len(),
+            input_text.len()
+        )));
+    };
+
+    let (code, stdout, stderr) = h.run(argv);
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(EndpointAttemptError::from_command(
+            stage, code, &stdout, &stderr,
+        ))
+    }
+}
+
 /// Inject a prompt until the tool accepts it, then wait for the resulting proof.
 ///
 /// `term --json` reports `ready:true` from the PTY ready pattern, but a TUI can
@@ -172,20 +402,15 @@ pub fn inject_prompt_until(
     let inject_deadline = Instant::now() + Duration::from_secs(40);
     let mut prompt_attempts = 0;
     while prompt_attempts < 5 && Instant::now() < inject_deadline {
-        let (code, stdout, stderr) = h.run(["term", "inject", name, prompt, "--enter", "--force"]);
-        if code != 0 {
-            let retryable = stdout.contains("No inject port")
-                || stdout.contains("No response from")
-                || stderr.contains("No inject port")
-                || stderr.contains("No response from");
-            if retryable {
-                std::thread::sleep(Duration::from_millis(250));
-                continue;
-            }
-            assert_eq!(
-                code, 0,
-                "{description}: inject failed: stdout={stdout} stderr={stderr}"
-            );
+        if let Err(error) = retry_fixture_endpoint(
+            description,
+            ENDPOINT_RETRY_LIMIT,
+            inject_deadline,
+            ENDPOINT_RETRY_INTERVAL,
+            || attempt_prompt_submit(h, name, prompt),
+            || fixture_process_state(h, name),
+        ) {
+            panic!("{error}\n{}", h.diagnostics());
         }
         prompt_attempts += 1;
         let deadline = Instant::now() + Duration::from_secs(20);
