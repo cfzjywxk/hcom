@@ -382,7 +382,8 @@ impl ProductionGitHubProvider {
                 &self.config.repository,
                 role,
                 unix_time(now)?,
-            )?;
+            )
+            .with_context(|| format!("{} GitHub App bootstrap preflight failed", role.as_str()))?;
             let repository: RepositoryObservation = self.client.get(
                 RestEndpoint::Repository {
                     owner: self.config.owner.clone(),

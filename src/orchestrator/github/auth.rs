@@ -103,6 +103,62 @@ impl fmt::Debug for AppJwt {
     }
 }
 
+/// A metadata-only installation token used just long enough to enumerate the
+/// installation's repository selection. It cannot authenticate any other REST
+/// endpoint and becomes an exact-repository token only after that list proves
+/// there is one positive repository ID.
+pub(crate) struct BootstrapInstallationToken {
+    token: SecretText,
+    expires_at_unix: i64,
+    role: GitHubAppRole,
+}
+
+impl BootstrapInstallationToken {
+    fn from_secret_github_response(
+        token: SecretText,
+        expires_at: &str,
+        role: GitHubAppRole,
+        now_unix: i64,
+    ) -> Result<Self> {
+        if !InstallationOperation::RepositoryMetadata.permits_role(role) {
+            bail!("GitHub bootstrap token role does not permit repository metadata");
+        }
+        Ok(Self {
+            token,
+            expires_at_unix: validated_installation_expiry(expires_at, now_unix)?,
+            role,
+        })
+    }
+
+    pub(super) fn expose(&self) -> &str {
+        self.token.expose()
+    }
+
+    fn into_repository_token(self, repository_id: u64) -> Result<InstallationToken> {
+        if repository_id == 0 {
+            bail!("GitHub installation token repository ID must be positive");
+        }
+        Ok(InstallationToken {
+            token: self.token,
+            expires_at_unix: self.expires_at_unix,
+            repository_id,
+            role: self.role,
+            operation: InstallationOperation::RepositoryMetadata,
+        })
+    }
+}
+
+impl fmt::Debug for BootstrapInstallationToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BootstrapInstallationToken")
+            .field("token", &"[redacted]")
+            .field("expires_at_unix", &self.expires_at_unix)
+            .field("role", &self.role)
+            .finish()
+    }
+}
+
 /// One exact-repository installation token. The returned expiry is retained
 /// as an authoritative bound and the token bytes are zeroized at drop.
 pub(crate) struct InstallationToken {
@@ -160,21 +216,7 @@ impl InstallationToken {
         if !operation.permits_role(role) {
             bail!("GitHub installation token role does not permit the operation");
         }
-        if now_unix < 0 {
-            bail!("system clock is before the Unix epoch");
-        }
-        let expires_at_unix = DateTime::parse_from_rfc3339(expires_at)
-            .map_err(|_| anyhow!("GitHub installation token expiry is not valid RFC 3339"))?
-            .timestamp();
-        if expires_at_unix <= now_unix.saturating_add(TOKEN_REFRESH_MARGIN_SECONDS) {
-            bail!("GitHub installation token expires inside the refresh safety margin");
-        }
-        // GitHub currently returns one-hour tokens. A two-hour ceiling avoids
-        // accidentally retaining an unbounded credential if a response is
-        // malformed or the remote contract changes.
-        if expires_at_unix > now_unix.saturating_add(7_200) {
-            bail!("GitHub installation token expiry exceeds the bounded lifetime");
-        }
+        let expires_at_unix = validated_installation_expiry(expires_at, now_unix)?;
         Ok(Self {
             token,
             expires_at_unix,
@@ -210,6 +252,25 @@ impl InstallationToken {
     pub(crate) fn git_credential(&self) -> Result<GitCredential> {
         GitCredential::new(self.expose().as_bytes().to_vec())
     }
+}
+
+fn validated_installation_expiry(expires_at: &str, now_unix: i64) -> Result<i64> {
+    if now_unix < 0 {
+        bail!("system clock is before the Unix epoch");
+    }
+    let expires_at_unix = DateTime::parse_from_rfc3339(expires_at)
+        .map_err(|_| anyhow!("GitHub installation token expiry is not valid RFC 3339"))?
+        .timestamp();
+    if expires_at_unix <= now_unix.saturating_add(TOKEN_REFRESH_MARGIN_SECONDS) {
+        bail!("GitHub installation token expires inside the refresh safety margin");
+    }
+    // GitHub currently returns one-hour tokens. A two-hour ceiling avoids
+    // accidentally retaining an unbounded credential if a response is
+    // malformed or the remote contract changes.
+    if expires_at_unix > now_unix.saturating_add(7_200) {
+        bail!("GitHub installation token expiry exceeds the bounded lifetime");
+    }
+    Ok(expires_at_unix)
 }
 
 struct SecretText(Zeroizing<String>);
@@ -393,6 +454,19 @@ struct InstallationTokenResponse {
 }
 
 #[derive(Deserialize)]
+struct BootstrapInstallationTokenResponse {
+    token: SecretText,
+    expires_at: String,
+    permissions: BTreeMap<String, GitHubPermissionLevel>,
+}
+
+#[derive(Deserialize)]
+struct InstallationRepositoriesResponse {
+    total_count: u64,
+    repositories: Vec<TokenRepository>,
+}
+
+#[derive(Deserialize)]
 struct TokenRepository {
     id: u64,
 }
@@ -434,12 +508,12 @@ pub(crate) fn mint_installation_token(
     )
 }
 
-/// Bootstrap an unscoped metadata token before the numeric repository ID is
-/// known. Omitting repository selectors makes GitHub report the installation's
-/// complete repository selection; that response must contain exactly one
-/// repository. The configured owner/name is then read with this token and must
-/// resolve to that same ID. Every later token is scoped by the frozen numeric
-/// ID.
+/// Bootstrap a metadata-only token before the numeric repository ID is known.
+/// GitHub does not include `repositories` in an unscoped token response, so the
+/// token may authenticate only the bounded installation-repositories endpoint.
+/// That listing must contain exactly one repository. The configured owner/name
+/// is then read with the resulting exact-repository token and must resolve to
+/// that same ID. Every later token is scoped by the frozen numeric ID.
 pub(crate) fn mint_bootstrap_repository_token(
     client: &super::client::GitHubRestClient,
     jwt: &AppJwt,
@@ -453,9 +527,9 @@ pub(crate) fn mint_bootstrap_repository_token(
     }
     super::validate_slug("GitHub bootstrap repository", repository)?;
     let request = BootstrapInstallationTokenRequest {
-        permissions: BTreeMap::new(),
+        permissions: BTreeMap::from([("metadata".into(), GitHubPermissionLevel::Read)]),
     };
-    let response: InstallationTokenResponse = client
+    let response: BootstrapInstallationTokenResponse = client
         .send_json(
             super::client::RestEndpoint::CreateInstallationToken { installation_id },
             super::client::GitHubAuthentication::App(jwt),
@@ -463,23 +537,32 @@ pub(crate) fn mint_bootstrap_repository_token(
         )
         .map_err(anyhow::Error::new)
         .context("bounded GitHub bootstrap-token request failed")?;
-    let repository_id = exact_bootstrap_repository_id(&response)?;
-    if !matches_requested_permissions(&response.permissions, &BTreeMap::new()) {
-        bail!("GitHub bootstrap token permissions exceed metadata-only access");
+    if response.permissions != request.permissions {
+        bail!("GitHub bootstrap token permissions differ from metadata-only access");
     }
-    let token = InstallationToken::from_secret_github_response(
+    let bootstrap = BootstrapInstallationToken::from_secret_github_response(
         response.token,
         &response.expires_at,
-        repository_id,
         role,
-        InstallationOperation::RepositoryMetadata,
         now_unix,
     )?;
+    let repositories: InstallationRepositoriesResponse = client
+        .get(
+            super::client::RestEndpoint::InstallationRepositories,
+            super::client::GitHubAuthentication::BootstrapInstallation(&bootstrap),
+        )
+        .map_err(anyhow::Error::new)
+        .context("bounded GitHub installation-repositories request failed")?;
+    let repository_id = exact_bootstrap_repository_id(&repositories)?;
+    let token = bootstrap.into_repository_token(repository_id)?;
     Ok((token, repository_id))
 }
 
-fn exact_bootstrap_repository_id(response: &InstallationTokenResponse) -> Result<u64> {
-    if response.repositories.len() != 1 || response.repositories[0].id == 0 {
+fn exact_bootstrap_repository_id(response: &InstallationRepositoriesResponse) -> Result<u64> {
+    if response.total_count != 1
+        || response.repositories.len() != 1
+        || response.repositories[0].id == 0
+    {
         bail!("GitHub App installation must select only one exact repository");
     }
     Ok(response.repositories[0].id)
@@ -931,20 +1014,158 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_token_omits_downscoping_and_rejects_multi_repository_installations() {
+    fn bootstrap_token_requests_metadata_and_lists_the_exact_installation_repository() {
+        struct FakeSigner;
+        impl SignOnlyRs256 for FakeSigner {
+            fn sign_rs256(&self, _message: &[u8]) -> Result<Vec<u8>> {
+                Ok(vec![7; 256])
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let response_bodies: [&[u8]; 2] = [
+                br#"{"token":"opaque bootstrap response value","expires_at":"1970-01-01T01:16:40Z","repository_selection":"selected","permissions":{"metadata":"read"}}"#,
+                br#"{"total_count":1,"repositories":[{"id":99}]}"#,
+            ];
+            let mut requests = Vec::new();
+            for response_body in response_bodies {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut headers = String::new();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length: ")
+                    {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                    headers.push_str(&line);
+                }
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).unwrap();
+                write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    if requests.is_empty() {
+                        "201 Created"
+                    } else {
+                        "200 OK"
+                    },
+                    response_body.len()
+                )
+                .unwrap();
+                reader.get_mut().write_all(response_body).unwrap();
+                requests.push((headers, body));
+            }
+            requests
+        });
+        let client = super::super::client::GitHubRestClient::new_for_test(
+            reqwest::Url::parse(&format!("http://{address}/")).unwrap(),
+        )
+        .unwrap();
+        let jwt = mint_app_jwt(
+            &FakeSigner,
+            1,
+            UNIX_EPOCH + std::time::Duration::from_secs(1_000),
+        )
+        .unwrap();
+        let (token, repository_id) = mint_bootstrap_repository_token(
+            &client,
+            &jwt,
+            2,
+            "repo",
+            GitHubAppRole::Architect,
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(repository_id, 99);
+        assert_eq!(token.repository_id(), 99);
+        assert_eq!(token.role(), GitHubAppRole::Architect);
+        assert_eq!(token.operation(), InstallationOperation::RepositoryMetadata);
+        assert!(!format!("{token:?}").contains("opaque bootstrap"));
+
+        let requests = server.join().unwrap();
+        assert!(
+            requests[0]
+                .0
+                .starts_with("POST /app/installations/2/access_tokens HTTP/1.1\r\n")
+        );
+        let request_body: serde_json::Value = serde_json::from_slice(&requests[0].1).unwrap();
+        assert_eq!(
+            request_body,
+            serde_json::json!({"permissions":{"metadata":"read"}})
+        );
+        assert!(
+            requests[1]
+                .0
+                .starts_with("GET /installation/repositories?per_page=2&page=1 HTTP/1.1\r\n")
+        );
+        assert!(
+            requests[1]
+                .0
+                .contains("authorization: Bearer opaque bootstrap response value")
+        );
+        assert!(requests[1].1.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_repository_listing_rejects_ambiguous_or_invalid_selections() {
         let request = BootstrapInstallationTokenRequest {
-            permissions: BTreeMap::new(),
+            permissions: BTreeMap::from([("metadata".into(), GitHubPermissionLevel::Read)]),
         };
         assert_eq!(
             serde_json::to_value(&request).unwrap(),
-            serde_json::json!({"permissions": {}})
+            serde_json::json!({"permissions": {"metadata":"read"}})
         );
-        let response = InstallationTokenResponse {
-            token: SecretText::new("opaque bootstrap fixture".into()).unwrap(),
-            expires_at: "1970-01-01T01:16:40Z".into(),
+        let response = InstallationRepositoriesResponse {
+            total_count: 2,
             repositories: vec![TokenRepository { id: 99 }, TokenRepository { id: 100 }],
-            permissions: BTreeMap::from([("metadata".into(), GitHubPermissionLevel::Read)]),
         };
         assert!(exact_bootstrap_repository_id(&response).is_err());
+        let response = InstallationRepositoriesResponse {
+            total_count: 1,
+            repositories: Vec::new(),
+        };
+        assert!(exact_bootstrap_repository_id(&response).is_err());
+        let response = InstallationRepositoriesResponse {
+            total_count: 1,
+            repositories: vec![TokenRepository { id: 0 }],
+        };
+        assert!(exact_bootstrap_repository_id(&response).is_err());
+    }
+
+    #[test]
+    fn bootstrap_token_cannot_authenticate_repository_routes() {
+        let client = super::super::client::GitHubRestClient::new_for_test(
+            reqwest::Url::parse("http://127.0.0.1:9/").unwrap(),
+        )
+        .unwrap();
+        let token = BootstrapInstallationToken::from_secret_github_response(
+            SecretText::new("opaque bootstrap fixture".into()).unwrap(),
+            "1970-01-01T01:16:40Z",
+            GitHubAppRole::Architect,
+            1_000,
+        )
+        .unwrap();
+        let error = client
+            .get::<serde_json::Value>(
+                super::super::client::RestEndpoint::Repository {
+                    owner: "owner".into(),
+                    repository: "repo".into(),
+                },
+                super::super::client::GitHubAuthentication::BootstrapInstallation(&token),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            super::super::client::GitHubApiError::CredentialScope { .. }
+        ));
+        assert!(!format!("{error}").contains("opaque bootstrap"));
     }
 }

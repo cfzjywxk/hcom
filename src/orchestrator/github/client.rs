@@ -4,7 +4,7 @@
 //! with native roots, disables redirects, and applies per-request body/time
 //! bounds. Tests may replace only the origin while exercising this same code.
 
-use super::auth::{AppJwt, InstallationOperation, InstallationToken};
+use super::auth::{AppJwt, BootstrapInstallationToken, InstallationOperation, InstallationToken};
 use super::{validate_branch, validate_slug};
 use anyhow::{Result, anyhow, bail};
 use reqwest::Url;
@@ -71,6 +71,7 @@ pub(crate) enum RestEndpoint {
     CreateInstallationToken {
         installation_id: u64,
     },
+    InstallationRepositories,
     Repository {
         owner: String,
         repository: String,
@@ -164,6 +165,7 @@ impl RestEndpoint {
         match self {
             Self::AppIdentity
             | Self::RepositoryInstallation { .. }
+            | Self::InstallationRepositories
             | Self::Repository { .. }
             | Self::BotUser { .. }
             | Self::Reference { .. }
@@ -193,6 +195,7 @@ impl RestEndpoint {
             Self::CreateInstallationToken { .. } => {
                 "POST /app/installations/{installation_id}/access_tokens"
             }
+            Self::InstallationRepositories => "GET /installation/repositories",
             Self::Repository { .. } => "GET /repos/{owner}/{repo}",
             Self::BotUser { .. } => "GET /users/{bot}",
             Self::Reference { .. } => "GET /repos/{owner}/{repo}/git/ref/{ref}",
@@ -229,6 +232,7 @@ impl RestEndpoint {
             Self::DeleteReference { .. } => 204,
             Self::AppIdentity
             | Self::RepositoryInstallation { .. }
+            | Self::InstallationRepositories
             | Self::Repository { .. }
             | Self::BotUser { .. }
             | Self::Reference { .. }
@@ -269,6 +273,7 @@ impl RestEndpoint {
             | Self::CreatePullRequest { owner, repository }
             | Self::CreateCheckRun { owner, repository } => validate_repo(owner, repository),
             Self::CreateInstallationToken { installation_id } => validate_number(*installation_id),
+            Self::InstallationRepositories => Ok(()),
             Self::BotUser { login } => {
                 let slug = login
                     .strip_suffix("[bot]")
@@ -408,6 +413,9 @@ impl RestEndpoint {
                         .push(&installation_id.to_string())
                         .push("access_tokens");
                 }
+                Self::InstallationRepositories => {
+                    segments.push("installation").push("repositories");
+                }
                 Self::Repository { owner, repository } => push_repo(owner, repository),
                 Self::BotUser { login } => {
                     segments.push("users").push(login);
@@ -538,6 +546,11 @@ impl RestEndpoint {
             }
         }
         match self {
+            Self::InstallationRepositories => {
+                url.query_pairs_mut()
+                    .append_pair("per_page", "2")
+                    .append_pair("page", "1");
+            }
             Self::ListPullRequests {
                 head, base, page, ..
             } => {
@@ -598,7 +611,8 @@ impl RestEndpoint {
             Self::DeleteReference { .. } => operation == O::RemoteRefCleanup,
             Self::AppIdentity
             | Self::RepositoryInstallation { .. }
-            | Self::CreateInstallationToken { .. } => false,
+            | Self::CreateInstallationToken { .. }
+            | Self::InstallationRepositories => false,
         }
     }
 }
@@ -612,6 +626,7 @@ fn validate_qualified_ref(value: &str) -> Result<()> {
 
 pub(crate) enum GitHubAuthentication<'a> {
     App(&'a AppJwt),
+    BootstrapInstallation(&'a BootstrapInstallationToken),
     Installation(&'a InstallationToken),
 }
 
@@ -619,6 +634,10 @@ impl fmt::Debug for GitHubAuthentication<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::App(_) => formatter.write_str("GitHubAuthentication::App([redacted])"),
+            Self::BootstrapInstallation(token) => formatter
+                .debug_tuple("GitHubAuthentication::BootstrapInstallation")
+                .field(token)
+                .finish(),
             Self::Installation(token) => formatter
                 .debug_tuple("GitHubAuthentication::Installation")
                 .field(token)
@@ -957,6 +976,11 @@ impl GitHubRestClient {
                     return Err(GitHubApiError::CredentialScope { endpoint: template });
                 }
             }
+            GitHubAuthentication::BootstrapInstallation(_) => {
+                if !matches!(endpoint, RestEndpoint::InstallationRepositories) {
+                    return Err(GitHubApiError::CredentialScope { endpoint: template });
+                }
+            }
             GitHubAuthentication::Installation(token) => {
                 if !endpoint.accepts_installation_operation(token.operation()) {
                     return Err(GitHubApiError::CredentialScope { endpoint: template });
@@ -1031,6 +1055,9 @@ fn client_builder(https_only: bool) -> reqwest::blocking::ClientBuilder {
 fn auth_ref<'a>(auth: &'a GitHubAuthentication<'a>) -> GitHubAuthentication<'a> {
     match auth {
         GitHubAuthentication::App(jwt) => GitHubAuthentication::App(jwt),
+        GitHubAuthentication::BootstrapInstallation(token) => {
+            GitHubAuthentication::BootstrapInstallation(token)
+        }
         GitHubAuthentication::Installation(token) => GitHubAuthentication::Installation(token),
     }
 }
@@ -1038,6 +1065,7 @@ fn auth_ref<'a>(auth: &'a GitHubAuthentication<'a>) -> GitHubAuthentication<'a> 
 fn authorization_header(auth: &GitHubAuthentication<'_>) -> Result<HeaderValue> {
     let value = match auth {
         GitHubAuthentication::App(jwt) => jwt.expose(),
+        GitHubAuthentication::BootstrapInstallation(token) => token.expose(),
         GitHubAuthentication::Installation(token) => token.expose(),
     };
     let bearer = Zeroizing::new(format!("Bearer {value}"));
