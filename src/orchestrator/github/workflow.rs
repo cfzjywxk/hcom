@@ -63,7 +63,8 @@ use uuid::Uuid;
 const MERGE_POLL_INITIAL: Duration = Duration::from_secs(1);
 const MERGE_POLL_MAX: Duration = Duration::from_secs(30);
 const CANCEL_POLL: Duration = Duration::from_millis(100);
-const MUTATION_RETRY_ATTEMPTS: usize = 3;
+const MUTATION_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const MUTATION_RETRY_MAX: Duration = Duration::from_secs(30);
 const MUTATION_RETRY_WINDOW: Duration = Duration::from_secs(120);
 
 fn ruleset_attestation_for_policy(
@@ -2740,34 +2741,59 @@ fn retryable_read_delay(error: &anyhow::Error, fallback: Duration) -> Result<Opt
 }
 
 fn retry_safe_mutation<T>(
-    mut operation: impl FnMut() -> std::result::Result<T, PublicationError>,
+    operation: impl FnMut() -> std::result::Result<T, PublicationError>,
 ) -> Result<T> {
-    let deadline = Instant::now()
-        .checked_add(MUTATION_RETRY_WINDOW)
+    retry_safe_mutation_with_policy(
+        operation,
+        MUTATION_RETRY_WINDOW,
+        MUTATION_RETRY_INITIAL,
+        MUTATION_RETRY_MAX,
+        Instant::now,
+        std::thread::sleep,
+    )
+}
+
+fn retry_safe_mutation_with_policy<T>(
+    mut operation: impl FnMut() -> std::result::Result<T, PublicationError>,
+    retry_window: Duration,
+    initial_delay: Duration,
+    max_delay: Duration,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+) -> Result<T> {
+    if initial_delay.is_zero() || max_delay < initial_delay {
+        bail!("GitHub mutation retry policy is invalid");
+    }
+    let deadline = now()
+        .checked_add(retry_window)
         .ok_or_else(|| anyhow!("GitHub mutation retry deadline overflow"))?;
-    let mut fallback = MERGE_POLL_INITIAL;
-    for attempt in 0..MUTATION_RETRY_ATTEMPTS {
+    let mut fallback = initial_delay;
+    loop {
         match operation() {
             Ok(value) => return Ok(value),
-            Err(PublicationError::RetrySafe {
-                reason,
-                retry_after_seconds,
-                rate_limit_reset_unix,
-            }) if attempt + 1 < MUTATION_RETRY_ATTEMPTS => {
-                let delay =
-                    retry_delay(retry_after_seconds, rate_limit_reset_unix)?.unwrap_or(fallback);
-                let remaining = deadline.saturating_duration_since(Instant::now());
+            Err(error) => {
+                let (retry_after_seconds, rate_limit_reset_unix) = match &error {
+                    PublicationError::RetrySafe {
+                        retry_after_seconds,
+                        rate_limit_reset_unix,
+                        ..
+                    } => (*retry_after_seconds, *rate_limit_reset_unix),
+                    _ => return Err(error.into()),
+                };
+                // Remote timing is a lower bound. Keeping the local exponential
+                // floor prevents a zero-valued signal from turning this bounded
+                // phase into a tight request loop.
+                let delay = retry_delay(retry_after_seconds, rate_limit_reset_unix)?
+                    .map_or(fallback, |remote| remote.max(fallback));
+                let remaining = deadline.saturating_duration_since(now());
                 if delay > remaining {
-                    bail!("GitHub mutation retry delay exceeds its bounded phase deadline");
+                    return Err(error.into());
                 }
-                std::thread::sleep(delay);
-                fallback = fallback.saturating_mul(2).min(MERGE_POLL_MAX);
-                let _ = reason;
+                sleep(delay);
+                fallback = fallback.saturating_mul(2).min(max_delay);
             }
-            Err(error) => return Err(error.into()),
         }
     }
-    unreachable!("bounded mutation retry loop always returns on its final attempt")
 }
 
 #[cfg(test)]
@@ -2776,23 +2802,72 @@ mod tests {
     use crate::control_api::GitHubReviewerAppBinding;
 
     #[test]
-    fn confirmed_zero_effect_mutations_retry_only_within_the_bounded_attempt_budget() {
+    fn confirmed_zero_effect_mutations_use_the_window_beyond_three_attempts() {
+        let clock = std::cell::Cell::new(Instant::now());
+        let sleeps = std::cell::RefCell::new(Vec::new());
         let mut attempts = 0;
-        let result = retry_safe_mutation(|| {
-            attempts += 1;
-            if attempts < MUTATION_RETRY_ATTEMPTS {
-                Err(PublicationError::RetrySafe {
-                    reason: "fake confirmed zero effect",
-                    retry_after_seconds: Some(0),
-                    rate_limit_reset_unix: None,
-                })
-            } else {
-                Ok("published")
-            }
-        })
+        let result = retry_safe_mutation_with_policy(
+            || {
+                attempts += 1;
+                if attempts < 5 {
+                    Err(PublicationError::RetrySafe {
+                        reason: "fake confirmed zero effect",
+                        retry_after_seconds: Some(0),
+                        rate_limit_reset_unix: None,
+                        failure: None,
+                    })
+                } else {
+                    Ok("published")
+                }
+            },
+            MUTATION_RETRY_WINDOW,
+            MUTATION_RETRY_INITIAL,
+            MUTATION_RETRY_MAX,
+            || clock.get(),
+            |delay| {
+                sleeps.borrow_mut().push(delay);
+                clock.set(clock.get() + delay);
+            },
+        )
         .unwrap();
         assert_eq!(result, "published");
-        assert_eq!(attempts, MUTATION_RETRY_ATTEMPTS);
+        assert_eq!(attempts, 5);
+        assert_eq!(
+            *sleeps.borrow(),
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+            ]
+        );
+    }
+
+    #[test]
+    fn mutation_retry_window_returns_the_last_retry_safe_error() {
+        let started = Instant::now();
+        let clock = std::cell::Cell::new(started);
+        let mut attempts = 0;
+        let error = retry_safe_mutation_with_policy(
+            || {
+                attempts += 1;
+                Err::<(), _>(PublicationError::RetrySafe {
+                    reason: "last confirmed zero effect",
+                    retry_after_seconds: None,
+                    rate_limit_reset_unix: None,
+                    failure: None,
+                })
+            },
+            MUTATION_RETRY_WINDOW,
+            MUTATION_RETRY_INITIAL,
+            MUTATION_RETRY_MAX,
+            || clock.get(),
+            |delay| clock.set(clock.get() + delay),
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 8);
+        assert_eq!(clock.get().duration_since(started), Duration::from_secs(91));
+        assert!(error.to_string().contains("last confirmed zero effect"));
     }
 
     #[test]

@@ -12,7 +12,6 @@ use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
-use thiserror::Error;
 
 pub(crate) const MAX_GITHUB_BODY_BYTES: usize = 60 * 1024;
 const MAX_TITLE_BYTES: usize = 256;
@@ -975,35 +974,85 @@ pub(crate) fn reconcile_merge(
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub(crate) enum PublicationError {
-    #[error(transparent)]
-    Api(#[from] GitHubApiError),
-    #[error("GitHub mutation remains ambiguous after bounded reconciliation")]
+    Api(GitHubApiError),
     Ambiguous,
-    #[error(
-        "GitHub operation is confirmed to have no effect and may be retried (retry_after={retry_after_seconds:?}, rate_limit_reset={rate_limit_reset_unix:?}): {reason}"
-    )]
     RetrySafe {
         reason: &'static str,
         retry_after_seconds: Option<u64>,
         rate_limit_reset_unix: Option<u64>,
+        failure: Option<Box<GitHubApiError>>,
     },
-    #[error("GitHub remote publication conflicts with the frozen operation: {0}")]
     Conflict(&'static str),
-    #[error("GitHub publication response violates the frozen operation: {0}")]
     Invalid(&'static str),
 }
 
+impl fmt::Display for PublicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Api(error) => error.fmt(formatter),
+            Self::Ambiguous => formatter
+                .write_str("GitHub mutation remains ambiguous after bounded reconciliation"),
+            Self::RetrySafe {
+                reason,
+                retry_after_seconds,
+                rate_limit_reset_unix,
+                failure,
+            } => {
+                write!(
+                    formatter,
+                    "GitHub operation is confirmed to have no effect and may be retried \
+                     (retry_after={retry_after_seconds:?}, \
+                     rate_limit_reset={rate_limit_reset_unix:?}): {reason}"
+                )?;
+                if let Some(failure) = failure {
+                    write!(formatter, "; original GitHub failure: {failure}")?;
+                }
+                Ok(())
+            }
+            Self::Conflict(reason) => write!(
+                formatter,
+                "GitHub remote publication conflicts with the frozen operation: {reason}"
+            ),
+            Self::Invalid(reason) => write!(
+                formatter,
+                "GitHub publication response violates the frozen operation: {reason}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PublicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Api(error) => Some(error),
+            Self::RetrySafe {
+                failure: Some(error),
+                ..
+            } => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl From<GitHubApiError> for PublicationError {
+    fn from(error: GitHubApiError) -> Self {
+        Self::Api(error)
+    }
+}
+
 impl PublicationError {
-    fn retry_safe(reason: &'static str, failure: Option<&GitHubApiError>) -> Self {
+    fn retry_safe(reason: &'static str, failure: Option<GitHubApiError>) -> Self {
         let (retry_after_seconds, rate_limit_reset_unix) = failure
+            .as_ref()
             .map(GitHubApiError::rate_limit_signals)
             .unwrap_or((None, None));
         Self::RetrySafe {
             reason,
             retry_after_seconds,
             rate_limit_reset_unix,
+            failure: failure.map(Box::new),
         }
     }
 }
@@ -1578,7 +1627,7 @@ impl<'a> GitHubPublisher<'a> {
                     Reconciliation::RetrySafe if status == Some(405) => {
                         Err(PublicationError::retry_safe(
                             "repository merge gates are not ready",
-                            Some(&error),
+                            Some(error),
                         ))
                     }
                     Reconciliation::RetrySafe if matches!(status, Some(409 | 422)) => {
@@ -1588,7 +1637,7 @@ impl<'a> GitHubPublisher<'a> {
                     }
                     Reconciliation::RetrySafe => Err(PublicationError::retry_safe(
                         "exact-head merge has no matching remote effect",
-                        Some(&error),
+                        Some(error),
                     )),
                     Reconciliation::Conflict(reason) => Err(PublicationError::Conflict(reason)),
                 }
@@ -1753,7 +1802,7 @@ fn finish_reconciliation<T>(
         Reconciliation::Exactly(value) => Ok(value),
         Reconciliation::RetrySafe => Err(PublicationError::retry_safe(
             "remote readback confirms the mutation has no matching effect",
-            failure.as_ref(),
+            failure,
         )),
         Reconciliation::Conflict(reason) => Err(PublicationError::Conflict(reason)),
     }
@@ -2752,6 +2801,72 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn retry_safe_pr_creation_preserves_the_sanitized_http_diagnostic() {
+        let context = context();
+        let task = task();
+        let publication = render_pull_request_body(
+            &context,
+            &[
+                ("TASK-1".into(), "First".into()),
+                ("TASK-2".into(), "Second".into()),
+            ],
+            &[(ReviewerId::Reviewer1, "reviewer-one[bot]".into())],
+            &task,
+            "STATUS: READY",
+        )
+        .unwrap();
+        let failure = json_http_response(
+            422,
+            serde_json::json!({
+                "message": "No commits between master and hcom/run-fixture"
+            }),
+            "X-GitHub-Request-Id: request-fixture-422\r\n",
+        );
+        let (client, server) = fake_raw_client(vec![
+            Some(failure),
+            Some(json_http_response(200, serde_json::json!([]), "")),
+        ]);
+        let publisher = GitHubPublisher::new(&client, &context).unwrap();
+        let error = publisher
+            .create_pull_request(
+                &pull_request_title(&context, &task).unwrap(),
+                &publication,
+                20,
+                &operation_token(InstallationOperation::PullRequestCreate),
+            )
+            .unwrap_err();
+
+        let PublicationError::RetrySafe {
+            retry_after_seconds: None,
+            rate_limit_reset_unix: None,
+            failure: Some(failure),
+            ..
+        } = &error
+        else {
+            panic!("expected retry-safe PR creation failure: {error}");
+        };
+        assert!(matches!(
+            failure.as_ref(),
+            GitHubApiError::Http {
+                    status: 422,
+                    request_id: Some(request_id),
+                    reason,
+                    ..
+            } if request_id == "request-fixture-422"
+                && reason == "No commits between master and hcom/run-fixture"
+        ));
+        let detail = error.to_string();
+        assert!(detail.contains("HTTP 422"));
+        assert!(detail.contains("request-fixture-422"));
+        assert!(detail.contains("No commits between master and hcom/run-fixture"));
+        assert!(
+            std::error::Error::source(&error)
+                .is_some_and(|source| source.downcast_ref::<GitHubApiError>().is_some())
+        );
         assert_eq!(server.join().unwrap().len(), 2);
     }
 

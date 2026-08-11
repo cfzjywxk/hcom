@@ -160,6 +160,12 @@ Architect does not adopt a preserved branch, worktree, or PR as a new run.
 The GitHub lane does not authorize install, release, deployment, or arbitrary
 GitHub mutation beyond the bound workflow.
 
+Retry-safe mutations use a 120-second phase window with a one-second initial
+delay and a 30-second capped exponential backoff. A GitHub-provided retry delay
+is treated as a lower bound. Every retry still follows a zero-effect
+reconciliation readback; exhausting the window reports the final bounded HTTP
+status, request ID, and sanitized GitHub reason when those fields were present.
+
 ## Local verification
 
 Normal source tests use temporary real Git repositories/bare remotes and fake
