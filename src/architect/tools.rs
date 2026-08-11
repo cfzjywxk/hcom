@@ -345,7 +345,6 @@ pub(crate) fn control_action_for_delivery(
     if let ControlAction::SessionPlanReplace {
         developer_adapter: requested_developer,
         reviewer_adapters: requested_reviewers,
-        github_inspection_id: _,
         ..
     } = &action
         && (requested_developer != developer_adapter || requested_reviewers != reviewer_adapters)

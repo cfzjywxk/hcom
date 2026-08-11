@@ -132,7 +132,9 @@ for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
 
 with open({report}, "w", encoding="utf-8") as output:
     json.dump({{"argv": sys.argv[1:]}}, output)
-time.sleep(0.6)
+# Stay alive long enough for the parent to finish bridge activation and its
+# final process-identity check, including on a loaded CI runner.
+time.sleep(5.0)
 "#,
         hcom_dir = serde_json::to_string(&hcom_dir.to_string_lossy()).unwrap(),
         home = serde_json::to_string(&home.to_string_lossy()).unwrap(),
