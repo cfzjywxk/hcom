@@ -24,6 +24,7 @@ pub mod architect {
         "Usage:\n  hcom arch\n\nhcom arch is supported only on Linux."
     }
 }
+#[cfg(target_os = "linux")]
 pub mod control_api;
 #[cfg(target_os = "linux")]
 pub mod orchestrator;

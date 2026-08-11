@@ -247,8 +247,9 @@ fn real_claude_approval_gate_blocks_pending_message_then_clears_on_approval() {
 
     // Approve. Claude's permission prompt defaults to "1. Yes", so a bare Enter
     // accepts it; this runs the command once and releases the held message.
+    // The fixture exclusively owns this disposable PTY, hence explicit --force.
     let (approve_code, approve_stdout, approve_stderr) =
-        h.run(["term", "inject", &name, "", "--enter"]);
+        h.run(["term", "inject", &name, "", "--enter", "--force"]);
     assert_eq!(
         approve_code, 0,
         "approval keystroke failed: stdout={approve_stdout} stderr={approve_stderr}"

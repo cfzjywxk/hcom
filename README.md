@@ -608,6 +608,8 @@ Custom scripts: drop `*.sh` or `*.py` into `~/.hcom/scripts/` — auto-discovere
 
 ```bash
 # Prerequisites: Rust 1.88+
+# Rust 1.88 is the MSRV. The checked-in toolchain pins CI and strict Clippy to
+# an exact compiler release, while clippy.toml keeps suggestions MSRV-aware.
 
 git clone https://github.com/cfzjywxk/hcom.git
 cd hcom
@@ -657,6 +659,9 @@ just ci  # run the CI gate locally
 # On native Windows (PowerShell)
 just ci-windows
 ```
+
+Real-tool integration tests use `--force` only for PTYs they create and own;
+ordinary terminal injection keeps the guarded prompt/draft ownership checks.
 
 ---
 

@@ -157,6 +157,10 @@ pub fn require_pinned<C: ToolCase>(h: &Hcom, case: &C) {
 /// still drop a keystroke right after launch or a resume re-render. Once the
 /// mock observes the prompt, never inject it again: the accepted turn may still
 /// be running, and retrying could duplicate side effects.
+///
+/// These real-tool fixtures create and exclusively own every target PTY, so
+/// each prompt/approval injection uses explicit `--force`. This helper must
+/// never target a pre-existing user terminal.
 pub fn inject_prompt_until(
     h: &Hcom,
     name: &str,
@@ -168,7 +172,7 @@ pub fn inject_prompt_until(
     let inject_deadline = Instant::now() + Duration::from_secs(40);
     let mut prompt_attempts = 0;
     while prompt_attempts < 5 && Instant::now() < inject_deadline {
-        let (code, stdout, stderr) = h.run(["term", "inject", name, prompt, "--enter"]);
+        let (code, stdout, stderr) = h.run(["term", "inject", name, prompt, "--enter", "--force"]);
         if code != 0 {
             let retryable = stdout.contains("No inject port")
                 || stdout.contains("No response from")
@@ -199,7 +203,8 @@ pub fn inject_prompt_until(
                     if last_approval_drive.elapsed() >= Duration::from_secs(1)
                         && instance_status_context(h, name).as_deref() == Some("pty:approval")
                     {
-                        let (code, stdout, stderr) = h.run(["term", "inject", name, "--enter"]);
+                        let (code, stdout, stderr) =
+                            h.run(["term", "inject", name, "--enter", "--force"]);
                         assert_eq!(
                             code, 0,
                             "{description}: approval confirm failed: stdout={stdout} stderr={stderr}"

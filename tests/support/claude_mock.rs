@@ -269,7 +269,8 @@ impl ToolCase for ClaudeCase {
                 ("", "")
             };
             if !what.is_empty() {
-                let (code, stdout, stderr) = h.run(["term", "inject", name, key, "--enter"]);
+                let (code, stdout, stderr) =
+                    h.run(["term", "inject", name, key, "--enter", "--force"]);
                 assert_eq!(
                     code, 0,
                     "drive_startup: inject for {what} failed: stdout={stdout} stderr={stderr}"

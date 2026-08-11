@@ -949,7 +949,9 @@ fn run_pty_test(tool: &str) {
     // Extra settle time
     thread::sleep(Duration::from_secs(2));
 
-    hcom_check(&format!("term inject {base_name} uncommitted text here"));
+    hcom_check(&format!(
+        "term inject {base_name} uncommitted text here --force"
+    ));
     logln!(log, "  OK: Injected uncommitted text");
 
     // Verify text appears in input box
@@ -1040,7 +1042,7 @@ fn run_pty_test(tool: &str) {
 
     let baseline_event3 = get_last_event_id(&base_name);
 
-    hcom_check(&format!("term inject {base_name} --enter"));
+    hcom_check(&format!("term inject {base_name} --enter --force"));
     logln!(log, "  OK: Sent --enter to submit uncommitted text");
 
     // Wait for screen to settle

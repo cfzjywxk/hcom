@@ -657,7 +657,10 @@ fn drive_claude_startup(hcom_dir: &str, name: &str, timeout: Duration) {
         }
         if bypass_confirm || onboarding {
             let key = if bypass_confirm { "2 " } else { "" };
-            let inject = hcom_with_dir(&format!("term inject {name} {key}--enter"), hcom_dir);
+            let inject = hcom_with_dir(
+                &format!("term inject {name} {key}--enter --force"),
+                hcom_dir,
+            );
             assert!(
                 inject.status.success(),
                 "drive startup inject failed\nstdout: {}\nstderr: {}",
@@ -1384,9 +1387,11 @@ fn test_relay_roundtrip() {
         "prompt not empty before inject: {before}"
     );
 
+    // Both relay devices and the target PTY are disposable test fixtures, so
+    // the remote draft/enter flow explicitly claims ownership with --force.
     const INJECT_MARKER: &str = "relay-inject-marker";
     let inject_out = hcom_with_dir(
-        &format!("term inject {remote_name} {INJECT_MARKER}"),
+        &format!("term inject {remote_name} {INJECT_MARKER} --force"),
         &path_a,
     );
     let inject_stdout = String::from_utf8_lossy(&inject_out.stdout).to_string();
@@ -1439,7 +1444,10 @@ fn test_relay_roundtrip() {
     // submit via --enter so the input_text clears. Phase 10 sends its own
     // real message separately via `hcom send`, so this enter only flushes
     // the marker and doesn't step on the test.
-    let clear_out = hcom_with_dir(&format!("term inject {remote_name} --enter"), &path_a);
+    let clear_out = hcom_with_dir(
+        &format!("term inject {remote_name} --enter --force"),
+        &path_a,
+    );
     assert!(clear_out.status.success());
     let rpc_inject_enter = poll_rpc_result_on_device(&path_b, "term_inject");
     assert_eq!(
