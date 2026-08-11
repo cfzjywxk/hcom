@@ -73,6 +73,15 @@ original verdicts/findings. A task is LGTM only when every active Reviewer \
 returned LGTM for that same generation; do not create or request a post-LGTM \
 commit.
 
+hcom session-control tools are direct MCP tools. Call them directly; never \
+wrap `session_wait` in `functions.exec`/`functions.wait`, add a timer, or emit a \
+heartbeat while it is pending. A pending wait consumes no Architect model turn \
+until hcom returns a normal Developer/Reviewer result, a Developer \
+clarification/blocker action, or a terminal result. Internal task-completion \
+bookkeeping, status publication, supervisor polling, timers, and transport \
+yields never release the wait. A terminal result supersedes queued progress so \
+the final Reviewer result and derived task completion cause only one wakeup.
+
 After a plan is approved and until that run is terminal, do not modify its bound \
 task/design sources or task repository. The only task-related file you may \
 create is a new clarification document at the exact clarification_output_path \
@@ -398,10 +407,10 @@ fn tool_description(action: ActionName, github_pr: bool) -> &'static str {
             "Read a bounded page of durable clarification records for one exact task in the exact current run_id. Status snapshots expose only clarification_record_count so control responses stay bounded. Start with after_sequence=0 and a limit from 1 through 8; if next_after_sequence is present, pass it as the next after_sequence until it is absent. Finish reading the terminal run before session_run_begin, because an earlier run is immutable durable evidence rather than the current in-memory control target. This read-only action does not consume a clarification round and is not a wait or polling mechanism."
         }
         ActionName::SessionWait if github_pr => {
-            "Passively wait within the exact current run_id for one retained GitHub delivery progress event, a terminal session, or a latched pending_architect_action. This is event-driven, not polling. Events may be candidate_published, review_requested, review_responded, task_completed, and, only for protected auto-merge, merge_waiting or run_finalizing. Display each event once with its delivery policy, exact PR URL, published/final head SHA, task position and generation when task-scoped, and Reviewer identity/verdict/response counts when review-scoped; a partial dual response must immediately re-arm this wait. Do not read or summarize native final files merely for progress. Preserve the existing clarification escalation contract. Queued progress must drain before terminal. At terminal, read the listed current-generation native finals and report the exact policy, PR, per-task ranges/outcomes, ordered Reviewer review URLs/verdicts, hcom/review Check, policy-applicable rules evidence, delivery outcome, merge SHA only when delivered, and preserved branch/worktree/PR for manual or other unmerged outcomes. Cancellation or interruption of this tool never cancels the run."
+            "Call this direct MCP tool directly; never wrap it in functions.exec/functions.wait or add a heartbeat around it. Passively wait within the exact current run_id. This is event-driven, not polling, and it returns only for a normal Developer/Reviewer result, a latched pending_architect_action from a Developer clarification/blocker, or a terminal session. A nonterminal progress result is one exact review_requested event after a Developer final or review_responded event after a Reviewer final. Internal candidate_published, task_completed, merge_waiting, and run_finalizing publication/delivery bookkeeping remains retained as bounded evidence but never completes this call or wakes the Architect in manual or protected auto-merge delivery. Pass after_progress_sequence as the last worker-result progress sequence already displayed in this run, or 0 before the first event; returned sequence numbers may skip that internal bookkeeping. Display each worker result once with its delivery policy, exact PR URL, published/final head SHA, task position and generation, and Reviewer identity/verdict/response counts when review-scoped; a partial dual response must immediately re-arm this wait. Do not read or summarize native final files merely for progress. Preserve the existing clarification escalation contract. A terminal snapshot supersedes queued progress and contains final worker and delivery evidence, so a final Reviewer result, derived task completion, final Check/delivery bookkeeping, and successful terminal transition produce one terminal wakeup rather than several; an abnormal terminal transition also returns immediately. At terminal, read the listed current-generation native finals and report the exact policy, PR, per-task ranges/outcomes, ordered Reviewer review URLs/verdicts, hcom/review Check, policy-applicable rules evidence, delivery outcome, merge SHA only when delivered, and preserved branch/worktree/PR for manual or other unmerged outcomes. Cancellation or interruption of this tool never cancels the run."
         }
         ActionName::SessionWait => {
-            "Passively wait within the exact current run_id for one retained progress event, a terminal session, or a latched pending_architect_action. This is event-driven, not polling. Pass after_progress_sequence as the last progress sequence already displayed in this run, or 0 before the first event. A progress result contains one exact review_requested, review_responded, or task_completed event plus durable Developer/Reviewer input or response paths. Display one concise human-visible update for that event before doing anything else: include task position/total, task_key, completed review_round and in-flight/current review_generation, the exact developer_final_path, and the Reviewer identity, verdict, and every reviewer_final_message_path when present. A review_requested event carries the ordered active Reviewer bindings. A review_responded event carries reviewer_id and responses_received/responses_expected; when fewer responses have arrived than are expected, say that another response is pending and immediately wait again. Do not read or summarize Reviewer final files merely for a progress update. Then immediately call session_wait again using the returned session_version as after_session_version and the displayed event.sequence as after_progress_sequence. Worker execution continues while progress is displayed; events produced before the next wait are retained and returned in sequence. A pending Architect action takes priority over queued progress. It carries published_version and is retained across interruption or reconnect: a wait from an older version in the same run re-delivers it, while a repeated wait at or after published_version is rejected until you resolve the action. On an action response, read the exact Developer request path. If it reports a conflict between an explicit no-commit instruction and the standard lane's required candidate commit, do not answer autonomously even when clarification budget remains: call session_clarification_require_human, ask the human, and end the turn without waiting. For other requests, if you can derive a bounded answer, create the exact clarification_output_path, submit it, and immediately wait again in the same turn using the last displayed progress sequence. If hcom already requires a human decision, or you choose to escalate with session_clarification_require_human, ask the human and end the turn without waiting. Queued progress is delivered before a terminal result, so display and re-arm every Reviewer response event and every other event until the terminal session arrives. Only after a terminal response, read every active Reviewer's listed current-generation final files; when clarification_record_count is nonzero, use session_clarifications_list with that run_id to read the bounded record pages before reporting the original outcomes. A task is LGTM only after every active same-generation Reviewer returns LGTM. For an LGTM task, the final Developer candidate commit was already reviewed at the reported exact range: report it as the local reviewed result, do not ask whether to retain or revert it merely for lack of separate commit authorization, and do not create another post-LGTM commit. Push, install, and release remain separately authorized actions. A later human request may then use session_run_begin to create a fresh run without restarting this Architect. Cancellation or interruption of this tool never cancels the run."
+            "Call this direct MCP tool directly; never wrap it in functions.exec/functions.wait or add a heartbeat around it. Passively wait within the exact current run_id. This is event-driven, not polling, and it returns only for a normal Developer/Reviewer result, a latched pending_architect_action from a Developer clarification/blocker, or a terminal session. Internal task_completed bookkeeping, status publication, supervisor poll/timer ticks, and transport yields never complete this call or wake the Architect. Pass after_progress_sequence as the last worker-result progress sequence already displayed in this run, or 0 before the first event. A nonterminal progress result is one exact review_requested event after a Developer final or review_responded event after a Reviewer final, plus durable input or response paths. Display one concise human-visible update for that result before doing anything else: include task position/total, task_key, completed review_round and in-flight/current review_generation, the exact developer_final_path, and the Reviewer identity, verdict, and every reviewer_final_message_path when present. A review_requested event carries the ordered active Reviewer bindings. A review_responded event carries reviewer_id and responses_received/responses_expected; when fewer responses have arrived than are expected, say that another response is pending and immediately wait again. Do not read or summarize Reviewer final files merely for a progress update. Then immediately call session_wait again using the returned session_version as after_session_version and the displayed event.sequence as after_progress_sequence. Worker execution continues while progress is displayed; normal worker-result events produced before the next wait are retained. Returned progress sequence numbers may skip internal bookkeeping events that never wake the Architect. A pending Architect action takes priority over worker progress. It carries published_version and is retained across interruption or reconnect: a wait from an older version in the same run re-delivers it, while a repeated wait at or after published_version is rejected until you resolve the action. On an action response, read the exact Developer request path. If it reports a conflict between an explicit no-commit instruction and the standard lane's required candidate commit, do not answer autonomously even when clarification budget remains: call session_clarification_require_human, ask the human, and end the turn without waiting. For other requests, if you can derive a bounded answer, create the exact clarification_output_path, submit it, and immediately wait again in the same turn using the last displayed progress sequence. If hcom already requires a human decision, or you choose to escalate with session_clarification_require_human, ask the human and end the turn without waiting. A terminal snapshot supersedes queued progress and contains the final worker evidence, so a final Reviewer result, derived task completion, and successful terminal transition produce one terminal wakeup rather than several; an abnormal terminal transition also returns immediately. Only after a terminal response, read every active Reviewer's listed current-generation final files; when clarification_record_count is nonzero, use session_clarifications_list with that run_id to read the bounded record pages before reporting the original outcomes. A task is LGTM only after every active same-generation Reviewer returns LGTM. For an LGTM task, the final Developer candidate commit was already reviewed at the reported exact range: report it as the local reviewed result, do not ask whether to retain or revert it merely for lack of separate commit authorization, and do not create another post-LGTM commit. Push, install, and release remain separately authorized actions. A later human request may then use session_run_begin to create a fresh run without restarting this Architect. Cancellation or interruption of this tool never cancels the run."
         }
         ActionName::SessionStatus if github_pr => {
             "Read the in-memory GitHub Pull Request delivery status only when the human asks. It includes the complete frozen delivery binding, latest inspection and run binding, PR/worktree/branch/head, delivery phase/outcome, merge/finalization/preservation state, active workers, ordered Reviewer bindings, and per-task ranges, native results, GitHub reviews, and hcom/review Check. It is not a keepalive or polling tool; use session_wait while the run is active with no human question pending."
@@ -1000,6 +1009,38 @@ mod tests {
             "run_finalizing",
         ] {
             assert!(github_wait.contains(event));
+        }
+        for required in [
+            "direct MCP tool directly",
+            "never wrap it in functions.exec/functions.wait",
+            "never completes this call or wakes the Architect",
+            "manual or protected auto-merge delivery",
+            "terminal snapshot supersedes queued progress",
+            "one terminal wakeup rather than several",
+        ] {
+            assert!(
+                github_wait.contains(required),
+                "GitHub wait contract omitted {required}"
+            );
+        }
+        assert!(!github_wait.contains("Queued progress must drain before terminal"));
+
+        let dual_reviewers = reviewer_adapters("codex-reviewer", "claude-reviewer");
+        for github_pr in [false, true] {
+            let single_wait =
+                tool_definitions_for_delivery("codex-developer", &reviewers, github_pr)
+                    .into_iter()
+                    .find(|tool| tool["name"] == "session_wait")
+                    .unwrap();
+            let dual_wait =
+                tool_definitions_for_delivery("codex-developer", &dual_reviewers, github_pr)
+                    .into_iter()
+                    .find(|tool| tool["name"] == "session_wait")
+                    .unwrap();
+            assert_eq!(
+                single_wait["description"], dual_wait["description"],
+                "wait wakeup semantics must not vary with single/dual review topology"
+            );
         }
         let github_status = github
             .iter()
@@ -1660,13 +1701,21 @@ mod tests {
         assert!(approve.contains("returned session.version"));
         assert!(approve.contains("Do not poll"));
         assert!(wait.contains("terminal session"));
+        assert!(wait.contains("direct MCP tool directly"));
+        assert!(wait.contains("never wrap it in functions.exec/functions.wait"));
+        assert!(wait.contains("heartbeat"));
         assert!(wait.contains("pending_architect_action"));
         assert!(wait.contains("published_version"));
         assert!(wait.contains("older version in the same run re-delivers"));
         assert!(wait.contains("repeated wait"));
         assert!(wait.contains("review_requested"));
         assert!(wait.contains("review_responded"));
-        assert!(wait.contains("task_completed"));
+        assert!(wait.contains("Internal task_completed bookkeeping"));
+        assert!(wait.contains("never complete this call or wake the Architect"));
+        assert!(wait.contains("normal Developer/Reviewer result"));
+        assert!(wait.contains("terminal snapshot supersedes queued progress"));
+        assert!(wait.contains("one terminal wakeup rather than several"));
+        assert!(wait.contains("abnormal terminal transition also returns immediately"));
         assert!(wait.contains("review_generation"));
         assert!(wait.contains("reviewer_id"));
         assert!(wait.contains("responses_received/responses_expected"));
@@ -1676,7 +1725,8 @@ mod tests {
         assert!(wait.contains("every active same-generation Reviewer returns LGTM"));
         assert!(wait.contains("developer_final_path"));
         assert!(wait.contains("reviewer_final_message_path"));
-        assert!(wait.contains("events produced before the next wait are retained"));
+        assert!(wait.contains("worker-result events produced before the next wait are retained"));
+        assert!(wait.contains("may skip internal bookkeeping events"));
         assert!(wait.contains("never cancels the run"));
         assert!(wait.contains("immediately wait again"));
         assert!(wait.contains("end the turn without waiting"));
@@ -1746,6 +1796,12 @@ mod tests {
             "responses_received` is less than `responses_expected",
             "Only after terminal",
             "every active Reviewer returned LGTM",
+            "direct MCP tools",
+            "never wrap `session_wait`",
+            "consumes no Architect model turn",
+            "Internal task-completion bookkeeping",
+            "transport yields never release the wait",
+            "final Reviewer result and derived task completion cause only one wakeup",
         ] {
             assert!(
                 ARCHITECT_INSTRUCTIONS.contains(required),

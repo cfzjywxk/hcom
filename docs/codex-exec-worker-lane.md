@@ -21,12 +21,13 @@ never protocol.
 **The supervisor is task-agnostic.** It sequences processes and carries
 messages between them. It does not run checks, inspect commits, or judge
 whether the work is any good. Developers verify their own work, reviewers
-verify independently at whatever depth they choose, and the human plus real CI
-are the last word. In the default local-candidate mode hcom neither pushes nor
-installs, so a wrong judgment costs a review round or a local commit, both
-cheap and revertible. The explicit [GitHub Pull Request lane](github-pr-lane.md)
-adds a supervisor-owned bound publication workflow; workers still receive no
-GitHub credentials or direct push authority.
+verify independently under the fixed review contract below, and the human plus
+real CI are the last word. In the default local-candidate mode hcom neither
+pushes nor installs, so a wrong judgment costs a review round or a local commit,
+both cheap and revertible. The explicit
+[GitHub Pull Request lane](github-pr-lane.md) adds a supervisor-owned bound
+publication workflow; workers still receive no GitHub credentials or direct
+push authority.
 
 **The approved local lane includes its candidate commit.** Each Developer
 creates exactly one signed-off local task commit before review and amends only
@@ -188,6 +189,23 @@ historical attempt artifacts stay on disk. The first Reviewer response never
 starts Developer correction; both logical responses must join, and every
 Developer amendment invalidates both prior verdicts.
 
+Reviewer1 and Reviewer2 remain equal peers: the contract does not specialize
+their roles or divide review categories. Each initial Reviewer turn completes a
+task-derived invariant, caller/consumer, and failure/lifecycle pass across the
+exact candidate range, continues after finding a blocker, performs a second
+counterexample sweep, and consolidates all substantiated Major/Critical findings.
+The final records the exact range and a concise coverage summary rather than the
+internal checklist.
+
+An exact-session re-review verifies that Reviewer's prior findings and audits
+the amendment plus its transitive impact. Still-valid prior coverage may be
+reused; every area invalidated by the amendment is reviewed again. A core
+invariant, state-machine or externally visible contract change, a new caller or
+concurrency/retry/cleanup/terminal path, a cross-subsystem amendment, or an
+impact that cannot be bounded triggers a complete exact-range review. Otherwise
+the Reviewer does not repeat unchanged low-risk coverage merely for ceremony.
+The resulting verdict still applies to the current exact candidate range.
+
 ## Evidence
 
 Durable artifacts live in `<project>/hcom-tasks/<run-id>/…`
@@ -344,13 +362,13 @@ It does not run checks, read commits, or look at Git at all. A developer that
 misreports what it did, omits a sign-off, commits outside the task's scope,
 rewrites history, or leaves the tree dirty will still reach review.
 
-*Stands in for it:* the reviewer verifies independently at whatever depth it
-chooses, the human reads the final report, and real CI runs after a separately
-authorized push. The local lane neither pushes nor installs, so the worst case
-is a wasted review round or a local commit to revert — both cheap. GitHub mode
-is deliberately different: its delivery adapter validates append-only exact
-commit topology and identity before publishing, while still leaving code
-quality judgment to the Reviewers.
+*Stands in for it:* each reviewer independently follows the fixed initial and
+change-aware review contract, the human reads the final report, and real CI runs
+after a separately authorized push. The local lane neither pushes nor installs,
+so the worst case is a wasted review round or a local commit to revert — both
+cheap. GitHub mode is deliberately different: its delivery adapter validates
+append-only exact commit topology and identity before publishing, while still
+leaving code quality judgment to the Reviewers.
 
 *To change it:* that is a different product. Adding any of those checks back
 turns an untidy checkout into a failed run, which is exactly the failure mode
@@ -415,10 +433,11 @@ A turn is killed after 6 hours of wall clock, monotonic and never reset by
 output. A genuinely slow turn is indistinguishable from a hung one; a wedged
 worker burns up to six hours before the watchdog fires. The foreground
 supervisor reports the resulting terminal state through the pending
-`session_wait`. The same wait returns once for every review-generation request,
-each Reviewer response, and task completion, so ordinary progress no longer
-requires an interrupt and `session_status` query. It exposes Reviewer identity,
-generation, and received/expected response counts. The first response is
+`session_wait`. The same wait returns only for a normal Developer result, each
+normal Reviewer response, a Developer clarification/blocker action, or a
+terminal state. Internal task completion, status publication, poll/timer ticks,
+and transport yields do not release it. Worker-result progress exposes Reviewer
+identity, generation, and received/expected response counts. The first response is
 partial progress and the Architect immediately waits for the peer response
 without reading the durable response body. The wait also returns for a latched
 Developer clarification/blocker action. Progress is retained under a run-local
@@ -426,6 +445,11 @@ sequence across the short display/re-wait gap. An action survives an
 interrupted wait and is immediately redelivered when the reconnect uses a
 version older than the action's `published_version`; a same-version repeat is
 rejected until the action is resolved.
+
+A terminal snapshot supersedes queued progress and contains final worker
+evidence. The final Reviewer response, derived task completion, and successful
+terminal transition therefore produce one wakeup; an abnormal terminal
+transition also releases the wait immediately.
 
 The six-hour watchdog applies only to an active Developer or Reviewer turn.
 `AwaitingArchitectAction` has no timeout: it may be waiting for a human

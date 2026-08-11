@@ -2355,24 +2355,28 @@ not add speculative findings or treat missing test coverage alone as a blocker.
 ";
 
 /// A re-review reuses still-valid independent coverage from the exact resumed
-/// Reviewer session and expands when the append/amendment has broad impact.
+/// Reviewer session and expands when an append-only correction or local
+/// amendment has broad impact.
 const REREVIEW_INSTRUCTIONS: &str = "
 The candidate changed because of the previous review generation for this task.
 First verify every finding you raised in the previous generation. Then
-independently audit the change and its transitive impact on invariants, callers
-and consumers, and success, failure, retry, cleanup, and terminal paths. Reuse
-your prior validated coverage only where the change cannot invalidate it, and
-re-review every invalidated area. Perform a complete exact-range review when the
-change affects a core invariant, state machine, or externally visible contract;
-adds a caller or concurrency, retry, cleanup, or terminal path; crosses subsystem
-boundaries; or has an impact you cannot bound reliably. Otherwise, do not repeat
-unchanged low-risk coverage merely for ceremony. Your verdict still applies to
-the current exact candidate range. Do not assume any finding was covered by the
-peer Reviewer, and do not depend on or guess the peer response.
+independently audit the append-only correction or local amendment and its
+transitive impact on invariants, callers and consumers, and success, failure,
+retry, cleanup, and terminal paths. Reuse your prior validated coverage only
+where the candidate change cannot invalidate it; re-review every invalidated area.
+Perform a complete exact-range review when the change affects a core
+invariant, state machine, or externally visible contract; adds a caller or
+concurrency, retry, cleanup, or terminal path; crosses subsystem boundaries; or
+has an impact you cannot bound reliably. Otherwise,
+do not repeat unchanged low-risk coverage merely for ceremony.
+Your verdict still applies to the current exact candidate range. Do not assume
+any finding was covered by the peer
+Reviewer, and do not depend on or guess the peer response.
 ";
 
-/// The reviewer's only output obligation. Deliberately narrow: hcom parses one
-/// anchored line and treats everything else as opaque payload.
+/// The reviewer's only output obligation. hcom parses one anchored line and
+/// treats everything else as opaque payload, but the concise coverage record
+/// lets the exact resumed Reviewer avoid repeating still-valid work.
 const REVIEWER_OUTPUT_CONTRACT: &str = "
 ## Required output format
 
@@ -2386,8 +2390,8 @@ write one consolidated set of all independently confirmed findings from this
 turn as concise free-form markdown (path:line references are helpful but not
 required). State the exact candidate range or commit you reviewed, and end with
 a brief `COVERAGE:` summary of the invariants, callers/consumers, and failure or
-lifecycle paths you inspected. On a re-review, also state whether the change
-triggered a complete exact-range review and why. Do not emit the internal
+lifecycle paths you inspected. On a re-review, also state whether the candidate
+change triggered a complete exact-range review and why. Do not emit the internal
 checklist or a long review narrative. If no blocking finding remains, say so
 directly. You have the same native host view as a human-launched Codex session,
 but the reviewer role forbids modifying the reviewed source, Git state,
@@ -3694,8 +3698,19 @@ mod tests {
             assert!(prompt.contains("foreground supervisor publishes your exact final"));
             assert!(prompt.contains("published byte-for-byte without redaction"));
             assert!(prompt.contains("60 KiB UTF-8 hard cap"));
-            if *purpose == RuntimeTurnPurpose::ReviewerRereview {
-                assert!(prompt.contains("First verify every finding you raised"));
+            match purpose {
+                RuntimeTurnPurpose::InitialReview => {
+                    assert!(prompt.contains("derive a task-specific coverage checklist"));
+                    assert!(prompt.contains("Do not stop after finding the first blocker"));
+                    assert!(prompt.contains("perform a second counterexample sweep"));
+                }
+                RuntimeTurnPurpose::ReviewerRereview => {
+                    assert!(prompt.contains("First verify every finding you raised"));
+                    assert!(prompt.contains("audit the append-only correction or local amendment"));
+                    assert!(prompt.contains("Reuse your prior validated coverage"));
+                    assert!(prompt.contains("do not repeat unchanged low-risk coverage"));
+                }
+                _ => unreachable!("filtered Reviewer prompt used an invalid purpose"),
             }
         }
     }
@@ -3727,6 +3742,7 @@ mod tests {
             runtime,
         )
         .unwrap();
+        let worker_audit = Arc::new(Mutex::new(Audit::default()));
         let scripts = vec![single_reviewer_task_script(
             "github-manual",
             vec![
@@ -3750,7 +3766,7 @@ mod tests {
             sources,
             Box::new(ScriptedFactory {
                 scripts: scripts.into(),
-                audit: Arc::new(Mutex::new(Audit::default())),
+                audit: worker_audit.clone(),
             }),
         )
         .unwrap();
@@ -3835,6 +3851,28 @@ mod tests {
         assert!(plan.contains("review_complete_unmerged"));
         assert!(plan.contains("no merge, remote branch deletion, or merged-run finalization"));
         assert!(!plan.contains("ruleset attestation SHA-256:"));
+
+        let audit = worker_audit.lock().unwrap();
+        let reviewer_prompt = audit
+            .prompts
+            .iter()
+            .find(|(role, purpose, _)| {
+                *role == WorkerRole::Reviewer && *purpose == RuntimeTurnPurpose::InitialReview
+            })
+            .map(|(_, _, prompt)| prompt)
+            .expect("manual single-review prompt");
+        for required in [
+            "delivery policy: manual",
+            "derive a task-specific coverage checklist",
+            "Do not stop after finding the first blocker",
+            "perform a second counterexample sweep",
+            "brief `COVERAGE:` summary",
+        ] {
+            assert!(
+                reviewer_prompt.contains(required),
+                "manual single-review prompt omitted {required}"
+            );
+        }
     }
 
     #[test]
@@ -4535,6 +4573,9 @@ mod tests {
 
         let reviewer = role_instructions(WorkerRole::Reviewer);
         for required in [
+            "Reviewer1 and Reviewer2 are equal peers",
+            "same complete review scope and authority",
+            "no role specialization or division of review responsibility",
             "exactly one signed-off local Developer candidate commit",
             "VERDICT: REQUEST_CHANGES",
             "REQUIREMENT_AMBIGUITY:",
@@ -4610,6 +4651,56 @@ mod tests {
                 "GitHub Developer output contract omitted {required}"
             );
         }
+    }
+
+    #[test]
+    fn reviewer_turn_contract_batches_initial_findings_and_bounds_rereview_scope() {
+        for required in [
+            "derive a task-specific coverage checklist",
+            "affected callers and consumers",
+            "Do not stop after finding the first blocker",
+            "perform a second counterexample sweep",
+            "confirmed Major or Critical finding",
+            "missing test coverage alone",
+        ] {
+            assert!(
+                INITIAL_REVIEW_INSTRUCTIONS.contains(required),
+                "initial Reviewer instructions omitted {required}"
+            );
+        }
+
+        for required in [
+            "verify every finding you raised",
+            "audit the append-only correction or local amendment",
+            "Reuse your prior validated coverage",
+            "re-review every invalidated area",
+            "Perform a complete exact-range review",
+            "impact you cannot bound reliably",
+            "do not repeat unchanged low-risk coverage",
+            "verdict still applies to the current exact candidate range",
+        ] {
+            assert!(
+                REREVIEW_INSTRUCTIONS.contains(required),
+                "Reviewer re-review instructions omitted {required}"
+            );
+        }
+
+        for required in [
+            "one consolidated set of all independently confirmed findings",
+            "exact candidate range or commit",
+            "brief `COVERAGE:` summary",
+            "triggered a complete exact-range review",
+            "checklist or a long review narrative",
+        ] {
+            assert!(
+                REVIEWER_OUTPUT_CONTRACT.contains(required),
+                "Reviewer output contract omitted {required}"
+            );
+        }
+        assert!(!REVIEWER_OUTPUT_CONTRACT.contains("Judge how deeply to verify"));
+        assert!(!REREVIEW_INSTRUCTIONS.contains(
+            "Independently and completely review the current exact candidate range again"
+        ));
     }
 
     #[derive(Clone)]
@@ -6107,6 +6198,27 @@ mod tests {
             .expect("single-review correction prompt");
         assert!(correction_prompt.contains("- reviewer1:"));
         assert!(!correction_prompt.contains("reviewer2"));
+        let initial_review = audit
+            .prompts
+            .iter()
+            .find(|(role, purpose, _)| {
+                *role == WorkerRole::Reviewer && *purpose == RuntimeTurnPurpose::InitialReview
+            })
+            .map(|(_, _, prompt)| prompt)
+            .expect("local single-review initial prompt");
+        assert!(initial_review.contains("derive a task-specific coverage checklist"));
+        assert!(initial_review.contains("perform a second counterexample sweep"));
+        let rereview = audit
+            .prompts
+            .iter()
+            .find(|(role, purpose, _)| {
+                *role == WorkerRole::Reviewer && *purpose == RuntimeTurnPurpose::ReviewerRereview
+            })
+            .map(|(_, _, prompt)| prompt)
+            .expect("local single-review re-review prompt");
+        assert!(rereview.contains("audit the append-only correction or local amendment"));
+        assert!(rereview.contains("Reuse your prior validated coverage"));
+        assert!(rereview.contains("do not repeat unchanged low-risk coverage"));
     }
 
     #[test]
@@ -6853,14 +6965,22 @@ mod tests {
             2
         );
         // Each role receives the peer's durable path, never the peer body.
-        let review_prompt = audit
+        let review_prompts = audit
             .prompts
             .iter()
-            .find(|(role, purpose, _)| {
+            .filter(|(role, purpose, _)| {
                 *role == WorkerRole::Reviewer && *purpose == RuntimeTurnPurpose::InitialReview
             })
             .map(|(_, _, prompt)| prompt.clone())
-            .expect("initial review prompt");
+            .collect::<Vec<_>>();
+        assert_eq!(review_prompts.len(), 2);
+        for review_prompt in &review_prompts {
+            assert!(review_prompt.contains("derive a task-specific coverage checklist"));
+            assert!(review_prompt.contains("Do not stop after finding the first blocker"));
+            assert!(review_prompt.contains("perform a second counterexample sweep"));
+            assert!(review_prompt.contains("brief `COVERAGE:` summary"));
+        }
+        let review_prompt = &review_prompts[0];
         let development_prompt = audit
             .prompts
             .iter()
@@ -6869,7 +6989,7 @@ mod tests {
             })
             .map(|(_, _, prompt)| prompt.clone())
             .expect("initial development prompt");
-        for prompt in [&development_prompt, &review_prompt] {
+        for prompt in [&development_prompt, review_prompt] {
             assert!(prompt.contains("AGENTS.md"));
             assert!(prompt.contains("AGENTS.override.md"));
             assert!(prompt.contains(fixture.project_root.to_str().unwrap()));
@@ -6916,14 +7036,29 @@ mod tests {
             .find(clarification_path.to_str().unwrap())
             .expect("clarification Reviewer path");
         assert!(original_index < clarification_index);
-        let rereview_prompt = audit
+        let rereview_prompts = audit
             .prompts
             .iter()
-            .find(|(role, purpose, _)| {
+            .filter(|(role, purpose, _)| {
                 *role == WorkerRole::Reviewer && *purpose == RuntimeTurnPurpose::ReviewerRereview
             })
             .map(|(_, _, prompt)| prompt.clone())
-            .expect("re-review prompt");
+            .collect::<Vec<_>>();
+        assert_eq!(rereview_prompts.len(), 2);
+        for rereview_prompt in &rereview_prompts {
+            assert!(rereview_prompt.contains("verify every finding you raised"));
+            assert!(
+                rereview_prompt.contains("audit the append-only correction or local amendment")
+            );
+            assert!(rereview_prompt.contains("Reuse your prior validated coverage"));
+            assert!(rereview_prompt.contains("re-review every invalidated area"));
+            assert!(rereview_prompt.contains("Perform a complete exact-range review"));
+            assert!(rereview_prompt.contains("do not repeat unchanged low-risk coverage"));
+            assert!(!rereview_prompt.contains(
+                "Independently and completely review the current exact candidate range again"
+            ));
+        }
+        let rereview_prompt = &rereview_prompts[0];
         assert!(!rereview_prompt.contains("second attempt: handled overflow"));
         assert!(
             rereview_prompt.contains(

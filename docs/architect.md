@@ -449,6 +449,26 @@ resumes its own exact session after every amendment. Any amendment invalidates
 all previous verdicts; only same-generation LGTM from every active Reviewer
 completes the task.
 
+Reviewer1 and Reviewer2 are equal independent peers. They receive the same
+complete scope and authority, with no role specialization or review-category
+division. On the initial generation, each Reviewer derives and completes a
+task-specific invariant, caller/consumer, and failure/lifecycle checklist over
+the exact candidate range, continues after the first blocker, performs a second
+counterexample sweep, and reports all substantiated Major/Critical findings in
+one response. Missing test coverage alone and speculative concerns are not
+blockers.
+
+On re-review, each exact resumed Reviewer first verifies its own earlier
+findings, then audits the amendment and its transitive impact. Prior coverage is
+reused only where the amendment cannot invalidate it; every invalidated area is
+re-reviewed. A complete exact-range review is repeated when the amendment
+changes a core invariant, state machine, or externally visible contract; adds a
+caller or concurrency/retry/cleanup/terminal path; crosses subsystem boundaries;
+or has impact the Reviewer cannot bound reliably. Otherwise unchanged low-risk
+coverage is not repeated merely for ceremony. The verdict still covers the
+current exact range. The final records that range and a concise coverage
+summary, but not the internal checklist or a long review narrative.
+
 After a run reaches a terminal state, the Architect first completes its
 Reviewer and clarification evidence handoff. For LGTM it reports the final
 local candidate commit as already reviewed at the exact range; it neither asks
@@ -562,11 +582,16 @@ results before retrying.
 
 After dispatch, the Codex Architect calls `session_wait` with the returned run
 ID and session version and `after_progress_sequence: 0`. This blocking MCP
-subscription completes for one retained `review_requested`,
-`review_responded`, or `task_completed` event; GitHub mode additionally emits
-`candidate_published`, `merge_waiting`, and `run_finalizing`; when the run becomes
-`completed`, `needs_human`, `failed`, or `canceled`; or when a Developer
-clarification/blocker action is latched. The local supervisor continues
+subscription is exposed directly and the hcom-reserved MCP server is omitted
+from code mode, so a pending wait does not create periodic code-mode cell
+yields or heartbeat model turns. It completes only for a retained `review_requested` event after a
+Developer final, a `review_responded` event after a Reviewer final, a terminal
+state (`completed`, `needs_human`, `failed`, or `canceled`), or a latched
+Developer clarification/blocker action. Internal `task_completed`
+bookkeeping, status publication, poll/timer ticks, and transport yields do not
+release it. GitHub publication/delivery bookkeeping (`candidate_published`,
+`merge_waiting`, and `run_finalizing`) is likewise retained as bounded evidence
+without waking the Architect. The local supervisor continues
 lifecycle monitoring and advances Developer-to-active-Reviewer and correction
 transitions without Architect model calls. For a progress result, the
 Architect displays one concise update and immediately waits again using the
@@ -588,9 +613,10 @@ and counts, says that another response is pending, and immediately waits again;
 it does not describe the review generation as complete or imply that Developer
 correction has started. In single mode the Reviewer1 response completes the
 join immediately. `task_completed` separately records LGTM or review exhaustion
-with every active current-generation typed Reviewer result. The Architect displays exact paths
-but does not read or summarize their contents merely to produce a progress
-update.
+with every active current-generation typed Reviewer result, but is internal
+bounded evidence and never releases `session_wait`. The Architect displays
+exact paths from worker-result events but does not read or summarize their
+contents merely to produce a progress update.
 
 Esc or MCP cancellation closes only the current wait subscription; it does not
 cancel the supervisor run. A pending Architect action records the session
@@ -599,9 +625,12 @@ from an older version immediately redelivers it; a repeated wait at or after
 that published version is rejected so it cannot spin on the same action. A
 run-local ordered event list retains progress produced between wait calls.
 Pending Architect actions take priority; after they are resolved, queued
-progress resumes at the last displayed sequence. Queued progress is drained
-before a retained terminal snapshot, so a run finishing during the gap does
-not hide any final Reviewer response or the task-completion event.
+worker-result progress resumes at the last displayed sequence; returned
+sequences may skip internal bookkeeping events. While the run is nonterminal,
+worker-result progress remains retained. A terminal snapshot supersedes queued
+progress and contains final worker evidence, so the final Reviewer response,
+derived task completion, and successful terminal transition are coalesced into
+one wakeup. An abnormal terminal transition also releases the wait immediately.
 
 Task-lane polling is fail-closed at both ownership layers. The driver does not
 drop its active-turn handle until the cloned core accepts the completion

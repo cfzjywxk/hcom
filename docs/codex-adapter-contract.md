@@ -68,7 +68,9 @@ codex
 That last override replaces only the hcom-reserved MCP leaf. Every other
 native MCP server remains loaded. Replacing the whole leaf prevents a stale
 user table with the reserved name from merging incompatible transport fields
-into the relay.
+into the relay. That reserved leaf alone is omitted from code mode, keeping its
+long-running `session_wait` as a direct MCP call; this prevents code-mode cell
+yields from waking the model while the underlying wait is still pending.
 
 The Architect inherits the complete parent environment and uses the real
 HOME/CODEX_HOME. Consequently native config.toml, AGENTS.md, project
@@ -144,17 +146,25 @@ paths. Each accepted clarification becomes ordered task runtime evidence and
 is supplied by path to every later Developer and Reviewer turn; it does not
 change the approved plan hash. `session_wait` is bound to the exact current run
 ID and a run-local progress sequence. It returns one retained review-request,
-per-Reviewer response, or task-completion event, a latched action, or a
-terminal state. Review-request events carry the exact Developer final path read
+per-Reviewer response, a latched action, or a terminal state. Review-request
+events correspond to a normal Developer final; review-response events
+correspond to normal Reviewer finals. Internal task-completion bookkeeping,
+status publication, poll/timer ticks, and transport yields never release the
+wait. Review-request events carry the exact Developer final path read
 by every active Reviewer, the approved task/design paths and selector, current
 generation, and ordered session-level Reviewer bindings. Review-response
 events carry exact Reviewer identity, generation, verdict, response counts,
 Developer path, and that Reviewer's ordered path chain. A response is partial
 while fewer responses have arrived than the active topology expects. Task
-completion carries every active current-generation typed result; no peer body is copied into any
-event. The Architect displays each event without reading response bodies and
-re-waits with its sequence. Events created between waits are retained, and
-queued progress—including every response event—is delivered before terminal.
+completion carries every active current-generation typed result as bounded
+internal evidence; it is not returned as a wait wakeup. No peer body is copied
+into any event. The Architect displays each worker-result event without reading
+response bodies and re-waits with its sequence. Events created between waits
+are retained while the run remains nonterminal, and returned sequences may
+skip internal bookkeeping. A terminal snapshot supersedes queued progress and
+contains the final worker evidence, coalescing a final Reviewer response,
+derived task completion, and successful terminal transition into one wakeup.
+Abnormal terminal transitions also release the wait immediately.
 
 Each action has a `published_version`: an interrupted client can recover it by
 waiting from an older version in that run, while a repeated wait at the
@@ -252,13 +262,13 @@ source gate unless the human explicitly authorizes it.
 |---|---|
 | defaults are explicit | `architect::profile::tests::missing_file_uses_reviewed_defaults`, `worker::profile::tests::task_lane_defaults_to_codex_developer_codex_reviewer1_and_claude_reviewer2` |
 | no prompt or input injection | `architect::launch::tests::native_profile_has_no_prompt_or_secret_transport`, `blank_codex_launch_keeps_input_empty_and_preserves_native_host_semantics` |
-| native config plus one MCP leaf | `architect::launch::tests::codex_control_server_is_an_additive_cli_overlay_not_a_private_config` |
+| native config plus one direct-only MCP leaf | `architect::launch::tests::codex_native_argv_keeps_only_hcom_control_tools_out_of_code_mode`, `architect::launch::tests::codex_control_server_is_an_additive_cli_overlay_not_a_private_config` |
 | Codex MCP schema compatibility across local/GitHub and single/dual inventories | `architect::tools::tests::generated_tool_schemas_stay_inside_the_codex_compatibility_policy`, `architect::tools::tests::codex_schema_policy_rejects_lossy_or_ambiguous_shapes_before_launch` |
 | full bounded local/GitHub status through duplicated MCP projection | `architect::bridge::tests::maximum_control_responses_fit_losslessly_in_the_duplicated_mcp_envelope` |
 | native worker argv/config | `worker::exec_runtime::tests::happy_developer_turn_completes_and_captures_thread_id`, `reviewer_registers_the_external_repository_as_a_native_workspace_root` |
 | byte-exact native environment with no additions | `orchestrator::task_lane::tests::complete_parent_environment_is_preserved_byte_for_byte` |
 | path-only peer and terminal handoff | `orchestrator::task_lane::tests::request_changes_round_routes_only_ordered_durable_paths`, `architect::bridge::tests::session_wait_keeps_mcp_responsive_and_returns_terminal_result` |
-| retained progress paths and wait priority | `orchestrator::core::tests::progress_events_preserve_review_paths_rounds_and_terminal_order`, `control_api::supervisor::tests::a_progress_event_releases_an_already_pending_wait`, `control_api::supervisor::tests::pending_action_precedes_progress_and_progress_precedes_terminal`, `architect::bridge::tests::progress_result_reaches_both_mcp_response_representations_without_peer_body` |
+| retained worker results and wakeup whitelist | `orchestrator::core::tests::progress_events_preserve_review_paths_rounds_and_terminal_order`, `control_api::supervisor::tests::a_worker_result_releases_an_already_pending_wait`, `control_api::supervisor::tests::status_and_derived_task_completion_do_not_release_wait_but_worker_return_does`, `control_api::supervisor::tests::pending_action_precedes_worker_return`, `control_api::supervisor::tests::terminal_coalesces_queued_worker_return_and_derived_completion`, `architect::bridge::tests::progress_result_reaches_both_mcp_response_representations_without_peer_body` |
 | sequential immutable runs in one Architect | `orchestrator::core::tests::terminal_core_creates_a_fresh_run_without_mutating_terminal_evidence`, `orchestrator::task_lane::tests::one_foreground_supervisor_runs_two_immutable_runs_with_fresh_workers`, `control_api::supervisor::tests::terminal_run_begin_creates_a_new_run_and_old_wait_identity_is_rejected` |
 | project ownership survives run transition | `orchestrator::task_lane::tests::one_foreground_supervisor_runs_two_immutable_runs_with_fresh_workers`, `orchestrator::workspace::tests::a_second_process_cannot_open_the_project_workspace_while_it_is_locked` |
 | bounded clarification control plane | `orchestrator::core::tests::status_snapshot_is_bounded_and_clarification_records_are_exactly_paginated`, `control_api::codec::tests::maximum_clarification_page_stays_within_the_control_response_frame`, `orchestrator::core::tests::clarification_capacity_exhaustion_terminalizes_instead_of_latching_more_state` |

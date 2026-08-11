@@ -198,13 +198,17 @@ amendment invalidates every previous verdict. Single-review plans accept
 `max_review_rounds` from 5 through 20, while dual-review plans accept 7 through
 20. After dispatch, the Codex
 Architect opens one blocking session_wait MCP call bound to the exact run_id
-and a run-local progress cursor. The foreground supervisor advances Developer
-and all active Reviewers without Architect model calls and completes that wait for one
-retained progress event, a terminal state, or a latched Developer
-clarification/blocker action. Progress events are emitted for each review
-generation, each Reviewer response, and task completion. They carry task
+and a run-local progress cursor. hcom exposes its reserved Codex control MCP
+server directly rather than as a nested code-mode tool, so this pending call
+does not produce code-mode cell yields or heartbeat model turns. The foreground
+supervisor advances Developer
+and all active Reviewers without Architect model calls. The wait returns only
+for a normal Developer result (`review_requested`), a normal Reviewer result
+(`review_responded`), a terminal state, or a latched Developer
+clarification/blocker action. Internal task completion, status publication,
+poll/timer ticks, and transport yields do not release it. Worker-result events carry task
 position, completed review round, current generation, Reviewer identity,
-response counts and verdict/outcome where applicable, the exact Developer
+response counts and verdict where applicable, the exact Developer
 final path, and ordered current-generation Reviewer final paths where
 applicable; review requests also carry the task/design paths, selector, and
 ordered active Reviewer bindings. The Architect displays each event once
@@ -222,8 +226,11 @@ status polls. Interrupting the wait cancels only that subscription, never the
 run. A still-latched action has priority over queued progress and is
 redelivered only to a wait from a version older than its published_version; a
 same-version repeated wait is rejected until the action is resolved. Queued
-progress, including every Reviewer response event, is delivered before a
-retained terminal result. Status snapshots expose bounded concurrent
+progress is retained while the run remains nonterminal. A terminal snapshot
+supersedes queued progress and carries the final worker evidence, coalescing a
+final Reviewer result, derived task completion, and successful terminal
+transition into one wakeup. Abnormal terminal transitions also release the
+wait immediately. Status snapshots expose bounded concurrent
 active_workers, session-level ordered Reviewer bindings, each task's
 review_round/review_generation, and typed current-generation Reviewer results;
 they carry clarification counts rather than record bodies.
