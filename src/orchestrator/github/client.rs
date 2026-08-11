@@ -70,7 +70,10 @@ pub(crate) enum TransportKind {
     NotConnected,
     BrokenPipe,
     UnexpectedEof,
+    ConnectionClosed,
+    RequestCanceled,
     Connect,
+    Protocol,
     Request,
     Body,
     Decode,
@@ -90,7 +93,10 @@ impl fmt::Display for TransportKind {
             Self::NotConnected => "not_connected",
             Self::BrokenPipe => "broken_pipe",
             Self::UnexpectedEof => "unexpected_eof",
+            Self::ConnectionClosed => "connection_closed",
+            Self::RequestCanceled => "request_canceled",
             Self::Connect => "connect",
+            Self::Protocol => "protocol",
             Self::Request => "request",
             Self::Body => "body",
             Self::Decode => "decode",
@@ -1149,6 +1155,22 @@ fn classify_reqwest_transport(error: &reqwest::Error) -> TransportKind {
     if error.is_connect() {
         return TransportKind::Connect;
     }
+    if error_chain_contains_message(error, "connection closed before message completed")
+        || error_chain_contains_message(error, "checked out connection was closed")
+    {
+        return TransportKind::ConnectionClosed;
+    }
+    if error_chain_contains_message(error, "operation was canceled")
+        || error_chain_contains_message(error, "request was canceled")
+    {
+        return TransportKind::RequestCanceled;
+    }
+    if error_chain_contains_message(error, "client error (sendrequest)")
+        || error_chain_contains_message(error, "http1 error")
+        || error_chain_contains_message(error, "http2 error")
+    {
+        return TransportKind::Protocol;
+    }
     if error.is_body() {
         return TransportKind::Body;
     }
@@ -1212,6 +1234,17 @@ fn error_chain_contains_tls(error: &(dyn StdError + 'static)) -> bool {
     false
 }
 
+fn error_chain_contains_message(error: &(dyn StdError + 'static), needle: &str) -> bool {
+    let mut cause = Some(error);
+    while let Some(current) = cause {
+        if current.to_string().to_ascii_lowercase().contains(needle) {
+            return true;
+        }
+        cause = current.source();
+    }
+    false
+}
+
 fn error_chain_io_kind(error: &(dyn StdError + 'static)) -> Option<TransportKind> {
     let mut cause = Some(error);
     while let Some(current) = cause {
@@ -1267,6 +1300,12 @@ fn client_builder(https_only: bool, request_timeout: Duration) -> reqwest::block
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(request_timeout)
         .redirect(Policy::none())
+        // The foreground supervisor can live across long model turns. Never
+        // reuse an idle API connection whose proxy tunnel or origin-side HTTP/1
+        // state may have gone stale: an ambiguous mutation must start on a
+        // fresh bounded connection, while application-level retries remain
+        // guarded by endpoint-specific zero-effect reconciliation.
+        .pool_max_idle_per_host(0)
         .default_headers(headers);
     if https_only {
         builder.https_only(true)
@@ -1484,8 +1523,8 @@ fn sanitized_remote_reason(body: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::control_api::GitHubAppRole;
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpListener;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::thread;
 
     fn token(operation: InstallationOperation) -> InstallationToken {
@@ -1567,6 +1606,81 @@ mod tests {
         (Url::parse(&format!("http://{address}/")).unwrap(), handle)
     }
 
+    fn read_http_request(reader: &mut BufReader<TcpStream>, first_byte: Option<u8>) -> String {
+        let mut request = String::new();
+        let mut content_length = 0usize;
+        let mut first_byte = first_byte;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if let Some(byte) = first_byte.take() {
+                line.insert(0, char::from(byte));
+            }
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                content_length = value.trim().parse().unwrap();
+            }
+            request.push_str(&line);
+        }
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body).unwrap();
+        request.push_str(std::str::from_utf8(&body).unwrap());
+        request
+    }
+
+    fn serve_two_requests_and_detect_reuse() -> (Url, thread::JoinHandle<(bool, String, String)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (first, _) = listener.accept().unwrap();
+            first
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut first = BufReader::new(first);
+            let first_request = read_http_request(&mut first, None);
+            let first_body = br#"{"id":99}"#;
+            write!(
+                first.get_mut(),
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                first_body.len()
+            )
+            .unwrap();
+            first.get_mut().write_all(first_body).unwrap();
+            first.get_mut().flush().unwrap();
+
+            let mut byte = [0u8; 1];
+            let (reused, second_request, mut response_stream) = match first.read(&mut byte) {
+                Ok(0) => {
+                    let (second, _) = listener.accept().unwrap();
+                    let mut second = BufReader::new(second);
+                    let request = read_http_request(&mut second, None);
+                    (false, request, second.into_inner())
+                }
+                Ok(1) => {
+                    let request = read_http_request(&mut first, Some(byte[0]));
+                    (true, request, first.into_inner())
+                }
+                Ok(_) => unreachable!(),
+                Err(error) => panic!("waiting for the next HTTP request failed: {error}"),
+            };
+            let second_body = br#"{}"#;
+            write!(
+                response_stream,
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                second_body.len()
+            )
+            .unwrap();
+            response_stream.write_all(second_body).unwrap();
+            response_stream.flush().unwrap();
+            (reused, first_request, second_request)
+        });
+        (Url::parse(&format!("http://{address}/")).unwrap(), handle)
+    }
+
     #[test]
     fn typed_client_uses_closed_url_headers_and_bounded_json_path() {
         let body = br#"{"id":99,"private":true}"#;
@@ -1615,6 +1729,38 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, GitHubApiError::CredentialScope { .. }));
         assert!(!format!("{error}").contains("fixture-token"));
+    }
+
+    #[test]
+    fn sequential_rest_operations_never_reuse_an_idle_tcp_connection() {
+        let (origin, server) = serve_two_requests_and_detect_reuse();
+        let client = GitHubRestClient::new_for_test(origin).unwrap();
+        let repository_token = token(InstallationOperation::RepositoryMetadata);
+        let _: serde_json::Value = client
+            .get(
+                RestEndpoint::Repository {
+                    owner: "owner".into(),
+                    repository: "repo".into(),
+                },
+                GitHubAuthentication::Installation(&repository_token),
+            )
+            .unwrap();
+        let pull_request_token = token(InstallationOperation::PullRequestCreate);
+        let _: serde_json::Value = client
+            .send_json(
+                RestEndpoint::CreatePullRequest {
+                    owner: "owner".into(),
+                    repository: "repo".into(),
+                },
+                GitHubAuthentication::Installation(&pull_request_token),
+                &serde_json::json!({"title":"fixture"}),
+            )
+            .unwrap();
+
+        let (reused, first, second) = server.join().unwrap();
+        assert!(!reused, "the second GitHub operation reused an idle socket");
+        assert!(first.starts_with("GET /repos/owner/repo HTTP/1.1\r\n"));
+        assert!(second.starts_with("POST /repos/owner/repo/pulls HTTP/1.1\r\n"));
     }
 
     #[test]
@@ -1890,6 +2036,39 @@ mod tests {
             ),
             "unexpected connection diagnostic: {error:?} / {error}"
         );
+    }
+
+    #[test]
+    fn connection_closed_before_response_is_not_a_generic_request_failure() {
+        let (origin, server) = serve_transport_case(None, Duration::ZERO, Duration::ZERO);
+        let client = GitHubRestClient::new_for_test(origin).unwrap();
+        let token = token(InstallationOperation::PullRequestCreate);
+        let error = client
+            .send_json::<_, serde_json::Value>(
+                RestEndpoint::CreatePullRequest {
+                    owner: "owner".into(),
+                    repository: "repo".into(),
+                },
+                GitHubAuthentication::Installation(&token),
+                &serde_json::json!({"title":"fixture"}),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                GitHubApiError::Transport {
+                    method: RestMethod::Post,
+                    stage: TransportStage::RequestSend,
+                    kind: TransportKind::ConnectionClosed,
+                    status: None,
+                    ambiguous: true,
+                    ..
+                }
+            ),
+            "unexpected closed-connection diagnostic: {error:?} / {error}"
+        );
+        server.join().unwrap();
     }
 
     #[test]

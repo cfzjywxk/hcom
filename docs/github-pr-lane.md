@@ -167,10 +167,18 @@ reconciliation readback; exhausting the window reports the final bounded HTTP
 status, request ID, and sanitized GitHub reason when those fields were present.
 It also reports the attempt count and elapsed retry time. Transport failures
 distinguish request-send from response-body reads and retain a bounded category
-(`timeout`, TLS/connect/I/O class, or body/decode), request/stage elapsed time,
-the configured timeout, and any status, request ID, or rate-limit headers that
-arrived before a body failure. No credential, request body, raw URL, or remote
-response body is copied into this diagnostic.
+(`timeout`, TLS/connect/I/O, connection-closed/canceled/protocol, or
+body/decode), request/stage elapsed time, the configured timeout, and any
+status, request ID, or rate-limit headers that arrived before a body failure.
+No credential, request body, raw URL, or remote response body is copied into
+this diagnostic.
+
+The production REST client does not reuse idle TCP connections between API
+operations. Architect sessions can span long model turns, and a proxy tunnel or
+origin-side HTTP/1 connection can become stale without the client observing the
+close until a later request starts. Each GitHub request therefore uses a fresh
+bounded connection; mutation retries remain exclusively at the workflow layer
+and still require endpoint-specific zero-effect reconciliation before replay.
 
 ## Local verification
 
