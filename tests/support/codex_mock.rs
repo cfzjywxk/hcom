@@ -11,14 +11,137 @@
 //! codec (SSE builders + body-addressed scripting). Codex only needs each turn's
 //! events terminated by `response.completed`; streaming deltas are not required.
 
+use std::time::{Duration, Instant};
+
 use serde_json::Value;
 
 use super::Hcom;
 pub use super::mock_http::Reply;
 use super::mock_http::{MockHttp, RecordedRequest};
 use super::real_tool::{
-    FORK_PROOF, INBOUND_PROOF, INITIAL_PROOF, RESUME_PROOF, ScenarioIds, ToolCase, ToolMeta,
+    EndpointAttemptError, FORK_PROOF, INBOUND_PROOF, INITIAL_PROOF, RESUME_PROOF, ScenarioIds,
+    ToolCase, ToolMeta, retry_live_fixture_endpoint,
 };
+
+const TRUST_QUESTION: &str = "Do you trust the contents of this directory?";
+const TRUST_YES: &str = "1. Yes, continue";
+const SELECTED_TRUST_YES: &str = "› 1. Yes, continue";
+const TRUST_CONTINUE_PROMPT: &str = "Press enter to continue";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexStartupAction {
+    ConfirmTrust,
+    Ready,
+    Wait,
+}
+
+/// Classify one atomic `term --json` snapshot. The selected menu label is also
+/// reported by Codex's input parser as `input_text`; it is safe to submit only
+/// when the same snapshot proves the exact trust question and selected default.
+pub(crate) fn classify_codex_startup_screen(
+    screen: &Value,
+    trust_confirmation_sent: bool,
+) -> Result<CodexStartupAction, String> {
+    let lines = screen
+        .get("lines")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Codex startup screen has no lines array".to_string())?;
+    let lines = lines
+        .iter()
+        .map(|line| {
+            line.as_str()
+                .ok_or_else(|| "Codex startup screen contains a non-text line".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let ready = screen
+        .get("ready")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "Codex startup screen has no boolean ready field".to_string())?;
+    let prompt_empty = screen
+        .get("prompt_empty")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "Codex startup screen has no boolean prompt_empty field".to_string())?;
+    let input_text = screen.get("input_text").and_then(Value::as_str);
+
+    let has_question = lines.iter().any(|line| line.contains(TRUST_QUESTION));
+    let has_selected_yes = lines.iter().any(|line| line.trim() == SELECTED_TRUST_YES);
+    let has_continue_prompt = lines
+        .iter()
+        .any(|line| line.trim() == TRUST_CONTINUE_PROMPT);
+    let has_menu_selector = lines.iter().any(|line| {
+        line.trim_start()
+            .strip_prefix('›')
+            .map(str::trim_start)
+            .and_then(|selection| selection.split_once(". "))
+            .is_some_and(|(ordinal, _)| ordinal.parse::<usize>().is_ok())
+    });
+    let input_is_yes = input_text == Some(TRUST_YES);
+    let exact_trust_surface = ready
+        && !prompt_empty
+        && has_question
+        && has_selected_yes
+        && has_continue_prompt
+        && input_is_yes;
+
+    if exact_trust_surface {
+        return Ok(if trust_confirmation_sent {
+            // The successful inject can race the next screen repaint. Never
+            // submit a second Enter; wait for a fresh normal-prompt snapshot.
+            CodexStartupAction::Wait
+        } else {
+            CodexStartupAction::ConfirmTrust
+        });
+    }
+
+    if has_question || has_selected_yes || has_continue_prompt || input_is_yes {
+        return Err(format!(
+            "incomplete Codex trust surface: ready={ready} prompt_empty={prompt_empty} question={has_question} selected_yes={has_selected_yes} continue_prompt={has_continue_prompt} input_is_yes={input_is_yes}"
+        ));
+    }
+    if has_menu_selector {
+        return Err("unknown Codex startup menu; refusing to submit it".to_string());
+    }
+    if input_text.is_some_and(|text| !text.is_empty()) {
+        return Err(format!(
+            "Codex startup found an ordinary draft; refusing to submit it (input_len={})",
+            input_text.unwrap_or_default().len()
+        ));
+    }
+    if ready && prompt_empty && input_text == Some("") {
+        return Ok(CodexStartupAction::Ready);
+    }
+    if ready || prompt_empty {
+        return Err(format!(
+            "incomplete Codex normal prompt: ready={ready} prompt_empty={prompt_empty} input_present={}",
+            input_text.is_some()
+        ));
+    }
+
+    Ok(CodexStartupAction::Wait)
+}
+
+fn observe_codex_startup(
+    h: &Hcom,
+    name: &str,
+    trust_confirmation_sent: bool,
+) -> Result<CodexStartupAction, EndpointAttemptError> {
+    let (code, stdout, stderr) = h.run(["term", name, "--json"]);
+    if code != 0 {
+        return Err(EndpointAttemptError::from_command(
+            "Codex startup screen handshake",
+            code,
+            &stdout,
+            &stderr,
+        ));
+    }
+    let screen: Value = serde_json::from_str(stdout.trim()).map_err(|error| {
+        EndpointAttemptError::fatal(format!(
+            "Codex startup screen handshake returned invalid JSON: {error}"
+        ))
+    })?;
+    classify_codex_startup_screen(&screen, trust_confirmation_sent)
+        .map_err(EndpointAttemptError::fatal)
+}
 
 const CODEX_META: ToolMeta = ToolMeta {
     tool: "codex",
@@ -63,6 +186,54 @@ impl ToolCase for CodexCase {
     fn launch_args(&self, _h: &Hcom) -> Vec<String> {
         // hcom supplies Codex's sandbox/trust/add-dir flags itself.
         Vec::new()
+    }
+
+    fn drive_startup(&self, h: &Hcom, name: &str) {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let first_action =
+            retry_live_fixture_endpoint(h, name, "Codex startup gate", deadline, || {
+                match observe_codex_startup(h, name, false)? {
+                    CodexStartupAction::ConfirmTrust => {
+                        // This PTY was created by and is exclusively owned by the
+                        // fixture. Empty text + Enter is the minimum confirmation.
+                        let (code, stdout, stderr) =
+                            h.run(["term", "inject", name, "--enter", "--force"]);
+                        if code == 0 {
+                            Ok(CodexStartupAction::ConfirmTrust)
+                        } else {
+                            Err(EndpointAttemptError::from_command(
+                                "Codex trust confirmation",
+                                code,
+                                &stdout,
+                                &stderr,
+                            ))
+                        }
+                    }
+                    CodexStartupAction::Ready => Ok(CodexStartupAction::Ready),
+                    CodexStartupAction::Wait => Err(EndpointAttemptError::recoverable(
+                        "Codex startup screen is not ready",
+                    )),
+                }
+            })
+            .unwrap_or_else(|error| panic!("{error}\n{}", h.diagnostics()));
+
+        if first_action == CodexStartupAction::Ready {
+            return;
+        }
+        assert_eq!(first_action, CodexStartupAction::ConfirmTrust);
+
+        retry_live_fixture_endpoint(h, name, "Codex post-trust normal prompt", deadline, || {
+            match observe_codex_startup(h, name, true)? {
+                CodexStartupAction::Ready => Ok(()),
+                CodexStartupAction::Wait => Err(EndpointAttemptError::recoverable(
+                    "Codex trust confirmation has not reached a fresh empty prompt",
+                )),
+                CodexStartupAction::ConfirmTrust => Err(EndpointAttemptError::fatal(
+                    "Codex startup requested duplicate trust confirmation",
+                )),
+            }
+        })
+        .unwrap_or_else(|error| panic!("{error}\n{}", h.diagnostics()));
     }
 
     fn is_followup_turn(&self, body: &str) -> bool {

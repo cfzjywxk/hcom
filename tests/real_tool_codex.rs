@@ -24,7 +24,7 @@ use std::time::Duration;
 use support::codex_mock::{
     CodexCase, MockResponses, Reply, completed, created, message, shell_call, sse,
 };
-use support::real_tool::{inject_prompt_until, require_pinned};
+use support::real_tool::{ToolCase, inject_prompt_until, require_pinned};
 use support::{Hcom, parse_launch_names, unique_suffix};
 
 #[test]
@@ -162,6 +162,9 @@ fn real_codex_approval_gate_blocks_pending_message_then_clears_on_approval() {
             }
         },
     );
+    // A clean CI CODEX_HOME has no workspace trust state. Drive only the exact
+    // fixture-owned trust surface, then require a fresh empty normal prompt.
+    CodexCase.drive_startup(&h, &name);
     h.eventually("Codex PTY inject endpoint", Duration::from_secs(90), || {
         let (code, stdout, _stderr) = h.run(["term", &name, "--json"]);
         if code == 0 && stdout.contains("\"ready\":true") {

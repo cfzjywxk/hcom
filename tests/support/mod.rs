@@ -365,7 +365,8 @@ impl Hcom {
 
     /// Write the isolated Codex `config.toml` pointing the default model
     /// provider at the localhost mock. hcom still installs every native Codex
-    /// hook and auto-trusts the workspace through the real launch path.
+    /// hook; real-tool tests accept workspace trust only through their owned
+    /// PTY startup driver, without pre-seeding Codex trust state here.
     ///
     /// `requires_openai_auth = false` plus the dummy `env_key` (DUMMY_KEY, set in
     /// the isolated env) lets Codex start fully headless against the mock. The

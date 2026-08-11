@@ -114,8 +114,8 @@ pub trait ToolCase: Clone + Send + Sync + 'static {
 
     /// Drive any one-time startup gate hcom surfaces in the PTY as
     /// `launch_blocked` before the tool is ready — e.g. Claude's onboarding +
-    /// workspace-trust prompts, which gate hook registration. Default no-op
-    /// (Codex starts straight into its TUI). This deliberately exercises the
+    /// workspace-trust prompts, which gate hook registration. Default no-op;
+    /// tools with a surfaced gate override it. This deliberately exercises the
     /// real surfaced-prompt path rather than pre-seeding trust state.
     fn drive_startup(&self, _h: &Hcom, _name: &str) {}
 }
@@ -200,14 +200,14 @@ pub(crate) struct EndpointAttemptError {
 }
 
 impl EndpointAttemptError {
-    fn recoverable(detail: impl Into<String>) -> Self {
+    pub(crate) fn recoverable(detail: impl Into<String>) -> Self {
         Self {
             kind: EndpointFailureKind::Recoverable,
             detail: detail.into(),
         }
     }
 
-    fn fatal(detail: impl Into<String>) -> Self {
+    pub(crate) fn fatal(detail: impl Into<String>) -> Self {
         Self {
             kind: EndpointFailureKind::Fatal,
             detail: detail.into(),
@@ -322,6 +322,26 @@ fn fixture_process_state(h: &Hcom, name: &str) -> Result<FixtureProcessState, St
         status,
         status_context,
     })
+}
+
+/// Production-shaped retry wrapper for a fixture-owned PTY endpoint. Keeping
+/// process inspection here makes every startup driver inherit the same bounded
+/// stale-port and dead-child behavior as prompt injection.
+pub(crate) fn retry_live_fixture_endpoint<T>(
+    h: &Hcom,
+    name: &str,
+    description: &str,
+    deadline: Instant,
+    attempt: impl FnMut() -> Result<T, EndpointAttemptError>,
+) -> Result<T, String> {
+    retry_fixture_endpoint(
+        description,
+        ENDPOINT_RETRY_LIMIT,
+        deadline,
+        ENDPOINT_RETRY_INTERVAL,
+        attempt,
+        || fixture_process_state(h, name),
+    )
 }
 
 fn attempt_prompt_submit(h: &Hcom, name: &str, prompt: &str) -> Result<(), EndpointAttemptError> {
