@@ -268,10 +268,16 @@ impl GitHubEvidenceWriter {
             bail!("GitHub evidence binding is inconsistent");
         }
         validate_git_sha("GitHub evidence expected base", &run.expected_base_sha)?;
-        validate_sha256(
-            "GitHub evidence ruleset attestation",
-            &run.ruleset_attestation_sha256,
-        )?;
+        match (
+            delivery.delivery_policy,
+            run.ruleset_attestation_sha256.as_deref(),
+        ) {
+            (crate::control_api::GitHubDeliveryPolicy::Manual, None) => {}
+            (crate::control_api::GitHubDeliveryPolicy::ProtectedAutoMerge, Some(attestation)) => {
+                validate_sha256("GitHub evidence ruleset attestation", attestation)?
+            }
+            _ => bail!("GitHub evidence ruleset binding differs from delivery policy"),
+        }
         let path = self.write_serialized(
             EvidencePath::Binding,
             &BindingEvidence {
@@ -499,6 +505,7 @@ mod tests {
             .effective_permissions
             .insert("contents".into(), GitHubPermissionLevel::Write);
         let delivery = GitHubPullRequestBinding {
+            delivery_policy: crate::control_api::GitHubDeliveryPolicy::ProtectedAutoMerge,
             owner: "owner".into(),
             repository: "repo".into(),
             repository_id: 99,
@@ -520,7 +527,7 @@ mod tests {
             inspected_repository_id: 99,
             expected_base_ref: "refs/heads/master".into(),
             expected_base_sha: "a".repeat(40),
-            ruleset_attestation_sha256: "b".repeat(64),
+            ruleset_attestation_sha256: Some("b".repeat(64)),
             inspection_id: "inspection-fixture".into(),
         };
         let run = GitHubRunBinding {

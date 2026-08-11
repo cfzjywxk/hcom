@@ -6,7 +6,12 @@ The GitHub lane is an explicit delivery mode for the foreground Architect:
 hcom arch codex --github-pr
 hcom arch codex --single-review --github-pr
 hcom arch claude --github-pr
+hcom arch codex --github-pr --protected-auto-merge
 ```
+
+`--github-pr` selects manual delivery by default. The optional
+`--protected-auto-merge` flag requires `--github-pr` and is the only way to
+select the strict ruleset-attested exact-head merge policy.
 
 Without `--github-pr`, `hcom arch` remains the local-candidate lane. A parsed
 `[architect.github]` table is then semantically inert: hcom does not validate
@@ -54,30 +59,44 @@ private_key_file = "/absolute/private/path/reviewer2.pem"
 ```
 
 The four Apps must have distinct App, installation, slug, and bot identities.
-The Architect App needs Administration read plus Contents, Pull requests, and
-Checks read/write. The Developer App needs Contents and Pull requests
-read/write and is the sole commit/push/PR-comment identity. Each Reviewer App
-needs Pull requests read/write and is the sole identity for its matching review
-lane. hcom requests down-scoped installation tokens and never exports tokens or
-keys to Architect or worker processes, Git argv, Git configuration, errors,
+In manual mode the Architect App minimum is Checks and Pull requests
+read/write; it does not require Administration or Contents write for merge or
+remote deletion. The Developer App needs Contents and Pull requests read/write
+and is the sole commit/push/PR-comment identity. Each Reviewer App needs Pull
+requests read/write and is the sole identity for its matching review lane.
+Protected auto-merge additionally requires the Architect Administration read
+and Contents write used by ruleset attestation, merge, and final cleanup. Hcom
+requests per-operation down-scoped installation tokens and never exports tokens
+or keys to Architect or worker processes, Git argv, Git configuration, errors,
 status, or durable evidence.
 
 Startup validates the effective provider topology and the Claude proxy gate
 first. GitHub mode then opens and parses only the active App keys, validates
 the canonical local repository root, and performs bounded read-only checks of
-the Apps, installations, private repository, base ref, permissions, actors,
-and hcom-critical rules. It freezes and prints the resulting non-secret
-delivery binding and first inspection before launching the blank interactive
-Architect. This preflight creates no ref, branch, worktree, Pull Request,
-Check, comment, review, or merge.
+the Apps, installations, private repository, base ref, permissions, and actors.
+Manual mode does not call, require, hash, freeze, or revalidate ruleset or
+branch-protection APIs; a GitHub Free private-repository ruleset 403 is therefore
+irrelevant. Protected auto-merge additionally attests the hcom-critical rules.
+Hcom freezes and prints the resulting non-secret delivery binding, explicit
+policy, and first inspection before launching the blank interactive Architect.
+This preflight creates no ref, branch, worktree, Pull Request, Check, comment,
+review, or merge.
 
 ## Authorization and one-run topology
 
 `--github-pr` authorizes read-only preflight only. The human still owns the
 Architect's first input. GitHub writes begin only after the Architect has
-refreshed the inspection, displayed a complete typed plan with its exact base
-SHA/rules attestation/generated branch, disclosed external publication, and
-received execution authorization under the normal plan contract.
+refreshed the inspection, displayed a complete typed plan with its exact
+delivery policy, base SHA, policy-applicable rules evidence, generated branch,
+external-publication disclosure, and terminal disposition, and received
+execution authorization under the normal plan contract.
+
+A manual plan explicitly discloses that hcom verifies its own exact base/head,
+actors, append-only task chain, published reviews, and `hcom/review` Check, but
+cannot prove server-side PR/direct-push enforcement for a private GitHub Free
+repository or prevent an authorized external actor from direct-pushing or
+merging early. Approval authorizes the bounded branch/worktree/push/PR/review/
+Check workflow, not merge, remote deletion, or merged-run finalization.
 
 One approved run is bound to one private repository, one base branch, one
 generated `hcom/run-...` branch, one linked worktree below the run evidence
@@ -104,26 +123,36 @@ later hcom-owned commit was appended. The `hcom/review` Check succeeds only
 when every task is LGTM and every active current-generation review is a
 published same-head approval.
 
-After the Check and rules/base/head identities are revalidated, hcom requests
-one exact-head squash merge and reconciles ambiguous responses before any
-retry. Confirmed merge finalization and its evidence must complete before the
-run reports `delivered`. hcom never retries a confirmed merge.
+In manual mode the final exact-head Check is the last run mutation. All-task
+LGTM completes as `review_complete_unmerged`: the PR remains open and the
+generated remote/local branch, linked worktree, and evidence are preserved for
+human disposition. This outcome means hcom review is complete; it is not a
+claim that GitHub rules or CI consider the PR merge-ready. A later foreground
+run never adopts those artifacts.
+
+Only protected auto-merge revalidates rules/base/head identities, requests one
+exact-head squash merge, and reconciles ambiguous responses before any retry.
+Confirmed merge finalization and its evidence must complete before that policy
+reports `delivered`. Hcom never retries a confirmed merge.
 
 ## Progress, terminal handoff, and failure behavior
 
 Progress reports the exact PR URL, task/generation, head SHA, publication
 identity and response counts. Terminal handoff includes the PR number/URL,
 run base and final head, each task's exact range and outcome, ordered Reviewer
-review URLs/verdicts, `hcom/review` Check URL/state, approved and final ruleset
-attestations, delivery outcome, and merge SHA when delivered. It also reports
-the preserved branch/worktree/PR for unmerged or human-action outcomes.
+review URLs/verdicts, `hcom/review` Check URL/state, delivery policy,
+policy-applicable approved/final ruleset attestations, delivery outcome, and
+merge SHA only when delivered. It reports the preserved branch/worktree/PR for
+`review_complete_unmerged`, review-exhausted, or human-action outcomes.
 
 Review exhaustion advances through remaining tasks, leaves the aggregate
 Check `action_required`, and completes as `unmerged_review_exhausted` without
-requesting merge. Base/rules/head/actor drift, conflicting remote state,
+requesting merge. Base/head/actor drift, conflicting remote state,
 publication identity failure, lifecycle failure, or cleanup failure enters a
 human-visible operational terminal. A confirmed merge followed by
-finalization failure remains distinguishable from an unmerged failure.
+finalization failure is possible only in protected mode and remains
+distinguishable from an unmerged failure. Rules drift applies only to protected
+auto-merge because manual delivery never reads or binds rules.
 
 The foreground parent owns the workflow and linked worktree. Parent exit
 stops workers; there is no daemon or restart recovery. A later foreground

@@ -1712,7 +1712,7 @@ mod tests {
                 inspected_repository_id: binding.repository_id,
                 expected_base_ref: "refs/heads/master".into(),
                 expected_base_sha: base_sha.clone(),
-                ruleset_attestation_sha256: "b".repeat(64),
+                ruleset_attestation_sha256: Some("b".repeat(64)),
                 inspection_id: "inspection-pr02".into(),
                 generated_run_branch: branch,
             };
@@ -3056,6 +3056,7 @@ exit "$status"
             ]),
         };
         GitHubPullRequestBinding {
+            delivery_policy: crate::control_api::GitHubDeliveryPolicy::ProtectedAutoMerge,
             owner: "owner".into(),
             repository: "repository".into(),
             repository_id: 42,

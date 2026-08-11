@@ -263,6 +263,13 @@ pub(crate) enum InstallationOperation {
 }
 
 impl InstallationOperation {
+    pub(crate) fn requires_protected_auto_merge(self) -> bool {
+        matches!(
+            self,
+            Self::RulesetAttestation | Self::Merge | Self::RemoteRefCleanup
+        )
+    }
+
     pub(crate) fn permits_role(self, role: GitHubAppRole) -> bool {
         match self {
             Self::RepositoryMetadata => true,
@@ -801,6 +808,29 @@ mod tests {
             ]),
             request.permissions(),
         ));
+    }
+
+    #[test]
+    fn only_protected_delivery_operations_require_merge_authority() {
+        for operation in [
+            InstallationOperation::RulesetAttestation,
+            InstallationOperation::Merge,
+            InstallationOperation::RemoteRefCleanup,
+        ] {
+            assert!(operation.requires_protected_auto_merge());
+        }
+        for operation in [
+            InstallationOperation::RepositoryAndRefRead,
+            InstallationOperation::GitFetch,
+            InstallationOperation::GitPush,
+            InstallationOperation::PullRequestCreate,
+            InstallationOperation::DeveloperComment,
+            InstallationOperation::ReviewPublish,
+            InstallationOperation::CheckPublish,
+            InstallationOperation::TerminalComment,
+        ] {
+            assert!(!operation.requires_protected_auto_merge());
+        }
     }
 
     #[test]

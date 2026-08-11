@@ -66,6 +66,34 @@ const CANCEL_POLL: Duration = Duration::from_millis(100);
 const MUTATION_RETRY_ATTEMPTS: usize = 3;
 const MUTATION_RETRY_WINDOW: Duration = Duration::from_secs(120);
 
+fn ruleset_attestation_for_policy(
+    policy: crate::control_api::GitHubDeliveryPolicy,
+    attest: impl FnOnce() -> Result<String>,
+) -> Result<Option<String>> {
+    if policy.is_protected_auto_merge() {
+        attest().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn validate_manual_terminal_audit_for_policy(
+    policy: crate::control_api::GitHubDeliveryPolicy,
+    task_ordinal: usize,
+    task_count: usize,
+    current_outcome: Option<TaskCompletionOutcome>,
+    validate: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if policy == crate::control_api::GitHubDeliveryPolicy::Manual
+        && task_ordinal.checked_add(1) == Some(task_count)
+        && current_outcome.is_some()
+    {
+        validate()
+    } else {
+        Ok(())
+    }
+}
+
 fn remote_ref_finalization_outcome_name(outcome: RemoteRefFinalizationOutcome) -> &'static str {
     match outcome {
         RemoteRefFinalizationOutcome::Deleted => "deleted",
@@ -290,6 +318,11 @@ impl ProductionGitHubProvider {
         role: GitHubAppRole,
         operation: InstallationOperation,
     ) -> Result<InstallationToken> {
+        if operation.requires_protected_auto_merge()
+            && !binding.delivery_policy.is_protected_auto_merge()
+        {
+            bail!("manual GitHub delivery forbids protected auto-merge operations");
+        }
         let app = Self::app_for_role(binding, role)?;
         let now = SystemTime::now();
         let jwt = self.signer(role)?.mint_jwt(app.app_id, now)?;
@@ -410,7 +443,11 @@ impl ProductionGitHubProvider {
                 apps: apps.clone(),
                 expected_base_ref: format!("refs/heads/{}", self.config.base_branch),
                 expected_base_sha: "0".repeat(40),
-                ruleset_attestation_sha256: "0".repeat(64),
+                ruleset_attestation_sha256: self
+                    .config
+                    .delivery_policy
+                    .is_protected_auto_merge()
+                    .then(|| "0".repeat(64)),
                 inspection_id: "inspection-provisional".into(),
             },
         )?;
@@ -432,13 +469,15 @@ impl ProductionGitHubProvider {
             bail!("GitHub base ref observation differs from configuration");
         }
         validate_git_sha("GitHub preflight base SHA", &reference.object.sha)?;
-        let architect_rules = self.token(
-            &provisional.delivery_binding,
-            GitHubAppRole::Architect,
-            InstallationOperation::RulesetAttestation,
-        )?;
         let ruleset_attestation_sha256 =
-            self.attest_rules(&provisional.delivery_binding, &architect_rules)?;
+            ruleset_attestation_for_policy(self.config.delivery_policy, || {
+                let architect_rules = self.token(
+                    &provisional.delivery_binding,
+                    GitHubAppRole::Architect,
+                    InstallationOperation::RulesetAttestation,
+                )?;
+                self.attest_rules(&provisional.delivery_binding, &architect_rules)
+            })?;
 
         Ok(GitHubPreflightObservation {
             owner: self.config.owner.clone(),
@@ -667,12 +706,81 @@ impl ProductionGitHubProvider {
         ))
     }
 
+    fn validate_manual_terminal_audit(
+        &self,
+        binding: &GitHubPullRequestBinding,
+        request: &PublishReviewCheckRequest,
+        require_all_checks_completed: bool,
+    ) -> Result<()> {
+        validate_manual_terminal_audit_for_policy(
+            binding.delivery_policy,
+            request.task_ordinal,
+            request.task_count,
+            request
+                .task_outcomes
+                .get(request.task_ordinal)
+                .and_then(|task| task.outcome),
+            || {
+                let (_, prepared, publication) = self.gate_snapshot()?;
+                if publication.context.run_id != request.run_id
+                    || publication.context.branch != prepared.branch()
+                    || request.task_outcomes.len() != request.task_count
+                    || request
+                        .task_outcomes
+                        .first()
+                        .is_none_or(|task| task.task_base_sha != prepared.base_sha())
+                {
+                    bail!("manual GitHub terminal audit differs from the frozen Pull Request");
+                }
+                let mut tasks = request.task_outcomes.clone();
+                let current = tasks.get_mut(request.task_ordinal).ok_or_else(|| {
+                    anyhow!("manual GitHub terminal audit lacks the current task")
+                })?;
+                if current.task_ordinal != request.task_ordinal
+                    || current
+                        .task_final_head_sha
+                        .as_ref()
+                        .is_some_and(|head| head != &request.head_sha)
+                {
+                    bail!("manual GitHub terminal audit differs from the exact final task");
+                }
+                current.task_final_head_sha = Some(request.head_sha.clone());
+                validate_terminal_task_chain(&tasks, &request.head_sha)?;
+
+                validate_remote_comments(self, binding, &publication, publication.pr.number)?;
+                validate_remote_checks(self, binding, &publication, require_all_checks_completed)?;
+                validate_remote_reviews(
+                    self,
+                    binding,
+                    &publication,
+                    publication.pr.number,
+                    &tasks,
+                )?;
+
+                // Read the Pull Request last so an edited, closed, merged, or
+                // rebound PR cannot be reported as the preserved terminal
+                // disposition after the audit-history reads complete.
+                let architect_pr = self.token(
+                    binding,
+                    GitHubAppRole::Architect,
+                    InstallationOperation::PullRequestRead,
+                )?;
+                let publisher = GitHubPublisher::new(&self.client, &publication.context)?;
+                let pr = publisher.read_pull_request(publication.pr.number, &architect_pr)?;
+                validate_open_pr(binding, &publication, &pr, &request.head_sha)
+            },
+        )
+    }
+
     fn probe_merge_gate(
         &self,
         request: &WaitForMergeGateRequest,
     ) -> Result<Option<MergeGateObservation>> {
         validate_all_lgtm_chain(&request.tasks, &request.final_head_sha)?;
         let (binding, prepared, publication) = self.gate_snapshot()?;
+        if !binding.delivery_policy.is_protected_auto_merge() {
+            bail!("manual GitHub delivery cannot enter the merge gate");
+        }
         if publication.pr.number != request.pr_number
             || publication.context.run_id != request.run_id
             || publication.context.branch != prepared.branch()
@@ -685,7 +793,8 @@ impl ProductionGitHubProvider {
         }
         let refreshed = self.refresh_inspection(&binding)?;
         if refreshed.inspection.expected_base_sha != prepared.base_sha()
-            || refreshed.inspection.ruleset_attestation_sha256 != request.ruleset_attestation_sha256
+            || refreshed.inspection.ruleset_attestation_sha256.as_deref()
+                != Some(request.ruleset_attestation_sha256.as_str())
         {
             bail!("GitHub base or ruleset drifted before merge");
         }
@@ -718,47 +827,14 @@ impl ProductionGitHubProvider {
         if !final_check.completed || final_check.conclusion != Some(CheckConclusion::Success) {
             bail!("GitHub merge gate final Check is not successful");
         }
-        let check_token = self.token(
+        validate_remote_checks(self, &binding, &publication, true)?;
+        validate_remote_reviews(
+            self,
             &binding,
-            GitHubAppRole::Architect,
-            InstallationOperation::CheckRead,
+            &publication,
+            request.pr_number,
+            &request.tasks,
         )?;
-        for (check_run_id, stored_check) in &publication.checks {
-            let conclusion = stored_check
-                .conclusion
-                .ok_or_else(|| anyhow!("an hcom-owned GitHub Check remained in progress"))?;
-            let values = self.client.paginated_values(
-                |page| RestEndpoint::ListCheckRuns {
-                    owner: binding.owner.clone(),
-                    repository: binding.repository.clone(),
-                    head_sha: stored_check.task.head_sha.clone(),
-                    page,
-                },
-                GitHubAuthentication::Installation(&check_token),
-                Some("check_runs"),
-            )?;
-            let remote_checks = values
-                .into_iter()
-                .map(serde_json::from_value::<CheckRunObservation>)
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|_| anyhow!("GitHub Check history response is invalid"))?;
-            if !matches!(
-                reconcile_check(
-                    remote_checks,
-                    binding.architect_app.app_id,
-                    Some(*check_run_id),
-                    &stored_check.external_id,
-                    "completed",
-                    Some(conclusion),
-                    &stored_check.marker,
-                    &stored_check.output,
-                ),
-                super::publication::Reconciliation::Exactly(_)
-            ) {
-                bail!("an hcom-owned GitHub Check was edited, deleted, or rebound");
-            }
-        }
-        validate_remote_reviews(self, &binding, &publication, request)?;
 
         if pr.mergeable_state.as_deref() == Some("dirty") {
             bail!("GitHub Pull Request has merge conflicts at the exact final head");
@@ -774,7 +850,10 @@ impl ProductionGitHubProvider {
                 pr_number: request.pr_number,
                 final_head_sha: request.final_head_sha.clone(),
                 base_sha: prepared.base_sha().into(),
-                ruleset_attestation_sha256: refreshed.inspection.ruleset_attestation_sha256,
+                ruleset_attestation_sha256: refreshed
+                    .inspection
+                    .ruleset_attestation_sha256
+                    .expect("protected merge inspection has a ruleset attestation"),
                 check_run_id: request.check_run_id,
             }));
         }
@@ -1473,6 +1552,7 @@ impl GitHubWorkflowProvider for ProductionGitHubProvider {
         {
             bail!("GitHub Check conclusion differs from its exact predecessor");
         }
+        self.validate_manual_terminal_audit(&binding, request, false)?;
         let outcomes = Self::outcomes(&request.task_outcomes)?;
         let conclusion = map_check_conclusion(request.conclusion);
         let (output, marker) = render_check_output(
@@ -1553,7 +1633,11 @@ impl GitHubWorkflowProvider for ProductionGitHubProvider {
         stored.observation = check.clone();
         stored.completed = true;
         stored.conclusion = Some(conclusion);
-        state.partial_operations.remove(&request.operation_id);
+        drop(state);
+        self.validate_manual_terminal_audit(&binding, request, true)?;
+        self.state()?
+            .partial_operations
+            .remove(&request.operation_id);
         Ok(ReviewCheckPublishedObservation {
             operation_id: request.operation_id.clone(),
             task_ordinal: request.task_ordinal,
@@ -2247,13 +2331,27 @@ fn validate_all_lgtm_chain(
     tasks: &[GitHubTaskOutcomeEvidence],
     final_head_sha: &str,
 ) -> Result<()> {
+    validate_terminal_task_chain(tasks, final_head_sha)?;
+    if tasks
+        .iter()
+        .any(|task| task.outcome != Some(TaskCompletionOutcome::Lgtm))
+    {
+        bail!("GitHub merge gate requires ordered all-LGTM task evidence");
+    }
+    Ok(())
+}
+
+fn validate_terminal_task_chain(
+    tasks: &[GitHubTaskOutcomeEvidence],
+    final_head_sha: &str,
+) -> Result<()> {
     if tasks.is_empty() {
-        bail!("GitHub merge gate has no task evidence");
+        bail!("GitHub terminal audit has no task evidence");
     }
     let mut previous_head: Option<&str> = None;
     for (ordinal, task) in tasks.iter().enumerate() {
-        if task.task_ordinal != ordinal || task.outcome != Some(TaskCompletionOutcome::Lgtm) {
-            bail!("GitHub merge gate requires ordered all-LGTM task evidence");
+        if task.task_ordinal != ordinal || task.outcome.is_none() {
+            bail!("GitHub terminal audit requires ordered completed task evidence");
         }
         if let Some(previous) = previous_head
             && task.task_base_sha != previous
@@ -2263,12 +2361,12 @@ fn validate_all_lgtm_chain(
         let head = task
             .task_final_head_sha
             .as_deref()
-            .ok_or_else(|| anyhow!("GitHub LGTM task lacks a final head"))?;
+            .ok_or_else(|| anyhow!("GitHub completed task lacks a final head"))?;
         validate_git_sha("GitHub task final head", head)?;
         previous_head = Some(head);
     }
     if previous_head != Some(final_head_sha) {
-        bail!("GitHub task chain does not end at the exact final head");
+        bail!("GitHub terminal task chain does not end at the exact final head");
     }
     Ok(())
 }
@@ -2372,22 +2470,95 @@ fn validate_remote_comments(
     Ok(())
 }
 
+fn validate_remote_checks(
+    provider: &ProductionGitHubProvider,
+    binding: &GitHubPullRequestBinding,
+    publication: &PublicationState,
+    require_all_completed: bool,
+) -> Result<()> {
+    let check_token = provider.token(
+        binding,
+        GitHubAppRole::Architect,
+        InstallationOperation::CheckRead,
+    )?;
+    for (check_run_id, stored_check) in &publication.checks {
+        if require_all_completed && !stored_check.completed {
+            bail!("an hcom-owned GitHub Check remained in progress");
+        }
+        let (status, conclusion) = if stored_check.completed {
+            (
+                "completed",
+                Some(stored_check.conclusion.ok_or_else(|| {
+                    anyhow!("a completed hcom-owned GitHub Check lacks a conclusion")
+                })?),
+            )
+        } else {
+            if stored_check.conclusion.is_some() {
+                bail!("an in-progress hcom-owned GitHub Check has a conclusion");
+            }
+            ("in_progress", None)
+        };
+        let values = provider.client.paginated_values(
+            |page| RestEndpoint::ListCheckRuns {
+                owner: binding.owner.clone(),
+                repository: binding.repository.clone(),
+                head_sha: stored_check.task.head_sha.clone(),
+                page,
+            },
+            GitHubAuthentication::Installation(&check_token),
+            Some("check_runs"),
+        )?;
+        let remote_checks = values
+            .into_iter()
+            .map(serde_json::from_value::<CheckRunObservation>)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| anyhow!("GitHub Check history response is invalid"))?;
+        if !matches!(
+            reconcile_check(
+                remote_checks,
+                binding.architect_app.app_id,
+                Some(*check_run_id),
+                &stored_check.external_id,
+                status,
+                conclusion,
+                &stored_check.marker,
+                &stored_check.output,
+            ),
+            super::publication::Reconciliation::Exactly(_)
+        ) {
+            bail!("an hcom-owned GitHub Check was edited, deleted, or rebound");
+        }
+    }
+    Ok(())
+}
+
 fn validate_remote_reviews(
     provider: &ProductionGitHubProvider,
     binding: &GitHubPullRequestBinding,
     publication: &PublicationState,
-    request: &WaitForMergeGateRequest,
+    pr_number: u64,
+    tasks: &[GitHubTaskOutcomeEvidence],
 ) -> Result<()> {
-    for task in &request.tasks {
+    for task in tasks {
         let Some(task_head) = task.task_final_head_sha.as_deref() else {
             bail!("GitHub final review evidence lacks a task head");
         };
-        if task.reviews.len() != binding.reviewer_apps.len()
+        let verdicts_match_outcome = match task.outcome {
+            Some(TaskCompletionOutcome::Lgtm) => task
+                .reviews
+                .iter()
+                .all(|review| review.verdict == ReviewerVerdict::Lgtm),
+            Some(TaskCompletionOutcome::ReviewExhausted) => task
+                .reviews
+                .iter()
+                .any(|review| review.verdict == ReviewerVerdict::RequestChanges),
+            None => false,
+        };
+        if !verdicts_match_outcome
+            || task.reviews.len() != binding.reviewer_apps.len()
             || binding.reviewer_apps.iter().any(|reviewer| {
                 !task.reviews.iter().any(|review| {
-                    review.reviewer_id == reviewer.reviewer_id
-                        && review.verdict == ReviewerVerdict::Lgtm
-                        && review.head_sha == task_head
+                    review.reviewer_id == reviewer.reviewer_id && review.head_sha == task_head
                 })
             })
         {
@@ -2415,7 +2586,7 @@ fn validate_remote_reviews(
             |page| RestEndpoint::ListReviews {
                 owner: binding.owner.clone(),
                 repository: binding.repository.clone(),
-                number: request.pr_number,
+                number: pr_number,
                 page,
             },
             GitHubAuthentication::Installation(&token),
@@ -2465,8 +2636,7 @@ fn validate_remote_reviews(
                 .iter()
                 .find(|review| review.id == expected.observation.id)
                 .ok_or_else(|| anyhow!("an hcom-owned GitHub review was deleted"))?;
-            let retained_final = request
-                .tasks
+            let retained_final = tasks
                 .get(expected.task_ordinal)
                 .and_then(|task| {
                     task.reviews.iter().find(|review| {
@@ -2478,8 +2648,7 @@ fn validate_remote_reviews(
                     })
                 })
                 .is_some();
-            let later_hcom_task_appended =
-                expected.task_ordinal < request.tasks.len().saturating_sub(1);
+            let later_hcom_task_appended = expected.task_ordinal < tasks.len().saturating_sub(1);
             let state_allowed = review_state_allowed(
                 retained_final,
                 later_hcom_task_appended,
@@ -2505,7 +2674,10 @@ fn review_state_allowed(
     observed_state: &str,
 ) -> bool {
     if retained_final && !later_hcom_task_appended {
-        return observed_state == "APPROVED";
+        return match verdict {
+            ReviewerVerdict::Lgtm => observed_state == "APPROVED",
+            ReviewerVerdict::RequestChanges => observed_state == "CHANGES_REQUESTED",
+        };
     }
     match verdict {
         ReviewerVerdict::Lgtm => matches!(observed_state, "APPROVED" | "DISMISSED"),
@@ -2642,6 +2814,109 @@ mod tests {
             ReviewerVerdict::RequestChanges,
             "DISMISSED"
         ));
+        assert!(review_state_allowed(
+            true,
+            false,
+            ReviewerVerdict::RequestChanges,
+            "CHANGES_REQUESTED"
+        ));
+        assert!(!review_state_allowed(
+            true,
+            false,
+            ReviewerVerdict::RequestChanges,
+            "APPROVED"
+        ));
+    }
+
+    #[test]
+    fn terminal_manual_check_propagates_remote_mutation_but_correction_skips_audit() {
+        use crate::control_api::GitHubDeliveryPolicy;
+
+        let mut final_manual_called = false;
+        let error = validate_manual_terminal_audit_for_policy(
+            GitHubDeliveryPolicy::Manual,
+            1,
+            2,
+            Some(TaskCompletionOutcome::Lgtm),
+            || {
+                final_manual_called = true;
+                bail!("fake closed or edited Pull Request")
+            },
+        )
+        .unwrap_err();
+        assert!(final_manual_called);
+        assert_eq!(error.to_string(), "fake closed or edited Pull Request");
+
+        let mut nonterminal_manual_called = false;
+        validate_manual_terminal_audit_for_policy(
+            GitHubDeliveryPolicy::Manual,
+            0,
+            2,
+            Some(TaskCompletionOutcome::Lgtm),
+            || {
+                nonterminal_manual_called = true;
+                bail!("nonterminal audit must be skipped")
+            },
+        )
+        .unwrap();
+        assert!(!nonterminal_manual_called);
+
+        let mut correction_called = false;
+        validate_manual_terminal_audit_for_policy(GitHubDeliveryPolicy::Manual, 0, 1, None, || {
+            correction_called = true;
+            bail!("last-task correction audit must be skipped")
+        })
+        .unwrap();
+        assert!(!correction_called);
+
+        let mut protected_called = false;
+        validate_manual_terminal_audit_for_policy(
+            GitHubDeliveryPolicy::ProtectedAutoMerge,
+            1,
+            2,
+            Some(TaskCompletionOutcome::Lgtm),
+            || {
+                protected_called = true;
+                bail!("protected mode retains its merge-gate audit")
+            },
+        )
+        .unwrap();
+        assert!(!protected_called);
+    }
+
+    #[test]
+    fn manual_terminal_chain_accepts_review_exhaustion_but_merge_chain_does_not() {
+        let task = |task_ordinal: usize,
+                    base: String,
+                    head: String,
+                    outcome: TaskCompletionOutcome| GitHubTaskOutcomeEvidence {
+            task_ordinal,
+            task_key: format!("task-{task_ordinal}"),
+            task_title: format!("Task {task_ordinal}"),
+            task_base_sha: base,
+            task_final_head_sha: Some(head),
+            outcome: Some(outcome),
+            reviews: Vec::new(),
+        };
+        let first_head = "b".repeat(40);
+        let final_head = "c".repeat(40);
+        let tasks = vec![
+            task(
+                0,
+                "a".repeat(40),
+                first_head.clone(),
+                TaskCompletionOutcome::Lgtm,
+            ),
+            task(
+                1,
+                first_head,
+                final_head.clone(),
+                TaskCompletionOutcome::ReviewExhausted,
+            ),
+        ];
+
+        validate_terminal_task_chain(&tasks, &final_head).unwrap();
+        assert!(validate_all_lgtm_chain(&tasks, &final_head).is_err());
     }
 
     #[test]
@@ -2659,6 +2934,7 @@ mod tests {
             ]),
         };
         let binding = GitHubPullRequestBinding {
+            delivery_policy: crate::control_api::GitHubDeliveryPolicy::ProtectedAutoMerge,
             owner: "owner".into(),
             repository: "repo".into(),
             repository_id: 99,
@@ -2726,5 +3002,34 @@ mod tests {
         bypassed[0]["bypass_actors"] =
             serde_json::json!([{"actor_id": 2, "actor_type": "RepositoryRole"}]);
         assert!(canonical_rules_attestation(&binding, &rules, &bypassed).is_ok());
+    }
+
+    #[test]
+    fn manual_policy_skips_a_ruleset_api_failure_while_protected_policy_requires_it() {
+        use crate::control_api::GitHubDeliveryPolicy;
+        let mut manual_called = false;
+        let manual = ruleset_attestation_for_policy(GitHubDeliveryPolicy::Manual, || {
+            manual_called = true;
+            bail!("fake GitHub Free private ruleset 403")
+        })
+        .unwrap();
+        assert_eq!(manual, None);
+        assert!(!manual_called);
+
+        let mut protected_called = false;
+        let protected =
+            ruleset_attestation_for_policy(GitHubDeliveryPolicy::ProtectedAutoMerge, || {
+                protected_called = true;
+                Ok("a".repeat(64))
+            })
+            .unwrap();
+        assert_eq!(protected, Some("a".repeat(64)));
+        assert!(protected_called);
+        assert!(
+            ruleset_attestation_for_policy(GitHubDeliveryPolicy::ProtectedAutoMerge, || bail!(
+                "fake GitHub Free private ruleset 403"
+            ))
+            .is_err()
+        );
     }
 }

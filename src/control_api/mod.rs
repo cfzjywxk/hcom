@@ -19,7 +19,7 @@ pub use protocol::{
     ClarificationPage, ClarificationRecord, ControlAction, ControlErrorBody, ControlErrorCode,
     ControlRequest, ControlResponse, ControlResult, DeliveryBinding, GITHUB_REVIEW_CHECK_NAME,
     GitHubAppBinding, GitHubAppRole, GitHubCheckSnapshot, GitHubCommitIdentity,
-    GitHubDeliveryOutcome, GitHubDeliveryPhase, GitHubDeliveryStatusSnapshot,
+    GitHubDeliveryOutcome, GitHubDeliveryPhase, GitHubDeliveryPolicy, GitHubDeliveryStatusSnapshot,
     GitHubFinalizationSnapshot, GitHubInspectionBinding, GitHubPermissionLevel,
     GitHubPullRequestBinding, GitHubReviewSnapshot, GitHubReviewerAppBinding, GitHubRunBinding,
     GitHubTaskProgressSnapshot, MAX_CLARIFICATION_PAGE_RECORDS, MAX_CLARIFICATION_RECORDS_PER_RUN,

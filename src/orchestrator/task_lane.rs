@@ -832,7 +832,8 @@ impl TaskLaneSupervisor {
                 .expect("a bound GitHub plan has a run binding");
             plan.push_str("## delivery\n\n- mode: GitHub Pull Request\n");
             plan.push_str(&format!(
-                "- private repository: {}/{} (id {})\n- local repository root: {}\n- base branch: {}\n- inspected base ref: {}\n- inspected base SHA: {}\n- ruleset attestation SHA-256: {}\n- inspection ID: {}\n- generated run branch: {}\n- merge method: {}\n- merge wait seconds: {}\n- review Check: {}\n- delete remote branch after merge: {}\n",
+                "- delivery policy: {}\n- private repository: {}/{} (id {})\n- local repository root: {}\n- base branch: {}\n- inspected base ref: {}\n- inspected base SHA: {}\n- inspection ID: {}\n- generated run branch: {}\n- review Check: {}\n",
+                binding.delivery_policy.as_str(),
                 binding.owner,
                 binding.repository,
                 binding.repository_id,
@@ -840,14 +841,26 @@ impl TaskLaneSupervisor {
                 binding.base_branch,
                 run_binding.expected_base_ref,
                 run_binding.expected_base_sha,
-                run_binding.ruleset_attestation_sha256,
                 run_binding.inspection_id,
                 run_binding.generated_run_branch,
-                binding.merge_method,
-                binding.merge_wait_seconds,
                 binding.review_check_name,
-                binding.delete_remote_branch_after_merge,
             ));
+            if binding.delivery_policy.is_protected_auto_merge() {
+                plan.push_str(&format!(
+                    "- ruleset attestation SHA-256: {}\n- merge method: {}\n- merge wait seconds: {}\n- delete remote branch after merge: {}\n",
+                    run_binding
+                        .ruleset_attestation_sha256
+                        .as_deref()
+                        .expect("protected plan has ruleset attestation"),
+                    binding.merge_method,
+                    binding.merge_wait_seconds,
+                    binding.delete_remote_branch_after_merge,
+                ));
+            } else {
+                plan.push_str(
+                    "- server-side enforcement: not attested; this private GitHub Free repository has no hcom-provable PR/direct-push protection\n- hcom enforcement boundary: hcom verifies its exact base/head, actors, append-only task chain, published reviews, and hcom/review Check, but cannot prevent an authorized external actor from direct-pushing or merging early\n- terminal disposition: all-LGTM means hcom review complete only, not GitHub rules/CI merge-ready; the open PR, generated remote/local branch, linked worktree, and evidence are preserved for human disposition\n- prohibited run operations: no merge, remote branch deletion, or merged-run finalization\n",
+                );
+            }
             let commit_identity = binding.developer_commit_identity();
             plan.push_str(&format!(
                 "- Developer commit identity: {} <{}> (author, committer, and Signed-off-by)\n",
@@ -880,9 +893,15 @@ impl TaskLaneSupervisor {
                         .expect("GitHub permission map is serializable"),
                 ));
             }
-            plan.push_str(
-                "- topology: one Pull Request per approved run; all tasks append commits to the one generated branch; final delivery uses one exact-head squash merge\n- publication: exact opaque Developer and Reviewer finals are published unredacted to the selected private repository; Architect owns hcom/review and final merge\n- credential boundary: keys and operation tokens remain supervisor-owned and never enter worker environments or prompts; mode-0600 files are not an adversarial boundary against another process running as the same user\n- hooks: native Developer commit hooks remain enabled; supervisor-authenticated fetch/push disables repository hooks\n- gates: every task must be LGTM for merge; review_exhausted completes unmerged; base/ruleset/permission/identity drift fails closed\n- cleanup: successful merge removes required generated local artifacts; unsuccessful or needs-human outcomes preserve the PR/branch/worktree with evidence\n\n",
-            );
+            if binding.delivery_policy.is_protected_auto_merge() {
+                plan.push_str(
+                    "- topology: one Pull Request per approved run; all tasks append commits to the one generated branch; final delivery uses one ruleset-attested exact-head squash merge\n- publication: exact opaque Developer and Reviewer finals are published unredacted to the selected private repository; Architect owns hcom/review and final merge\n- credential boundary: keys and operation tokens remain supervisor-owned and never enter worker environments or prompts; mode-0600 files are not an adversarial boundary against another process running as the same user\n- hooks: native Developer commit hooks remain enabled; supervisor-authenticated fetch/push disables repository hooks\n- gates: every task must be LGTM for merge; review_exhausted completes unmerged; base/ruleset/permission/identity drift fails closed\n- cleanup: successful merge removes required generated local artifacts; unsuccessful or needs-human outcomes preserve the PR/branch/worktree with evidence\n\n",
+                );
+            } else {
+                plan.push_str(
+                    "- topology: one Pull Request per approved run; all tasks append commits to the one generated branch; hcom stops after the final exact-head review Check\n- publication: exact opaque Developer and Reviewer finals are published unredacted to the selected private repository; Architect owns hcom/review but has no run authority to merge\n- credential boundary: keys and operation tokens remain supervisor-owned and never enter worker environments or prompts; mode-0600 files are not an adversarial boundary against another process running as the same user\n- hooks: native Developer commit hooks remain enabled; supervisor-authenticated fetch/push disables repository hooks\n- gates: review_complete_unmerged follows all-task LGTM; review_exhausted remains unmerged; base/head/permission/identity drift fails closed\n- cleanup: manual completion and every unsuccessful or needs-human outcome preserve the PR/branch/worktree with evidence\n\n",
+                );
+            }
         }
         for (ordinal, task) in self.core.tasks().iter().enumerate() {
             let spec = &task.spec;
@@ -2015,8 +2034,9 @@ impl TaskLaneSupervisor {
                         .get(task_ordinal)
                         .ok_or_else(|| anyhow!("GitHub prompt task status is unavailable"))?;
                     prompt.push_str(&format!(
-                        "\nGitHub Pull Request commit contract:\n- run branch: {}\n- task base: {}\n- previously published head: {}\n- Developer App: {} (app {}, bot user {})\n- exact commit author, committer, and Signed-off-by identity: {} <{}>\n\
+                        "\nGitHub Pull Request commit contract:\n- delivery policy: {}\n- run branch: {}\n- task base: {}\n- previously published head: {}\n- Developer App: {} (app {}, bot user {})\n- exact commit author, committer, and Signed-off-by identity: {} <{}>\n\
                          Create exactly one new signed-off child commit in this turn. Never amend, rebase, squash, force-push, or rewrite an existing commit. Leave the index and worktree clean. Do not push: the foreground supervisor validates and publishes the commit after your final. Your final is opaque payload published byte-for-byte without redaction or secret scanning to the selected private repository; keep the complete generated GitHub body within its 60 KiB UTF-8 hard cap.\n",
+                        binding.delivery_policy.as_str(),
                         task_status.branch.as_deref().unwrap_or("not-yet-published"),
                         task_status.base_revision.as_deref().unwrap_or("run-base-pending"),
                         snapshot
@@ -2183,8 +2203,9 @@ impl TaskLaneSupervisor {
                         .find(|reviewer| reviewer.reviewer_id == reviewer_id)
                         .ok_or_else(|| anyhow!("GitHub Reviewer App binding is unavailable"))?;
                     prompt.push_str(&format!(
-                        "\nGitHub Pull Request review contract:\n- exact range: {}..{}\n- run branch: {}\n- Reviewer App: {} (app {}, bot user {})\n\
+                        "\nGitHub Pull Request review contract:\n- delivery policy: {}\n- exact range: {}..{}\n- run branch: {}\n- Reviewer App: {} (app {}, bot user {})\n\
                          Review this complete exact range in the managed worktree. It may contain one initial task commit plus append-only correction commits; confirm every commit is a direct child in the published chain, has the frozen Developer identity/sign-off, and no published commit was rewritten. Do not push or publish a GitHub review: the foreground supervisor publishes your exact final under the mapped Reviewer App only after proving the repository still matches this head. Your final is opaque payload published byte-for-byte without redaction or secret scanning to the selected private repository; keep the complete generated review body within its 60 KiB UTF-8 hard cap.\n",
+                        binding.delivery_policy.as_str(),
                         task_status
                             .base_revision
                             .as_deref()
@@ -2642,6 +2663,7 @@ mod tests {
         };
         let github = DeliveryBinding::GitHubPullRequest {
             binding: Box::new(crate::control_api::GitHubPullRequestBinding {
+                delivery_policy: crate::control_api::GitHubDeliveryPolicy::ProtectedAutoMerge,
                 owner: "owner".into(),
                 repository: "repo".into(),
                 repository_id: 99,
@@ -2670,6 +2692,16 @@ mod tests {
         assert_ne!(
             base_hash, github_hash,
             "delivery mode must bind the session hash"
+        );
+        let mut manual = github.clone();
+        let DeliveryBinding::GitHubPullRequest { binding } = &mut manual else {
+            unreachable!()
+        };
+        binding.delivery_policy = crate::control_api::GitHubDeliveryPolicy::Manual;
+        let manual_hash = session_binding_hash(&base, &workers, &contract, &[], &manual).unwrap();
+        assert_ne!(
+            github_hash, manual_hash,
+            "GitHub delivery policy must bind the session hash"
         );
     }
 
@@ -3108,6 +3140,7 @@ mod tests {
             crate::control_api::GitHubPermissionLevel::Write,
         )];
         let binding = crate::control_api::GitHubPullRequestBinding {
+            delivery_policy: crate::control_api::GitHubDeliveryPolicy::ProtectedAutoMerge,
             owner: "owner".into(),
             repository: "repo".into(),
             repository_id: 99,
@@ -3160,7 +3193,7 @@ mod tests {
             inspected_repository_id: 99,
             expected_base_ref: "refs/heads/master".into(),
             expected_base_sha: "a".repeat(40),
-            ruleset_attestation_sha256: "b".repeat(64),
+            ruleset_attestation_sha256: Some("b".repeat(64)),
             inspection_id: "inspection-initial".into(),
         };
         let refreshed = GitHubInspectionBinding {
@@ -3200,6 +3233,24 @@ mod tests {
             .delivery_binding
             .reviewer_apps
             .truncate(1);
+        (runtime, inspector)
+    }
+
+    fn github_runtime_for_manual_single_review_test(
+        repository: &Path,
+    ) -> (
+        crate::orchestrator::github::GitHubRuntimeBinding,
+        Arc<MutableGitHubInspector>,
+    ) {
+        let (mut runtime, inspector) = github_runtime_for_single_review_test(repository);
+        runtime.binding.delivery_policy = crate::control_api::GitHubDeliveryPolicy::Manual;
+        runtime.initial_inspection.ruleset_attestation_sha256 = None;
+        {
+            let mut result = inspector.result.lock().unwrap();
+            result.delivery_binding.delivery_policy =
+                crate::control_api::GitHubDeliveryPolicy::Manual;
+            result.inspection.ruleset_attestation_sha256 = None;
+        }
         (runtime, inspector)
     }
 
@@ -3647,6 +3698,143 @@ mod tests {
                 assert!(prompt.contains("First verify every finding you raised"));
             }
         }
+    }
+
+    #[test]
+    fn github_manual_driver_preserves_review_complete_pr_without_merge_or_finalization() {
+        let fixture = Fixture::new();
+        let (mut runtime, _inspector) =
+            github_runtime_for_manual_single_review_test(&fixture.repository);
+        let workflow = Arc::new(ScriptedGitHubWorkflow {
+            heads: Mutex::new(VecDeque::from(["c".repeat(40)])),
+            audit: Mutex::new(Vec::new()),
+            worktree: Mutex::new(None),
+            fail_after_confirmation: None,
+            partial_operations: Mutex::new(BTreeMap::new()),
+            merge_gate_entered: None,
+            merge_gate_release: None,
+            merge_entered: None,
+            merge_release: None,
+        });
+        runtime.workflow = workflow.clone();
+        let profiles =
+            SessionInvocationProfiles::for_single_review_task_lane(ArchitectAdapter::Codex)
+                .unwrap();
+        let sources = SessionRuntimeSources::capture_with_github(
+            fixture.sources.parent_environment.clone(),
+            profiles,
+            Vec::new(),
+            runtime,
+        )
+        .unwrap();
+        let scripts = vec![single_reviewer_task_script(
+            "github-manual",
+            vec![
+                FakeTurnScript::new(
+                    WorkerRole::Developer,
+                    RuntimeTurnPurpose::InitialDevelopment,
+                    [ready("github-manual-initial")],
+                ),
+                FakeTurnScript::new(
+                    WorkerRole::Reviewer,
+                    RuntimeTurnPurpose::InitialReview,
+                    [lgtm("github-manual-lgtm")],
+                ),
+            ],
+            vec![Mutation::None; 2],
+        )];
+        let mut supervisor = TaskLaneSupervisor::open_with_factory(
+            "run-github-manual".into(),
+            fixture.project_root.clone(),
+            fixture.run_root.clone(),
+            sources,
+            Box::new(ScriptedFactory {
+                scripts: scripts.into(),
+                audit: Arc::new(Mutex::new(Audit::default())),
+            }),
+        )
+        .unwrap();
+        let (plan_version, plan_hash) = supervisor
+            .replace_plan_with_inspection(
+                0,
+                CODEX_TASK_WORKER_ADAPTER,
+                &pure_codex_single_reviewer_adapters(),
+                Some("inspection-initial"),
+                vec![fixture.task(
+                    "github-manual",
+                    &[],
+                    crate::control_api::protocol::MIN_SINGLE_REVIEW_ROUNDS,
+                )],
+            )
+            .unwrap();
+        supervisor
+            .approve_and_start(1, plan_version, &plan_hash, true)
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !supervisor.snapshot().state.is_terminal() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "manual GitHub workflow did not become terminal"
+            );
+            supervisor.poll_once().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let snapshot = supervisor.snapshot();
+        let DeliveryBinding::GitHubPullRequest { binding } = &snapshot.delivery_binding else {
+            panic!("manual run lost its GitHub binding")
+        };
+        assert_eq!(
+            binding.delivery_policy,
+            crate::control_api::GitHubDeliveryPolicy::Manual
+        );
+        let github = snapshot.github.unwrap();
+        assert_eq!(
+            github.outcome,
+            Some(crate::control_api::GitHubDeliveryOutcome::ReviewCompleteUnmerged)
+        );
+        assert_eq!(
+            github.phase,
+            Some(crate::control_api::GitHubDeliveryPhase::PreservedUnmerged)
+        );
+        assert_eq!(
+            github
+                .run_binding
+                .as_ref()
+                .and_then(|run| run.ruleset_attestation_sha256.as_ref()),
+            None
+        );
+        assert!(github.merge_sha.is_none());
+        assert!(github.finalization.is_none());
+        assert!(github.preserved_branch.is_some());
+        assert!(github.preserved_worktree.is_some());
+        assert!(
+            fixture
+                .project_root
+                .join("hcom-tasks/run-github-manual/repository")
+                .exists()
+        );
+        let operations = workflow.audit.lock().unwrap();
+        assert!(operations.iter().all(|operation| {
+            !matches!(operation.as_str(), "merge-gate" | "merge" | "finalize")
+        }));
+        assert!(
+            operations
+                .iter()
+                .any(|operation| operation.starts_with("check:"))
+        );
+        drop(operations);
+        let plan = fs::read_to_string(
+            fixture
+                .project_root
+                .join("hcom-tasks/run-github-manual/plan.md"),
+        )
+        .unwrap();
+        assert!(plan.contains("delivery policy: manual"));
+        assert!(plan.contains("server-side enforcement: not attested"));
+        assert!(plan.contains("review_complete_unmerged"));
+        assert!(plan.contains("no merge, remote branch deletion, or merged-run finalization"));
+        assert!(!plan.contains("ruleset attestation SHA-256:"));
     }
 
     #[test]

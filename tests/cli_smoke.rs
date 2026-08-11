@@ -413,13 +413,13 @@ fn fork_version_help_and_status_use_human_visible_version() {
 
     let (code, stdout, stderr) = h.run(["--version"]);
     assert_eq!(code, 0);
-    assert_eq!(stdout, "hcom 1.0.20\n");
+    assert_eq!(stdout, "hcom 1.0.21\n");
     assert!(stderr.is_empty(), "stderr={stderr}");
 
     let (code, stdout, stderr) = h.run(["--help"]);
     assert_eq!(code, 0, "stderr={stderr}");
     assert!(
-        stdout.starts_with("hcom (hook-comms) v1.0.20 "),
+        stdout.starts_with("hcom (hook-comms) v1.0.21 "),
         "stdout={stdout}"
     );
     assert!(
@@ -430,14 +430,14 @@ fn fork_version_help_and_status_use_human_visible_version() {
 
     let (code, stdout, stderr) = h.run(["status"]);
     assert_eq!(code, 0, "stderr={stderr}");
-    assert_eq!(stdout.lines().next(), Some("hcom 1.0.20"));
+    assert_eq!(stdout.lines().next(), Some("hcom 1.0.21"));
     assert!(stderr.is_empty(), "stderr={stderr}");
 
     let (code, stdout, stderr) = h.run(["status", "--json"]);
     assert_eq!(code, 0, "stderr={stderr}");
     assert!(stderr.is_empty(), "stderr={stderr}");
     let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(status["version"]["current"], "1.0.20");
+    assert_eq!(status["version"]["current"], "1.0.21");
     assert!(status["version"]["latest"].is_null());
     assert_eq!(status["version"]["update_available"], false);
     assert!(status["version"]["update_cmd"].is_null());
@@ -637,7 +637,7 @@ fn misordered_architect_form_fails_before_opening_state() {
     );
     assert!(
         stderr.contains(
-            "`hcom arch codex [--single-review] [--github-pr] [architect-profile-options]`"
+            "`hcom arch codex [--single-review] [--github-pr [--protected-auto-merge]] [architect-profile-options]`"
         ),
         "stderr={stderr}"
     );
@@ -820,12 +820,14 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     );
     assert!(stdout.contains("--single-review"), "stdout={stdout}");
     assert!(stdout.contains("--github-pr"), "stdout={stdout}");
+    assert!(stdout.contains("--protected-auto-merge"), "stdout={stdout}");
     assert!(stdout.contains("[architect.github]"), "stdout={stdout}");
     assert!(
         normalized_stdout.contains("one hcom-owned branch, linked worktree, and Pull Request")
             && normalized_stdout
                 .contains("publishes them byte-for-byte without redaction or secret scanning")
             && normalized_stdout.contains("60 KiB UTF-8 cap")
+            && normalized_stdout.contains("review_complete_unmerged")
             && normalized_stdout.contains(
                 "Review exhaustion leaves the PR, branch, and worktree preserved and unmerged"
             ),

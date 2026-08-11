@@ -8,8 +8,8 @@
 use crate::control_api::{
     ActiveWorkerSnapshot, ArchitectActionReason, ClarificationPage, ClarificationRecord,
     DeliveryBinding, GitHubCheckSnapshot, GitHubDeliveryOutcome, GitHubDeliveryPhase,
-    GitHubDeliveryStatusSnapshot, GitHubFinalizationSnapshot, GitHubInspectionBinding,
-    GitHubReviewSnapshot, GitHubRunBinding, GitHubTaskProgressSnapshot,
+    GitHubDeliveryPolicy, GitHubDeliveryStatusSnapshot, GitHubFinalizationSnapshot,
+    GitHubInspectionBinding, GitHubReviewSnapshot, GitHubRunBinding, GitHubTaskProgressSnapshot,
     MAX_CLARIFICATION_PAGE_RECORDS, MAX_CLARIFICATION_RECORDS_PER_RUN,
     MAX_CLARIFICATION_RECORDS_PER_TASK, MAX_PROGRESS_EVENTS_PER_RUN,
     PendingArchitectActionSnapshot, ReviewerBindingSnapshot, ReviewerResultSnapshot,
@@ -247,7 +247,7 @@ pub struct PublishReviewCheckRequest {
     pub head_sha: String,
     pub check_run_id: u64,
     pub check_url: String,
-    pub ruleset_attestation_sha256: String,
+    pub ruleset_attestation_sha256: Option<String>,
     pub conclusion: GitHubReviewCheckConclusion,
     pub task_outcomes: Vec<GitHubTaskOutcomeEvidence>,
 }
@@ -1804,6 +1804,16 @@ impl SupervisorCore {
                 ));
             }
             (DeliveryBinding::GitHubPullRequest { binding }, Some(run)) => {
+                let ruleset_binding_valid = match (
+                    binding.delivery_policy,
+                    run.ruleset_attestation_sha256.as_deref(),
+                ) {
+                    (GitHubDeliveryPolicy::Manual, None) => true,
+                    (GitHubDeliveryPolicy::ProtectedAutoMerge, Some(attestation)) => {
+                        validate_sha256("GitHub ruleset attestation", attestation).is_ok()
+                    }
+                    _ => false,
+                };
                 if run.inspected_repository_id != binding.repository_id
                     || run.expected_base_ref != format!("refs/heads/{}", binding.base_branch)
                     || run.expected_base_sha.len() != 40
@@ -1811,11 +1821,7 @@ impl SupervisorCore {
                         .expected_base_sha
                         .bytes()
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                    || validate_sha256(
-                        "GitHub ruleset attestation",
-                        &run.ruleset_attestation_sha256,
-                    )
-                    .is_err()
+                    || !ruleset_binding_valid
                     || validate_identifier("GitHub inspection ID", &run.inspection_id).is_err()
                     || binding
                         .reviewer_apps
@@ -3516,6 +3522,42 @@ impl SupervisorCore {
                         .clone()
                         .expect("completed session has terminal detail"),
                 });
+            } else if self
+                .delivery_binding
+                .github()
+                .is_some_and(|binding| binding.delivery_policy == GitHubDeliveryPolicy::Manual)
+            {
+                let state = self.github_state()?;
+                let final_head_sha = state.published_head_sha.clone().ok_or_else(|| {
+                    SupervisorError::invariant(
+                        "all-LGTM manual GitHub run has no published final head",
+                    )
+                })?;
+                let check = state.current_check.clone().ok_or_else(|| {
+                    SupervisorError::invariant("all-LGTM manual GitHub run has no final Check")
+                })?;
+                if check.state != GitHubReviewCheckConclusion::Success.as_str()
+                    || check.head_sha != final_head_sha
+                {
+                    return Err(SupervisorError::invariant(
+                        "all-LGTM manual GitHub run lacks a successful exact-final-head Check",
+                    ));
+                }
+                let state = self.github_state_mut()?;
+                state.phase = GitHubDeliveryPhase::PreservedUnmerged;
+                state.outcome = Some(GitHubDeliveryOutcome::ReviewCompleteUnmerged);
+                self.session_state = SessionState::Completed;
+                self.terminal_detail = Some(
+                    "GitHub review completed; Pull Request, generated refs, and linked worktree preserved unmerged for human disposition"
+                        .into(),
+                );
+                effects.push(SupervisorEffect::FinishSession {
+                    state: SessionState::Completed,
+                    detail: self
+                        .terminal_detail
+                        .clone()
+                        .expect("completed manual session has terminal detail"),
+                });
             } else {
                 let state = self.github_state()?;
                 let final_head_sha = state.published_head_sha.clone().ok_or_else(|| {
@@ -3545,7 +3587,12 @@ impl SupervisorCore {
                         .as_ref()
                         .ok_or_else(|| SupervisorError::invariant("GitHub run binding is missing"))?
                         .ruleset_attestation_sha256
-                        .clone(),
+                        .clone()
+                        .ok_or_else(|| {
+                            SupervisorError::invariant(
+                                "protected auto-merge run binding lacks ruleset attestation",
+                            )
+                        })?,
                     tasks: self.task_outcome_evidence(None),
                 };
                 let state = self.github_state_mut()?;
@@ -3581,6 +3628,15 @@ impl SupervisorCore {
         ruleset_attestation_sha256: &str,
         check_run_id: u64,
     ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        if self
+            .delivery_binding
+            .github()
+            .is_none_or(|binding| !binding.delivery_policy.is_protected_auto_merge())
+        {
+            return Err(SupervisorError::invalid_transition(
+                "manual GitHub delivery cannot observe a merge gate",
+            ));
+        }
         let pending = self.take_github_operation(operation_id)?;
         let PendingGitHubOperation::MergeGate(request) = pending else {
             return Err(SupervisorError::invalid_identity(
@@ -3596,7 +3652,7 @@ impl SupervisorCore {
             || request.final_head_sha != final_head_sha
             || request.check_run_id != check_run_id
             || run.expected_base_sha != base_sha
-            || run.ruleset_attestation_sha256 != ruleset_attestation_sha256
+            || run.ruleset_attestation_sha256.as_deref() != Some(ruleset_attestation_sha256)
             || self.github_state()?.phase != GitHubDeliveryPhase::AwaitingMerge
             || self.tasks.iter().any(|task| task.state != TaskState::Lgtm)
         {
@@ -3637,6 +3693,15 @@ impl SupervisorCore {
         actor_bot_user_id: u64,
         merge_evidence_durable: bool,
     ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        if self
+            .delivery_binding
+            .github()
+            .is_none_or(|binding| !binding.delivery_policy.is_protected_auto_merge())
+        {
+            return Err(SupervisorError::invalid_transition(
+                "manual GitHub delivery cannot accept a merge",
+            ));
+        }
         let pending = self.take_github_operation(operation_id)?;
         let PendingGitHubOperation::Merge(request) = pending else {
             return Err(SupervisorError::invalid_identity(
@@ -3689,6 +3754,15 @@ impl SupervisorCore {
         merge_sha: &str,
         finalization: GitHubFinalizationSnapshot,
     ) -> Result<Vec<SupervisorEffect>, SupervisorError> {
+        if self
+            .delivery_binding
+            .github()
+            .is_none_or(|binding| !binding.delivery_policy.is_protected_auto_merge())
+        {
+            return Err(SupervisorError::invalid_transition(
+                "manual GitHub delivery cannot accept finalization",
+            ));
+        }
         let pending = self.take_github_operation(operation_id)?;
         let PendingGitHubOperation::Finalize(request) = pending else {
             return Err(SupervisorError::invalid_identity(
@@ -4174,6 +4248,11 @@ impl SupervisorCore {
         let state = self.github_state()?;
         let check = task.github_check.as_ref().or(state.current_check.as_ref());
         Ok(GitHubTaskProgressSnapshot {
+            delivery_policy: self
+                .delivery_binding
+                .github()
+                .ok_or_else(|| SupervisorError::invariant("GitHub delivery binding is missing"))?
+                .delivery_policy,
             pr_number: state
                 .pr_number
                 .ok_or_else(|| SupervisorError::invariant("GitHub progress PR is missing"))?,
@@ -5207,22 +5286,33 @@ impl SupervisorCore {
                             "GitHub merge phase retains a worker or non-LGTM task",
                         ));
                     }
-                    GitHubDeliveryPhase::PreservedUnmerged
-                        if self.session_state != SessionState::Completed
-                            || state.outcome
-                                != Some(GitHubDeliveryOutcome::UnmergedReviewExhausted)
-                            || !self
+                    GitHubDeliveryPhase::PreservedUnmerged => {
+                        let valid_outcome = match state.outcome {
+                            Some(GitHubDeliveryOutcome::UnmergedReviewExhausted) => self
                                 .tasks
                                 .iter()
-                                .any(|task| task.state == TaskState::ReviewExhausted) =>
-                    {
-                        return Err(SupervisorError::invariant(
-                            "preserved GitHub run lacks completed review-exhausted evidence",
-                        ));
+                                .any(|task| task.state == TaskState::ReviewExhausted),
+                            Some(GitHubDeliveryOutcome::ReviewCompleteUnmerged) => {
+                                self.delivery_binding.github().is_some_and(|binding| {
+                                    binding.delivery_policy == GitHubDeliveryPolicy::Manual
+                                }) && self.tasks.iter().all(|task| task.state == TaskState::Lgtm)
+                                    && state.merge_sha.is_none()
+                                    && state.finalization.is_none()
+                            }
+                            _ => false,
+                        };
+                        if self.session_state != SessionState::Completed || !valid_outcome {
+                            return Err(SupervisorError::invariant(
+                                "preserved GitHub run lacks a valid completed-unmerged outcome",
+                            ));
+                        }
                     }
                     GitHubDeliveryPhase::Delivered
                         if self.session_state != SessionState::Completed
                             || state.outcome != Some(GitHubDeliveryOutcome::Delivered)
+                            || self.delivery_binding.github().is_none_or(|binding| {
+                                !binding.delivery_policy.is_protected_auto_merge()
+                            })
                             || state.merge_sha.is_none()
                             || state.finalization.as_ref().is_none_or(|finalization| {
                                 !finalization.local_worktree_removed
@@ -6789,7 +6879,7 @@ mod tests {
         );
     }
 
-    fn github_delivery_binding() -> DeliveryBinding {
+    fn github_delivery_binding_for_policy(policy: GitHubDeliveryPolicy) -> DeliveryBinding {
         let app =
             |id: u64, slug: &str, permissions: &[(&str, GitHubPermissionLevel)]| GitHubAppBinding {
                 app_id: id,
@@ -6804,6 +6894,7 @@ mod tests {
         let reviewer_permissions = [("pull_requests", GitHubPermissionLevel::Write)];
         DeliveryBinding::GitHubPullRequest {
             binding: Box::new(GitHubPullRequestBinding {
+                delivery_policy: policy,
                 owner: "owner".into(),
                 repository: "repo".into(),
                 repository_id: 99,
@@ -6846,9 +6937,17 @@ mod tests {
         }
     }
 
-    fn github_core(tasks: Vec<TaskDraft>, single_review: bool) -> SupervisorCore {
+    fn github_delivery_binding() -> DeliveryBinding {
+        github_delivery_binding_for_policy(GitHubDeliveryPolicy::ProtectedAutoMerge)
+    }
+
+    fn github_core_with_policy(
+        tasks: Vec<TaskDraft>,
+        single_review: bool,
+        policy: GitHubDeliveryPolicy,
+    ) -> SupervisorCore {
         let mut reviewer_bindings = default_reviewer_bindings();
-        let mut delivery = github_delivery_binding();
+        let mut delivery = github_delivery_binding_for_policy(policy);
         if single_review {
             reviewer_bindings.truncate(1);
             let DeliveryBinding::GitHubPullRequest { binding } = &mut delivery else {
@@ -6868,7 +6967,7 @@ mod tests {
             inspected_repository_id: 99,
             expected_base_ref: "refs/heads/master".into(),
             expected_base_sha: "a".repeat(40),
-            ruleset_attestation_sha256: "d".repeat(64),
+            ruleset_attestation_sha256: policy.is_protected_auto_merge().then(|| "d".repeat(64)),
             inspection_id: "inspect-github".into(),
         };
         let plan_hash = core.expected_plan_hash_for_inspection(1, &tasks, Some(&inspection));
@@ -6889,6 +6988,14 @@ mod tests {
         })
         .unwrap();
         core
+    }
+
+    fn github_core(tasks: Vec<TaskDraft>, single_review: bool) -> SupervisorCore {
+        github_core_with_policy(
+            tasks,
+            single_review,
+            GitHubDeliveryPolicy::ProtectedAutoMerge,
+        )
     }
 
     fn prepare_github(core: &mut SupervisorCore) -> Vec<SupervisorEffect> {
@@ -7130,7 +7237,7 @@ mod tests {
             inspected_repository_id: 99,
             expected_base_ref: "refs/heads/master".into(),
             expected_base_sha: "a".repeat(40),
-            ruleset_attestation_sha256: "b".repeat(64),
+            ruleset_attestation_sha256: Some("b".repeat(64)),
             inspection_id: "inspect-one".into(),
         };
         let hash = github.expected_plan_hash_for_inspection(1, &tasks, Some(&inspection));
@@ -7152,6 +7259,21 @@ mod tests {
             hash,
             actor_core.expected_plan_hash_for_inspection(1, &tasks, Some(&inspection))
         );
+        let manual_core = SupervisorCore::new_with_delivery_binding(
+            "run-one".into(),
+            PathBuf::from("/project"),
+            PROFILE_HASH.into(),
+            default_reviewer_bindings(),
+            github_delivery_binding_for_policy(GitHubDeliveryPolicy::Manual),
+        )
+        .unwrap();
+        let mut manual_inspection = inspection.clone();
+        manual_inspection.ruleset_attestation_sha256 = None;
+        assert_ne!(
+            hash,
+            manual_core.expected_plan_hash_for_inspection(1, &tasks, Some(&manual_inspection)),
+            "delivery policy must bind the plan hash"
+        );
         let mut moved_base = inspection.clone();
         moved_base.expected_base_sha = "c".repeat(40);
         assert_ne!(
@@ -7159,7 +7281,7 @@ mod tests {
             github.expected_plan_hash_for_inspection(1, &tasks, Some(&moved_base))
         );
         let mut moved_rules = inspection.clone();
-        moved_rules.ruleset_attestation_sha256 = "d".repeat(64);
+        moved_rules.ruleset_attestation_sha256 = Some("d".repeat(64));
         assert_ne!(
             hash,
             github.expected_plan_hash_for_inspection(1, &tasks, Some(&moved_rules))
@@ -7242,7 +7364,7 @@ mod tests {
             check.conclusion,
             GitHubReviewCheckConclusion::ActionRequired
         );
-        assert_eq!(check.ruleset_attestation_sha256, "d".repeat(64));
+        assert_eq!(check.ruleset_attestation_sha256, Some("d".repeat(64)));
         let effects = publish_github_check(&mut core, &effects);
         record(&effects);
         let developer_session = core.tasks[0].developer_session.unwrap();
@@ -7467,6 +7589,69 @@ mod tests {
         ] {
             assert!(observed.contains(&required), "missing {required:?}");
         }
+    }
+
+    #[test]
+    fn github_manual_all_lgtm_completes_unmerged_without_merge_or_finalization_effects() {
+        let mut core = github_core_with_policy(
+            vec![task("manual", "/repo", MIN_SINGLE_REVIEW_ROUNDS)],
+            true,
+            GitHubDeliveryPolicy::Manual,
+        );
+        prepare_github(&mut core);
+        let developer = start_first_developer(&mut core, 0, 1, 1, "manual-dev");
+        publish_github_candidate(&mut core, developer, &"b".repeat(40));
+        let candidate_progress = core
+            .progress_events
+            .last()
+            .expect("manual candidate progress exists");
+        assert!(matches!(
+            candidate_progress,
+            SessionProgressEvent::CandidatePublished {
+                github: GitHubTaskProgressSnapshot {
+                    delivery_policy: GitHubDeliveryPolicy::Manual,
+                    ..
+                },
+                ..
+            }
+        ));
+        start_github_reviewers(&mut core, 0, 10, 20, true);
+        let reviews =
+            publish_github_reviews(&mut core, &[(ReviewerId::Reviewer1, ReviewerVerdict::Lgtm)]);
+        let effects = publish_github_check(&mut core, &reviews);
+        assert_eq!(core.session_state(), SessionState::Completed);
+        assert!(effects.iter().all(|effect| {
+            !matches!(
+                effect,
+                SupervisorEffect::WaitForMergeGate(_)
+                    | SupervisorEffect::MergePullRequest(_)
+                    | SupervisorEffect::FinalizeGitHubRun(_)
+            )
+        }));
+        assert!(core.progress_events.iter().all(|event| {
+            !matches!(
+                event,
+                SessionProgressEvent::MergeWaiting { .. }
+                    | SessionProgressEvent::RunFinalizing { .. }
+            )
+        }));
+        let snapshot = core.snapshot();
+        let github = snapshot.github.expect("manual GitHub status exists");
+        assert_eq!(
+            github.outcome,
+            Some(GitHubDeliveryOutcome::ReviewCompleteUnmerged)
+        );
+        assert_eq!(github.phase, Some(GitHubDeliveryPhase::PreservedUnmerged));
+        assert_eq!(github.merge_sha, None);
+        assert_eq!(github.finalization, None);
+        assert!(github.preserved_branch.is_some());
+        assert!(github.preserved_worktree.is_some());
+        assert!(
+            snapshot
+                .terminal_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("human disposition"))
+        );
     }
 
     #[test]
@@ -9260,6 +9445,7 @@ mod tests {
                         review_generation,
                         developer_final_path: "/artifacts/developer/final.md".into(),
                         github: GitHubTaskProgressSnapshot {
+                            delivery_policy: GitHubDeliveryPolicy::ProtectedAutoMerge,
                             pr_number: 1,
                             pr_url: "https://github.com/owner/repo/pull/1".into(),
                             task_base_sha: "a".repeat(40),

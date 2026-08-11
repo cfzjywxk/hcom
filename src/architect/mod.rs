@@ -34,8 +34,8 @@ pub fn run_cli_with_config(args: &[String], config_path: &Path) -> Result<i32> {
 pub fn help_text() -> &'static str {
     r#"Usage:
   cd <project-directory>
-  hcom arch codex [--single-review] [--github-pr] [architect-profile-options]
-  hcom arch claude [--github-pr] [architect-profile-options]
+  hcom arch codex [--single-review] [--github-pr [--protected-auto-merge]] [architect-profile-options]
+  hcom arch claude [--github-pr [--protected-auto-merge]] [architect-profile-options]
 
 Launch one blank, foreground Codex or Claude architect with capability-bound
 in-memory session-task tools. The invocation's exact current directory is the
@@ -71,7 +71,9 @@ absolute regular file that exists, so a mistyped path fails closed instead of
 silently selecting the built-in defaults, while an absent default path still
 selects them. Startup prints the exact loaded path and marks it as --config.
 
---github-pr explicitly selects the GitHub Pull Request delivery surface. A
+--github-pr explicitly selects the manual GitHub Pull Request delivery surface.
+--protected-auto-merge requires --github-pr and opts in to the strict,
+ruleset-attested exact-head merge path. A
 GitHub table is inert without that flag: the local lane does not validate its
 values, inspect/open App keys, invoke Git, or contact GitHub. With the flag,
 the closed deployment table and exact active single/dual App set are validated
@@ -82,8 +84,12 @@ task commits append without force-push. Successful Developer and Reviewer
 finals are opaque publication payloads: hcom publishes them byte-for-byte
 without redaction or secret scanning, and rejects generated bodies above the
 60 KiB UTF-8 cap. All active Reviewers must publish same-head LGTM before the
-`hcom/review` Check succeeds and an exact-head squash merge is attempted.
-Review exhaustion leaves the PR, branch, and worktree preserved and unmerged.
+`hcom/review` Check succeeds. Manual delivery then completes as
+review_complete_unmerged and preserves the PR, generated refs, and worktree for
+human disposition; it does not attest server-side rules or request
+merge/deletion/finalization. Protected auto-merge retains the strict exact-head
+squash-merge path. Review exhaustion leaves the PR, branch, and worktree
+preserved and unmerged.
 Neither delivery mode authorizes install or release, and the GitHub lane never
 adopts an earlier foreground process's preserved artifacts as a new run.
 
@@ -126,7 +132,7 @@ Only typed profile fields are accepted; arbitrary native argv is not. The
 effective sanitized profiles, their SHA-256 hash, and the exact session binding
 hash are printed at startup and frozen for every sequential run in that
 foreground Architect invocation. Startup also prints `review mode: single` or
-`review mode: dual`. The private task-control protocol is v10:
+`review mode: dual`. The private task-control protocol is v11:
 its plan hash binds the ordered Reviewer identities and exact session
 profile/runtime contract; the closed bridge bootstrap carries the same binding
 hash. A mismatched hcom and

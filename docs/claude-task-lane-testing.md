@@ -5,7 +5,7 @@ Real Claude tests are explicit, serial, headless opt-ins. Ordinary
 No test launches the interactive Architect TUI.
 
 The named task-lane scenarios below are the released protocol-v7
-single-Reviewer evidence. They do not constitute protocol-v10 concurrent
+single-Reviewer evidence. They do not constitute protocol-v11 concurrent
 dual-review acceptance, and the former 10/10 result must not be reported as
 v9 evidence. The explicit v9 dual-review E2E definitions are listed below,
 but they have not been authorized or executed: real-model v9 dual-review E2E

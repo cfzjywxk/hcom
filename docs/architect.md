@@ -26,8 +26,10 @@ cd /path/to/project
 hcom arch codex
 # Codex Architect with only Reviewer1:
 hcom arch codex --single-review
-# opt-in Pull Request delivery (also composes with --single-review):
+# opt-in manual Pull Request delivery (also composes with --single-review):
 hcom arch codex --github-pr
+# strict ruleset-attested exact-head merge:
+hcom arch codex --github-pr --protected-auto-merge
 # or
 hcom arch claude [--add-dir /absolute/external/repository]...
 # Claude Architect with opt-in Pull Request delivery:
@@ -275,7 +277,7 @@ and the additional-directory instruction policy. The session binding hash
 includes the exact Architect/worker profiles, ordered Reviewer identities,
 worker runtime contracts, and ordered Claude Architect `--add-dir` roots; the
 approved plan hash binds it. The bridge bootstrap carries the same hash under a
-closed schema. Private task-control protocol v10 exposes the ordered active
+closed schema. Private task-control protocol v11 exposes the ordered active
 Reviewer state; an old or mismatched `hcom`/`hcom-architect-mcp` pair rejects the
 bootstrap or protocol version instead of falling back to weaker/default
 profiles.
@@ -287,18 +289,24 @@ profiles.
 GitHub. Tasks operate directly in their named source repositories and finish
 as reviewed signed-off local candidate commits.
 
-`--github-pr` selects `GitHubPullRequest`. Only this flag activates the closed
+`--github-pr` selects `GitHubPullRequest` with `delivery_policy=manual`.
+`--protected-auto-merge` requires `--github-pr` and is the only strict merge
+opt-in. Only `--github-pr` activates the closed
 `[architect.github]` configuration and read-only private-repository/App/base/
-rules preflight. Preflight finishes before the blank foreground Architect is
+identity preflight; protected auto-merge additionally attests rules. Manual
+mode never calls or requires ruleset/branch-protection APIs. Preflight finishes
+before the blank foreground Architect is
 launched and creates no remote or local delivery artifact. Startup prints the
-frozen non-secret repository, merge policy, active App identities and complete
-permission maps, and initial base/rules inspection. Keys, JWTs, installation
+frozen non-secret repository, delivery policy, active App identities and
+complete permission maps, and initial base/policy-applicable rules inspection.
+Keys, JWTs, installation
 tokens, and key paths are excluded from that binding.
 
 Before each plan is displayed, the Architect refreshes the read-only delivery
-inspection. The typed plan binds its exact inspection ID, base ref/SHA,
-ruleset attestation, and derived run branch. Start revalidates the base and
-rules before creating a linked worktree or making any GitHub write; stale
+inspection. The typed plan binds its explicit policy, exact inspection ID, base
+ref/SHA, policy-applicable rules attestation, and derived run branch. Start
+revalidates the base and, only in protected mode, rules before creating a linked
+worktree or making any GitHub write; stale
 approval is rejected and must be reinspected and redisplayed. The frozen
 delivery profile persists across sequential runs, while every run receives a
 fresh run ID, inspection, base SHA, plan hash, branch, worktree, and PR.
@@ -308,10 +316,16 @@ and one PR. Successful Developer and Reviewer finals are opaque and published
 byte-for-byte without redaction or secret scanning, under the 60 KiB UTF-8
 generated-body limit disclosed in the plan. Active Reviewers publish
 independently under their bound Apps; same-head LGTM from all active lanes is
-required before `hcom/review` succeeds and the exact-head squash merge begins.
-Review exhaustion completes unmerged and preserves the PR, branch, and
-worktree. Parent exit provides no recovery, and a later foreground Architect
-does not adopt those preserved artifacts as a new run.
+required before `hcom/review` succeeds. Manual delivery then completes as
+`review_complete_unmerged`, preserving the open PR, generated refs, linked
+worktree, and evidence for human disposition. The manual plan discloses that
+hcom cannot prove server-side protection for a private repository on GitHub
+Free or prevent authorized external direct push/early merge; it never requests
+merge, remote deletion, or merged-run finalization. Protected auto-merge retains
+the ruleset-attested exact-head squash-merge and cleanup path. Review exhaustion
+completes unmerged and preserves the PR, branch, and worktree. Parent exit
+provides no recovery, and a later foreground Architect does not adopt those
+preserved artifacts as a new run.
 
 ## Session identity
 
@@ -446,8 +460,9 @@ For GitHub delivery, progress includes the exact PR URL, generation, and head
 SHA without rereading native-final bodies. Terminal handoff additionally gives
 the PR number/URL; run base/final head; every task's exact base/final range and
 outcome; ordered Reviewer App review URLs/verdicts; `hcom/review` Check
-URL/state; approved and final ruleset attestations; delivery outcome; and merge
-SHA if delivered. An unmerged or human-action outcome names the preserved
+URL/state; explicit policy; policy-applicable approved/final ruleset
+attestations; delivery outcome; and merge SHA only if delivered. A manual,
+unmerged, or human-action outcome names the preserved
 branch/worktree/PR. A confirmed-merge finalization failure is reported as such,
 never as unmerged and never as permission to retry merge.
 
@@ -631,7 +646,7 @@ generation paths and Reviewer bodies are not copied into the response.
 Snapshots carry `clarification_record_count` rather than the accumulating
 record vector; the Architect uses `session_clarifications_list` with the exact
 run ID and pages of at most eight to read the ordered chain. MCP compatibility
-text and `structuredContent` carry the same v10 metadata without any Reviewer
+text and `structuredContent` carry the same v11 metadata without any Reviewer
 body. Only after a terminal `session_wait` response does the Architect read
 every active Reviewer's non-empty current-generation path chain and use the original
 verdicts and findings for the human-facing delivery. It distinguishes
@@ -684,9 +699,9 @@ without approving a plan or starting workers. The local source gate already
 checks a narrow fail-closed schema policy and a Codex-0.145/0.146 compatibility
 projection, so this real canary is confirmation of the external service rather
 than the primary regression test.
-The protocol-v10 dual-review runner is separately authorized, serial, and
+The protocol-v11 dual-review runner is separately authorized, serial, and
 Haiku/medium-only for Claude; its definitions are present but have not been run.
-Earlier protocol results are not v10 dual-review evidence.
+Earlier protocol results are not v11 dual-review evidence.
 
 The default test suite exercises the complete delivery matrix without live
 services: local and GitHub modes, single and dual Reviewers, temporary Git

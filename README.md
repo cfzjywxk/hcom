@@ -106,25 +106,33 @@ cd /path/to/project
 hcom arch codex
 # single Reviewer1 lane:
 hcom arch codex --single-review
-# opt-in GitHub Pull Request delivery (also composes with --single-review):
+# opt-in manual GitHub Pull Request delivery (also composes with --single-review):
 hcom arch codex --github-pr
+# opt in to the strict ruleset-attested exact-head merge path:
+hcom arch codex --github-pr --protected-auto-merge
 # or: hcom arch claude
 # profiles from an exact file instead of $HCOM_DIR/config.toml:
 hcom arch codex --config /absolute/path/to/profiles.toml
 ```
 
-`--github-pr` is an explicit delivery surface. Without it, any
+`--github-pr` explicitly selects manual Pull Request delivery. Without it, any
 `[architect.github]` table is inert and the local lane opens no App key,
 invokes no feature-owned Git command, and makes no GitHub request. With it,
-hcom performs read-only private-repository/App/rules preflight before the blank
-Architect starts; writes begin only after an inspected typed plan is approved.
+hcom performs read-only private-repository/App/base preflight before the blank
+Architect starts; manual mode neither calls nor requires repository rules APIs.
+Writes begin only after an inspected typed plan is approved.
 One approved run owns one append-only branch, linked worktree, and Pull
 Request. Successful Developer and Reviewer finals are published byte-for-byte
 without redaction or secret scanning, subject to a 60 KiB UTF-8 generated-body
 cap. Every active Reviewer must publish same-head LGTM before the final Check
-can succeed and an exact-head squash merge can be requested; review exhaustion
-preserves the PR/branch/worktree unmerged. Install and release are never
-implied. See the [GitHub Pull Request lane guide](docs/github-pr-lane.md).
+can succeed. Manual mode then completes as `review_complete_unmerged`, preserving
+the open PR, remote/local run branch, linked worktree, and evidence for human
+disposition; it cannot prove server-side protection for a private repository on
+GitHub Free and never requests merge, branch deletion, or merged-run
+finalization. `--protected-auto-merge` requires `--github-pr` and explicitly
+selects the existing strict ruleset-attested exact-head squash-merge path.
+Review exhaustion preserves the PR/branch/worktree unmerged. Install and release
+are never implied. See the [GitHub Pull Request lane guide](docs/github-pr-lane.md).
 
 Codex roles default to `gpt-5.6-sol` with `xhigh` reasoning,
 `danger-full-access`, and approval policy `never`. Claude roles default to

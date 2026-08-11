@@ -9,7 +9,7 @@ use crate::control_api::registration::{
     RegistrationAction, RegistrationCaller, RegistrationClient,
 };
 use crate::control_api::supervisor::{ControlPaths, SessionSupervisorEndpoint};
-use crate::control_api::{ActionName, ReviewerAdapterBinding};
+use crate::control_api::{ActionName, GitHubDeliveryPolicy, ReviewerAdapterBinding};
 use crate::orchestrator::SessionRuntimeSources;
 use crate::worker::environment::{
     CLAUDE_ADDITIONAL_DIRECTORIES_INSTRUCTIONS, CLAUDE_DISABLE_BACKGROUND_TASKS,
@@ -67,6 +67,10 @@ struct ArchitectArgs {
     #[arg(long = "github-pr")]
     github_pr: bool,
 
+    /// Opt in to ruleset-attested exact-head merge for the GitHub lane.
+    #[arg(long = "protected-auto-merge")]
+    protected_auto_merge: bool,
+
     #[arg(long)]
     model: Option<String>,
 
@@ -106,6 +110,9 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
     let architect_adapter = ArchitectAdapter::parse(&args.adapter)?;
     if args.single_review && architect_adapter != ArchitectAdapter::Codex {
         bail!("--single-review is available only with `hcom arch codex`");
+    }
+    if args.protected_auto_merge && !args.github_pr {
+        bail!("--protected-auto-merge requires --github-pr");
     }
     let parent_environment = ParentEnvironment::capture_current()?;
     // An explicit --config replaces only the profile configuration source; every
@@ -164,8 +171,14 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         let github = loaded.github.take().ok_or_else(|| {
             anyhow::anyhow!("--github-pr requires a closed [architect.github] configuration")
         })?;
+        let delivery_policy = if args.protected_auto_merge {
+            GitHubDeliveryPolicy::ProtectedAutoMerge
+        } else {
+            GitHubDeliveryPolicy::Manual
+        };
         let deployment = crate::orchestrator::github::parse_github_deployment_config(
             github,
+            delivery_policy,
             &reviewer_ids,
             &project_root,
         )?;
@@ -661,6 +674,11 @@ fn write_delivery_startup_summary(
     )?;
     writeln!(
         output,
+        "github delivery policy: {}",
+        binding.delivery_policy.as_str()
+    )?;
+    writeln!(
+        output,
         "github repository: {}/{} id={} visibility={} local_root={} base={}",
         binding.owner,
         binding.repository,
@@ -669,14 +687,26 @@ fn write_delivery_startup_summary(
         binding.local_repository_root,
         binding.base_branch
     )?;
-    writeln!(
-        output,
-        "github delivery: merge_method={} merge_wait_seconds={} delete_remote_branch_after_merge={} review_check={}",
-        binding.merge_method,
-        binding.merge_wait_seconds,
-        binding.delete_remote_branch_after_merge,
-        binding.review_check_name
-    )?;
+    if binding.delivery_policy.is_protected_auto_merge() {
+        writeln!(
+            output,
+            "github protected delivery: merge_method={} merge_wait_seconds={} delete_remote_branch_after_merge={} review_check={}",
+            binding.merge_method,
+            binding.merge_wait_seconds,
+            binding.delete_remote_branch_after_merge,
+            binding.review_check_name
+        )?;
+    } else {
+        writeln!(
+            output,
+            "github manual delivery: review_check={}; no ruleset attestation, merge, remote-ref deletion, or merged-run finalization will be requested",
+            binding.review_check_name
+        )?;
+        writeln!(
+            output,
+            "github manual enforcement disclosure: hcom verifies its own exact base/head, actor, append-only task chain, published reviews, and review Check, but GitHub Free private repositories provide no hcom-attested server-side protection against authorized external direct push or early merge"
+        )?;
+    }
     write_github_app_summary(output, "architect", &binding.architect_app)?;
     write_github_app_summary(output, "developer", &binding.developer_app)?;
     for reviewer in &binding.reviewer_apps {
@@ -689,7 +719,10 @@ fn write_delivery_startup_summary(
         inspection.inspected_repository_id,
         inspection.expected_base_ref,
         inspection.expected_base_sha,
-        inspection.ruleset_attestation_sha256
+        inspection
+            .ruleset_attestation_sha256
+            .as_deref()
+            .unwrap_or("not_applicable")
     )?;
     writeln!(
         output,
@@ -1842,6 +1875,19 @@ mod tests {
             &[
                 "arch".into(),
                 "codex".into(),
+                "--protected-auto-merge".into(),
+            ],
+            Some(&absent),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "--protected-auto-merge requires --github-pr"
+        );
+        let error = run_cli(
+            &[
+                "arch".into(),
+                "codex".into(),
                 "--single-review".into(),
                 "--github-pr".into(),
                 "--config".into(),
@@ -2274,6 +2320,7 @@ private_key_file = "/var/lib/hcom-secrets/reviewer1.pem"
             )]),
         };
         let binding = crate::control_api::GitHubPullRequestBinding {
+            delivery_policy: crate::control_api::GitHubDeliveryPolicy::ProtectedAutoMerge,
             owner: "owner".into(),
             repository: "repository".into(),
             repository_id: 42,
@@ -2295,7 +2342,7 @@ private_key_file = "/var/lib/hcom-secrets/reviewer1.pem"
             inspected_repository_id: 42,
             expected_base_ref: "refs/heads/master".into(),
             expected_base_sha: "a".repeat(40),
-            ruleset_attestation_sha256: "b".repeat(64),
+            ruleset_attestation_sha256: Some("b".repeat(64)),
             inspection_id: "inspection-1".into(),
         };
         let mut github = Vec::new();
@@ -2303,6 +2350,7 @@ private_key_file = "/var/lib/hcom-secrets/reviewer1.pem"
         let github = String::from_utf8(github).unwrap();
         for required in [
             "delivery mode: GitHub Pull Request (explicit --github-pr)",
+            "github delivery policy: protected_auto_merge",
             "github repository: owner/repository id=42 visibility=private local_root=/source base=master",
             "github architect app: app_id=1 installation_id=11 slug=hcom-arch bot_user_id=21 permissions={\"checks\":\"write\"}",
             "github reviewer1 app: app_id=3 installation_id=13 slug=hcom-reviewer1",
@@ -2314,6 +2362,20 @@ private_key_file = "/var/lib/hcom-secrets/reviewer1.pem"
         ] {
             assert!(github.contains(required), "missing {required:?}: {github}");
         }
+
+        let mut manual_binding = binding;
+        manual_binding.delivery_policy = crate::control_api::GitHubDeliveryPolicy::Manual;
+        let mut manual_inspection = inspection;
+        manual_inspection.ruleset_attestation_sha256 = None;
+        let mut manual = Vec::new();
+        write_delivery_startup_summary(&mut manual, Some((&manual_binding, &manual_inspection)))
+            .unwrap();
+        let manual = String::from_utf8(manual).unwrap();
+        assert!(manual.contains("github delivery policy: manual"));
+        assert!(manual.contains("no ruleset attestation, merge, remote-ref deletion"));
+        assert!(manual.contains("no hcom-attested server-side protection"));
+        assert!(manual.contains("ruleset_attestation_sha256=not_applicable"));
+        assert!(!manual.contains("github protected delivery:"));
         assert!(!github.contains("private_key"));
         assert!(!github.contains("token"));
     }

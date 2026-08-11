@@ -21,7 +21,7 @@ pub(crate) use workflow::ProductionGitHubProvider;
 
 use crate::control_api::{
     DeliveryBinding, GITHUB_REVIEW_CHECK_NAME, GitHubAppBinding, GitHubAppRole,
-    GitHubInspectionBinding, GitHubPermissionLevel, GitHubPullRequestBinding,
+    GitHubDeliveryPolicy, GitHubInspectionBinding, GitHubPermissionLevel, GitHubPullRequestBinding,
     GitHubReviewerAppBinding,
 };
 use crate::orchestrator::core::{
@@ -61,6 +61,8 @@ struct GitHubAppsConfig {
 #[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GitHubDeploymentConfig {
+    #[serde(skip)]
+    pub(crate) delivery_policy: GitHubDeliveryPolicy,
     pub(crate) owner: String,
     pub(crate) repository: String,
     pub(crate) local_repository_root: PathBuf,
@@ -109,11 +111,9 @@ pub(crate) struct GitHubPreflightObservation {
     pub(crate) apps: Vec<GitHubAppObservation>,
     pub(crate) expected_base_ref: String,
     pub(crate) expected_base_sha: String,
-    /// SHA-256 of the provider-validated canonical hcom-critical rule subset
-    /// and integration IDs. Raw response ordering must not affect this value;
-    /// missing PR-only/strict/check-source/force-push/deletion/no-bypass rules
-    /// are provider errors and must never produce an observation.
-    pub(crate) ruleset_attestation_sha256: String,
+    /// Present only for protected auto-merge. Manual delivery never requests,
+    /// hashes, freezes, or revalidates repository rules.
+    pub(crate) ruleset_attestation_sha256: Option<String>,
     pub(crate) inspection_id: String,
 }
 
@@ -331,12 +331,14 @@ where
 
 pub(crate) fn parse_github_deployment_config(
     value: toml::Value,
+    delivery_policy: GitHubDeliveryPolicy,
     reviewer_ids: &[ReviewerId],
     project_root: &Path,
 ) -> Result<GitHubDeploymentConfig> {
-    let config: GitHubDeploymentConfig = value
+    let mut config: GitHubDeploymentConfig = value
         .try_into()
         .map_err(|error| anyhow::anyhow!("invalid [architect.github] configuration: {error}"))?;
+    config.delivery_policy = delivery_policy;
     validate_github_deployment_config(&config, reviewer_ids, project_root)?;
     Ok(config)
 }
@@ -427,9 +429,9 @@ pub(crate) fn freeze_preflight(
         bail!("GitHub preflight base ref differs from configuration");
     }
     validate_git_sha("GitHub preflight base SHA", &observation.expected_base_sha)?;
-    validate_sha256(
-        "GitHub ruleset attestation",
-        &observation.ruleset_attestation_sha256,
+    validate_ruleset_attestation(
+        config.delivery_policy,
+        observation.ruleset_attestation_sha256.as_deref(),
     )?;
     validate_id("GitHub inspection ID", &observation.inspection_id)?;
 
@@ -482,7 +484,11 @@ pub(crate) fn freeze_preflight(
                 app.role.as_str()
             );
         }
-        validate_effective_permissions(app.role, &app.effective_permissions)?;
+        validate_effective_permissions(
+            config.delivery_policy,
+            app.role,
+            &app.effective_permissions,
+        )?;
         if !app_ids.insert(app.app_id)
             || !bot_ids.insert(app.bot_user_id)
             || !slugs.insert(app.slug.clone())
@@ -524,6 +530,7 @@ pub(crate) fn freeze_preflight(
         })
         .collect();
     let delivery_binding = GitHubPullRequestBinding {
+        delivery_policy: config.delivery_policy,
         owner: config.owner.clone(),
         repository: config.repository.clone(),
         repository_id: observation.repository_id,
@@ -638,7 +645,7 @@ fn validate_frozen_delivery_binding(
             &format!("frozen {} GitHub App slug", role.as_str()),
             &app.slug,
         )?;
-        validate_effective_permissions(role, &app.effective_permissions)?;
+        validate_effective_permissions(binding.delivery_policy, role, &app.effective_permissions)?;
         if !app_ids.insert(app.app_id)
             || !bot_ids.insert(app.bot_user_id)
             || !slugs.insert(app.slug.as_str())
@@ -665,14 +672,15 @@ fn validate_inspection_against_delivery(
         bail!("GitHub inspection differs from the frozen repository/base binding");
     }
     validate_git_sha("GitHub inspected base SHA", &inspection.expected_base_sha)?;
-    validate_sha256(
-        "GitHub inspected ruleset attestation",
-        &inspection.ruleset_attestation_sha256,
+    validate_ruleset_attestation(
+        delivery.delivery_policy,
+        inspection.ruleset_attestation_sha256.as_deref(),
     )?;
     validate_id("GitHub inspection ID", &inspection.inspection_id)
 }
 
 fn validate_effective_permissions(
+    delivery_policy: GitHubDeliveryPolicy,
     role: GitHubAppRole,
     permissions: &BTreeMap<String, GitHubPermissionLevel>,
 ) -> Result<()> {
@@ -695,7 +703,7 @@ fn validate_effective_permissions(
             );
         }
     }
-    for &(name, required) in required_permissions(role) {
+    for &(name, required) in required_permissions(delivery_policy, role) {
         if !permissions
             .get(name)
             .is_some_and(|actual| actual.satisfies(required))
@@ -710,6 +718,7 @@ fn validate_effective_permissions(
 }
 
 pub(crate) fn required_permissions(
+    delivery_policy: GitHubDeliveryPolicy,
     role: GitHubAppRole,
 ) -> &'static [(&'static str, GitHubPermissionLevel)] {
     const ARCHITECT: &[(&str, GitHubPermissionLevel)] = &[
@@ -724,10 +733,33 @@ pub(crate) fn required_permissions(
     ];
     const REVIEWER: &[(&str, GitHubPermissionLevel)] =
         &[("pull_requests", GitHubPermissionLevel::Write)];
-    match role {
-        GitHubAppRole::Architect => ARCHITECT,
-        GitHubAppRole::Developer => DEVELOPER,
-        GitHubAppRole::Reviewer1 | GitHubAppRole::Reviewer2 => REVIEWER,
+    const MANUAL_ARCHITECT: &[(&str, GitHubPermissionLevel)] = &[
+        ("checks", GitHubPermissionLevel::Write),
+        ("pull_requests", GitHubPermissionLevel::Write),
+    ];
+    match (delivery_policy, role) {
+        (GitHubDeliveryPolicy::ProtectedAutoMerge, GitHubAppRole::Architect) => ARCHITECT,
+        (GitHubDeliveryPolicy::Manual, GitHubAppRole::Architect) => MANUAL_ARCHITECT,
+        (_, GitHubAppRole::Developer) => DEVELOPER,
+        (_, GitHubAppRole::Reviewer1 | GitHubAppRole::Reviewer2) => REVIEWER,
+    }
+}
+
+fn validate_ruleset_attestation(
+    delivery_policy: GitHubDeliveryPolicy,
+    ruleset_attestation_sha256: Option<&str>,
+) -> Result<()> {
+    match (delivery_policy, ruleset_attestation_sha256) {
+        (GitHubDeliveryPolicy::Manual, None) => Ok(()),
+        (GitHubDeliveryPolicy::Manual, Some(_)) => {
+            bail!("manual GitHub delivery must not carry a ruleset attestation")
+        }
+        (GitHubDeliveryPolicy::ProtectedAutoMerge, Some(attestation)) => {
+            validate_sha256("GitHub ruleset attestation", attestation)
+        }
+        (GitHubDeliveryPolicy::ProtectedAutoMerge, None) => {
+            bail!("protected auto-merge requires a ruleset attestation")
+        }
     }
 }
 
@@ -853,6 +885,7 @@ mod tests {
             private_key_file: PathBuf::from(format!("/var/lib/hcom-secrets/{slug}.pem")),
         };
         GitHubDeploymentConfig {
+            delivery_policy: GitHubDeliveryPolicy::ProtectedAutoMerge,
             owner: "owner".into(),
             repository: "repository".into(),
             local_repository_root: root.into(),
@@ -915,7 +948,7 @@ mod tests {
                 .collect(),
             expected_base_ref: "refs/heads/master".into(),
             expected_base_sha: "a".repeat(40),
-            ruleset_attestation_sha256: "b".repeat(64),
+            ruleset_attestation_sha256: Some("b".repeat(64)),
             inspection_id: "inspection-one".into(),
         }
     }
@@ -1049,6 +1082,49 @@ mod tests {
     }
 
     #[test]
+    fn manual_preflight_omits_ruleset_and_strict_architect_permissions() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let reviewers = [ReviewerId::Reviewer1];
+        let mut config = config(&root, false);
+        config.delivery_policy = GitHubDeliveryPolicy::Manual;
+        let mut observed = observation(&config, &reviewers);
+        observed.ruleset_attestation_sha256 = None;
+        let architect = observed
+            .apps
+            .iter_mut()
+            .find(|app| app.role == GitHubAppRole::Architect)
+            .unwrap();
+        architect.effective_permissions.remove("administration");
+        architect.effective_permissions.remove("contents");
+
+        let frozen = freeze_preflight(&config, &reviewers, observed.clone()).unwrap();
+        assert_eq!(
+            frozen.delivery_binding.delivery_policy,
+            GitHubDeliveryPolicy::Manual
+        );
+        assert_eq!(frozen.inspection.ruleset_attestation_sha256, None);
+        assert_eq!(
+            required_permissions(GitHubDeliveryPolicy::Manual, GitHubAppRole::Architect),
+            &[
+                ("checks", GitHubPermissionLevel::Write),
+                ("pull_requests", GitHubPermissionLevel::Write),
+            ]
+        );
+        assert!(
+            required_permissions(
+                GitHubDeliveryPolicy::ProtectedAutoMerge,
+                GitHubAppRole::Architect
+            )
+            .contains(&("administration", GitHubPermissionLevel::Read))
+        );
+
+        let mut protected = config;
+        protected.delivery_policy = GitHubDeliveryPolicy::ProtectedAutoMerge;
+        assert!(freeze_preflight(&protected, &reviewers, observed).is_err());
+    }
+
+    #[test]
     fn mockable_preflight_seam_freezes_runtime_and_exact_request_identity() {
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
@@ -1144,7 +1220,15 @@ mod tests {
             "owner='owner'\nrepository='repo'\nlocal_repository_root='{}'\nbase_branch='master'\nmerge_method='squash'\nmerge_wait_seconds=60\ndelete_remote_branch_after_merge=true\nprivate_repository_required=true\nunknown=true\n",
             root.display()
         )).unwrap();
-        assert!(parse_github_deployment_config(value, &reviewers, Path::new("/project")).is_err());
+        assert!(
+            parse_github_deployment_config(
+                value,
+                GitHubDeliveryPolicy::Manual,
+                &reviewers,
+                Path::new("/project")
+            )
+            .is_err()
+        );
     }
 
     #[test]

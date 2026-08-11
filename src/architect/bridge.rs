@@ -1381,6 +1381,7 @@ mod tests {
         let rules = "c".repeat(64);
         session.delivery_binding = crate::control_api::DeliveryBinding::GitHubPullRequest {
             binding: Box::new(crate::control_api::GitHubPullRequestBinding {
+                delivery_policy: crate::control_api::GitHubDeliveryPolicy::ProtectedAutoMerge,
                 owner: "owner".into(),
                 repository: "repository".into(),
                 repository_id: u64::MAX,
@@ -1400,7 +1401,7 @@ mod tests {
             inspected_repository_id: u64::MAX,
             expected_base_ref: "refs/heads/master".into(),
             expected_base_sha: base_sha.clone(),
-            ruleset_attestation_sha256: rules.clone(),
+            ruleset_attestation_sha256: Some(rules.clone()),
             inspection_id: "inspection-maximum".into(),
             generated_run_branch: branch.clone(),
         };
@@ -1710,7 +1711,7 @@ mod tests {
     }
 
     #[test]
-    fn status_result_preserves_v10_active_bindings_and_current_generation_without_peer_body() {
+    fn status_result_preserves_v11_active_bindings_and_current_generation_without_peer_body() {
         let reviewer1_path = "/artifacts/reviewer/reviewer1/final.md";
         let mut session = status_snapshot();
         session.state = SessionState::Running;

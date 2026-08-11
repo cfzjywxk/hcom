@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
 
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 // A response can accumulate current-generation evidence for all 64 tasks:
 // four Reviewer final paths, one Developer path, two review URLs, and one
@@ -49,6 +49,27 @@ const fn max_progress_events_per_run() -> usize {
 pub const MAX_PROGRESS_EVENTS_PER_RUN: usize = max_progress_events_per_run();
 
 pub const GITHUB_REVIEW_CHECK_NAME: &str = "hcom/review";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubDeliveryPolicy {
+    #[default]
+    Manual,
+    ProtectedAutoMerge,
+}
+
+impl GitHubDeliveryPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::ProtectedAutoMerge => "protected_auto_merge",
+        }
+    }
+
+    pub fn is_protected_auto_merge(self) -> bool {
+        self == Self::ProtectedAutoMerge
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -121,6 +142,7 @@ pub struct GitHubCommitIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GitHubPullRequestBinding {
+    pub delivery_policy: GitHubDeliveryPolicy,
     pub owner: String,
     pub repository: String,
     pub repository_id: u64,
@@ -180,7 +202,8 @@ pub struct GitHubInspectionBinding {
     pub inspected_repository_id: u64,
     pub expected_base_ref: String,
     pub expected_base_sha: String,
-    pub ruleset_attestation_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ruleset_attestation_sha256: Option<String>,
     pub inspection_id: String,
 }
 
@@ -190,7 +213,8 @@ pub struct GitHubRunBinding {
     pub inspected_repository_id: u64,
     pub expected_base_ref: String,
     pub expected_base_sha: String,
-    pub ruleset_attestation_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ruleset_attestation_sha256: Option<String>,
     pub inspection_id: String,
     pub generated_run_branch: String,
 }
@@ -222,6 +246,7 @@ pub enum GitHubDeliveryPhase {
 #[serde(rename_all = "snake_case")]
 pub enum GitHubDeliveryOutcome {
     Delivered,
+    ReviewCompleteUnmerged,
     UnmergedReviewExhausted,
 }
 
@@ -800,6 +825,7 @@ pub enum TaskCompletionOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GitHubTaskProgressSnapshot {
+    pub delivery_policy: GitHubDeliveryPolicy,
     pub pr_number: u64,
     pub pr_url: String,
     pub task_base_sha: String,
@@ -1673,7 +1699,7 @@ mod tests {
                 inspected_repository_id: 99,
                 expected_base_ref: "refs/heads/master".into(),
                 expected_base_sha: "a".repeat(40),
-                ruleset_attestation_sha256: "b".repeat(64),
+                ruleset_attestation_sha256: Some("b".repeat(64)),
                 inspection_id: "inspection-one".into(),
             },
         };
@@ -1687,10 +1713,10 @@ mod tests {
 
     #[test]
     fn previous_protocol_version_fails_closed() {
-        assert_eq!(PROTOCOL_VERSION, 10);
+        assert_eq!(PROTOCOL_VERSION, 11);
         let request = ControlRequest {
             protocol_version: 9,
-            request_id: "v10-request".into(),
+            request_id: "v11-request".into(),
             caller: CallerAuth::Human {
                 process_birth: "123:456".into(),
             },
@@ -1700,7 +1726,7 @@ mod tests {
 
         let response = ControlResponse {
             protocol_version: 9,
-            request_id: "v10-response".into(),
+            request_id: "v11-response".into(),
             ok: false,
             result: None,
             error: Some(ControlErrorBody {
