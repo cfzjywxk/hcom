@@ -165,6 +165,12 @@ delay and a 30-second capped exponential backoff. A GitHub-provided retry delay
 is treated as a lower bound. Every retry still follows a zero-effect
 reconciliation readback; exhausting the window reports the final bounded HTTP
 status, request ID, and sanitized GitHub reason when those fields were present.
+It also reports the attempt count and elapsed retry time. Transport failures
+distinguish request-send from response-body reads and retain a bounded category
+(`timeout`, TLS/connect/I/O class, or body/decode), request/stage elapsed time,
+the configured timeout, and any status, request ID, or rate-limit headers that
+arrived before a body failure. No credential, request body, raw URL, or remote
+response body is copied into this diagnostic.
 
 ## Local verification
 
@@ -175,7 +181,11 @@ Reviewer verdict matrices; synchronized reviews and Checks; exhaustion;
 exact-head merge and finalization; drift, cancellation, cleanup, hostile Git
 configuration, timeout-after-success reconciliation, schema projections, and
 control/MCP size limits. They make no live GitHub, provider-model, network, or
-interactive TUI call.
+interactive TUI call. An ignored, stateless transport probe can explicitly send
+a fake credential and inert head name through the production reqwest/proxy
+builder to `POST /repos/octocat/Hello-World/pulls`; success means GitHub returned
+the expected HTTP 401 rather than a transport failure, and can never create a
+PR.
 
 Live private-repository canaries, installation, push of this source tree, and
 release remain separate operations requiring explicit human authorization.

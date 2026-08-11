@@ -27,7 +27,8 @@ impl ControlClient {
     }
 
     pub fn request(&self, request: &ControlRequest) -> Result<ControlResponse> {
-        self.begin_request(request, Some(SOCKET_IO_TIMEOUT))?.wait()
+        self.begin_request(request, response_read_timeout(&request.action))?
+            .wait()
     }
 
     pub(crate) fn begin_wait(&self, request: &ControlRequest) -> Result<PendingControlResponse> {
@@ -93,6 +94,26 @@ impl ControlClient {
     }
 }
 
+fn response_read_timeout(action: &super::protocol::ControlAction) -> Option<Duration> {
+    use super::protocol::ControlAction;
+
+    match action {
+        // These two local reads never run lifecycle, filesystem, process, or
+        // network effects. Keep a bounded transport failure for a wedged
+        // supervisor.
+        ControlAction::SessionStatus | ControlAction::SessionClarificationsList { .. } => {
+            Some(SOCKET_IO_TIMEOUT)
+        }
+        // Every other action can legitimately outlive the socket I/O bound:
+        // GitHub inspection and approval contain bounded remote operations,
+        // while mutation acknowledgements must not become ambiguous merely
+        // because their effect took more than five seconds. Their owned
+        // operation supplies the bound; EOF still releases this wait if the
+        // supervisor exits.
+        _ => None,
+    }
+}
+
 impl PendingControlResponse {
     pub(crate) fn cancellation_stream(&self) -> Result<UnixStream> {
         self.stream
@@ -111,5 +132,52 @@ impl PendingControlResponse {
             bail!("session supervisor returned an invalid control response envelope");
         }
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control_api::ControlAction;
+
+    #[test]
+    fn effectful_and_remote_actions_do_not_use_the_five_second_ack_timeout() {
+        let actions = [
+            ControlAction::SessionGitHubDeliveryInspect {
+                expected_session_version: 1,
+                run_id: "run-fixture".into(),
+            },
+            ControlAction::SessionApproveAndStart {
+                expected_session_version: 1,
+                plan_version: 1,
+                plan_hash: "a".repeat(64),
+                approval_confirmed: true,
+            },
+            ControlAction::SessionCancel {
+                expected_session_version: 1,
+                reason: "fixture".into(),
+            },
+        ];
+        for action in actions {
+            assert_eq!(response_read_timeout(&action), None);
+        }
+    }
+
+    #[test]
+    fn purely_local_read_actions_keep_the_bounded_ack_timeout() {
+        assert_eq!(
+            response_read_timeout(&ControlAction::SessionStatus),
+            Some(SOCKET_IO_TIMEOUT)
+        );
+        assert_eq!(
+            response_read_timeout(&ControlAction::SessionClarificationsList {
+                run_id: "run-fixture".into(),
+                task_ordinal: 0,
+                task_key: "task-fixture".into(),
+                after_sequence: 0,
+                limit: 1,
+            }),
+            Some(SOCKET_IO_TIMEOUT)
+        );
     }
 }

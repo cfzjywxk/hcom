@@ -16,9 +16,10 @@ use reqwest::header::{
 use reqwest::redirect::Policy;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::error::Error as StdError;
 use std::fmt;
-use std::io::Read;
-use std::time::Duration;
+use std::io::{self, Read};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -41,6 +42,62 @@ pub(crate) enum RestMethod {
     Patch,
     Put,
     Delete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransportStage {
+    RequestSend,
+    ResponseBody,
+}
+
+impl fmt::Display for TransportStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::RequestSend => "request_send",
+            Self::ResponseBody => "response_body",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransportKind {
+    Timeout,
+    ConnectTimeout,
+    Tls,
+    ConnectionRefused,
+    ConnectionReset,
+    ConnectionAborted,
+    NotConnected,
+    BrokenPipe,
+    UnexpectedEof,
+    Connect,
+    Request,
+    Body,
+    Decode,
+    Io,
+    Other,
+}
+
+impl fmt::Display for TransportKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Timeout => "timeout",
+            Self::ConnectTimeout => "connect_timeout",
+            Self::Tls => "tls",
+            Self::ConnectionRefused => "connection_refused",
+            Self::ConnectionReset => "connection_reset",
+            Self::ConnectionAborted => "connection_aborted",
+            Self::NotConnected => "not_connected",
+            Self::BrokenPipe => "broken_pipe",
+            Self::UnexpectedEof => "unexpected_eof",
+            Self::Connect => "connect",
+            Self::Request => "request",
+            Self::Body => "body",
+            Self::Decode => "decode",
+            Self::Io => "io",
+            Self::Other => "other",
+        })
+    }
 }
 
 impl RestMethod {
@@ -683,14 +740,25 @@ impl ApiResponse {
 
 #[derive(Debug, Error)]
 pub(crate) enum GitHubApiError {
-    #[error("GitHub {method:?} {endpoint} transport failed (ambiguous={ambiguous})")]
+    #[error(
+        "GitHub {endpoint} transport failed (stage={stage}, kind={kind}, elapsed_ms={elapsed_millis}, stage_elapsed_ms={stage_elapsed_millis}, timeout_ms={timeout_millis}, http_status={status:?}, request_id={request_id:?}, retry_after={retry_after_seconds:?}, rate_limit_reset={rate_limit_reset_unix:?}, ambiguous={ambiguous})"
+    )]
     Transport {
         method: RestMethod,
         endpoint: &'static str,
+        stage: TransportStage,
+        kind: TransportKind,
+        elapsed_millis: u64,
+        stage_elapsed_millis: u64,
+        timeout_millis: u64,
+        status: Option<u16>,
+        request_id: Option<String>,
+        retry_after_seconds: Option<u64>,
+        rate_limit_reset_unix: Option<u64>,
         ambiguous: bool,
     },
     #[error(
-        "GitHub {method:?} {endpoint} returned HTTP {status} (request_id={request_id:?}, retry_after={retry_after_seconds:?}, rate_limit_reset={rate_limit_reset_unix:?}): {reason}"
+        "GitHub {endpoint} returned HTTP {status} (request_id={request_id:?}, retry_after={retry_after_seconds:?}, rate_limit_reset={rate_limit_reset_unix:?}): {reason}"
     )]
     Http {
         method: RestMethod,
@@ -738,6 +806,7 @@ impl GitHubApiError {
 
     pub(crate) fn http_status(&self) -> Option<u16> {
         match self {
+            Self::Transport { status, .. } => *status,
             Self::Http { status, .. } => Some(*status),
             _ => None,
         }
@@ -749,7 +818,12 @@ impl GitHubApiError {
 
     pub(crate) fn rate_limit_signals(&self) -> (Option<u64>, Option<u64>) {
         match self {
-            Self::Http {
+            Self::Transport {
+                retry_after_seconds,
+                rate_limit_reset_unix,
+                ..
+            }
+            | Self::Http {
                 retry_after_seconds,
                 rate_limit_reset_unix,
                 ..
@@ -785,6 +859,7 @@ impl GitHubApiError {
 pub(crate) struct GitHubRestClient {
     client: Client,
     api_base: Url,
+    request_timeout: Duration,
 }
 
 impl fmt::Debug for GitHubRestClient {
@@ -793,6 +868,7 @@ impl fmt::Debug for GitHubRestClient {
             .debug_struct("GitHubRestClient")
             .field("origin", &self.api_base.origin().ascii_serialization())
             .field("redirects", &"disabled")
+            .field("request_timeout", &self.request_timeout)
             .field("response_cap", &MAX_RESPONSE_BODY_BYTES)
             .finish()
     }
@@ -802,23 +878,39 @@ impl GitHubRestClient {
     pub(crate) fn new() -> Result<Self> {
         ensure_rustls_crypto_provider()?;
         let api_base = Url::parse(GITHUB_API_ORIGIN).expect("fixed GitHub API URL is valid");
-        let client = client_builder(true)
+        let client = client_builder(true, REQUEST_TIMEOUT)
             .build()
             .map_err(|_| anyhow!("failed to build the bounded rustls GitHub HTTP client"))?;
-        Ok(Self { client, api_base })
+        Ok(Self {
+            client,
+            api_base,
+            request_timeout: REQUEST_TIMEOUT,
+        })
     }
 
     #[cfg(test)]
     pub(super) fn new_for_test(api_base: Url) -> Result<Self> {
+        Self::new_for_test_with_timeout(api_base, REQUEST_TIMEOUT)
+    }
+
+    #[cfg(test)]
+    fn new_for_test_with_timeout(api_base: Url, request_timeout: Duration) -> Result<Self> {
         if api_base.scheme() != "http" || api_base.cannot_be_a_base() {
             bail!("fake GitHub origin must be a hierarchical HTTP URL");
         }
+        if request_timeout.is_zero() {
+            bail!("fake GitHub request timeout must be positive");
+        }
         ensure_rustls_crypto_provider()?;
-        let client = client_builder(false)
+        let client = client_builder(false, request_timeout)
             .no_proxy()
             .build()
             .map_err(|_| anyhow!("failed to build fake GitHub HTTP client"))?;
-        Ok(Self { client, api_base })
+        Ok(Self {
+            client,
+            api_base,
+            request_timeout,
+        })
     }
 
     pub(crate) fn get<T: DeserializeOwned>(
@@ -1004,14 +1096,145 @@ impl GitHubRestClient {
                 .header(CONTENT_TYPE, "application/json")
                 .body(body.to_vec());
         }
-        let response = request.send().map_err(|_| GitHubApiError::Transport {
-            method,
-            endpoint: template,
-            // A mutating request can have reached GitHub before a timeout or
-            // connection loss was observed. It must be reconciled before retry.
-            ambiguous: method.is_mutating(),
+        let send_started = Instant::now();
+        let response = request.send().map_err(|error| {
+            let elapsed_millis = duration_millis(send_started.elapsed());
+            GitHubApiError::Transport {
+                method,
+                endpoint: template,
+                stage: TransportStage::RequestSend,
+                kind: classify_reqwest_transport(&error),
+                elapsed_millis,
+                stage_elapsed_millis: elapsed_millis,
+                timeout_millis: duration_millis(self.request_timeout),
+                status: error.status().map(|status| status.as_u16()),
+                request_id: None,
+                retry_after_seconds: None,
+                rate_limit_reset_unix: None,
+                // Even connect-looking failures can be reported by a proxy after
+                // it accepted request bytes. Keep mutations ambiguous until the
+                // endpoint-specific remote reconciliation proves zero effect.
+                ambiguous: method.is_mutating(),
+            }
         })?;
-        normalize_response(method, template, expected_status, response)
+        normalize_response(
+            method,
+            template,
+            expected_status,
+            response,
+            self.request_timeout,
+            send_started,
+        )
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+fn classify_reqwest_transport(error: &reqwest::Error) -> TransportKind {
+    if error.is_timeout() {
+        return if error.is_connect() {
+            TransportKind::ConnectTimeout
+        } else {
+            TransportKind::Timeout
+        };
+    }
+    if error_chain_contains_tls(error) {
+        return TransportKind::Tls;
+    }
+    if let Some(kind) = error_chain_io_kind(error) {
+        return kind;
+    }
+    if error.is_connect() {
+        return TransportKind::Connect;
+    }
+    if error.is_body() {
+        return TransportKind::Body;
+    }
+    if error.is_decode() {
+        return TransportKind::Decode;
+    }
+    if error.is_request() {
+        return TransportKind::Request;
+    }
+    TransportKind::Other
+}
+
+fn classify_io_transport(error: &io::Error) -> TransportKind {
+    if let Some(kind) = io_transport_kind(error.kind()) {
+        return kind;
+    }
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
+            return classify_reqwest_transport(error);
+        }
+        if cause.downcast_ref::<rustls::Error>().is_some() {
+            return TransportKind::Tls;
+        }
+        if let Some(error) = cause.downcast_ref::<io::Error>()
+            && let Some(kind) = io_transport_kind(error.kind())
+        {
+            return kind;
+        }
+        source = cause.source();
+    }
+    TransportKind::Io
+}
+
+fn classify_response_body_transport(
+    error: &io::Error,
+    elapsed: Duration,
+    request_timeout: Duration,
+) -> TransportKind {
+    let kind = classify_io_transport(error);
+    if kind == TransportKind::Io && elapsed >= request_timeout {
+        // reqwest's blocking adapter can surface its deadline as an opaque
+        // std::io::Error without preserving the inner reqwest::Error in the
+        // public source chain. The configured deadline plus measured stage
+        // duration still distinguishes it deterministically from an immediate
+        // protocol/body I/O failure.
+        TransportKind::Timeout
+    } else {
+        kind
+    }
+}
+
+fn error_chain_contains_tls(error: &(dyn StdError + 'static)) -> bool {
+    let mut cause = Some(error);
+    while let Some(current) = cause {
+        if current.downcast_ref::<rustls::Error>().is_some() {
+            return true;
+        }
+        cause = current.source();
+    }
+    false
+}
+
+fn error_chain_io_kind(error: &(dyn StdError + 'static)) -> Option<TransportKind> {
+    let mut cause = Some(error);
+    while let Some(current) = cause {
+        if let Some(error) = current.downcast_ref::<io::Error>()
+            && let Some(kind) = io_transport_kind(error.kind())
+        {
+            return Some(kind);
+        }
+        cause = current.source();
+    }
+    None
+}
+
+fn io_transport_kind(kind: io::ErrorKind) -> Option<TransportKind> {
+    match kind {
+        io::ErrorKind::TimedOut => Some(TransportKind::Timeout),
+        io::ErrorKind::ConnectionRefused => Some(TransportKind::ConnectionRefused),
+        io::ErrorKind::ConnectionReset => Some(TransportKind::ConnectionReset),
+        io::ErrorKind::ConnectionAborted => Some(TransportKind::ConnectionAborted),
+        io::ErrorKind::NotConnected => Some(TransportKind::NotConnected),
+        io::ErrorKind::BrokenPipe => Some(TransportKind::BrokenPipe),
+        io::ErrorKind::UnexpectedEof => Some(TransportKind::UnexpectedEof),
+        _ => None,
     }
 }
 
@@ -1028,7 +1251,7 @@ fn ensure_rustls_crypto_provider() -> Result<()> {
     Ok(())
 }
 
-fn client_builder(https_only: bool) -> reqwest::blocking::ClientBuilder {
+fn client_builder(https_only: bool, request_timeout: Duration) -> reqwest::blocking::ClientBuilder {
     let mut headers = HeaderMap::new();
     headers.insert(
         ACCEPT,
@@ -1042,7 +1265,7 @@ fn client_builder(https_only: bool) -> reqwest::blocking::ClientBuilder {
     );
     let builder = Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
+        .timeout(request_timeout)
         .redirect(Policy::none())
         .default_headers(headers);
     if https_only {
@@ -1078,6 +1301,8 @@ fn normalize_response(
     endpoint: &'static str,
     expected_status: u16,
     mut response: Response,
+    request_timeout: Duration,
+    request_started: Instant,
 ) -> std::result::Result<ApiResponse, GitHubApiError> {
     let status = response.status();
     let request_id = bounded_header(response.headers(), "x-github-request-id");
@@ -1129,16 +1354,30 @@ fn normalize_response(
     // owned response body, not merely bodies the typed layer already knows to
     // contain a token.
     let mut body = Zeroizing::new(Vec::new());
+    let body_started = Instant::now();
     response
         .by_ref()
         .take(MAX_RESPONSE_BODY_BYTES as u64 + 1)
         .read_to_end(&mut body)
-        .map_err(|_| GitHubApiError::Transport {
-            method,
-            endpoint,
-            // The request has already returned headers; callers of a mutating
-            // endpoint reconcile any body-read failure conservatively.
-            ambiguous: method.is_mutating(),
+        .map_err(|error| {
+            let stage_elapsed = body_started.elapsed();
+            let elapsed = request_started.elapsed();
+            GitHubApiError::Transport {
+                method,
+                endpoint,
+                stage: TransportStage::ResponseBody,
+                kind: classify_response_body_transport(&error, elapsed, request_timeout),
+                elapsed_millis: duration_millis(elapsed),
+                stage_elapsed_millis: duration_millis(stage_elapsed),
+                timeout_millis: duration_millis(request_timeout),
+                status: Some(status.as_u16()),
+                request_id: request_id.clone(),
+                retry_after_seconds,
+                rate_limit_reset_unix,
+                // The request has already returned headers; callers of a mutating
+                // endpoint reconcile any body-read failure conservatively.
+                ambiguous: method.is_mutating(),
+            }
         })?;
     if body.len() > MAX_RESPONSE_BODY_BYTES {
         return Err(GitHubApiError::BoundExceeded {
@@ -1289,6 +1528,41 @@ mod tests {
             }
             reader.get_mut().write_all(&response).unwrap();
             request
+        });
+        (Url::parse(&format!("http://{address}/")).unwrap(), handle)
+    }
+
+    fn serve_transport_case(
+        response: Option<Vec<u8>>,
+        delay_before_response: Duration,
+        hold_after_response: Duration,
+    ) -> (Url, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body).unwrap();
+            thread::sleep(delay_before_response);
+            if let Some(response) = response {
+                reader.get_mut().write_all(&response).unwrap();
+                reader.get_mut().flush().unwrap();
+            }
+            thread::sleep(hold_after_response);
         });
         (Url::parse(&format!("http://{address}/")).unwrap(), handle)
     }
@@ -1515,6 +1789,15 @@ mod tests {
         let transport = GitHubApiError::Transport {
             method: RestMethod::Get,
             endpoint: "GET /repos/{owner}/{repo}",
+            stage: TransportStage::RequestSend,
+            kind: TransportKind::Timeout,
+            elapsed_millis: 30_000,
+            stage_elapsed_millis: 30_000,
+            timeout_millis: 30_000,
+            status: None,
+            request_id: None,
+            retry_after_seconds: None,
+            rate_limit_reset_unix: None,
             ambiguous: false,
         };
         assert!(transport.is_retryable_read());
@@ -1534,5 +1817,183 @@ mod tests {
             ambiguous: false,
         };
         assert!(!invalid.is_retryable_read());
+    }
+
+    #[test]
+    fn request_send_timeout_is_classified_before_any_response_headers() {
+        let timeout = Duration::from_millis(75);
+        let (origin, server) =
+            serve_transport_case(None, Duration::from_millis(250), Duration::ZERO);
+        let client = GitHubRestClient::new_for_test_with_timeout(origin, timeout).unwrap();
+        let token = token(InstallationOperation::PullRequestCreate);
+        let error = client
+            .send_json::<_, serde_json::Value>(
+                RestEndpoint::CreatePullRequest {
+                    owner: "owner".into(),
+                    repository: "repo".into(),
+                },
+                GitHubAuthentication::Installation(&token),
+                &serde_json::json!({"title":"fixture"}),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            GitHubApiError::Transport {
+                method: RestMethod::Post,
+                stage: TransportStage::RequestSend,
+                kind: TransportKind::Timeout,
+                timeout_millis: 75,
+                status: None,
+                request_id: None,
+                ambiguous: true,
+                ..
+            }
+        ));
+        let detail = error.to_string();
+        assert!(detail.contains("stage=request_send"));
+        assert!(detail.contains("kind=timeout"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn connection_refusal_is_distinct_from_a_request_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let origin = Url::parse(&format!("http://{address}/")).unwrap();
+        let client =
+            GitHubRestClient::new_for_test_with_timeout(origin, Duration::from_millis(500))
+                .unwrap();
+        let token = token(InstallationOperation::RepositoryMetadata);
+        let error = client
+            .get::<serde_json::Value>(
+                RestEndpoint::Repository {
+                    owner: "owner".into(),
+                    repository: "repo".into(),
+                },
+                GitHubAuthentication::Installation(&token),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                GitHubApiError::Transport {
+                    method: RestMethod::Get,
+                    stage: TransportStage::RequestSend,
+                    kind: TransportKind::ConnectionRefused,
+                    status: None,
+                    ambiguous: false,
+                    ..
+                }
+            ),
+            "unexpected connection diagnostic: {error:?} / {error}"
+        );
+    }
+
+    #[test]
+    fn truncated_response_body_retains_headers_and_body_stage() {
+        let response = b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 64\r\nX-GitHub-Request-Id: fixture-truncated\r\nConnection: close\r\n\r\n{\"id\":".to_vec();
+        let (origin, server) = serve_transport_case(Some(response), Duration::ZERO, Duration::ZERO);
+        let client = GitHubRestClient::new_for_test(origin).unwrap();
+        let token = token(InstallationOperation::PullRequestCreate);
+        let error = client
+            .send_json::<_, serde_json::Value>(
+                RestEndpoint::CreatePullRequest {
+                    owner: "owner".into(),
+                    repository: "repo".into(),
+                },
+                GitHubAuthentication::Installation(&token),
+                &serde_json::json!({"title":"fixture"}),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            GitHubApiError::Transport {
+                method: RestMethod::Post,
+                stage: TransportStage::ResponseBody,
+                kind: TransportKind::Body | TransportKind::UnexpectedEof,
+                status: Some(201),
+                request_id: Some(request_id),
+                ambiguous: true,
+                ..
+            } if request_id == "fixture-truncated"
+        ));
+        let detail = error.to_string();
+        assert!(detail.contains("stage=response_body"));
+        assert!(detail.contains("http_status=Some(201)"));
+        assert!(detail.contains("fixture-truncated"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn response_body_timeout_is_distinct_from_request_send_timeout() {
+        let timeout = Duration::from_millis(75);
+        let response = b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 64\r\nX-GitHub-Request-Id: fixture-body-timeout\r\n\r\n{\"id\":".to_vec();
+        let (origin, server) =
+            serve_transport_case(Some(response), Duration::ZERO, Duration::from_millis(250));
+        let client = GitHubRestClient::new_for_test_with_timeout(origin, timeout).unwrap();
+        let token = token(InstallationOperation::PullRequestCreate);
+        let error = client
+            .send_json::<_, serde_json::Value>(
+                RestEndpoint::CreatePullRequest {
+                    owner: "owner".into(),
+                    repository: "repo".into(),
+                },
+                GitHubAuthentication::Installation(&token),
+                &serde_json::json!({"title":"fixture"}),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                GitHubApiError::Transport {
+                    method: RestMethod::Post,
+                    stage: TransportStage::ResponseBody,
+                    kind: TransportKind::Timeout,
+                    timeout_millis: 75,
+                    status: Some(201),
+                    request_id: Some(request_id),
+                    ambiguous: true,
+                    ..
+                } if request_id == "fixture-body-timeout"
+            ),
+            "unexpected body timeout diagnostic: {error:?} / {error}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "stateless live GitHub transport probe; run only with explicit network authorization"]
+    fn live_exact_pr_post_transport_probe_reaches_an_http_response() {
+        let client = GitHubRestClient::new().unwrap();
+        let token = token(InstallationOperation::PullRequestCreate);
+        let error = client
+            .send_json::<_, serde_json::Value>(
+                RestEndpoint::CreatePullRequest {
+                    owner: "octocat".into(),
+                    repository: "Hello-World".into(),
+                },
+                GitHubAuthentication::Installation(&token),
+                &serde_json::json!({
+                    "title":"hcom stateless transport probe",
+                    "head":"hcom-stateless-transport-probe",
+                    "base":"master",
+                    "body":"x".repeat(7 * 1024),
+                    "draft":false
+                }),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            GitHubApiError::Http {
+                method: RestMethod::Post,
+                status: 401,
+                ..
+            }
+        ));
     }
 }

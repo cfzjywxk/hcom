@@ -52,6 +52,7 @@ use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -2753,6 +2754,34 @@ fn retry_safe_mutation<T>(
     )
 }
 
+#[derive(Debug)]
+struct MutationRetryExhausted {
+    attempts: usize,
+    elapsed_millis: u64,
+    last: PublicationError,
+}
+
+impl fmt::Display for MutationRetryExhausted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let attempt_label = if self.attempts == 1 {
+            "attempt"
+        } else {
+            "attempts"
+        };
+        write!(
+            formatter,
+            "GitHub mutation retry exhausted after {} {} over {} ms; last failure: {}",
+            self.attempts, attempt_label, self.elapsed_millis, self.last
+        )
+    }
+}
+
+impl std::error::Error for MutationRetryExhausted {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.last)
+    }
+}
+
 fn retry_safe_mutation_with_policy<T>(
     mut operation: impl FnMut() -> std::result::Result<T, PublicationError>,
     retry_window: Duration,
@@ -2764,11 +2793,16 @@ fn retry_safe_mutation_with_policy<T>(
     if initial_delay.is_zero() || max_delay < initial_delay {
         bail!("GitHub mutation retry policy is invalid");
     }
-    let deadline = now()
+    let started = now();
+    let deadline = started
         .checked_add(retry_window)
         .ok_or_else(|| anyhow!("GitHub mutation retry deadline overflow"))?;
     let mut fallback = initial_delay;
+    let mut attempts = 0usize;
     loop {
+        attempts = attempts
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("GitHub mutation retry attempt counter overflow"))?;
         match operation() {
             Ok(value) => return Ok(value),
             Err(error) => {
@@ -2785,9 +2819,18 @@ fn retry_safe_mutation_with_policy<T>(
                 // phase into a tight request loop.
                 let delay = retry_delay(retry_after_seconds, rate_limit_reset_unix)?
                     .map_or(fallback, |remote| remote.max(fallback));
-                let remaining = deadline.saturating_duration_since(now());
+                let observed = now();
+                let remaining = deadline.saturating_duration_since(observed);
                 if delay > remaining {
-                    return Err(error.into());
+                    return Err(MutationRetryExhausted {
+                        attempts,
+                        elapsed_millis: observed
+                            .saturating_duration_since(started)
+                            .as_millis()
+                            .min(u64::MAX as u128) as u64,
+                        last: error,
+                    }
+                    .into());
                 }
                 sleep(delay);
                 fallback = fallback.saturating_mul(2).min(max_delay);
@@ -2867,7 +2910,53 @@ mod tests {
         .unwrap_err();
         assert_eq!(attempts, 8);
         assert_eq!(clock.get().duration_since(started), Duration::from_secs(91));
-        assert!(error.to_string().contains("last confirmed zero effect"));
+        let exhausted = error.downcast_ref::<MutationRetryExhausted>().unwrap();
+        assert_eq!(exhausted.attempts, 8);
+        assert_eq!(exhausted.elapsed_millis, 91_000);
+        let detail = error.to_string();
+        assert!(detail.contains("after 8 attempts over 91000 ms"));
+        assert!(detail.contains("last confirmed zero effect"));
+    }
+
+    #[test]
+    fn mutation_retry_exhaustion_preserves_the_transport_stage_and_headers() {
+        let started = Instant::now();
+        let error = retry_safe_mutation_with_policy(
+            || {
+                Err::<(), _>(PublicationError::RetrySafe {
+                    reason: "fixture zero effect",
+                    retry_after_seconds: None,
+                    rate_limit_reset_unix: None,
+                    failure: Some(Box::new(GitHubApiError::Transport {
+                        method: super::super::client::RestMethod::Post,
+                        endpoint: "POST /repos/{owner}/{repo}/pulls",
+                        stage: super::super::client::TransportStage::ResponseBody,
+                        kind: super::super::client::TransportKind::Timeout,
+                        elapsed_millis: 30_000,
+                        stage_elapsed_millis: 29_900,
+                        timeout_millis: 30_000,
+                        status: Some(201),
+                        request_id: Some("fixture-request".into()),
+                        retry_after_seconds: None,
+                        rate_limit_reset_unix: None,
+                        ambiguous: true,
+                    })),
+                })
+            },
+            Duration::ZERO,
+            MUTATION_RETRY_INITIAL,
+            MUTATION_RETRY_MAX,
+            || started,
+            |_| unreachable!("zero retry window must not sleep"),
+        )
+        .unwrap_err();
+
+        let detail = error.to_string();
+        assert!(detail.contains("after 1 attempt over 0 ms"));
+        assert!(detail.contains("stage=response_body"));
+        assert!(detail.contains("kind=timeout"));
+        assert!(detail.contains("http_status=Some(201)"));
+        assert!(detail.contains("fixture-request"));
     }
 
     #[test]

@@ -379,6 +379,14 @@ session_wait({
 })
 ```
 
+Purely local `session_status` and clarification-page reads retain a bounded
+five-second control response timeout. Effectful actions and GitHub inspection
+wait for their lifecycle/network operation to return instead: those operations
+already own their individual bounds, and a successful action must not be
+reported as an ambiguous control transport failure merely because it took more
+than five seconds. Supervisor exit still releases the Unix-socket wait through
+EOF.
+
 The supervisor validates the exact session version, plan version/hash, frozen
 session worker profiles, confirmation bit, field shape, and lexical
 absolute-path syntax. It checks only that `repository_root` is an existing
