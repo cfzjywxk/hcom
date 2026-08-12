@@ -413,6 +413,33 @@ and an explicit “do not start” always wins. A bare generic
 implement/proceed/finish/drive request selects the delegated workflow rather
 than Architect-side implementation, but does not by itself authorize start.
 
+After the Architect completes the prior terminal Reviewer and clarification
+evidence handoff, a new default local-candidate run has two permitted
+continuation bases:
+
+1. a post-terminal human request for more delegated work; or
+2. explicit standing human execution authorization granted before the earlier
+   run for continued or sequential completion of a bounded objective that
+   necessarily spans named runs, packages, a task range, or a phase.
+
+The second basis is valid only when the new plan faithfully advances the same
+stated objective, does not materially expand behavior, acceptance,
+repositories, delivery mechanism, or task set, introduces no unresolved
+material decision, and is not contradicted by a later pause, stop, no-start,
+cancellation, scope change, or revocation. A generic one-shot
+`implement`/`proceed`/`finish`/`drive` request is not standing authorization.
+When applicability is unclear the Architect requires a new human request; an
+explicit pause, stop, or no-start always wins. Carry-forward removes only the
+redundant timing requirement for another human message. The Architect still
+creates a fresh run, displays the complete typed task binding and material
+assumptions, binds the exact new plan/hash, and attests execution authorization
+before workers start.
+
+This standing authority is local-lane-only. It never authorizes a new Pull
+Request, push, merge, release, installation, or deployment. A later GitHub run
+requires a post-terminal human request for its newly inspected and completely
+displayed exact external workflow.
+
 Execution approval for the local-candidate lane includes exactly one
 signed-off local Developer candidate commit per task. Reviewer corrections
 amend that same commit, and LGTM applies to the final exact candidate range;
@@ -494,8 +521,9 @@ unmerged, or human-action outcome names the preserved
 branch/worktree/PR. A confirmed-merge finalization failure is reported as such,
 never as unmerged and never as permission to retry merge.
 
-If the human later requests more delegated work, the same foreground Architect
-creates a new empty run:
+After that handoff, either a post-terminal human request or still-valid bounded
+standing local authorization can permit the same foreground Architect to
+create a new empty run:
 
 ```text
 session_run_begin({

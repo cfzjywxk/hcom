@@ -169,6 +169,28 @@ not by itself authorize starting it. The supervisor validates the exact plan
 version/hash and required confirmation bit, but does not independently attest
 an OS-level human keystroke.
 
+After the Architect has delivered all terminal Reviewer and clarification
+evidence, a later default local-candidate run has two authorization bases. The
+human may request more delegated work after terminal, or may already have
+explicitly granted standing execution authorization for continued/sequential
+completion of a bounded objective that necessarily spans named runs, packages,
+a task range, or a phase. The second basis applies only when the new plan
+faithfully advances the same stated objective, does not materially expand its
+behavior, acceptance, repositories, delivery mechanism, or task set,
+introduces no unresolved material decision, and is not contradicted by a later
+pause, stop, no-start, cancellation, scope change, or revocation. A generic
+one-shot `implement`/`proceed`/`finish`/`drive` request is not standing
+authorization; ambiguity requires a new human request, and an explicit pause,
+stop, or no-start always wins. Carry-forward removes only the redundant timing
+requirement for another human message: the fresh run still displays its
+complete typed binding and assumptions, binds the exact plan/hash, and attests
+execution authorization before workers start.
+
+Standing local authorization never grants a new Pull Request, push, merge,
+release, installation, or deployment. Every later GitHub run still requires a
+post-terminal human request for its newly inspected and completely displayed
+exact external workflow.
+
 Codex Architects and workers use the launching terminal's real
 HOME/CODEX_HOME and native Codex config, authentication, trust, AGENTS.md,
 rules, hooks, skills, plugins, MCP servers, feature flags, custom providers,
@@ -301,12 +323,14 @@ most eight. Only after terminal does the Architect read all active Reviewers'
 current-generation evidence chains and report the original verdicts/findings.
 
 A terminal run remains immutable but does not end the foreground Architect.
-After delivering all Reviewer and clarification evidence, a later human
-request can use `session_run_begin` with that terminal run ID and version to
-create a fresh empty run in the same Architect process. The new run has a new
-run ID, fresh Developer/Reviewer sessions and a separately bound and approved
-plan; the cross-run session version remains monotonic so delayed old mutations
-cannot match it. No new terminal, daemon, or cross-parent recovery is involved.
+After delivering all Reviewer and clarification evidence, either a
+post-terminal human request or still-valid bounded standing local authorization
+can permit `session_run_begin` with that terminal run ID and version to create a
+fresh empty run in the same Architect process. The new run has a new run ID,
+fresh Developer/Reviewer sessions, a separately bound exact plan, and its own
+execution-authorization attestation; the cross-run session version remains
+monotonic so delayed old mutations cannot match it. No new terminal, daemon, or
+cross-parent recovery is involved.
 Once the first approved run acquires the project `hcom-tasks/.lock`, the
 foreground supervisor retains that ownership lease across terminal handoff and
 `session_run_begin`; only the per-run evidence handle changes. A later approve

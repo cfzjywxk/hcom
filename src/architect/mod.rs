@@ -128,6 +128,25 @@ request selects delegation rather than Architect-side development, but does not
 by itself authorize starting the delegated loop. hcom validates the typed plan
 revision/hash and confirmation bit, not OS-level keyboard provenance.
 
+After the prior terminal Reviewer/clarification evidence handoff, a fresh
+default local-candidate run may rely either on a post-terminal human request or
+on explicit standing execution authorization granted before the earlier run
+for continued or sequential completion of a bounded objective that necessarily
+spans named runs, packages, a task range, or a phase. The carried authorization
+is valid only when the new plan faithfully advances that same objective, does
+not materially expand its behavior, acceptance, repositories, delivery
+mechanism, or task set, introduces no unresolved material decision, and has
+not been superseded by a later pause, stop, no-start, cancellation, scope
+change, or revocation. A generic one-shot implement/proceed/finish/drive request
+is not standing authorization; ambiguity requires a new human request, and an
+explicit pause, stop, or no-start always wins. Carry-forward removes only the
+timing requirement for another message: the Architect still creates a fresh run,
+displays its complete typed binding and assumptions, binds its exact plan/hash,
+and attests authorization before workers start. This local authority never
+authorizes a fresh GitHub Pull Request, push, merge, release, installation, or
+deployment; a later GitHub run requires a post-terminal human request for its
+newly inspected and completely displayed exact external workflow.
+
 Only typed profile fields are accepted; arbitrary native argv is not. The
 effective sanitized profiles, their SHA-256 hash, and the exact session binding
 hash are printed at startup and frozen for every sequential run in that
@@ -247,11 +266,13 @@ commit is already reviewed at the reported exact range; the Architect reports
 it without asking whether to retain or revert it merely because commit was not
 separately authorized. Push, install, and release remain separate. A terminal
 run remains immutable but does not end the foreground Architect. After
-completing that evidence handoff, a later human request can call
-session_run_begin with the exact terminal run_id
-and version to create a fresh empty run under the same parent. The new run gets
+completing that evidence handoff, either a post-terminal human request or still
+valid bounded standing local authorization can permit `session_run_begin` with
+the exact terminal run_id and version to create a fresh empty run under the
+same parent. The new run gets
 a new run_id, monotonically advances the session version, resets run-local
-task/worker identity, and still requires a separately bound and approved plan.
+task/worker identity, and still requires a separately bound exact plan plus its
+own execution-authorization attestation.
 
 See docs/architect.md for the complete TOML schema and examples."#
 }

@@ -42,6 +42,23 @@ effect. Read, analyze, discuss, summarize, draft, or update-a-plan requests \
 without an execution directive do not authorize start. An explicit instruction \
 not to start always wins.
 
+After completing the prior terminal Reviewer/clarification evidence handoff, \
+continuation has two permitted local-run bases: a post-terminal human request \
+for more delegated work, or explicit standing human execution authorization \
+granted before the earlier run for continued or sequential completion of a \
+bounded objective that necessarily spans named runs, packages, a task range, or \
+a phase. Carry the earlier authorization only when the new plan faithfully \
+advances that same stated objective, does not materially expand behavior, \
+acceptance, repositories, delivery mechanism, or task set, introduces no \
+unresolved material decision, and is not contradicted by any later pause, stop, \
+no-start, cancellation, scope change, or revocation. A generic one-shot \
+\"implement\", \"proceed\", \"finish\", or \"drive\" request is not standing \
+authorization. If applicability is unclear, require a new human request; an \
+explicit pause, stop, or no-start always wins. Carry-forward removes only the \
+redundant timing requirement for a new human message: create a fresh run, \
+display the complete typed binding and material assumptions, bind its exact \
+plan/hash, and attest execution authorization before workers start.
+
 The standard delegated loop requires each Developer to create exactly one \
 signed-off local candidate commit for its task before review and to amend only \
 that same task commit for corrections. Approval of the run includes this local \
@@ -89,10 +106,11 @@ supplied by hcom. Never edit or reuse an earlier clarification. hcom only \
 transports these paths; it does not interpret task Markdown, `ASSUMPTION:`, \
 `REQUIREMENT_AMBIGUITY:`, or implementation quality. A terminal run and its \
 artifacts remain immutable, but terminal does not end this foreground \
-Architect. After completing the terminal evidence handoff, a later human \
-request may update planning sources and begin a fresh empty run in this same \
-Architect session; the new run still requires an exact plan binding and \
-explicit execution authorization. For an LGTM task, the final Developer task \
+Architect. After completing the terminal evidence handoff, conversation \
+evidence that satisfies the applicable continuation contract may update \
+planning sources and begin a fresh empty run in this same Architect session; \
+the new run still requires an exact plan binding and execution-authorization \
+attestation. For an LGTM task, the final Developer task \
 commit has already been reviewed at its exact candidate range. Report that \
 local reviewed commit and the absence of any separately authorized push or \
 install; do not ask whether to retain or revert it merely because commit was \
@@ -101,6 +119,10 @@ not separately authorized, and do not create another post-LGTM commit.";
 const LOCAL_ARCHITECT_COMMIT_CONTRACT: &str = "The standard delegated loop requires each Developer to create exactly one signed-off local candidate commit for its task before review and to amend only that same task commit for corrections. Approval of the run includes this local candidate-commit topology; it does not authorize push, install, release, or an extra commit after LGTM. Do not write or bind a task/design source that forbids the required local candidate commit. A general rule that local commits require human authorization is satisfied by the human's execution authorization for this run. If the human explicitly requires this run to remain uncommitted, explain that the standard lane is incompatible and ask before binding or starting it. If a Developer reports this authority conflict after start, it is never an Architect-derivable clarification: call session_clarification_require_human even while autonomous clarification budget remains. Do not submit an autonomous clarification or reinterpret run approval as overriding the explicit no-commit instruction.";
 
 const GITHUB_ARCHITECT_COMMIT_CONTRACT: &str = "The GitHub Pull Request delegated loop requires every Developer turn to create exactly one new signed-off child commit on the generated run branch. Corrections and later-task initial turns append commits; they never amend, rebase, squash, reword, or force-push published run history. The foreground supervisor publishes each successful Developer final and each Reviewer final byte-for-byte, without redaction or secret scanning, inside a generated GitHub body whose UTF-8 hard cap is 60 KiB; disclose that external publication to the selected private repository in the complete plan. Approval of the exact displayed plan includes this append-only commit and bounded one-PR push topology; it does not authorize install, release, deployment, or a further commit for a task after that task reaches LGTM. Do not write or bind a task/design source that forbids the required commits. A general rule that commits and the bound GitHub writes require human authorization is satisfied by the human's execution authorization for this exact plan. If the human explicitly requires this run to remain uncommitted or unpushed, explain that the GitHub Pull Request lane is incompatible and ask before binding or starting it. If a Developer reports this authority conflict after start, it is never an Architect-derivable clarification: call session_clarification_require_human even while autonomous clarification budget remains. Do not submit an autonomous clarification or reinterpret run approval as overriding the explicit restriction.";
+
+const LOCAL_CONTINUATION_AUTHORIZATION_CONTRACT: &str = "After completing the prior terminal Reviewer/clarification evidence handoff, continuation has two permitted local-run bases: a post-terminal human request for more delegated work, or explicit standing human execution authorization granted before the earlier run for continued or sequential completion of a bounded objective that necessarily spans named runs, packages, a task range, or a phase. Carry the earlier authorization only when the new plan faithfully advances that same stated objective, does not materially expand behavior, acceptance, repositories, delivery mechanism, or task set, introduces no unresolved material decision, and is not contradicted by any later pause, stop, no-start, cancellation, scope change, or revocation. A generic one-shot \"implement\", \"proceed\", \"finish\", or \"drive\" request is not standing authorization. If applicability is unclear, require a new human request; an explicit pause, stop, or no-start always wins. Carry-forward removes only the redundant timing requirement for a new human message: create a fresh run, display the complete typed binding and material assumptions, bind its exact plan/hash, and attest execution authorization before workers start.";
+
+const GITHUB_CONTINUATION_AUTHORIZATION_CONTRACT: &str = "For continuation after completing the prior terminal Reviewer/clarification evidence handoff, begin a fresh GitHub Pull Request run only from a post-terminal human request that authorizes its newly inspected and completely displayed exact external workflow. Standing local continuation authorization never carries into a new Pull Request, push, merge, release, installation, or deployment. The fresh run still requires its complete typed delivery/task binding and material assumptions, exact plan/hash, and execution-authorization attestation before any worker or GitHub write starts; any later pause, stop, no-start, cancellation, scope change, or revocation wins.";
 
 const LOCAL_ARCHITECT_LGTM_HANDOFF: &str = "For an LGTM task, the final Developer task commit has already been reviewed at its exact candidate range. Report that local reviewed commit and the absence of any separately authorized push or install; do not ask whether to retain or revert it merely because commit was not separately authorized, and do not create another post-LGTM commit.";
 
@@ -146,8 +168,13 @@ pub(crate) fn architect_instructions_for_delivery(github_pr: bool) -> String {
                 LOCAL_ARCHITECT_COMMIT_CONTRACT,
                 GITHUB_ARCHITECT_COMMIT_CONTRACT,
             )
+            .replace(
+                LOCAL_CONTINUATION_AUTHORIZATION_CONTRACT,
+                GITHUB_CONTINUATION_AUTHORIZATION_CONTRACT,
+            )
             .replace(LOCAL_ARCHITECT_LGTM_HANDOFF, GITHUB_ARCHITECT_LGTM_HANDOFF);
         debug_assert!(!instructions.contains(LOCAL_ARCHITECT_COMMIT_CONTRACT));
+        debug_assert!(!instructions.contains(LOCAL_CONTINUATION_AUTHORIZATION_CONTRACT));
         debug_assert!(!instructions.contains(LOCAL_ARCHITECT_LGTM_HANDOFF));
         format!("{instructions}{GITHUB_ARCHITECT_INSTRUCTIONS_SUFFIX}")
     } else {
@@ -371,10 +398,13 @@ pub(crate) fn control_action_for_delivery(
     Ok(action)
 }
 
-fn tool_description(action: ActionName, github_pr: bool) -> &'static str {
-    match action {
+fn tool_description(action: ActionName, github_pr: bool) -> String {
+    let description = match action {
+        ActionName::SessionRunBegin if github_pr => {
+            "Begin a fresh empty GitHub Pull Request run inside this same foreground Architect after the current run is terminal. The old run, its terminal snapshot, Pull Request/worktree, and durable artifacts remain immutable; this action creates a new run_id, preserves the frozen project/profile/delivery binding, advances the session version, and resets run-local task and worker identity. Call it only after reading and reporting every required terminal Reviewer/clarification/delivery artifact from the old run and after a post-terminal human request for a newly inspected and completely displayed exact external workflow. Bind terminal_run_id and expected_session_version to the exact terminal snapshot. This action does not inspect delivery, bind a plan, approve execution, start a worker, or authorize a GitHub write. After success, use the returned new run_id and version for inspection and plan binding. Never use it to skip, abandon, reorder, replace, or adopt artifacts from a non-terminal or earlier run."
+        }
         ActionName::SessionRunBegin => {
-            "Begin a fresh empty run inside this same foreground Architect after the current run is terminal. The old run, its terminal snapshot, and its durable artifacts remain immutable; this action creates a new run_id, preserves the frozen project/profile binding, advances the session version, and resets run-local task and worker identity. Call it only after reading and reporting every required terminal Reviewer/clarification artifact from the old run and only when the human has supplied a later request that needs a new delegated plan. Bind terminal_run_id and expected_session_version to the exact terminal snapshot. This action does not bind a plan, approve execution, or start a worker. After success, use the returned new run_id and version for plan binding. Never use it to skip, abandon, reorder, or replace a non-terminal run."
+            "Begin a fresh empty local run inside this same foreground Architect after the current run is terminal. The old run, its terminal snapshot, and its durable artifacts remain immutable; this action creates a new run_id, preserves the frozen project/profile binding, advances the session version, and resets run-local task and worker identity. Call it only after reading and reporting every required terminal Reviewer/clarification artifact from the old run and only when conversation evidence satisfies one of the permitted local continuation bases stated below. Bind terminal_run_id and expected_session_version to the exact terminal snapshot. This action does not bind a plan, approve execution, or start a worker. After success, use the returned new run_id and version for plan binding. Never use it to skip, abandon, reorder, or replace a non-terminal run."
         }
         ActionName::SessionGitHubDeliveryInspect => {
             "Refresh the exact read-only private repository, base ref/SHA, complete active-App permission maps, identities, and installations for the current GitHub Pull Request run. Protected auto-merge additionally refreshes the canonical hcom-critical ruleset attestation; manual delivery does not call, require, hash, freeze, or revalidate repository rules. Bind run_id and expected_session_version to the current snapshot. This operation creates no ref, worktree, branch, Pull Request, Check, comment, or token-bearing artifact and does not advance session.version. Only its newest inspection_id can be consumed by session_plan_replace; a later inspection supersedes an earlier one even when the observed SHA is unchanged. It is available only in explicit --github-pr mode."
@@ -410,7 +440,7 @@ fn tool_description(action: ActionName, github_pr: bool) -> &'static str {
             "Call this direct MCP tool directly; never wrap it in functions.exec/functions.wait or add a heartbeat around it. Passively wait within the exact current run_id. This is event-driven, not polling, and it returns only for a normal Developer/Reviewer result, a latched pending_architect_action from a Developer clarification/blocker, or a terminal session. A nonterminal progress result is one exact review_requested event after a Developer final or review_responded event after a Reviewer final. Internal candidate_published, task_completed, merge_waiting, and run_finalizing publication/delivery bookkeeping remains retained as bounded evidence but never completes this call or wakes the Architect in manual or protected auto-merge delivery. Pass after_progress_sequence as the last worker-result progress sequence already displayed in this run, or 0 before the first event; returned sequence numbers may skip that internal bookkeeping. Display each worker result once with its delivery policy, exact PR URL, published/final head SHA, task position and generation, and Reviewer identity/verdict/response counts when review-scoped; a partial dual response must immediately re-arm this wait. Do not read or summarize native final files merely for progress. Preserve the existing clarification escalation contract. A terminal snapshot supersedes queued progress and contains final worker and delivery evidence, so a final Reviewer result, derived task completion, final Check/delivery bookkeeping, and successful terminal transition produce one terminal wakeup rather than several; an abnormal terminal transition also returns immediately. At terminal, read the listed current-generation native finals and report the exact policy, PR, per-task ranges/outcomes, ordered Reviewer review URLs/verdicts, hcom/review Check, policy-applicable rules evidence, delivery outcome, merge SHA only when delivered, and preserved branch/worktree/PR for manual or other unmerged outcomes. Cancellation or interruption of this tool never cancels the run."
         }
         ActionName::SessionWait => {
-            "Call this direct MCP tool directly; never wrap it in functions.exec/functions.wait or add a heartbeat around it. Passively wait within the exact current run_id. This is event-driven, not polling, and it returns only for a normal Developer/Reviewer result, a latched pending_architect_action from a Developer clarification/blocker, or a terminal session. Internal task_completed bookkeeping, status publication, supervisor poll/timer ticks, and transport yields never complete this call or wake the Architect. Pass after_progress_sequence as the last worker-result progress sequence already displayed in this run, or 0 before the first event. A nonterminal progress result is one exact review_requested event after a Developer final or review_responded event after a Reviewer final, plus durable input or response paths. Display one concise human-visible update for that result before doing anything else: include task position/total, task_key, completed review_round and in-flight/current review_generation, the exact developer_final_path, and the Reviewer identity, verdict, and every reviewer_final_message_path when present. A review_requested event carries the ordered active Reviewer bindings. A review_responded event carries reviewer_id and responses_received/responses_expected; when fewer responses have arrived than are expected, say that another response is pending and immediately wait again. Do not read or summarize Reviewer final files merely for a progress update. Then immediately call session_wait again using the returned session_version as after_session_version and the displayed event.sequence as after_progress_sequence. Worker execution continues while progress is displayed; normal worker-result events produced before the next wait are retained. Returned progress sequence numbers may skip internal bookkeeping events that never wake the Architect. A pending Architect action takes priority over worker progress. It carries published_version and is retained across interruption or reconnect: a wait from an older version in the same run re-delivers it, while a repeated wait at or after published_version is rejected until you resolve the action. On an action response, read the exact Developer request path. If it reports a conflict between an explicit no-commit instruction and the standard lane's required candidate commit, do not answer autonomously even when clarification budget remains: call session_clarification_require_human, ask the human, and end the turn without waiting. For other requests, if you can derive a bounded answer, create the exact clarification_output_path, submit it, and immediately wait again in the same turn using the last displayed progress sequence. If hcom already requires a human decision, or you choose to escalate with session_clarification_require_human, ask the human and end the turn without waiting. A terminal snapshot supersedes queued progress and contains the final worker evidence, so a final Reviewer result, derived task completion, and successful terminal transition produce one terminal wakeup rather than several; an abnormal terminal transition also returns immediately. Only after a terminal response, read every active Reviewer's listed current-generation final files; when clarification_record_count is nonzero, use session_clarifications_list with that run_id to read the bounded record pages before reporting the original outcomes. A task is LGTM only after every active same-generation Reviewer returns LGTM. For an LGTM task, the final Developer candidate commit was already reviewed at the reported exact range: report it as the local reviewed result, do not ask whether to retain or revert it merely for lack of separate commit authorization, and do not create another post-LGTM commit. Push, install, and release remain separately authorized actions. A later human request may then use session_run_begin to create a fresh run without restarting this Architect. Cancellation or interruption of this tool never cancels the run."
+            "Call this direct MCP tool directly; never wrap it in functions.exec/functions.wait or add a heartbeat around it. Passively wait within the exact current run_id. This is event-driven, not polling, and it returns only for a normal Developer/Reviewer result, a latched pending_architect_action from a Developer clarification/blocker, or a terminal session. Internal task_completed bookkeeping, status publication, supervisor poll/timer ticks, and transport yields never complete this call or wake the Architect. Pass after_progress_sequence as the last worker-result progress sequence already displayed in this run, or 0 before the first event. A nonterminal progress result is one exact review_requested event after a Developer final or review_responded event after a Reviewer final, plus durable input or response paths. Display one concise human-visible update for that result before doing anything else: include task position/total, task_key, completed review_round and in-flight/current review_generation, the exact developer_final_path, and the Reviewer identity, verdict, and every reviewer_final_message_path when present. A review_requested event carries the ordered active Reviewer bindings. A review_responded event carries reviewer_id and responses_received/responses_expected; when fewer responses have arrived than are expected, say that another response is pending and immediately wait again. Do not read or summarize Reviewer final files merely for a progress update. Then immediately call session_wait again using the returned session_version as after_session_version and the displayed event.sequence as after_progress_sequence. Worker execution continues while progress is displayed; normal worker-result events produced before the next wait are retained. Returned progress sequence numbers may skip internal bookkeeping events that never wake the Architect. A pending Architect action takes priority over worker progress. It carries published_version and is retained across interruption or reconnect: a wait from an older version in the same run re-delivers it, while a repeated wait at or after published_version is rejected until you resolve the action. On an action response, read the exact Developer request path. If it reports a conflict between an explicit no-commit instruction and the standard lane's required candidate commit, do not answer autonomously even when clarification budget remains: call session_clarification_require_human, ask the human, and end the turn without waiting. For other requests, if you can derive a bounded answer, create the exact clarification_output_path, submit it, and immediately wait again in the same turn using the last displayed progress sequence. If hcom already requires a human decision, or you choose to escalate with session_clarification_require_human, ask the human and end the turn without waiting. A terminal snapshot supersedes queued progress and contains the final worker evidence, so a final Reviewer result, derived task completion, and successful terminal transition produce one terminal wakeup rather than several; an abnormal terminal transition also returns immediately. Only after a terminal response, read every active Reviewer's listed current-generation final files; when clarification_record_count is nonzero, use session_clarifications_list with that run_id to read the bounded record pages before reporting the original outcomes. A task is LGTM only after every active same-generation Reviewer returns LGTM. For an LGTM task, the final Developer candidate commit was already reviewed at the reported exact range: report it as the local reviewed result, do not ask whether to retain or revert it merely for lack of separate commit authorization, and do not create another post-LGTM commit. Push, install, and release remain separately authorized actions. After the required terminal evidence handoff, session_run_begin may create a fresh local run only under one of the continuation bases stated below. Cancellation or interruption of this tool never cancels the run."
         }
         ActionName::SessionStatus if github_pr => {
             "Read the in-memory GitHub Pull Request delivery status only when the human asks. It includes the complete frozen delivery binding, latest inspection and run binding, PR/worktree/branch/head, delivery phase/outcome, merge/finalization/preservation state, active workers, ordered Reviewer bindings, and per-task ranges, native results, GitHub reviews, and hcom/review Check. It is not a keepalive or polling tool; use session_wait while the run is active with no human question pending."
@@ -421,6 +451,22 @@ fn tool_description(action: ActionName, github_pr: bool) -> &'static str {
         ActionName::SessionCancel => {
             "Cancel this foreground run at an exact version only after the human requests cancellation."
         }
+    };
+    if matches!(
+        action,
+        ActionName::SessionRunBegin
+            | ActionName::SessionPlanReplace
+            | ActionName::SessionApproveAndStart
+            | ActionName::SessionWait
+    ) {
+        let continuation_contract = if github_pr {
+            GITHUB_CONTINUATION_AUTHORIZATION_CONTRACT
+        } else {
+            LOCAL_CONTINUATION_AUTHORIZATION_CONTRACT
+        };
+        format!("{description} {continuation_contract}")
+    } else {
+        description.to_owned()
     }
 }
 
@@ -626,11 +672,15 @@ fn action_schema(
     }
 }
 
-fn approval_confirmation_description(github_pr: bool) -> &'static str {
+fn approval_confirmation_description(github_pr: bool) -> String {
     if github_pr {
-        "Attest that the human explicitly authorized execution by approving this exact displayed draft, by directing the Architect to follow/implement/execute a named existing detailed plan/specification/current_todo, or by directing the Architect to plan/define the solution and then implement/proceed/finish/drive the requested work. A faithful derived plan may use the last form in the same turn when it adds no unresolved material decision. GitHub-lane execution includes one new signed-off commit per Developer turn, append-only correction and later-task history, and the bounded one-PR push/review/check workflow. Only an exact protected_auto_merge plan also authorizes its ruleset-attested exact-head merge and generated-ref finalization; manual policy never authorizes merge or deletion. Neither policy authorizes install/release/deployment or unrelated mutation."
+        format!(
+            "Attest that the human explicitly authorized execution by approving this exact displayed draft, by directing the Architect to follow/implement/execute a named existing detailed plan/specification/current_todo, or by directing the Architect to plan/define the solution and then implement/proceed/finish/drive the requested work. A faithful derived plan may use the last form in the same turn when it adds no unresolved material decision. GitHub-lane execution includes one new signed-off commit per Developer turn, append-only correction and later-task history, and the bounded one-PR push/review/check workflow. Only an exact protected_auto_merge plan also authorizes its ruleset-attested exact-head merge and generated-ref finalization; manual policy never authorizes merge or deletion. Neither policy authorizes install/release/deployment or unrelated mutation. {GITHUB_CONTINUATION_AUTHORIZATION_CONTRACT}"
+        )
     } else {
-        "Attest that the human explicitly authorized execution by approving this exact displayed draft, by directing the Architect to follow/implement/execute a named existing detailed plan/specification/current_todo, or by directing the Architect to plan/define the solution and then implement/proceed/finish/drive the requested work. A faithful derived plan may use the last form in the same turn when it adds no unresolved material decision. Standard-lane execution includes one local signed-off candidate commit per task and same-commit amendments, but not push/install/release."
+        format!(
+            "Attest that the human explicitly authorized execution by approving this exact displayed draft, by directing the Architect to follow/implement/execute a named existing detailed plan/specification/current_todo, or by directing the Architect to plan/define the solution and then implement/proceed/finish/drive the requested work. A faithful derived plan may use the last form in the same turn when it adds no unresolved material decision. Standard-lane execution includes one local signed-off candidate commit per task and same-commit amendments, but not push/install/release. {LOCAL_CONTINUATION_AUTHORIZATION_CONTRACT}"
+        )
     }
 }
 
@@ -1346,6 +1396,113 @@ mod tests {
                 ref terminal_run_id,
             } if terminal_run_id == "run-completed"
         ));
+    }
+
+    #[test]
+    fn generated_local_continuation_contract_carries_only_bounded_standing_authorization() {
+        let reviewers = reviewer_adapters("codex-reviewer", "claude-reviewer-2.1.220");
+        let local_tools = tool_definitions("codex-developer", &reviewers);
+        let mut local_contracts = vec![(
+            "Architect instructions",
+            architect_instructions_for_delivery(false),
+        )];
+        for name in [
+            "session_run_begin",
+            "session_plan_replace",
+            "session_approve_and_start",
+            "session_wait",
+        ] {
+            let description = local_tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap()["description"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            local_contracts.push((name, description));
+        }
+        let local_attestation = local_tools
+            .iter()
+            .find(|tool| tool["name"] == "session_approve_and_start")
+            .unwrap()["inputSchema"]["properties"]["approval_confirmed"]["description"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        local_contracts.push(("approval_confirmed", local_attestation));
+
+        for (surface, contract) in &local_contracts {
+            assert!(
+                contract.contains(LOCAL_CONTINUATION_AUTHORIZATION_CONTRACT),
+                "{surface} did not use the shared local continuation contract"
+            );
+            for required in [
+                "prior terminal Reviewer/clarification evidence handoff",
+                "two permitted local-run bases",
+                "post-terminal human request",
+                "explicit standing human execution authorization",
+                "granted before the earlier run",
+                "continued or sequential completion of a bounded objective",
+                "faithfully advances that same stated objective",
+                "does not materially expand behavior, acceptance, repositories, delivery mechanism, or task set",
+                "introduces no unresolved material decision",
+                "later pause, stop, no-start, cancellation, scope change, or revocation",
+                "generic one-shot",
+                "is not standing authorization",
+                "If applicability is unclear, require a new human request",
+                "explicit pause, stop, or no-start always wins",
+                "Carry-forward removes only the redundant timing requirement",
+                "complete typed binding and material assumptions",
+                "exact plan/hash",
+                "attest execution authorization before workers start",
+            ] {
+                assert!(
+                    contract.contains(required),
+                    "{surface} omitted local continuation guard {required}"
+                );
+            }
+        }
+
+        let github_tools = tool_definitions_for_delivery("codex-developer", &reviewers, true);
+        let mut github_contracts = vec![(
+            "GitHub Architect instructions",
+            architect_instructions_for_delivery(true),
+        )];
+        for name in [
+            "session_run_begin",
+            "session_plan_replace",
+            "session_approve_and_start",
+            "session_wait",
+        ] {
+            let description = github_tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap()["description"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            github_contracts.push((name, description));
+        }
+        let github_attestation = github_tools
+            .iter()
+            .find(|tool| tool["name"] == "session_approve_and_start")
+            .unwrap()["inputSchema"]["properties"]["approval_confirmed"]["description"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        github_contracts.push(("GitHub approval_confirmed", github_attestation));
+
+        for (surface, contract) in github_contracts {
+            assert!(
+                contract.contains(GITHUB_CONTINUATION_AUTHORIZATION_CONTRACT),
+                "{surface} did not use the shared GitHub continuation contract"
+            );
+            assert!(!contract.contains(LOCAL_CONTINUATION_AUTHORIZATION_CONTRACT));
+            assert!(contract.contains("post-terminal human request"));
+            assert!(contract.contains(
+                "Standing local continuation authorization never carries into a new Pull Request"
+            ));
+            assert!(contract.contains("before any worker or GitHub write starts"));
+        }
     }
 
     #[test]

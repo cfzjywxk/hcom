@@ -196,12 +196,33 @@ modification. The Architect must call `session_clarification_require_human`
 regardless of autonomous budget and cannot submit an Architect-derived
 override.
 
+After the prior terminal Reviewer/clarification evidence handoff, the local
+adapter contract permits a new run either for a post-terminal human request or
+under explicit standing human execution authorization granted before the
+earlier run for continued/sequential completion of a bounded objective that
+necessarily spans named runs, packages, a task range, or a phase. Carrying that
+authorization is valid only when the new plan faithfully advances the same
+objective, does not materially expand behavior, acceptance, repositories,
+delivery mechanism, or task set, introduces no unresolved material decision,
+and is not contradicted by a later pause, stop, no-start, cancellation, scope
+change, or revocation. A generic one-shot execution request is not standing
+authorization; ambiguity requires another human request, and pause/stop/no-start
+always wins. The fresh run still needs its complete displayed typed binding and
+material assumptions, exact plan/hash binding, and execution-authorization
+attestation before any worker starts.
+
+This carry-forward is local-only. It does not authorize a new Pull Request,
+push, merge, release, installation, or deployment; a new GitHub run requires a
+post-terminal request for its newly inspected and completely displayed exact
+external workflow.
+
 The terminal run stays immutable. After its evidence handoff, a later human
-request may use `session_run_begin` to allocate a new run ID under the same
-foreground Architect. The new run resets task and logical worker identity but
-keeps a monotonically increasing session version and the frozen
-project/profile binding. Its plan hash is run-bound, and it still needs a fresh
-plan plus explicit approval before any worker starts.
+request or still-valid bounded standing local authorization may use
+`session_run_begin` to allocate a new run ID under the same foreground
+Architect. The new run resets task and logical worker identity but keeps a
+monotonically increasing session version and the frozen project/profile
+binding. Its plan hash is run-bound, and it still needs a fresh plan plus an
+execution-authorization attestation before any worker starts.
 The first approved run acquires the project `hcom-tasks` ownership lock. That
 project lease remains held by the foreground supervisor across every terminal
 run and `session_run_begin`; per-run evidence directories are claimed

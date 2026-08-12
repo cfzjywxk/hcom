@@ -91,6 +91,14 @@ delivery policy, base SHA, policy-applicable rules evidence, generated branch,
 external-publication disclosure, and terminal disposition, and received
 execution authorization under the normal plan contract.
 
+Standing authorization carried across local-candidate runs does not authorize
+a later GitHub run. After a terminal GitHub handoff, a fresh run requires a
+post-terminal human request for its newly inspected and completely displayed
+exact external workflow. No earlier local continuation authority can create a
+new Pull Request or authorize a push, merge, release, installation, or
+deployment. A later pause, stop, no-start, cancellation, scope change, or
+revocation always wins.
+
 A manual plan explicitly discloses that hcom verifies its own exact base/head,
 actors, append-only task chain, published reviews, and `hcom/review` Check, but
 cannot prove server-side PR/direct-push enforcement for a private GitHub Free
