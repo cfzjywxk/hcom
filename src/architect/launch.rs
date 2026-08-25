@@ -59,9 +59,9 @@ struct ArchitectArgs {
     /// Exact enabled architect adapter.
     adapter: String,
 
-    /// Use only Reviewer1. Available only with the Codex Architect.
-    #[arg(long = "single-review")]
-    single_review: bool,
+    /// Add Reviewer2. Available only with the Codex Architect.
+    #[arg(long = "double-review")]
+    double_review: bool,
 
     /// Select the explicit GitHub Pull Request delivery lane.
     #[arg(long = "github-pr")]
@@ -108,9 +108,7 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         std::iter::once("hcom arch".to_owned()).chain(argv.iter().skip(1).cloned()),
     )?;
     let architect_adapter = ArchitectAdapter::parse(&args.adapter)?;
-    if args.single_review && architect_adapter != ArchitectAdapter::Codex {
-        bail!("--single-review is available only with `hcom arch codex`");
-    }
+    let include_reviewer2 = reviewer2_enabled(architect_adapter, args.double_review)?;
     if args.protected_auto_merge && !args.github_pr {
         bail!("--protected-auto-merge requires --github-pr");
     }
@@ -124,14 +122,12 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
         .transpose()?;
     // Both public entrypoints share the same provider-routed task worker lane.
     let mut loaded = match explicit_config.as_deref().or(config_path) {
-        Some(path) => {
-            load_task_lane_profiles_for_mode(path, architect_adapter, args.single_review)?
-        }
+        Some(path) => load_task_lane_profiles_for_mode(path, architect_adapter, include_reviewer2)?,
         None => {
-            let profiles = if args.single_review {
-                SessionInvocationProfiles::for_single_review_task_lane(architect_adapter)?
-            } else {
+            let profiles = if include_reviewer2 {
                 SessionInvocationProfiles::for_task_lane(architect_adapter)?
+            } else {
+                SessionInvocationProfiles::for_single_review_task_lane(architect_adapter)?
             };
             LoadedInvocationProfiles {
                 profiles,
@@ -513,6 +509,16 @@ pub(super) fn run_cli(argv: &[String], config_path: Option<&Path>) -> Result<i32
     supervisor.stop_and_join()?;
     let _ = fs::remove_dir(&paths.runtime);
     Ok(outcome)
+}
+
+fn reviewer2_enabled(architect_adapter: ArchitectAdapter, double_review: bool) -> Result<bool> {
+    match (architect_adapter, double_review) {
+        (ArchitectAdapter::Codex, enabled) => Ok(enabled),
+        (ArchitectAdapter::Claude, false) => Ok(true),
+        (ArchitectAdapter::Claude, true) => {
+            bail!("--double-review is available only with `hcom arch codex`")
+        }
+    }
 }
 
 struct SessionSupervisorThread {
@@ -1892,7 +1898,6 @@ mod tests {
             &[
                 "arch".into(),
                 "codex".into(),
-                "--single-review".into(),
                 "--github-pr".into(),
                 "--config".into(),
                 absent.to_string_lossy().into_owned(),
@@ -1913,7 +1918,6 @@ mod tests {
             &[
                 "arch".into(),
                 "codex".into(),
-                "--single-review".into(),
                 "--config".into(),
                 invalid.to_string_lossy().into_owned(),
             ],
@@ -1929,7 +1933,6 @@ mod tests {
             &[
                 "arch".into(),
                 "codex".into(),
-                "--single-review".into(),
                 "--github-pr".into(),
                 "--config".into(),
                 invalid.to_string_lossy().into_owned(),
@@ -1981,7 +1984,6 @@ private_key_file = "/var/lib/hcom-secrets/reviewer1.pem"
             &[
                 "arch".into(),
                 "codex".into(),
-                "--single-review".into(),
                 "--github-pr".into(),
                 "--config".into(),
                 valid.to_string_lossy().into_owned(),
@@ -1998,16 +2000,39 @@ private_key_file = "/var/lib/hcom-secrets/reviewer1.pem"
     }
 
     #[test]
-    fn single_review_flag_is_codex_only_before_terminal_or_claude_preflight() {
+    fn removed_single_review_flag_is_unknown_before_terminal_preflight() {
         let error = run_cli(
-            &["arch".into(), "claude".into(), "--single-review".into()],
+            &["arch".into(), "codex".into(), "--single-review".into()],
+            None,
+        )
+        .unwrap_err();
+        let error = error.to_string();
+        assert!(
+            error.contains("unexpected argument '--single-review'"),
+            "unexpected removed-flag error: {error}"
+        );
+        assert!(!error.contains("foreground terminal"));
+    }
+
+    #[test]
+    fn double_review_flag_is_codex_only_before_terminal_or_claude_preflight() {
+        let error = run_cli(
+            &["arch".into(), "claude".into(), "--double-review".into()],
             None,
         )
         .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "--single-review is available only with `hcom arch codex`"
+            "--double-review is available only with `hcom arch codex`"
         );
+    }
+
+    #[test]
+    fn review_topology_selection_preserves_claude_dual_and_makes_codex_dual_explicit() {
+        assert!(!reviewer2_enabled(ArchitectAdapter::Codex, false).unwrap());
+        assert!(reviewer2_enabled(ArchitectAdapter::Codex, true).unwrap());
+        assert!(reviewer2_enabled(ArchitectAdapter::Claude, false).unwrap());
+        assert!(reviewer2_enabled(ArchitectAdapter::Claude, true).is_err());
     }
 
     #[test]
@@ -2172,7 +2197,21 @@ private_key_file = "/var/lib/hcom-secrets/reviewer1.pem"
     }
 
     #[test]
-    fn both_public_entrypoints_use_the_mixed_worker_default() {
+    fn public_entrypoints_bind_the_selected_default_topology() {
+        let codex_single =
+            SessionInvocationProfiles::for_single_review_task_lane(ArchitectAdapter::Codex)
+                .unwrap();
+        assert_eq!(
+            worker_adapter_bindings(ArchitectAdapter::Codex, &codex_single).unwrap(),
+            (
+                "codex-exec",
+                vec![ReviewerAdapterBinding {
+                    reviewer_id: crate::worker::profile::ReviewerId::Reviewer1,
+                    adapter: "codex-exec".into(),
+                }],
+            )
+        );
+
         for adapter in [ArchitectAdapter::Codex, ArchitectAdapter::Claude] {
             let profiles = SessionInvocationProfiles::for_task_lane(adapter).unwrap();
             assert_eq!(

@@ -370,12 +370,14 @@ pub(crate) fn validate_github_deployment_config(
 
     let expected_roles = GitHubAppRole::for_reviewers(reviewer_ids);
     if reviewer_ids == [ReviewerId::Reviewer1] && config.apps.reviewer2.is_some() {
-        bail!("[architect.github.apps.reviewer2] is not allowed in single-review mode");
+        bail!(
+            "[architect.github.apps.reviewer2] is not allowed for the active single-review topology"
+        );
     }
     if reviewer_ids == [ReviewerId::Reviewer1, ReviewerId::Reviewer2]
         && config.apps.reviewer2.is_none()
     {
-        bail!("[architect.github.apps.reviewer2] is required in dual-review mode");
+        bail!("[architect.github.apps.reviewer2] is required for the active dual-review topology");
     }
     if !matches!(
         reviewer_ids,
@@ -1156,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn single_mode_omits_reviewer2_everywhere_and_rejects_an_inactive_profile() {
+    fn active_reviewer_collection_controls_single_and_dual_app_validation() {
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let reviewers = [ReviewerId::Reviewer1];
@@ -1174,6 +1176,21 @@ mod tests {
         assert!(
             validate_github_deployment_config(&inactive, &reviewers, Path::new("/project"))
                 .is_err()
+        );
+
+        let dual_reviewers = [ReviewerId::Reviewer1, ReviewerId::Reviewer2];
+        let missing_reviewer2 = config(&root, false);
+        let error = validate_github_deployment_config(
+            &missing_reviewer2,
+            &dual_reviewers,
+            Path::new("/project"),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "[architect.github.apps.reviewer2] is required for the active dual-review topology"
+            ),
+            "unexpected dual App validation error: {error}"
         );
     }
 

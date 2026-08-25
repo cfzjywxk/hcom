@@ -3,9 +3,9 @@
 The Codex provider inside hcom's task worker lane: one native `codex exec`
 process per selected Codex turn, no protocol conversation, and a supervisor
 that never judges the work. Developer, Reviewer1, and Reviewer2 adapters are
-independent; the built-in lanes are Codex Developer + Codex Reviewer1 + Claude
-Reviewer2, while explicit canonical overrides can retain this provider for any
-or all worker lanes.
+independent. Codex defaults to Codex Developer + Codex Reviewer1; its explicit
+dual topology and Claude's default dual topology add Claude Reviewer2. Canonical
+overrides can retain this provider for any active worker lane.
 
 ## The two rules
 

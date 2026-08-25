@@ -34,7 +34,7 @@ pub fn run_cli_with_config(args: &[String], config_path: &Path) -> Result<i32> {
 pub fn help_text() -> &'static str {
     r#"Usage:
   cd <project-directory>
-  hcom arch codex [--single-review] [--github-pr [--protected-auto-merge]] [architect-profile-options]
+  hcom arch codex [--double-review] [--github-pr [--protected-auto-merge]] [architect-profile-options]
   hcom arch claude [--github-pr [--protected-auto-merge]] [architect-profile-options]
 
 Launch one blank, foreground Codex or Claude architect with capability-bound
@@ -56,14 +56,15 @@ Profile configuration is read once from $HCOM_DIR/config.toml (default:
 Each table is a partial override: omitted fields keep the built-in role
 default. Codex accepts reasoning_effort or its effort alias. Developer,
 Reviewer1, and Reviewer2 adapters are selected independently; their defaults
-are codex, codex, and claude respectively. By default both Reviewer lanes are
-active. `hcom arch codex --single-review` activates only Reviewer1; an explicit
-[architect.reviewer2] table is rejected in that mode, while Reviewer1 may still
-select either provider. The flag is rejected for `hcom arch claude` before any
-interactive process starts. A legacy-only [architect.reviewer] profile is
-resolved once and applied to Reviewer1 in single mode or copied to both
-Reviewer lanes in dual mode, with a deprecation notice; mixing it with either
-canonical Reviewer table fails closed.
+are codex, codex, and claude respectively. `hcom arch codex` activates only
+Reviewer1 by default. `--double-review` adds Reviewer2 and restores the dual
+Codex topology; an explicit [architect.reviewer2] table is rejected without
+that flag, while Reviewer1 may still select either provider. `hcom arch claude`
+remains dual by default and rejects the flag before any interactive process
+starts. A legacy-only [architect.reviewer] profile is resolved once and applied
+to Reviewer1 in single mode or copied to both Reviewer lanes in dual mode, with
+a deprecation notice; mixing it with either canonical Reviewer table fails
+closed.
 
 --config selects only the profile configuration source; every other hcom
 setting still comes from $HCOM_DIR/config.toml. It must be a canonical
@@ -104,9 +105,10 @@ Architect CLI overrides (higher priority than TOML):
 
 Built-in Architect defaults are Codex gpt-5.6-sol/xhigh with
 danger-full-access/never, or Claude opus/xhigh with
-dangerously-skip-permissions. Both entrypoints share one provider-routed worker
-lane bundle. Developer and Reviewer1 default to Codex gpt-5.6-sol/xhigh with
-danger-full-access/never; Reviewer2 defaults to Claude opus/xhigh with
+dangerously-skip-permissions. Both entrypoints use the provider-routed worker
+lane. Developer and Reviewer1 default to Codex gpt-5.6-sol/xhigh with
+danger-full-access/never. Reviewer2, when active for Codex `--double-review` or
+the default Claude topology, defaults to Claude opus/xhigh with
 dangerously-skip-permissions. Any worker lane can explicitly select codex or
 claude. An unavailable selected adapter fails closed without fallback.
 

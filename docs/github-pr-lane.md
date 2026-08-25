@@ -4,7 +4,7 @@ The GitHub lane is an explicit delivery mode for the foreground Architect:
 
 ```bash
 hcom arch codex --github-pr
-hcom arch codex --single-review --github-pr
+hcom arch codex --double-review --github-pr
 hcom arch claude --github-pr
 hcom arch codex --github-pr --protected-auto-merge
 ```
@@ -51,7 +51,8 @@ app_id = 1003
 slug = "example-hcom-reviewer1"
 private_key_file = "/absolute/private/path/reviewer1.pem"
 
-# Required only in dual-review mode; forbidden with --single-review.
+# Required only in dual-review mode; forbidden for the default Codex single
+# topology.
 [architect.github.apps.reviewer2]
 app_id = 1004
 slug = "example-hcom-reviewer2"

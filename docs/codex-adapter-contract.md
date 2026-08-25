@@ -98,13 +98,16 @@ its first task-control call.
 
 Both `hcom arch codex` and `hcom arch claude` bind one provider-routed worker
 lane bundle. The foreground Architect adapter does not change the independently
-configured worker adapters. The defaults are Codex Developer, Codex Reviewer1,
-and Claude Reviewer2. Canonical `[architect.reviewer1]` and
+configured worker adapters. Codex defaults to Codex Developer and Codex
+Reviewer1 only; `--double-review` adds the default Claude Reviewer2. Claude
+retains Codex Developer + Codex Reviewer1 + Claude Reviewer2 by default.
+Canonical `[architect.reviewer1]` and
 `[architect.reviewer2]` tables independently select either provider; a
 legacy-only `[architect.reviewer]` profile is copied completely to both lanes
-in dual mode, or applied once to Reviewer1 with `--single-review`. The latter
-flag is available only to the Codex Architect, rejects an explicit
-`[architect.reviewer2]` table, and otherwise keeps normal Reviewer1 overrides.
+in dual mode, or applied once to Reviewer1 in the default Codex single mode.
+`--double-review` is available only to the Codex Architect. Without it, an
+explicit `[architect.reviewer2]` table is rejected and normal Reviewer1
+overrides remain available.
 A selected unavailable provider fails closed without fallback.
 
 The exec lane:
@@ -266,7 +269,7 @@ supporting a new Codex schema adapter, separately authorize a minimal real API
 canary in a newly created disposable terminal:
 
 ```text
-hcom arch codex --single-review \
+hcom arch codex \
   --model gpt-5.3-codex-spark --reasoning medium \
   --sandbox read-only --approval never
 ```
@@ -281,7 +284,7 @@ source gate unless the human explicitly authorizes it.
 
 | Contract | Regression |
 |---|---|
-| defaults are explicit | `architect::profile::tests::missing_file_uses_reviewed_defaults`, `worker::profile::tests::task_lane_defaults_to_codex_developer_codex_reviewer1_and_claude_reviewer2` |
+| defaults are explicit | `architect::profile::tests::codex_default_single_review_has_only_reviewer1_without_claude_gate`, `architect::launch::tests::public_entrypoints_bind_the_selected_default_topology`, `worker::profile::tests::task_lane_defaults_to_codex_developer_codex_reviewer1_and_claude_reviewer2` |
 | no prompt or input injection | `architect::launch::tests::native_profile_has_no_prompt_or_secret_transport`, `blank_codex_launch_keeps_input_empty_and_preserves_native_host_semantics` |
 | native config plus one direct-only MCP leaf | `architect::launch::tests::codex_native_argv_keeps_only_hcom_control_tools_out_of_code_mode`, `architect::launch::tests::codex_control_server_is_an_additive_cli_overlay_not_a_private_config` |
 | Codex MCP schema compatibility across local/GitHub and single/dual inventories | `architect::tools::tests::generated_tool_schemas_stay_inside_the_codex_compatibility_policy`, `architect::tools::tests::codex_schema_policy_rejects_lossy_or_ambiguous_shapes_before_launch` |

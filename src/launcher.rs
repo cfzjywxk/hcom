@@ -2199,7 +2199,7 @@ pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<Stri
             vec![
                 "unexpected argument `arch` after `codex`.\n\
                  `arch` is a top-level hcom command; use \
-                 `hcom arch codex [--single-review] [--github-pr [--protected-auto-merge]] [architect-profile-options]` instead."
+                 `hcom arch codex [--double-review] [--github-pr [--protected-auto-merge]] [architect-profile-options]` instead."
                     .to_string(),
             ]
         }

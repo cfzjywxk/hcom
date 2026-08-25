@@ -84,10 +84,11 @@ hcom
 `hcom arch` runs one blank interactive Codex or Claude architect and an
 in-memory, ordered task supervisor. Each approved task gets fresh no-TUI
 Developer and active Reviewer sessions routed independently to native Codex or
-Claude workers. The default built-in lanes are Codex Developer + Codex
-Reviewer1 + Claude Reviewer2. Each review generation starts both default
-Reviewers concurrently and waits for both responses. With
-`hcom arch codex --single-review`, only Reviewer1 is active. Same-task
+Claude workers. `hcom arch codex` defaults to Codex Developer + Codex Reviewer1
+with no Reviewer2. `--double-review` explicitly adds the default Claude
+Reviewer2; `hcom arch claude` retains that dual topology by default. A dual
+review generation starts both Reviewers concurrently and waits for both
+responses. Same-task
 corrections resume the exact Developer session and re-review resumes each
 active Reviewer's own exact native session.
 Reviewer1 and Reviewer2 are equal peers with the same complete scope and
@@ -113,9 +114,9 @@ first developer result forgot the commit.
 ```bash
 cd /path/to/project
 hcom arch codex
-# single Reviewer1 lane:
-hcom arch codex --single-review
-# opt-in manual GitHub Pull Request delivery (also composes with --single-review):
+# opt in to Reviewer1 + Reviewer2:
+hcom arch codex --double-review
+# opt-in manual GitHub Pull Request delivery (also composes with --double-review):
 hcom arch codex --github-pr
 # opt in to the strict ruleset-attested exact-head merge path:
 hcom arch codex --github-pr --protected-auto-merge
@@ -147,12 +148,13 @@ Codex roles default to `gpt-5.6-sol` with `xhigh` reasoning,
 `danger-full-access`, and approval policy `never`. Claude roles default to
 `opus`/`xhigh` with `dangerously-skip-permissions`. These values are explicit
 and therefore do not inherit model/effort defaults from native configuration.
-`hcom arch codex` selects a Codex foreground Architect; `hcom arch claude`
-selects a Claude foreground Architect. Both retain the Codex Developer + Codex
-Reviewer1 + Claude Reviewer2 worker defaults unless their role tables override
-them. `--single-review` is supported only with the Codex Architect and removes
-Reviewer2 from the effective topology; an explicit `[architect.reviewer2]`
-table is rejected in that mode. The
+`hcom arch codex` selects a Codex foreground Architect with the Codex Developer
+and Codex Reviewer1 defaults; Reviewer2 is absent. Its Codex-only
+`--double-review` flag adds the default Claude Reviewer2. `hcom arch claude`
+selects a Claude foreground Architect and retains the dual Reviewer1 +
+Reviewer2 topology by default; it rejects `--double-review`. An explicit
+`[architect.reviewer2]` table is rejected for the default Codex single
+topology. The
 capability-bound session-control MCP server is additive, so all other native
 MCP servers remain available. A human request that
 explicitly says to follow or execute a named existing detailed plan,

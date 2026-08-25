@@ -403,10 +403,10 @@ impl SessionInvocationProfiles {
         }
     }
 
-    /// Built-in profiles for the provider-routed task-runtime lane.
+    /// Built-in profiles for the dual provider-routed task-runtime topology.
     ///
     /// The foreground Architect adapter is selected independently from the
-    /// default Codex Developer + Codex Reviewer1 + Claude Reviewer2 workers.
+    /// Codex Developer + Codex Reviewer1 + Claude Reviewer2 role defaults.
     pub fn for_task_lane(adapter: ArchitectAdapter) -> Result<Self> {
         Self::for_task_lane_topology(adapter, true)
     }

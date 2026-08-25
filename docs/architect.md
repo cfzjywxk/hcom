@@ -24,9 +24,9 @@ run does not revive or modify it.
 ```bash
 cd /path/to/project
 hcom arch codex
-# Codex Architect with only Reviewer1:
-hcom arch codex --single-review
-# opt-in manual Pull Request delivery (also composes with --single-review):
+# Codex Architect with Reviewer1 + Reviewer2:
+hcom arch codex --double-review
+# opt-in manual Pull Request delivery (also composes with --double-review):
 hcom arch codex --github-pr
 # strict ruleset-attested exact-head merge:
 hcom arch codex --github-pr --protected-auto-merge
@@ -53,17 +53,17 @@ Both public entrypoints use the same provider-routed worker lane bundle. The
 command selects only the foreground Architect; worker tables remain
 independent:
 
-- `hcom arch codex`: Codex foreground Architect, Codex Developer, Codex
-  Reviewer1, and Claude Reviewer2 by default.
-- `hcom arch codex --single-review`: Codex foreground Architect, Codex
-  Developer, and Codex Reviewer1 by default; Reviewer2 is absent.
+- `hcom arch codex`: Codex foreground Architect, Codex Developer, and Codex
+  Reviewer1 by default; Reviewer2 is absent.
+- `hcom arch codex --double-review`: Codex foreground Architect, Codex
+  Developer, Codex Reviewer1, and Claude Reviewer2 by default.
 - `hcom arch claude`: Claude foreground Architect, Codex Developer, Codex
   Reviewer1, and Claude Reviewer2 by default.
 
 Each worker lane may explicitly select Codex or Claude. An unavailable selected
 adapter fails closed; hcom never silently falls back to another provider.
-`--single-review` is rejected for a Claude foreground Architect before any
-interactive process is spawned.
+`--double-review` is rejected for a Claude foreground Architect before any
+interactive process is spawned; its no-flag topology remains dual.
 
 The delivery mode is independent of provider topology. See the
 [GitHub Pull Request lane](github-pr-lane.md) for its closed deployment
@@ -187,7 +187,8 @@ Built-in defaults are:
 
 | Command | Architect | Developer | Reviewer1 | Reviewer2 |
 |---|---|---|---|---|
-| `hcom arch codex` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Claude `opus`, `xhigh`, skip permissions |
+| `hcom arch codex` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | absent |
+| `hcom arch codex --double-review` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Claude `opus`, `xhigh`, skip permissions |
 | `hcom arch claude` | Claude `opus`, `xhigh`, skip permissions | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Codex `gpt-5.6-sol`, `xhigh`, `danger-full-access`, `never` | Claude `opus`, `xhigh`, skip permissions |
 
 Every table is a partial override. Omitted fields retain that role's built-in
@@ -218,17 +219,18 @@ dangerously_skip_permissions = true
 ```
 
 `adapter` is optional in worker tables. Developer and Reviewer1 default to
-`codex`; Reviewer2 defaults to `claude`. Setting an adapter switches that table
-to the selected role's complete built-in default before applying its remaining
-partial overrides. Canonical configurations use `[architect.reviewer1]` and
-`[architect.reviewer2]`. For migration only, a legacy-only
+`codex`; Reviewer2, when active, defaults to `claude`. Setting an adapter
+switches that table to the selected role's complete built-in default before
+applying its remaining partial overrides. Canonical configurations use
+`[architect.reviewer1]` and `[architect.reviewer2]`. For migration only, a legacy-only
 `[architect.reviewer]` table is resolved once using the released single-table
 rules and copied completely to both Reviewer lanes in dual mode. In single
 mode it is applied once to Reviewer1. Startup prints a mode-specific
 deprecation notice. Combining the legacy table with either canonical Reviewer
-table fails closed. In single mode an explicit `[architect.reviewer2]` table is
-rejected; `[architect.reviewer1]` remains a normal partial override and may
-select Claude, which activates the Claude environment gate. With no override,
+table fails closed. In the default Codex single mode an explicit
+`[architect.reviewer2]` table is rejected with guidance to use
+`--double-review`; `[architect.reviewer1]` remains a normal partial override and
+may select Claude, which activates the Claude environment gate. With no override,
 single mode is pure Codex and does not activate that gate. Codex workers
 require `sandbox = "danger-full-access"` and
 `ask_for_approval = "never"` because they have no human approval channel.
@@ -757,8 +759,8 @@ disposable terminal because automated submission of its first prompt would
 violate user input ownership.
 When Architect MCP schemas or the supported native Codex schema adapter
 changes, that separately authorized smoke should use
-`gpt-5.3-codex-spark`/`medium`, single-review mode, read-only sandboxing, and a
-human-submitted non-executing first prompt. Its first success criterion is that
+`gpt-5.3-codex-spark`/`medium`, the default single-review mode, read-only
+sandboxing, and a human-submitted non-executing first prompt. Its first success criterion is that
 the service accepts every advertised tool schema without a 400; it must exit
 without approving a plan or starting workers. The local source gate already
 checks a narrow fail-closed schema policy and a Codex-0.145/0.146 compatibility

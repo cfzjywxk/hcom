@@ -5,6 +5,8 @@ mod support;
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 #[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -681,7 +683,7 @@ fn misordered_architect_form_fails_before_opening_state() {
     );
     assert!(
         stderr.contains(
-            "`hcom arch codex [--single-review] [--github-pr [--protected-auto-merge]] [architect-profile-options]`"
+            "`hcom arch codex [--double-review] [--github-pr [--protected-auto-merge]] [architect-profile-options]`"
         ),
         "stderr={stderr}"
     );
@@ -741,7 +743,7 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
     let normalized_stdout = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
         normalized_stdout.contains(
-            "Developer and Reviewer1 default to Codex gpt-5.6-sol/xhigh with danger-full-access/never; Reviewer2 defaults to Claude opus/xhigh with dangerously-skip-permissions"
+            "Developer and Reviewer1 default to Codex gpt-5.6-sol/xhigh with danger-full-access/never. Reviewer2, when active for Codex `--double-review` or the default Claude topology, defaults to Claude opus/xhigh with dangerously-skip-permissions"
         ) && normalized_stdout.contains(
             "An unavailable selected adapter fails closed without fallback"
         ),
@@ -862,7 +864,8 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
         ),
         "stdout={stdout}"
     );
-    assert!(stdout.contains("--single-review"), "stdout={stdout}");
+    assert!(stdout.contains("--double-review"), "stdout={stdout}");
+    assert!(!stdout.contains("--single-review"), "stdout={stdout}");
     assert!(stdout.contains("--github-pr"), "stdout={stdout}");
     assert!(stdout.contains("--protected-auto-merge"), "stdout={stdout}");
     assert!(stdout.contains("[architect.github]"), "stdout={stdout}");
@@ -892,19 +895,38 @@ fn architect_help_is_additive_and_does_not_open_v24_state() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn claude_architect_rejects_single_review_before_terminal_preflight() {
+fn claude_architect_rejects_double_review_before_terminal_preflight() {
     let h = Hcom::new();
     let db_path = h.path().join("hcom.db");
-    let (code, stdout, stderr) = h.run(["arch", "claude", "--single-review"]);
+    let (code, stdout, stderr) = h.run(["arch", "claude", "--double-review"]);
     assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
     assert!(stdout.is_empty(), "stdout={stdout}");
     assert!(
-        stderr.contains("--single-review is available only with `hcom arch codex`"),
+        stderr.contains("--double-review is available only with `hcom arch codex`"),
         "stderr={stderr}"
     );
     assert!(
         !stderr.contains("foreground terminal"),
         "mode rejection must precede terminal preflight: {stderr}"
+    );
+    assert!(!db_path.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn removed_single_review_flag_is_unknown_before_terminal_preflight() {
+    let h = Hcom::new();
+    let db_path = h.path().join("hcom.db");
+    let (code, stdout, stderr) = h.run(["arch", "codex", "--single-review"]);
+    assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.is_empty(), "stdout={stdout}");
+    assert!(
+        stderr.contains("unexpected argument '--single-review'"),
+        "stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("foreground terminal"),
+        "removed flag must fail before terminal preflight: {stderr}"
     );
     assert!(!db_path.exists());
 }
@@ -944,15 +966,46 @@ fn architect_rejects_the_removed_repository_argument() {
 #[test]
 fn architect_startup_gates_run_before_opening_either_state_lane() {
     let h = Hcom::new();
-    for adapter in ["codex", "claude"] {
-        let (code, stdout, stderr) = h.run(["arch", adapter]);
-        assert_ne!(code, 0, "adapter={adapter} stdout={stdout} stderr={stderr}");
+    let (code, stdout, stderr) = h.run(["arch", "codex"]);
+    assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.is_empty(), "stdout={stdout}");
+    assert!(
+        stderr.contains("hcom arch requires stdin/stdout/stderr on a real terminal"),
+        "the default Codex single topology must not validate an absent Claude lane: {stderr}"
+    );
+
+    for argv in [
+        vec!["arch", "codex", "--double-review"],
+        vec!["arch", "claude"],
+    ] {
+        let (code, stdout, stderr) = h.run(argv.clone());
+        assert_ne!(code, 0, "argv={argv:?} stdout={stdout} stderr={stderr}");
         assert!(stdout.is_empty(), "stdout={stdout}");
         assert!(
             stderr.contains("Claude proxy environment variable HTTP_PROXY is missing"),
-            "the default dual topology must validate its Claude lane before terminal launch: {stderr}"
+            "an effective Claude role must be validated before terminal launch: {stderr}"
         );
     }
+
+    let claude_reviewer1 = h.workspace.join("claude-reviewer1.toml");
+    std::fs::write(
+        &claude_reviewer1,
+        "[architect.reviewer1]\nadapter = \"claude\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&claude_reviewer1, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let (code, stdout, stderr) = h.run([
+        "arch",
+        "codex",
+        "--config",
+        claude_reviewer1.to_str().unwrap(),
+    ]);
+    assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.is_empty(), "stdout={stdout}");
+    assert!(
+        stderr.contains("Claude proxy environment variable HTTP_PROXY is missing"),
+        "a Claude Reviewer1 override must activate the effective Claude gate: {stderr}"
+    );
     assert!(!h.path().join("hcom.db").exists());
     assert!(
         !h.root_path()
