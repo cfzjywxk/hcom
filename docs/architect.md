@@ -45,7 +45,7 @@ Enter. The human owns the first and every later interactive input.
 
 Each task names an absolute, lexically normalized `repository_root` that exists
 as a directory. It may be `/home/user/src/hcom` while the project is
-`/home/user/work/data/hcom-interactive`, or it may be nested below the project.
+`/home/user/work/hcom-project`, or it may be nested below the project.
 hcom passes this source path to every task worker; it does not infer it from plan
 markdown or search the filesystem for a repository.
 
@@ -152,8 +152,8 @@ parse, merge, truncate, summarize, or resolve instruction files itself.
 For example, with:
 
 ```text
-project: /home/ywxk/src/work/data/hcom-interactive
-source:  /home/ywxk/src/hcom
+project: /home/user/work/hcom-project
+source:  /home/user/src/hcom
 ```
 
 native Codex loads the real user/project context from the first path, while

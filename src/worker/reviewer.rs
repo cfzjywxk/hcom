@@ -39,12 +39,25 @@ use uuid::Uuid;
 
 pub const CODEX_REVIEWER_MODEL: &str = "gpt-5.6-sol";
 pub const CODEX_REVIEWER_REASONING: &str = "xhigh";
-pub const CLAUDE_REVIEWER_EXECUTABLE: &str = "/home/ywxk/.local/share/claude/versions/2.1.220";
+pub const CLAUDE_REVIEWER_PINNED_VERSION: &str = "2.1.220";
 pub const CLAUDE_REVIEWER_CLI_VERSION: &str = "2.1.220 (Claude Code)";
 pub const CLAUDE_REVIEWER_MODEL: &str = "opus";
 pub const CLAUDE_REVIEWER_REASONING: &str = "xhigh";
-pub const CLAUDE_DEVELOPER_EXECUTABLE: &str = CLAUDE_REVIEWER_EXECUTABLE;
 pub const CLAUDE_DEVELOPER_CLI_VERSION: &str = CLAUDE_REVIEWER_CLI_VERSION;
+
+/// Pinned Claude CLI binary for this adapter: the versioned install below the
+/// invoking user's home directory.
+pub fn claude_reviewer_executable() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    home.join(".local/share/claude/versions")
+        .join(CLAUDE_REVIEWER_PINNED_VERSION)
+}
+
+pub fn claude_developer_executable() -> PathBuf {
+    claude_reviewer_executable()
+}
 
 const BWRAP_EXECUTABLE: &str = "/usr/bin/bwrap";
 const BWRAP_VERSION: &str = "bubblewrap 0.9.0";
@@ -375,10 +388,11 @@ pub struct ClaudeDeveloperAdapter {
 impl ClaudeDeveloperAdapter {
     pub fn discover(config: ClaudeDeveloperConfig) -> Result<Self> {
         validate_production_runtime_contract(&config.host_runtime_dir, &config.run_id)?;
-        validate_claude_cli(Path::new(CLAUDE_DEVELOPER_EXECUTABLE))?;
+        let claude = claude_developer_executable();
+        validate_claude_cli(&claude)?;
         Self::discover_with_paths(
             config,
-            Path::new(CLAUDE_DEVELOPER_EXECUTABLE),
+            &claude,
             Path::new(BWRAP_EXECUTABLE),
             Path::new(GIT_EXECUTABLE),
         )
@@ -660,10 +674,11 @@ pub struct ClaudeReviewerAdapter {
 impl ClaudeReviewerAdapter {
     pub fn discover(config: ClaudeReviewerConfig) -> Result<Self> {
         validate_production_runtime_contract(&config.host_runtime_dir, &config.run_id)?;
-        validate_claude_cli(Path::new(CLAUDE_REVIEWER_EXECUTABLE))?;
+        let claude = claude_reviewer_executable();
+        validate_claude_cli(&claude)?;
         Self::discover_with_paths(
             config,
-            Path::new(CLAUDE_REVIEWER_EXECUTABLE),
+            &claude,
             Path::new(BWRAP_EXECUTABLE),
             Path::new(GIT_EXECUTABLE),
         )
@@ -2765,9 +2780,9 @@ mod tests {
 
     #[test]
     fn pinned_claude_help_matches_configurable_command_contract_when_installed() {
-        let claude = Path::new(CLAUDE_REVIEWER_EXECUTABLE);
+        let claude = claude_reviewer_executable();
         if claude.exists() {
-            validate_claude_cli(claude).unwrap();
+            validate_claude_cli(&claude).unwrap();
         }
     }
 
